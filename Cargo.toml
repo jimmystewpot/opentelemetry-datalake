@@ -1,0 +1,65 @@
+[package]
+name = "opentelemetry-datalake"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/*"
+]
+
+[dependencies]
+pipeline-core = { path = "crates/core" }
+otlp-receiver = { path = "crates/otlp-receiver" }
+noop-transformer = { path = "crates/noop-transformer" }
+kafka-sink = { path = "crates/kafka-sink" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+figment = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.37", features = ["full"] }
+
+# Errors
+thiserror = "2.0.18"
+anyhow = "1.0"
+
+# Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.33.0"
+opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "metrics", "logs"] }
+async-trait = "0.1"
+
+# Serialization & Config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+figment = { version = "0.10", features = ["env", "toml"] }
+
+# Arrow
+arrow = "58.3.0"
+
+# Codec & OTLP Parsing
+prost = "0.14.4"
+opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "serde"] }
+
+# Networking
+tonic = "0.14.6"
+axum = "0.8.9"
+
+# Sinks
+rdkafka = { version = "0.39.0", features = ["cmake-build"] }
+
+# Testing & Benchmarking
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[profile.release]
+lto = "thin"
+debug = true

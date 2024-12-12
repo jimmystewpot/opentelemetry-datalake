@@ -1,0 +1,21 @@
+[package]
+name = "arrow-codec"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pipeline-core = { path = "../core" }
+arrow = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "codec_bench"
+harness = false

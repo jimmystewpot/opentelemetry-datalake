@@ -1,0 +1,13 @@
+[package]
+name = "noop-transformer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pipeline-core = { path = "../core" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+arrow = { workspace = true }

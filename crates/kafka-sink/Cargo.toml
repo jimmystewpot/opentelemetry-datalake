@@ -1,0 +1,15 @@
+[package]
+name = "kafka-sink"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pipeline-core = { path = "../core" }
+arrow = { workspace = true, features = ["ipc"] }
+rdkafka = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

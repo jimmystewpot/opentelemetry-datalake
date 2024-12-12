@@ -1,0 +1,22 @@
+[package]
+name = "otlp-receiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pipeline-core = { path = "../core" }
+arrow-codec = { path = "../arrow-codec" }
+arrow = { workspace = true }
+opentelemetry-proto = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+axum = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
