@@ -14,7 +14,8 @@ struct AppConfig {
     #[serde(default)]
     telemetry: pipeline_core::telemetry::TelemetryConfig,
     server: ServerConfig,
-    kafka: KafkaConfig,
+    kafka: Option<KafkaConfig>,
+    iceberg: Option<storage::iceberg::IcebergSinkConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -92,36 +93,6 @@ async fn main() -> anyhow::Result<()> {
     let mut traces_transformer = noop_transformer::NoopTransformer::new();
     let mut metrics_transformer = noop_transformer::NoopTransformer::new();
 
-    // Create Kafka Sinks
-    let parse_format = |f: &str| {
-        if f.eq_ignore_ascii_case("ipc") {
-            kafka_sink::SerializationFormat::Ipc
-        } else {
-            kafka_sink::SerializationFormat::Json
-        }
-    };
-
-    let mut logs_sink = kafka_sink::KafkaSink::try_new(
-        &config.kafka.brokers,
-        &config.kafka.logs_topic,
-        parse_format(&config.kafka.logs_format),
-        &config.kafka.options,
-    )?;
-
-    let mut traces_sink = kafka_sink::KafkaSink::try_new(
-        &config.kafka.brokers,
-        &config.kafka.traces_topic,
-        parse_format(&config.kafka.traces_format),
-        &config.kafka.options,
-    )?;
-
-    let mut metrics_sink = kafka_sink::KafkaSink::try_new(
-        &config.kafka.brokers,
-        &config.kafka.metrics_topic,
-        parse_format(&config.kafka.metrics_format),
-        &config.kafka.options,
-    )?;
-
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
         if let Err(e) = logs_transformer.transform(logs_rx, logs_sink_tx).await {
@@ -148,23 +119,84 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn sinks
-    let logs_sink_handle = tokio::spawn(async move {
-        if let Err(e) = logs_sink.run(logs_sink_rx).await {
-            tracing::error!("Logs sink error: {}", e);
-        }
-    });
+    let logs_sink_handle;
+    let traces_sink_handle;
+    let metrics_sink_handle;
 
-    let traces_sink_handle = tokio::spawn(async move {
-        if let Err(e) = traces_sink.run(traces_sink_rx).await {
-            tracing::error!("Traces sink error: {}", e);
-        }
-    });
+    if let Some(ref iceberg_cfg) = config.iceberg {
+        tracing::info!("Initializing Iceberg sinks");
+        let mut logs_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
+        let mut traces_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
+        let mut metrics_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
 
-    let metrics_sink_handle = tokio::spawn(async move {
-        if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-            tracing::error!("Metrics sink error: {}", e);
-        }
-    });
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs Iceberg sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces Iceberg sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics Iceberg sink error: {}", e);
+            }
+        });
+    } else if let Some(ref kafka_cfg) = config.kafka {
+        tracing::info!("Initializing Kafka sinks");
+        let parse_format = |f: &str| {
+            if f.eq_ignore_ascii_case("ipc") {
+                kafka_sink::SerializationFormat::Ipc
+            } else {
+                kafka_sink::SerializationFormat::Json
+            }
+        };
+
+        let mut logs_sink = kafka_sink::KafkaSink::try_new(
+            &kafka_cfg.brokers,
+            &kafka_cfg.logs_topic,
+            parse_format(&kafka_cfg.logs_format),
+            &kafka_cfg.options,
+        )?;
+
+        let mut traces_sink = kafka_sink::KafkaSink::try_new(
+            &kafka_cfg.brokers,
+            &kafka_cfg.traces_topic,
+            parse_format(&kafka_cfg.traces_format),
+            &kafka_cfg.options,
+        )?;
+
+        let mut metrics_sink = kafka_sink::KafkaSink::try_new(
+            &kafka_cfg.brokers,
+            &kafka_cfg.metrics_topic,
+            parse_format(&kafka_cfg.metrics_format),
+            &kafka_cfg.options,
+        )?;
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs Kafka sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces Kafka sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics Kafka sink error: {}", e);
+            }
+        });
+    } else {
+        return Err(anyhow::anyhow!("Either [kafka] or [iceberg] configuration must be provided"));
+    }
 
     // Spawn source
     let source_handle = tokio::spawn(async move {

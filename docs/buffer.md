@@ -37,6 +37,17 @@ This specification addresses direct buffer development and telemetry. It does no
 
 ---
 
+## Buffering and Flushing Defaults
+
+To ensure optimal performance and alignment with downstream sinks (such as Transactional Lakehouses), all buffer implementations **SHOULD** adhere to the following default flushing triggers:
+
+*   **Default Max Batch Size**: `134217728` bytes (128 MB).
+*   **Default Max Batch Interval**: `60` seconds.
+
+The buffer **MUST** trigger a flush event when *either* of these thresholds is reached. These defaults are designed to balance data latency with write efficiency, particularly for Parquet-based storage formats.
+
+---
+
 ## Instrumentation Requirements
 
 This section extends the [Instrumentation Specification](instrumentation.md), which SHOULD be read first. All buffers MUST emit telemetry via structured events and corresponding metrics.

@@ -1,0 +1,25 @@
+[package]
+name = "storage"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["aws"]
+aws = ["dep:iceberg-catalog-glue", "dep:iceberg-catalog-s3tables"]
+
+[dependencies]
+pipeline-core = { path = "../core" }
+arrow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { version = "0.4.38", features = ["serde"] }
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+
+# Conditional AWS Catalog Dependencies
+iceberg-catalog-glue = { version = "0.9.1", optional = true }
+iceberg-catalog-s3tables = { version = "0.9.1", optional = true }
