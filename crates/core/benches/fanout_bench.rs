@@ -1,7 +1,7 @@
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use pipeline_core::pipeline::{Fanout, SignalBatch};
 use std::sync::Arc;
 use tokio::runtime::Runtime;

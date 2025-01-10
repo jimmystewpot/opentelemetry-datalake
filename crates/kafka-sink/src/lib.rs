@@ -14,6 +14,18 @@ pub enum SerializationFormat {
     Json,
 }
 
+impl std::str::FromStr for SerializationFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "ipc" => Ok(Self::Ipc),
+            "json" => Ok(Self::Json),
+            _ => Err(format!("Unknown serialization format: {s}")),
+        }
+    }
+}
+
 /// Sink that writes Arrow record batches to Apache Kafka.
 pub struct KafkaSink {
     producer: FutureProducer,
@@ -58,13 +70,14 @@ impl KafkaSink {
     pub fn serialize_batch(
         &self,
         batch: &arrow::record_batch::RecordBatch,
-    ) -> Result<Vec<u8>, PipelineError> {
+        buf: &mut Vec<u8>,
+    ) -> Result<(), PipelineError> {
+        buf.clear();
         match self.format {
             SerializationFormat::Ipc => {
-                let mut buf = Vec::new();
                 {
                     let mut writer =
-                        arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+                        arrow::ipc::writer::StreamWriter::try_new(buf, &batch.schema())
                             .map_err(|e| PipelineError::Internal(e.to_string()))?;
                     writer
                         .write(batch)
@@ -73,17 +86,16 @@ impl KafkaSink {
                         .finish()
                         .map_err(|e| PipelineError::Internal(e.to_string()))?;
                 }
-                Ok(buf)
+                Ok(())
             }
             SerializationFormat::Json => {
-                let mut buf = Vec::new();
                 {
-                    let mut writer = arrow::json::LineDelimitedWriter::new(&mut buf);
+                    let mut writer = arrow::json::LineDelimitedWriter::new(buf);
                     writer
                         .write(batch)
                         .map_err(|e| PipelineError::Internal(e.to_string()))?;
                 }
-                Ok(buf)
+                Ok(())
             }
         }
     }
@@ -92,6 +104,7 @@ impl KafkaSink {
 #[async_trait]
 impl Sink for KafkaSink {
     async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+        let mut buffer = Vec::with_capacity(8192);
         while let Some(signal) = input.recv().await {
             let batch = match signal {
                 SignalBatch::Logs(b) | SignalBatch::Traces(b) | SignalBatch::Metrics(b) => b,
@@ -101,9 +114,9 @@ impl Sink for KafkaSink {
                 continue;
             }
 
-            let payload = self.serialize_batch(&batch)?;
+            self.serialize_batch(&batch, &mut buffer)?;
 
-            let record = FutureRecord::to(&self.topic).payload(&payload).key("");
+            let record = FutureRecord::to(&self.topic).payload(&buffer).key("");
 
             if let Err((e, _)) = self
                 .producer
@@ -143,9 +156,11 @@ mod tests {
         )
         .unwrap();
 
+        let mut buffer = Vec::new();
+
         // Verify JSON serialization
-        let json_payload = sink.serialize_batch(&batch).unwrap();
-        let json_str = String::from_utf8(json_payload).unwrap();
+        sink.serialize_batch(&batch, &mut buffer).unwrap();
+        let json_str = String::from_utf8(buffer.clone()).unwrap();
         assert!(json_str.contains("{\"f\":1}"));
 
         // Verify IPC serialization
@@ -156,7 +171,7 @@ mod tests {
             &options,
         )
         .unwrap();
-        let ipc_payload = ipc_sink.serialize_batch(&batch).unwrap();
-        assert!(!ipc_payload.is_empty());
+        ipc_sink.serialize_batch(&batch, &mut buffer).unwrap();
+        assert!(!buffer.is_empty());
     }
 }

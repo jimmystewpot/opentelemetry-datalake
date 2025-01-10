@@ -42,7 +42,10 @@ impl LogsService for GrpcLogsService {
         match arrow_codec::decode_logs(&req) {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    let _ = self.tx.send(SignalBatch::Logs(batch)).await;
+                    self.tx
+                        .send(SignalBatch::Logs(batch))
+                        .await
+                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
                 }
                 Ok(Response::new(ExportLogsServiceResponse {
                     partial_success: None,
@@ -68,7 +71,10 @@ impl TraceService for GrpcTraceService {
         match arrow_codec::decode_traces(&req) {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    let _ = self.tx.send(SignalBatch::Traces(batch)).await;
+                    self.tx
+                        .send(SignalBatch::Traces(batch))
+                        .await
+                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
                 }
                 Ok(Response::new(ExportTraceServiceResponse {
                     partial_success: None,
@@ -94,7 +100,10 @@ impl MetricsService for GrpcMetricsService {
         match arrow_codec::decode_metrics(&req) {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    let _ = self.tx.send(SignalBatch::Metrics(batch)).await;
+                    self.tx
+                        .send(SignalBatch::Metrics(batch))
+                        .await
+                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
                 }
                 Ok(Response::new(ExportMetricsServiceResponse {
                     partial_success: None,
@@ -142,7 +151,11 @@ async fn handle_logs(
     match arrow_codec::decode_logs(&req) {
         Ok(batch) => {
             if batch.num_rows() > 0 {
-                let _ = state.logs_tx.send(SignalBatch::Logs(batch)).await;
+                state
+                    .logs_tx
+                    .send(SignalBatch::Logs(batch))
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             }
             Ok((
                 StatusCode::OK,
@@ -169,7 +182,11 @@ async fn handle_traces(
     match arrow_codec::decode_traces(&req) {
         Ok(batch) => {
             if batch.num_rows() > 0 {
-                let _ = state.traces_tx.send(SignalBatch::Traces(batch)).await;
+                state
+                    .traces_tx
+                    .send(SignalBatch::Traces(batch))
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             }
             Ok((
                 StatusCode::OK,
@@ -196,7 +213,11 @@ async fn handle_metrics(
     match arrow_codec::decode_metrics(&req) {
         Ok(batch) => {
             if batch.num_rows() > 0 {
-                let _ = state.metrics_tx.send(SignalBatch::Metrics(batch)).await;
+                state
+                    .metrics_tx
+                    .send(SignalBatch::Metrics(batch))
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             }
             Ok((
                 StatusCode::OK,

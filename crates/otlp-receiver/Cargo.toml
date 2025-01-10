@@ -1,11 +1,11 @@
 [package]
 name = "otlp-receiver"
-version = "0.1.0"
-edition = "2024"
+version = { workspace = true }
+edition = { workspace = true }
 
 [dependencies]
-pipeline-core = { path = "../core" }
-arrow-codec = { path = "../arrow-codec" }
+pipeline-core = { workspace = true }
+arrow-codec = { workspace = true }
 arrow = { workspace = true }
 opentelemetry-proto = { workspace = true }
 prost = { workspace = true }

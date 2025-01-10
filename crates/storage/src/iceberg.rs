@@ -4,22 +4,21 @@ use arrow::compute::{SortColumn, lexsort_to_indices};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use iceberg::Catalog;
 use iceberg::CatalogBuilder;
 use iceberg::TableIdent;
 use iceberg::transaction::Transaction;
-use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(feature = "aws")]
 use iceberg_catalog_glue::GlueCatalogBuilder;
+use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(feature = "aws")]
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
+use pipeline_core::error::PipelineError;
+use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::info;
-
 
 /// Configuration for commit batching.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -205,9 +204,41 @@ impl IcebergSink {
     }
 
     /// Appends `SchemaMode` compliance (including catalog-based field pruning).
-    pub fn apply_schema_mode(&self, batch: &RecordBatch, table: Option<&iceberg::table::Table>) -> Result<RecordBatch, PipelineError> {
+    pub fn apply_schema_mode(
+        &self,
+        batch: &RecordBatch,
+        table: Option<&iceberg::table::Table>,
+    ) -> Result<RecordBatch, PipelineError> {
         match self.config.schema_mode {
-            SchemaMode::Fixed | SchemaMode::Auto => {
+            SchemaMode::Fixed => Ok(batch.clone()),
+            SchemaMode::Auto => {
+                let Some(table) = table else {
+                    return Ok(batch.clone());
+                };
+                let schema = table.current_schema_ref();
+                let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
+                    .map_err(|e| PipelineError::Internal(e.to_string()))?;
+
+                for field in batch.schema().fields() {
+                    match arrow_schema.field_with_name(field.name()) {
+                        Ok(table_field) => {
+                            if field.data_type() != table_field.data_type() {
+                                return Err(PipelineError::Internal(format!(
+                                    "Schema mismatch for field '{}': batch type {:?} is incompatible with table type {:?}",
+                                    field.name(),
+                                    field.data_type(),
+                                    table_field.data_type()
+                                )));
+                            }
+                        }
+                        Err(_) => {
+                            return Err(PipelineError::Internal(format!(
+                                "Additive schema evolution failed: new column '{}' detected but schema evolution is not supported by the client library",
+                                field.name()
+                            )));
+                        }
+                    }
+                }
                 Ok(batch.clone())
             }
             SchemaMode::Catalog => {
@@ -224,8 +255,14 @@ impl IcebergSink {
 
                 for field in batch.schema().fields() {
                     if arrow_schema.field_with_name(field.name()).is_ok() {
-                        let col = batch.column_by_name(field.name())
-                            .ok_or_else(|| PipelineError::Internal(format!("Column {} missing from batch", field.name())))?
+                        let col = batch
+                            .column_by_name(field.name())
+                            .ok_or_else(|| {
+                                PipelineError::Internal(format!(
+                                    "Column {} missing from batch",
+                                    field.name()
+                                ))
+                            })?
                             .clone();
                         final_columns.push(col);
                         final_fields.push(field.clone());
@@ -235,7 +272,10 @@ impl IcebergSink {
                 }
 
                 if !dropped_fields.is_empty() && self.config.log_dropped_fields {
-                    tracing::warn!("Dropped fields not present in catalog schema: {:?}", dropped_fields);
+                    tracing::warn!(
+                        "Dropped fields not present in catalog schema: {:?}",
+                        dropped_fields
+                    );
                 }
 
                 let new_schema = Arc::new(arrow::datatypes::Schema::new(final_fields));
@@ -257,7 +297,7 @@ fn extract_service_names(resource_attrs: &StringArray) -> StringArray {
             let service_name = serde_json::from_str::<serde_json::Value>(json_str)
                 .ok()
                 .and_then(|v| {
-                    v.get("service.name")
+                    v.get(opentelemetry_semantic_conventions::resource::SERVICE_NAME)
                         .and_then(serde_json::Value::as_str)
                         .map(String::from)
                 })
@@ -285,30 +325,35 @@ fn sort_batch(batch: &RecordBatch, sort_cols: &[SortColumn]) -> Result<RecordBat
 }
 
 /// Computes partition paths according to ISO-8601 derived timestamp rules.
-#[must_use]
-pub fn get_partition_path(timestamp_nanos: i64, granularity: PartitionGranularity) -> String {
+///
+/// # Errors
+///
+/// Returns `PipelineError::Internal` if the timestamp is invalid.
+pub fn get_partition_path(
+    timestamp_nanos: i64,
+    granularity: PartitionGranularity,
+) -> Result<String, PipelineError> {
     let secs = timestamp_nanos.div_euclid(1_000_000_000);
     let nanos = timestamp_nanos.rem_euclid(1_000_000_000);
     let nanos_u32 = u32::try_from(nanos).unwrap_or(0);
-    let datetime = Utc.timestamp_opt(secs, nanos_u32).unwrap();
+    let datetime = Utc
+        .timestamp_opt(secs, nanos_u32)
+        .single()
+        .ok_or_else(|| PipelineError::Internal("Malformed OTLP timestamp".to_string()))?;
     match granularity {
-        PartitionGranularity::Hourly => {
-            format!(
-                "year={}/month={:02}/day={:02}/hour={:02}/",
-                datetime.format("%Y"),
-                datetime.format("%m"),
-                datetime.format("%d"),
-                datetime.format("%H")
-            )
-        }
-        PartitionGranularity::Daily => {
-            format!(
-                "year={}/month={:02}/day={:02}/",
-                datetime.format("%Y"),
-                datetime.format("%m"),
-                datetime.format("%d")
-            )
-        }
+        PartitionGranularity::Hourly => Ok(format!(
+            "year={}/month={:02}/day={:02}/hour={:02}/",
+            datetime.format("%Y"),
+            datetime.format("%m"),
+            datetime.format("%d"),
+            datetime.format("%H")
+        )),
+        PartitionGranularity::Daily => Ok(format!(
+            "year={}/month={:02}/day={:02}/",
+            datetime.format("%Y"),
+            datetime.format("%m"),
+            datetime.format("%d")
+        )),
     }
 }
 
@@ -326,7 +371,7 @@ pub fn partition_batch(
     let mut partitions: HashMap<String, Vec<u32>> = HashMap::new();
     for i in 0..batch.num_rows() {
         let val = ts_array.value(i);
-        let path = get_partition_path(val, granularity);
+        let path = get_partition_path(val, granularity)?;
         let idx = u32::try_from(i).map_err(|e| PipelineError::Internal(e.to_string()))?;
         partitions.entry(path).or_default().push(idx);
     }
@@ -360,20 +405,15 @@ impl Sink for IcebergSink {
         );
 
         let mut catalog: Option<Arc<dyn Catalog>> = None;
-        let is_mock = self.config.catalog_uri == "http://localhost" || self.config.catalog_uri.contains("mock");
+        let is_mock = self.config.catalog_uri == "http://localhost"
+            || self.config.catalog_uri.contains("mock");
 
         if !is_mock {
             match self.config.catalog_type {
                 CatalogType::Rest => {
                     let mut props = HashMap::new();
-                    props.insert(
-                        "uri".to_string(),
-                        self.config.catalog_uri.clone(),
-                    );
-                    props.insert(
-                        "warehouse".to_string(),
-                        self.config.warehouse.clone(),
-                    );
+                    props.insert("uri".to_string(), self.config.catalog_uri.clone());
+                    props.insert("warehouse".to_string(), self.config.warehouse.clone());
                     for (k, v) in &self.config.properties {
                         props.insert(k.clone(), v.clone());
                     }
@@ -386,10 +426,7 @@ impl Sink for IcebergSink {
                 #[cfg(feature = "aws")]
                 CatalogType::Glue => {
                     let mut props = HashMap::new();
-                    props.insert(
-                        "warehouse".to_string(),
-                        self.config.warehouse.clone(),
-                    );
+                    props.insert("warehouse".to_string(), self.config.warehouse.clone());
                     for (k, v) in &self.config.properties {
                         props.insert(k.clone(), v.clone());
                     }
@@ -419,9 +456,12 @@ impl Sink for IcebergSink {
                 SignalBatch::Logs(ref batch) => {
                     let mut loaded_table = None;
                     if let Some(ref cat) = catalog {
-                        let table_ident = TableIdent::from_strs(self.config.table_identifier.split('.'))
-                            .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                        let table = cat.load_table(&table_ident).await
+                        let table_ident =
+                            TableIdent::from_strs(self.config.table_identifier.split('.'))
+                                .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                        let table = cat
+                            .load_table(&table_ident)
+                            .await
                             .map_err(|e| PipelineError::Internal(e.to_string()))?;
                         loaded_table = Some(table);
                     }
@@ -444,9 +484,13 @@ impl Sink for IcebergSink {
                         if let Some(ref cat) = catalog {
                             if let Some(ref table) = loaded_table {
                                 let tx = Transaction::new(table);
-                                tx.commit(cat.as_ref()).await
+                                tx.commit(cat.as_ref())
+                                    .await
                                     .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                                info!("Committed ACID transaction for table: {}", self.config.table_identifier);
+                                info!(
+                                    "Committed ACID transaction for table: {}",
+                                    self.config.table_identifier
+                                );
                             }
                         } else {
                             info!("Simulating ACID transaction commit for partition: {}", path);
@@ -456,9 +500,12 @@ impl Sink for IcebergSink {
                 SignalBatch::Metrics(ref batch) => {
                     let mut loaded_table = None;
                     if let Some(ref cat) = catalog {
-                        let table_ident = TableIdent::from_strs(self.config.table_identifier.split('.'))
-                            .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                        let table = cat.load_table(&table_ident).await
+                        let table_ident =
+                            TableIdent::from_strs(self.config.table_identifier.split('.'))
+                                .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                        let table = cat
+                            .load_table(&table_ident)
+                            .await
                             .map_err(|e| PipelineError::Internal(e.to_string()))?;
                         loaded_table = Some(table);
                     }
@@ -481,9 +528,13 @@ impl Sink for IcebergSink {
                         if let Some(ref cat) = catalog {
                             if let Some(ref table) = loaded_table {
                                 let tx = Transaction::new(table);
-                                tx.commit(cat.as_ref()).await
+                                tx.commit(cat.as_ref())
+                                    .await
                                     .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                                info!("Committed ACID transaction for table: {}", self.config.table_identifier);
+                                info!(
+                                    "Committed ACID transaction for table: {}",
+                                    self.config.table_identifier
+                                );
                             }
                         } else {
                             info!("Simulating ACID transaction commit for partition: {}", path);
@@ -493,9 +544,12 @@ impl Sink for IcebergSink {
                 SignalBatch::Traces(ref batch) => {
                     let mut loaded_table = None;
                     if let Some(ref cat) = catalog {
-                        let table_ident = TableIdent::from_strs(self.config.table_identifier.split('.'))
-                            .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                        let table = cat.load_table(&table_ident).await
+                        let table_ident =
+                            TableIdent::from_strs(self.config.table_identifier.split('.'))
+                                .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                        let table = cat
+                            .load_table(&table_ident)
+                            .await
                             .map_err(|e| PipelineError::Internal(e.to_string()))?;
                         loaded_table = Some(table);
                     }
@@ -518,9 +572,13 @@ impl Sink for IcebergSink {
                         if let Some(ref cat) = catalog {
                             if let Some(ref table) = loaded_table {
                                 let tx = Transaction::new(table);
-                                tx.commit(cat.as_ref()).await
+                                tx.commit(cat.as_ref())
+                                    .await
                                     .map_err(|e| PipelineError::Internal(e.to_string()))?;
-                                info!("Committed ACID transaction for table: {}", self.config.table_identifier);
+                                info!(
+                                    "Committed ACID transaction for table: {}",
+                                    self.config.table_identifier
+                                );
                             }
                         } else {
                             info!("Simulating ACID transaction commit for partition: {}", path);
@@ -642,5 +700,140 @@ mod tests {
         drop(tx);
 
         sink.run(rx).await.unwrap();
+    }
+
+    #[test]
+    fn test_schema_mode_auto_validation() {
+        let metadata_json = r#"{
+          "format-version": 2,
+          "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+          "location": "s3://bucket/test/location",
+          "last-sequence-number": 0,
+          "last-updated-ms": 1602638573000,
+          "last-column-id": 3,
+          "current-schema-id": 0,
+          "schemas": [
+            {
+              "type": "struct",
+              "schema-id": 0,
+              "fields": [
+                {
+                  "id": 1,
+                  "name": "timestamp",
+                  "required": true,
+                  "type": "timestamp_ns"
+                },
+                {
+                  "id": 2,
+                  "name": "severity_text",
+                  "required": false,
+                  "type": "string"
+                },
+                {
+                  "id": 3,
+                  "name": "resource_attributes",
+                  "required": false,
+                  "type": "string"
+                }
+              ]
+            }
+          ],
+          "default-spec-id": 0,
+          "partition-specs": [
+            {
+              "spec-id": 0,
+              "fields": []
+            }
+          ],
+          "last-partition-id": 999,
+          "default-sort-order-id": 0,
+          "sort-orders": [
+            {
+              "order-id": 0,
+              "fields": []
+            }
+          ],
+          "properties": {},
+          "current-snapshot-id": -1,
+          "snapshots": [],
+          "snapshot-log": [],
+          "metadata-log": []
+        }"#;
+
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(metadata_json).unwrap();
+        let table = iceberg::table::Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .build()
+            .unwrap();
+
+        // 1. Matching schema batch should succeed under Auto mode
+        let config_auto = IcebergSinkConfig {
+            catalog_type: CatalogType::Rest,
+            catalog_uri: "http://localhost".to_string(),
+            warehouse: "s3://wh/".to_string(),
+            table_identifier: "db.tbl".to_string(),
+            schema_mode: SchemaMode::Auto,
+            partition_granularity: PartitionGranularity::Hourly,
+            log_dropped_fields: true,
+            batching: None,
+            properties: HashMap::new(),
+        };
+        let sink = IcebergSink::new(config_auto);
+        let valid_batch = make_test_logs_batch();
+        let res = sink.apply_schema_mode(&valid_batch, Some(&table));
+        assert!(res.is_ok());
+
+        // 2. Schema with extra/new column should fail under Auto mode
+        let extra_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("severity_text", DataType::Utf8, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
+            Field::new("new_field", DataType::Int32, true),
+        ]));
+        let extra_batch = RecordBatch::try_new(
+            extra_schema,
+            vec![
+                Arc::new(arrow::array::TimestampNanosecondArray::from(vec![0])),
+                Arc::new(arrow::array::StringArray::from(vec!["INFO"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    r#"{"service.name":"service-a"}"#,
+                ])),
+                Arc::new(arrow::array::Int32Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+        let res_extra = sink.apply_schema_mode(&extra_batch, Some(&table));
+        assert!(res_extra.is_err());
+        let err = res_extra.err().unwrap().to_string();
+        assert!(err.contains("new column 'new_field' detected"));
+
+        // 3. Schema with data type mismatch should fail under Auto mode
+        let mismatch_schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Utf8, false), // should be Int64 (long)
+            Field::new("severity_text", DataType::Utf8, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
+        ]));
+        let mismatch_batch = RecordBatch::try_new(
+            mismatch_schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["not-a-timestamp"])),
+                Arc::new(arrow::array::StringArray::from(vec!["INFO"])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    r#"{"service.name":"service-a"}"#,
+                ])),
+            ],
+        )
+        .unwrap();
+        let res_mismatch = sink.apply_schema_mode(&mismatch_batch, Some(&table));
+        assert!(res_mismatch.is_err());
+        let err_mismatch = res_mismatch.err().unwrap().to_string();
+        assert!(err_mismatch.contains("Schema mismatch for field 'timestamp'"));
     }
 }

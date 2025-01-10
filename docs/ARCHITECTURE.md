@@ -171,12 +171,20 @@ Sinks have two components that make building them somewhat more complex than sou
 Healthchecks are one-off tasks that run at startup to discover any issues that may prevent the sink from running properly (e.g., permissions or connectivity issues) and notify the user. They can be enabled or disabled both individually and at a global level, and the user can choose whether a failing healthcheck should prevent `otel-datalake` from starting.
 
 #### Buffers
-Buffers are a configurable mechanism for dealing with backpressure. By default, sinks will buffer some small number of events in memory before propagating backpressure upstream. Buffer configuration allows individual sinks to change that behavior:
+Buffers are a configurable mechanism for dealing with backpressure and ensuring **at-least-once delivery guarantees**. By default, sinks will buffer some small number of events in memory before propagating backpressure upstream. Buffer configuration allows individual sinks to change that behavior:
 * Choose between memory and disk for storing the buffered events.
 * Set a maximum buffer size.
 * Decide what should happen when the buffer is full (backpressure or load shedding).
 
+The pipeline is designed to propagate backpressure all the way to the OTLP receivers. When downstream buffers or sinks are full, the receivers will return a `503 Service Unavailable` or gRPC `UNAVAILABLE` status, signaling to the producer to retry later.
+
 Disk buffers add complexity in topology construction because they are persistent across config reloads and process restarts. They are built normally with their corresponding sink, but they are also stashed to the side if topology construction fails after a buffer has been built. This allows a subsequent build (likely of the previous configuration during a rollback) to pull from the already-built buffer without losing the persisted contents.
+
+#### Graceful Shutdown
+To prevent data loss during shutdown, `otel-datalake` implements a structured shutdown sequence:
+1. The **Source** tasks are stopped first, closing their network listeners and dropping their sender handles.
+2. **Transform** and **Sink** tasks continue running until their input channels are fully drained.
+3. Once all buffered events have been flushed to the final storage (e.g., Iceberg or Kafka), the process exits.
 
 Once the healthcheck and buffer are built, the sink itself is constructed via `SinkConfig::build`. The surrounding task is defined to finalize its use of the buffer (removing it from the fallback stash), filter and wrap the input stream with telemetry, and then pass it to `SinkWriter::run` (or the corresponding writer trait).
 

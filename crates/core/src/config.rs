@@ -1,7 +1,7 @@
 use crate::error::PipelineError;
 use figment::{
-    providers::{Env, Format, Toml},
     Figment,
+    providers::{Env, Format, Toml},
 };
 use serde::Deserialize;
 

@@ -215,6 +215,7 @@ dependencies = [
  "arrow",
  "criterion",
  "opentelemetry-proto",
+ "opentelemetry-semantic-conventions",
  "pipeline-core",
  "prost",
  "serde",
@@ -1194,9 +1195,9 @@ dependencies = [
 
 [[package]]
 name = "const-hex"
-version = "1.19.0"
+version = "1.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20d9a563d167a9cce0f94153382b33cb6eded6dfabff03c69ad65a28ea1514e0"
+checksum = "33e2a781ebdf4467d1428dc4593067825fb646f6871475098d8577421af73558"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -1300,7 +1301,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
- "itertools",
+ "itertools 0.13.0",
  "num-traits",
  "oorandom",
  "page_size",
@@ -1321,7 +1322,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
- "itertools",
+ "itertools 0.13.0",
 ]
 
 [[package]]
@@ -2193,7 +2194,7 @@ dependencies = [
  "flate2",
  "fnv",
  "futures",
- "itertools",
+ "itertools 0.13.0",
  "moka",
  "murmur3",
  "once_cell",
@@ -2244,7 +2245,7 @@ dependencies = [
  "chrono",
  "http 1.4.2",
  "iceberg",
- "itertools",
+ "itertools 0.13.0",
  "reqwest 0.12.28",
  "serde",
  "serde_derive",
@@ -2458,6 +2459,15 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -2972,6 +2982,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ca2f98a0437b427b4b08f19f1caa3c44db885a202bc12cfea13d6c702243d68"
+
+[[package]]
 name = "opentelemetry_sdk"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3350,7 +3366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -4196,6 +4212,8 @@ dependencies = [
  "iceberg-catalog-glue",
  "iceberg-catalog-rest",
  "iceberg-catalog-s3tables",
+ "opentelemetry-semantic-conventions",
+ "parquet",
  "pipeline-core",
  "serde",
  "serde_json",

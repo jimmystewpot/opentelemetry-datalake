@@ -89,7 +89,8 @@ All table interactions must use the official, native Rust implementations where 
 
 To ensure maximum availability under load, this codebase enforces a strict **no-panic policy** in production paths.
 
-*   **Prohibited Macros**: Do not use `unwrap()`, `expect()`, `panic!()`, or `todo!()` in `src/` directories.
+*   **Prohibited Macros**: Do not use `unwrap()`, `expect()`, `panic!()`, or `todo!()` in `src/` directories, especially on data originating from external sources (OTLP, Config, Catalog).
+*   **Safe Data Conversion**: Handle malformed timestamps or protocol violations using `Result` propagation (e.g., use `Utc.timestamp_opt(...).single()` instead of `.unwrap()`).
 *   **Allowed Exceptions**: `unwrap()` or `expect()` are permitted *only* in test suites (`#[cfg(test)]`) or setup code (e.g., parsing hardcoded configurations during initialization) where failure prevents startup entirely.
 *   **Error Enforcement**: Use the `thiserror` crate for defining structured, domain-specific error types within libraries, and `anyhow` exclusively in binary targets or integration wrappers if required.
 
@@ -131,7 +132,9 @@ All pipeline components, buffers, and sinks MUST adhere to standard naming and t
 ### 5. Rust Coding Anti-Patterns to Avoid
 
 To maintain codebase cleanlines and compiler guarantees, agents MUST avoid the following patterns:
-*   **Unnecessary `.clone()` Calls**: Avoid cloning large structures or buffers to satisfy the borrow checker; use reference lifetimes where possible.
+*   **Unnecessary `.clone()` Calls**: Avoid cloning large structures or buffers to satisfy the borrow checker. Inside loops or per-event decoders, use reference lifetimes or `.as_str()`.
+*   **Zero-Clone Hot Paths**: In Arrow builders, prefer `.append_value(&slice)` over `.append_value(owned_string)`. Avoid `String` and `Vec` allocations for every record.
+*   **At-Least-Once Delivery**: Never swallow `Err` from channel `.send().await`. Propagate backpressure to OTLP receiver handlers so they can return `503` or `UNAVAILABLE` to the producer.
 *   **Premature `.collect()`**: Avoid collecting iterators early; leverage lazy evaluation.
 *   **Path Resolution**: Prefer `crate::` over `super::` in production source code (`src/` directories). `super::` is acceptable only in test modules (`#[cfg(test)]`).
 *   **Imports Visibility**: Do not use `pub use` on imports unless explicitly re-exposing a dependency for downstream library consumers.

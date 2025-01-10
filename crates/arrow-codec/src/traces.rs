@@ -9,7 +9,7 @@ use std::sync::Arc;
 fn to_hex_string(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        let _ = write!(&mut s, "{b:02x}");
+        write!(&mut s, "{b:02x}").expect("writing to String should not fail");
     }
     s
 }
@@ -33,7 +33,7 @@ fn convert_attributes(attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue]
                 }
                 _ => "Unsupported".to_string(),
             };
-            map.insert(attr.key.clone(), val_str);
+            map.insert(attr.key.as_str(), val_str);
         }
     }
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
@@ -77,9 +77,9 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
 
         for s_span in &r_span.scope_spans {
             let (scope_name, scope_version) = if let Some(ref scope) = s_span.scope {
-                (scope.name.clone(), scope.version.clone())
+                (scope.name.as_str(), scope.version.as_str())
             } else {
-                (String::new(), String::new())
+                ("", "")
             };
 
             for span in &s_span.spans {
@@ -87,7 +87,7 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
                 span_id_builder.append_value(to_hex_string(&span.span_id));
                 trace_state_builder.append_value(&span.trace_state);
                 parent_span_id_builder.append_value(to_hex_string(&span.parent_span_id));
-                name_builder.append_value(&span.name);
+                name_builder.append_value(span.name.as_str());
                 kind_builder.append_value(span.kind);
                 start_time_builder.append_value(span.start_time_unix_nano as i64);
                 end_time_builder.append_value(span.end_time_unix_nano as i64);
@@ -96,8 +96,8 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
                 attributes_builder.append_value(&span_attrs_json);
 
                 resource_attributes_builder.append_value(&resource_attrs_json);
-                scope_name_builder.append_value(&scope_name);
-                scope_version_builder.append_value(&scope_version);
+                scope_name_builder.append_value(scope_name);
+                scope_version_builder.append_value(scope_version);
 
                 if let Some(ref status) = span.status {
                     status_code_builder.append_value(status.code);
@@ -178,7 +178,7 @@ mod tests {
         let mut r_span = ResourceSpans::default();
         r_span.resource = Some(Resource {
             attributes: vec![KeyValue {
-                key: "service.name".to_string(),
+                key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
                 value: Some(AnyValue {
                     value: Some(any_value::Value::StringValue("test-service".to_string())),
                 }),

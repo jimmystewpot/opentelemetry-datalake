@@ -1,10 +1,10 @@
 use crate::error::PipelineError;
-use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{trace::Sampler, Resource};
+use opentelemetry_sdk::{Resource, trace::Sampler};
 use serde::Deserialize;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Configuration for local telemetry instrumentation.
 #[derive(Debug, Deserialize, Clone)]

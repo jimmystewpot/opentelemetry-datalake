@@ -1,7 +1,7 @@
 [package]
 name = "opentelemetry-datalake"
-version = "0.1.0"
-edition = "2024"
+version = { workspace = true }
+edition = { workspace = true }
 
 [workspace]
 resolver = "2"
@@ -9,12 +9,16 @@ members = [
     "crates/*"
 ]
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
 [dependencies]
-pipeline-core = { path = "crates/core" }
-otlp-receiver = { path = "crates/otlp-receiver" }
-noop-transformer = { path = "crates/noop-transformer" }
-kafka-sink = { path = "crates/kafka-sink" }
-storage = { path = "crates/storage", default-features = true }
+pipeline-core = { workspace = true }
+otlp-receiver = { workspace = true }
+noop-transformer = { workspace = true }
+kafka-sink = { workspace = true }
+storage = { workspace = true, default-features = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -23,6 +27,14 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 
 [workspace.dependencies]
+# Internal Workspace Crates
+pipeline-core = { path = "crates/core", version = "0.1.0" }
+arrow-codec = { path = "crates/arrow-codec", version = "0.1.0" }
+otlp-receiver = { path = "crates/otlp-receiver", version = "0.1.0" }
+noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
+kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
+storage = { path = "crates/storage", version = "0.1.0" }
+
 # Async Runtime
 tokio = { version = "1.37", features = ["full"] }
 
@@ -37,6 +49,7 @@ tracing-opentelemetry = "0.33.0"
 opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "metrics", "logs"] }
+opentelemetry-semantic-conventions = "0.32.0"
 async-trait = "0.1"
 
 # Serialization & Config
@@ -46,6 +59,7 @@ figment = { version = "0.10", features = ["env", "toml"] }
 
 # Arrow
 arrow = "57.3.1"
+parquet = { version = "57.3.1", features = ["async"] }
 
 # Codec & OTLP Parsing
 prost = "0.14.4"
@@ -60,6 +74,13 @@ rdkafka = { version = "0.39.0", features = ["cmake-build"] }
 
 # Testing & Benchmarking
 criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+# Storage & Iceberg Catalogs
+chrono = { version = "0.4.38", features = ["serde"] }
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-catalog-glue = "0.9.1"
+iceberg-catalog-s3tables = "0.9.1"
 
 [profile.release]
 lto = "thin"

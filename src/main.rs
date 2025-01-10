@@ -148,32 +148,31 @@ async fn main() -> anyhow::Result<()> {
         });
     } else if let Some(ref kafka_cfg) = config.kafka {
         tracing::info!("Initializing Kafka sinks");
-        let parse_format = |f: &str| {
-            if f.eq_ignore_ascii_case("ipc") {
-                kafka_sink::SerializationFormat::Ipc
-            } else {
-                kafka_sink::SerializationFormat::Json
-            }
-        };
 
         let mut logs_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.logs_topic,
-            parse_format(&kafka_cfg.logs_format),
+            kafka_cfg.logs_format.parse().map_err(anyhow::Error::msg)?,
             &kafka_cfg.options,
         )?;
 
         let mut traces_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.traces_topic,
-            parse_format(&kafka_cfg.traces_format),
+            kafka_cfg
+                .traces_format
+                .parse()
+                .map_err(anyhow::Error::msg)?,
             &kafka_cfg.options,
         )?;
 
         let mut metrics_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.metrics_topic,
-            parse_format(&kafka_cfg.metrics_format),
+            kafka_cfg
+                .metrics_format
+                .parse()
+                .map_err(anyhow::Error::msg)?,
             &kafka_cfg.options,
         )?;
 
@@ -195,7 +194,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     } else {
-        return Err(anyhow::anyhow!("Either [kafka] or [iceberg] configuration must be provided"));
+        return Err(anyhow::anyhow!(
+            "Either [kafka] or [iceberg] configuration must be provided"
+        ));
     }
 
     // Spawn source
@@ -205,21 +206,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let source_abort_handle = source_handle.abort_handle();
+
     // Handle shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Received shutdown signal. Exiting...");
+            tracing::info!("Received shutdown signal. Starting graceful shutdown...");
+            source_abort_handle.abort();
         }
         _ = source_handle => {
             tracing::error!("Source receiver stopped unexpectedly.");
         }
-        _ = logs_trans_handle => {}
-        _ = traces_trans_handle => {}
-        _ = metrics_trans_handle => {}
-        _ = logs_sink_handle => {}
-        _ = traces_sink_handle => {}
-        _ = metrics_sink_handle => {}
     }
 
+    // Wait for pipeline to drain
+    let _ = tokio::join!(
+        logs_trans_handle,
+        traces_trans_handle,
+        metrics_trans_handle,
+        logs_sink_handle,
+        traces_sink_handle,
+        metrics_sink_handle
+    );
+
+    tracing::info!("Shutdown complete.");
     Ok(())
 }

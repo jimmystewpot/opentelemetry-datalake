@@ -24,7 +24,7 @@ fn convert_attributes(attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue]
                 }
                 _ => "Unsupported".to_string(),
             };
-            map.insert(attr.key.clone(), val_str);
+            map.insert(attr.key.as_str(), val_str);
         }
     }
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
@@ -83,15 +83,15 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
         for s_metric in &r_metric.scope_metrics {
             let (scope_name, scope_version) = if let Some(ref scope) = s_metric.scope {
-                (scope.name.clone(), scope.version.clone())
+                (scope.name.as_str(), scope.version.as_str())
             } else {
-                (String::new(), String::new())
+                ("", "")
             };
 
             for metric in &s_metric.metrics {
-                let name = &metric.name;
-                let desc = &metric.description;
-                let unit = &metric.unit;
+                let name = metric.name.as_str();
+                let desc = metric.description.as_str();
+                let unit = metric.unit.as_str();
 
                 if let Some(ref data) = metric.data {
                     match data {
@@ -111,8 +111,8 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
                                 resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(&scope_name);
-                                scope_version_builder.append_value(&scope_version);
+                                scope_name_builder.append_value(scope_name);
+                                scope_version_builder.append_value(scope_version);
                             }
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
@@ -131,8 +131,8 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
                                 resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(&scope_name);
-                                scope_version_builder.append_value(&scope_version);
+                                scope_name_builder.append_value(scope_name);
+                                scope_version_builder.append_value(scope_version);
                             }
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
@@ -148,8 +148,8 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
                                 resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(&scope_name);
-                                scope_version_builder.append_value(&scope_version);
+                                scope_name_builder.append_value(scope_name);
+                                scope_version_builder.append_value(scope_version);
                             }
                         }
                         _ => {}
@@ -215,7 +215,7 @@ mod tests {
         let mut r_metric = ResourceMetrics::default();
         r_metric.resource = Some(Resource {
             attributes: vec![KeyValue {
-                key: "service.name".to_string(),
+                key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
                 value: Some(AnyValue {
                     value: Some(any_value::Value::StringValue("test-service".to_string())),
                 }),

@@ -9,7 +9,7 @@ use std::sync::Arc;
 fn to_hex_string(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        let _ = write!(&mut s, "{b:02x}");
+        write!(&mut s, "{b:02x}").expect("writing to String should not fail");
     }
     s
 }
@@ -101,9 +101,9 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
 
         for s_log in &r_log.scope_logs {
             let (scope_name, scope_version) = if let Some(ref scope) = s_log.scope {
-                (scope.name.clone(), scope.version.clone())
+                (scope.name.as_str(), scope.version.as_str())
             } else {
-                (String::new(), String::new())
+                ("", "")
             };
 
             for log in &s_log.log_records {
@@ -127,8 +127,8 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
                 attributes_builder.append_value(&log_attrs_json);
 
                 resource_attributes_builder.append_value(&resource_attrs_json);
-                scope_name_builder.append_value(&scope_name);
-                scope_version_builder.append_value(&scope_version);
+                scope_name_builder.append_value(scope_name);
+                scope_version_builder.append_value(scope_version);
             }
         }
     }
@@ -197,7 +197,7 @@ mod tests {
         let mut r_log = ResourceLogs::default();
         r_log.resource = Some(Resource {
             attributes: vec![KeyValue {
-                key: "service.name".to_string(),
+                key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
                 value: Some(AnyValue {
                     value: Some(any_value::Value::StringValue("test-service".to_string())),
                 }),
