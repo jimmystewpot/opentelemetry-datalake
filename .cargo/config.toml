@@ -1,0 +1,7 @@
+[alias]
+check-clippy = "clippy --workspace --all-features --all-targets --no-deps -- -D warnings"
+clippy-fix = "clippy --fix --allow-dirty --allow-staged --workspace --all-features --all-targets"
+check-fmt = "fmt --all -- --check"
+# Markdown linting is run via `just check-markdown` (shells out to
+# `markdownlint-cli2`). Cargo aliases cannot invoke non-cargo commands, so
+# we don't register a `cargo check-markdown` alias — see justfile.
