@@ -1,0 +1,259 @@
+name: 🧪 CI & 🚀 Deploy
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: "-D warnings"
+
+jobs:
+  # --- FAST PATH GATES ---
+
+  fmt:
+    name: Code Formatting
+    runs-on: arc-runner-set
+    if: github.actor != 'dependabot[bot]'
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          cache: false
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+  lint:
+    name: Lint Check
+    needs: [fmt]
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "lint"
+
+      - name: cargo clippy
+        # Use --no-deps for speed in the fast path gate
+        run: cargo clippy --workspace --all-features --all-targets --no-deps -- -D warnings
+
+  unit-test:
+    needs: [fmt]
+    name: Unit Test
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "unit-test-no-cov"
+
+      - name: cargo unit tests
+        # No coverage instrumentation here for maximum speed in the fast path
+        run: cargo test --workspace --all-features --lib --bins
+
+  # --- ASYNC QUALITY GATES ---
+
+  coverage:
+    needs: [lint, unit-test]
+    name: Code Coverage
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "coverage"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: cargo coverage
+        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v6.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: lcov.info
+
+  smoke-test:
+    needs: [lint, unit-test]
+    name: Smoke Test (Integration)
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "smoke-test"
+
+      - name: cargo smoke test (integration)
+        run: cargo test --workspace --all-features --tests
+
+  bench:
+    needs: [lint, unit-test]
+    name: Benchmarks
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "benchmarks"
+
+      - name: cargo bench (smoke test)
+        run: cargo bench --workspace --all-features -- --test
+
+  deny:
+    needs: [lint, unit-test]
+    name: License & Advisory Check
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: cargo deny (advisories)
+        run: cargo deny check advisories
+
+      - name: cargo deny (licenses)
+        run: cargo deny check licenses
+
+  doc:
+    needs: [lint, unit-test]
+    name: Documentation
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "doc"
+
+      - name: cargo doc
+        run: cargo doc --no-deps --workspace --all-features
