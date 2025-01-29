@@ -2,6 +2,7 @@
 name = "opentelemetry-datalake"
 version = { workspace = true }
 edition = { workspace = true }
+license = { workspace = true }
 
 [workspace]
 resolver = "2"
@@ -12,6 +13,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MPL-2.0"
 
 [dependencies]
 pipeline-core = { workspace = true }
@@ -85,3 +87,7 @@ iceberg-catalog-s3tables = "0.9.1"
 [profile.release]
 lto = "thin"
 debug = true
+
+[patch.crates-io]
+paste = { git = "https://github.com/dtolnay/paste" }
+
