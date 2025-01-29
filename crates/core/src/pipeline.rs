@@ -53,9 +53,18 @@ pub struct Fanout {
 
 impl Fanout {
     /// Creates a new Fanout instance.
-    #[must_use]
-    pub fn new(outputs: Vec<PipelineSender>) -> Self {
-        Self { outputs }
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Internal` if `outputs` is empty, since a
+    /// fanout with zero sinks would silently drop all data.
+    pub fn try_new(outputs: Vec<PipelineSender>) -> Result<Self, PipelineError> {
+        if outputs.is_empty() {
+            return Err(PipelineError::Internal(
+                "Fanout requires at least one output".into(),
+            ));
+        }
+        Ok(Self { outputs })
     }
 
     /// Sends a batch to all downstreams.
@@ -86,7 +95,7 @@ mod tests {
     async fn test_fanout_send() {
         let (tx1, mut rx1) = mpsc::channel(10);
         let (tx2, mut rx2) = mpsc::channel(10);
-        let fanout = Fanout::new(vec![tx1, tx2]);
+        let fanout = Fanout::try_new(vec![tx1, tx2]).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch =

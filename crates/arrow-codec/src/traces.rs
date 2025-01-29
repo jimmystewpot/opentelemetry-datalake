@@ -3,48 +3,15 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use pipeline_core::error::PipelineError;
-use std::fmt::Write;
 use std::sync::Arc;
 
-fn to_hex_string(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        write!(&mut s, "{b:02x}").expect("writing to String should not fail");
-    }
-    s
-}
-
-fn convert_attributes(attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue]) -> String {
-    let mut map = std::collections::HashMap::new();
-    for attr in attrs {
-        if let Some(ref val) = attr.value {
-            let val_str = match &val.value {
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) => {
-                    s.clone()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(i)) => {
-                    i.to_string()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(d)) => {
-                    d.to_string()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::BoolValue(b)) => {
-                    b.to_string()
-                }
-                _ => "Unsupported".to_string(),
-            };
-            map.insert(attr.key.as_str(), val_str);
-        }
-    }
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
-}
+use crate::common::{convert_attributes, timestamp_to_i64, to_hex_string};
 
 /// Decodes OTLP Trace requests into an Arrow `RecordBatch`.
 ///
 /// # Errors
 ///
 /// Returns `PipelineError::Internal` if schema matching or record creation fails.
-#[allow(clippy::cast_possible_wrap)]
 pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, PipelineError> {
     let mut total_records = 0;
     for r_span in &req.resource_spans {
@@ -89,8 +56,8 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
                 parent_span_id_builder.append_value(to_hex_string(&span.parent_span_id));
                 name_builder.append_value(span.name.as_str());
                 kind_builder.append_value(span.kind);
-                start_time_builder.append_value(span.start_time_unix_nano as i64);
-                end_time_builder.append_value(span.end_time_unix_nano as i64);
+                start_time_builder.append_value(timestamp_to_i64(span.start_time_unix_nano)?);
+                end_time_builder.append_value(timestamp_to_i64(span.end_time_unix_nano)?);
 
                 let span_attrs_json = convert_attributes(&span.attributes);
                 attributes_builder.append_value(&span_attrs_json);
@@ -154,7 +121,7 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             Arc::new(status_message_builder.finish()),
         ],
     )
-    .map_err(|e| PipelineError::Internal(e.to_string()))
+    .map_err(PipelineError::Arrow)
 }
 
 #[cfg(test)]
@@ -174,31 +141,36 @@ mod tests {
 
     #[test]
     fn test_decode_traces_non_empty() {
-        let mut req = ExportTraceServiceRequest::default();
-        let mut r_span = ResourceSpans::default();
-        r_span.resource = Some(Resource {
-            attributes: vec![KeyValue {
-                key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue("test-service".to_string())),
-                }),
+        let r_span = ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("test-service".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                dropped_attributes_count: 0,
+                ..Default::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    name: "test-span".to_string(),
+                    kind: 1,
+                    start_time_unix_nano: 1_000_000_000,
+                    end_time_unix_nano: 2_000_000_000,
+                    ..Default::default()
+                }],
                 ..Default::default()
             }],
-            dropped_attributes_count: 0,
             ..Default::default()
-        });
+        };
 
-        let mut s_span = ScopeSpans::default();
-        let mut span = Span::default();
-        span.trace_id = vec![1; 16];
-        span.span_id = vec![2; 8];
-        span.name = "test-span".to_string();
-        span.kind = 1;
-        span.start_time_unix_nano = 1_000_000_000;
-        span.end_time_unix_nano = 2_000_000_000;
-        s_span.spans.push(span);
-        r_span.scope_spans.push(s_span);
-        req.resource_spans.push(r_span);
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        };
 
         let batch = decode_traces(&req).unwrap();
         assert_eq!(batch.num_rows(), 1);

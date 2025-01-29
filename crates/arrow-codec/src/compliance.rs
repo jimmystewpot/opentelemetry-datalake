@@ -1,10 +1,12 @@
-use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::array::{Array, ArrayRef};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_semantic_conventions as semconv;
 use pipeline_core::error::PipelineError;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::common::downcast_string_array;
 
 /// Defines the strategy for handling non-compliant records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -54,29 +56,33 @@ impl ComplianceEngine {
     }
 
     /// Checks if a batch contains the required `service.name` resource attribute.
-    #[must_use]
-    pub fn check_batch_compliance(&self, batch: &RecordBatch) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Internal` if the `resource_attributes` column
+    /// is not a UTF-8 string array.
+    pub fn check_batch_compliance(&self, batch: &RecordBatch) -> Result<bool, PipelineError> {
         let Some(col) = batch.column_by_name("resource_attributes") else {
-            return false;
+            return Ok(false);
         };
 
-        let arr = col.as_string::<i32>();
+        let arr = downcast_string_array(col.as_ref(), "resource_attributes")?;
         for i in 0..arr.len() {
             if arr.is_null(i) {
-                return false;
+                return Ok(false);
             }
             let val = arr.value(i);
             let Ok(json_val) = serde_json::from_str::<serde_json::Value>(val) else {
-                return false;
+                return Ok(false);
             };
             let Some(map) = json_val.as_object() else {
-                return false;
+                return Ok(false);
             };
             if !map.contains_key(semconv::resource::SERVICE_NAME) {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Injects `otel::compliance::status = "verified"` into the schema metadata.
@@ -106,10 +112,10 @@ impl ComplianceEngine {
 
         match self.mode {
             ComplianceMode::Strict => {
-                if self.check_batch_compliance(&batch) {
+                if self.check_batch_compliance(&batch)? {
                     let new_schema = self.tag_schema_compliant(&batch.schema());
                     let tagged_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())
-                        .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                        .map_err(PipelineError::Arrow)?;
                     Ok(ComplianceOutput::Compliant(tagged_batch))
                 } else {
                     Err(PipelineError::Internal(
@@ -119,10 +125,10 @@ impl ComplianceEngine {
                 }
             }
             ComplianceMode::Quarantine => {
-                if self.check_batch_compliance(&batch) {
+                if self.check_batch_compliance(&batch)? {
                     let new_schema = self.tag_schema_compliant(&batch.schema());
                     let tagged_batch = RecordBatch::try_new(new_schema, batch.columns().to_vec())
-                        .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                        .map_err(PipelineError::Arrow)?;
                     Ok(ComplianceOutput::Compliant(tagged_batch))
                 } else {
                     Ok(ComplianceOutput::Quarantined(batch))
@@ -130,17 +136,17 @@ impl ComplianceEngine {
             }
             ComplianceMode::Remap => {
                 let remapped = self.execute_remap_rules(&batch)?;
-                if self.check_batch_compliance(&remapped) {
+                if self.check_batch_compliance(&remapped)? {
                     let new_schema = self.tag_schema_compliant(&remapped.schema());
                     let tagged_batch =
                         RecordBatch::try_new(new_schema, remapped.columns().to_vec())
-                            .map_err(|e| PipelineError::Internal(e.to_string()))?;
+                            .map_err(PipelineError::Arrow)?;
                     Ok(ComplianceOutput::Remapped(tagged_batch))
                 } else {
                     Ok(ComplianceOutput::Quarantined(remapped))
                 }
             }
-            ComplianceMode::Off => unreachable!(),
+            ComplianceMode::Off => Ok(ComplianceOutput::Compliant(batch)),
         }
     }
 
@@ -151,7 +157,7 @@ impl ComplianceEngine {
         for (i, field) in schema.fields().iter().enumerate() {
             let col = batch.column(i);
             if field.name() == "attributes" || field.name() == "resource_attributes" {
-                let arr = col.as_string::<i32>();
+                let arr = downcast_string_array(col.as_ref(), field.name())?;
                 let mut builder = arrow::array::StringBuilder::new();
                 for j in 0..arr.len() {
                     if arr.is_null(j) {
@@ -179,15 +185,14 @@ impl ComplianceEngine {
             }
         }
 
-        RecordBatch::try_new(schema.clone(), new_columns)
-            .map_err(|e| PipelineError::Internal(e.to_string()))
+        RecordBatch::try_new(schema.clone(), new_columns).map_err(PipelineError::Arrow)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::StringArray;
+    use arrow::array::{AsArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn make_test_batch(service_name: Option<&str>, legacy_key: Option<&str>) -> RecordBatch {

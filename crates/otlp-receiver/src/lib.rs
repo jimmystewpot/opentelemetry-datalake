@@ -238,6 +238,7 @@ pub struct OtlpReceiverSource {
     logs_tx: mpsc::Sender<SignalBatch>,
     traces_tx: mpsc::Sender<SignalBatch>,
     metrics_tx: mpsc::Sender<SignalBatch>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl OtlpReceiverSource {
@@ -249,6 +250,7 @@ impl OtlpReceiverSource {
         logs_tx: mpsc::Sender<SignalBatch>,
         traces_tx: mpsc::Sender<SignalBatch>,
         metrics_tx: mpsc::Sender<SignalBatch>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
         Self {
             grpc_addr,
@@ -256,6 +258,7 @@ impl OtlpReceiverSource {
             logs_tx,
             traces_tx,
             metrics_tx,
+            shutdown_rx,
         }
     }
 }
@@ -273,11 +276,17 @@ impl Source for OtlpReceiverSource {
             tx: self.metrics_tx.clone(),
         };
 
+        let mut shutdown_rx_grpc = self.shutdown_rx.clone();
+        let grpc_shutdown = async move {
+            let _ = shutdown_rx_grpc.changed().await;
+            tracing::info!("gRPC server shutting down gracefully");
+        };
+
         let grpc_server = tonic::transport::Server::builder()
             .add_service(LogsServiceServer::new(grpc_service_logs))
             .add_service(TraceServiceServer::new(grpc_service_traces))
             .add_service(MetricsServiceServer::new(grpc_service_metrics))
-            .serve(self.grpc_addr);
+            .serve_with_shutdown(self.grpc_addr, grpc_shutdown);
 
         let http_state = HttpState {
             logs_tx: self.logs_tx.clone(),
@@ -295,19 +304,29 @@ impl Source for OtlpReceiverSource {
             .await
             .map_err(|e| PipelineError::Internal(format!("Failed to bind HTTP: {e}")))?;
 
-        let http_server = axum::serve(listener, app);
+        let mut shutdown_rx_http = self.shutdown_rx.clone();
+        let http_shutdown = async move {
+            let _ = shutdown_rx_http.changed().await;
+            tracing::info!("HTTP server shutting down gracefully");
+        };
+
+        let http_server = axum::serve(listener, app).with_graceful_shutdown(http_shutdown);
 
         tracing::info!("gRPC server listening on {}", self.grpc_addr);
         tracing::info!("HTTP server listening on {}", self.http_addr);
 
-        tokio::select! {
-            res = grpc_server => {
-                res.map_err(|e| PipelineError::Internal(format!("gRPC server error: {e}")))?;
-            }
-            res = http_server => {
-                res.map_err(|e| PipelineError::Internal(format!("HTTP server error: {e}")))?;
-            }
-        }
+        let grpc_fut = async {
+            grpc_server
+                .await
+                .map_err(|e| PipelineError::Internal(format!("gRPC server error: {e}")))
+        };
+        let http_fut = async {
+            http_server
+                .await
+                .map_err(|e| PipelineError::Internal(format!("HTTP server error: {e}")))
+        };
+
+        tokio::try_join!(grpc_fut, http_fut)?;
 
         Ok(())
     }
@@ -328,8 +347,16 @@ mod tests {
         let grpc_addr = SocketAddr::new(loopback, 0);
         let http_addr = SocketAddr::new(loopback, 0);
 
-        let mut source =
-            OtlpReceiverSource::new(grpc_addr, http_addr, logs_tx, traces_tx, metrics_tx);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let mut source = OtlpReceiverSource::new(
+            grpc_addr,
+            http_addr,
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+            shutdown_rx,
+        );
 
         // Run source with a timeout to verify it can bind successfully
         let handle = tokio::spawn(async move {
@@ -337,6 +364,7 @@ mod tests {
         });
 
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        handle.abort();
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
     }
 }

@@ -15,13 +15,15 @@ pub enum SerializationFormat {
 }
 
 impl std::str::FromStr for SerializationFormat {
-    type Err = String;
+    type Err = PipelineError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "ipc" => Ok(Self::Ipc),
             "json" => Ok(Self::Json),
-            _ => Err(format!("Unknown serialization format: {s}")),
+            _ => Err(PipelineError::Internal(format!(
+                "Unknown serialization format: {s}"
+            ))),
         }
     }
 }

@@ -5,41 +5,19 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use pipeline_core::error::PipelineError;
 use std::sync::Arc;
 
-fn convert_attributes(attrs: &[opentelemetry_proto::tonic::common::v1::KeyValue]) -> String {
-    let mut map = std::collections::HashMap::new();
-    for attr in attrs {
-        if let Some(ref val) = attr.value {
-            let val_str = match &val.value {
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(s)) => {
-                    s.clone()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(i)) => {
-                    i.to_string()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::DoubleValue(d)) => {
-                    d.to_string()
-                }
-                Some(opentelemetry_proto::tonic::common::v1::any_value::Value::BoolValue(b)) => {
-                    b.to_string()
-                }
-                _ => "Unsupported".to_string(),
-            };
-            map.insert(attr.key.as_str(), val_str);
-        }
-    }
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
-}
+use crate::common::{convert_attributes, timestamp_to_i64};
 
 /// Decodes OTLP Metrics requests into an Arrow `RecordBatch`.
 ///
 /// # Errors
 ///
 /// Returns `PipelineError::Internal` if schema matching or record creation fails.
-#[allow(
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    clippy::too_many_lines
-)]
+///
+/// # Precision Limitation
+///
+/// Casting `AsInt(i)` values to `f64` in `decode_metrics` can lead to a loss of
+/// precision for integers whose absolute values exceed 2^53.
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, PipelineError> {
     // Count total data points first to set builder capacity
     let mut total_records = 0;
@@ -100,10 +78,12 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 name_builder.append_value(name);
                                 desc_builder.append_value(desc);
                                 unit_builder.append_value(unit);
-                                timestamp_builder.append_value(dp.time_unix_nano as i64);
+                                timestamp_builder
+                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
 
                                 let val = match dp.value {
                                     Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(d)) => d,
+                                    // NOTE: Potential precision loss for integer values exceeding 2^53.
                                     Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => i as f64,
                                     None => 0.0,
                                 };
@@ -120,10 +100,12 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 name_builder.append_value(name);
                                 desc_builder.append_value(desc);
                                 unit_builder.append_value(unit);
-                                timestamp_builder.append_value(dp.time_unix_nano as i64);
+                                timestamp_builder
+                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
 
                                 let val = match dp.value {
                                     Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(d)) => d,
+                                    // NOTE: Potential precision loss for integer values exceeding 2^53.
                                     Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => i as f64,
                                     None => 0.0,
                                 };
@@ -140,9 +122,11 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 name_builder.append_value(name);
                                 desc_builder.append_value(desc);
                                 unit_builder.append_value(unit);
-                                timestamp_builder.append_value(dp.time_unix_nano as i64);
+                                timestamp_builder
+                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
 
                                 // Use sum as value if available, otherwise fallback to count
+                                #[allow(clippy::cast_precision_loss)]
                                 let val = dp.sum.unwrap_or(dp.count as f64);
                                 value_builder.append_value(val);
 
@@ -189,7 +173,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
             Arc::new(scope_version_builder.finish()),
         ],
     )
-    .map_err(|e| PipelineError::Internal(e.to_string()))
+    .map_err(PipelineError::Arrow)
 }
 
 #[cfg(test)]
@@ -211,37 +195,40 @@ mod tests {
 
     #[test]
     fn test_decode_metrics_non_empty() {
-        let mut req = ExportMetricsServiceRequest::default();
-        let mut r_metric = ResourceMetrics::default();
-        r_metric.resource = Some(Resource {
-            attributes: vec![KeyValue {
-                key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
-                value: Some(AnyValue {
-                    value: Some(any_value::Value::StringValue("test-service".to_string())),
-                }),
+        let r_metric = ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("test-service".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                dropped_attributes_count: 0,
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "test_gauge".to_string(),
+                    description: "A test gauge".to_string(),
+                    unit: "1".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(42.5)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
                 ..Default::default()
             }],
-            dropped_attributes_count: 0,
             ..Default::default()
-        });
+        };
 
-        let mut s_metric = ScopeMetrics::default();
-        let mut metric = Metric::default();
-        metric.name = "test_gauge".to_string();
-        metric.description = "A test gauge".to_string();
-        metric.unit = "1".to_string();
-
-        let mut gauge = Gauge::default();
-        let mut dp = NumberDataPoint::default();
-        dp.time_unix_nano = 1_000_000_000;
-        dp.value =
-            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(42.5));
-        gauge.data_points.push(dp);
-        metric.data = Some(metric::Data::Gauge(gauge));
-
-        s_metric.metrics.push(metric);
-        r_metric.scope_metrics.push(s_metric);
-        req.resource_metrics.push(r_metric);
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        };
 
         let batch = decode_metrics(&req).unwrap();
         assert_eq!(batch.num_rows(), 1);

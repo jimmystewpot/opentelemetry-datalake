@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize, Clone)]
 struct AppConfig {
-    #[serde(default)]
-    telemetry: pipeline_core::telemetry::TelemetryConfig,
+    #[serde(flatten)]
+    pipeline: pipeline_core::config::PipelineConfig,
     server: ServerConfig,
     kafka: Option<KafkaConfig>,
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     let config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
 
     // Initialize telemetry
-    pipeline_core::telemetry::init_telemetry(&config.telemetry)?;
+    pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
 
     tracing::info!("Starting opentelemetry-datalake service");
 
@@ -79,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
     let (traces_sink_tx, traces_sink_rx) = tokio::sync::mpsc::channel(1000);
     let (metrics_sink_tx, metrics_sink_rx) = tokio::sync::mpsc::channel(1000);
 
+    // Create shutdown watch channel
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // Create OTLP Receiver Source
     let mut source = otlp_receiver::OtlpReceiverSource::new(
         config.server.grpc_addr,
@@ -86,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         logs_tx,
         traces_tx,
         metrics_tx,
+        shutdown_rx,
     );
 
     // Create Noop Transformers
@@ -152,27 +156,21 @@ async fn main() -> anyhow::Result<()> {
         let mut logs_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.logs_topic,
-            kafka_cfg.logs_format.parse().map_err(anyhow::Error::msg)?,
+            kafka_cfg.logs_format.parse()?,
             &kafka_cfg.options,
         )?;
 
         let mut traces_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.traces_topic,
-            kafka_cfg
-                .traces_format
-                .parse()
-                .map_err(anyhow::Error::msg)?,
+            kafka_cfg.traces_format.parse()?,
             &kafka_cfg.options,
         )?;
 
         let mut metrics_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.metrics_topic,
-            kafka_cfg
-                .metrics_format
-                .parse()
-                .map_err(anyhow::Error::msg)?,
+            kafka_cfg.metrics_format.parse()?,
             &kafka_cfg.options,
         )?;
 
@@ -200,22 +198,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Spawn source
-    let source_handle = tokio::spawn(async move {
-        if let Err(e) = source.run().await {
-            tracing::error!("Source error: {}", e);
-        }
-    });
-
-    let source_abort_handle = source_handle.abort_handle();
+    let mut source_handle = tokio::spawn(async move { source.run().await });
 
     // Handle shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("Received shutdown signal. Starting graceful shutdown...");
-            source_abort_handle.abort();
+            let _ = shutdown_tx.send(true);
+            match source_handle.await {
+                Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {}", e),
+                Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
+                Err(e) => tracing::error!("Source receiver task failed/panicked: {}", e),
+            }
         }
-        _ = source_handle => {
-            tracing::error!("Source receiver stopped unexpectedly.");
+        res = &mut source_handle => {
+            match res {
+                Ok(Err(e)) => tracing::error!("Source receiver stopped unexpectedly with error: {}", e),
+                Ok(Ok(())) => tracing::error!("Source receiver stopped unexpectedly."),
+                Err(e) => tracing::error!("Source receiver task panicked: {}", e),
+            }
         }
     }
 

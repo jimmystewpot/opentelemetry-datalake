@@ -46,7 +46,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), PipelineError> {
         .with_tonic()
         .with_endpoint(&config.otlp_endpoint)
         .build()
-        .map_err(|e| PipelineError::Configuration(e.to_string()))?;
+        .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)

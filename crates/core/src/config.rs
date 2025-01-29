@@ -24,6 +24,6 @@ impl PipelineConfig {
             .merge(Toml::file(path))
             .merge(Env::prefixed("DATALAKE_").split("_"))
             .extract()
-            .map_err(|e| PipelineError::Configuration(e.to_string()))
+            .map_err(|e| PipelineError::Configuration(Box::new(e)))
     }
 }

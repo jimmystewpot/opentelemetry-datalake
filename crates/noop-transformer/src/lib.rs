@@ -22,9 +22,10 @@ impl Transform for NoopTransformer {
         output: PipelineSender,
     ) -> Result<(), PipelineError> {
         while let Some(batch) = input.recv().await {
-            if output.send(batch).await.is_err() {
-                break;
-            }
+            output
+                .send(batch)
+                .await
+                .map_err(|_| PipelineError::DownstreamClosed)?;
         }
         Ok(())
     }

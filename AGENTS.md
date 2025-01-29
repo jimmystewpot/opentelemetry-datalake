@@ -164,6 +164,13 @@ pub fn validate_http_attributes(key: &str) -> bool {
 
 ```
 
+### 7. DRY & Code Reuse Guidelines
+
+To prevent code duplication, promote maintainability, and ensure consistency across signal types (Logs, Metrics, Traces):
+*   **Centralize Codec Logic**: Common OTLP transformation patterns, such as timestamp conversion (`timestamp_to_i64`), hex formatting (`to_hex_string`), and attribute conversion (`convert_attributes`), must reside in the centralized `arrow-codec::common` module rather than being duplicated locally within signal-specific codecs.
+*   **Unify Sink Pipelines**: Sinks must not triplicate pipeline processing loops across signal types. Instead, consolidate core processing logic (e.g. schema mode resolution, sorting, partitioning, and ACID transaction commits) into generic helper methods (such as `process_signal` inside `IcebergSink`) that parameterize behavior based on the signal type.
+*   **Consolidate Configuration Models**: Ensure configurations avoid duplicate field setups and reuse centralized workspace structures where possible (e.g. flattening `PipelineConfig` inside `AppConfig`).
+
 ## 7. Define a Two-Tier Pipeline Remapping Strategy
 
 To handle non-compliant versus compliant telemetry without destroying performance, use a **Dual-Path Remapper** design within your core engine.
