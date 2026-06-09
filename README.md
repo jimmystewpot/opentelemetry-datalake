@@ -1,5 +1,8 @@
 # OpenTelemetry Datalake
 
+[![codecov](https://codecov.io/github/jimmystewpot/opentelemetry-datalake/graph/badge.svg?token=8WT93L06CN)](https://codecov.io/github/jimmystewpot/opentelemetry-datalake)
+[![license](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
+
 `opentelemetry-datalake` is an ultra-high-performance, horizontally scalable OpenTelemetry (OTLP) receiver pipeline written in Rust. It ingests OTLP metrics, traces, and logs, decodes them into memory-efficient **Apache Arrow** formats, and channels them through to a downstream data lake sink (such as Kafka or ACID table formats like Delta Lake, Iceberg, and Hudi).
 
 Designed with zero-cost abstractions, lock-free concurrency, and zero-panic error handling, this pipeline is engineered to ingest telemetry at maximum throughput.
