@@ -17,9 +17,8 @@ use std::fmt::Write;
 pub fn to_hex_string(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        // SAFETY rationale for expect: `write!` into a `String` is infallible
-        // because `String` implements `fmt::Write` without I/O.
-        write!(&mut s, "{b:02x}").expect("writing to String should not fail");
+        // SAFETY rationale: `write!` into a `String` is infallible.
+        let _ = write!(&mut s, "{b:02x}");
     }
     s
 }

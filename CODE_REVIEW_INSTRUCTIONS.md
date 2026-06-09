@@ -36,6 +36,17 @@ Examine the changes specifically for the following:
 5. EDGE CASES
 - What input payloads, malformed OTLP protobuf boundaries, missing semantic conventions, or target cloud storage connection dropouts would break this logic?
 
+6. TEST COVERAGE & EFFICACY
+- Missing Unit Tests: Every new feature, pipeline transform, codec encoder, or storage sink implementation MUST be accompanied by comprehensive unit tests (`#[cfg(test)]`). 
+- Validation of the Negative Path: Tests must not just validate the "happy path." Ensure there are explicit tests verifying how the code handles malformed OTLP payloads, network dropouts, full buffers, and schema mismatches.
+- Benchmark Regressions: If changes are made to the hot path (e.g., `crates/arrow-codec/` or `crates/core/`), verify that corresponding microbenchmarks in the `benches/` directory have been updated or created, ensuring no throughput regressions.
+- Mock Quality: Ensure that mocks for external catalog services or cloud storage protocols accurately simulate real-world failure modes (e.g., OCC lock conflicts or rate-limiting responses) rather than just returning empty success states.
+
+7. DRY (DON'T REPEAT YOURSELF) & ABSTRACTION INTEGRITY
+- Structural & Schema Duplication: Ensure that Apache Arrow schemas, field layouts, or OTLP field mappings are defined in a centralized, single source of truth (e.g., `crates/arrow-codec/src/schema.rs`). Sinks MUST NOT redefine local copies of identical table structures.
+- Redundant Data Boilerplate: Check for repeated boilerplate patterns across the storage sink implementations (`delta.rs`, `iceberg.rs`, etc.). Common behaviors—such as retrying transactions, mapping standard errors, or splitting buffers based on hour/day enums—MUST be abstracted into shared traits or helpers within `crates/core/`.
+- Macro Overuse vs. Generics: Identify instances where copy-pasted code blocks could be safely reduced via clean Rust generics or lightweight macros, without compromising zero-cost abstraction profiles or readability.
+
 ---
 
 ### VALIDATION GATES (Mandatory Pre-Flight Checks)

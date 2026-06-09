@@ -18,6 +18,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 iceberg = { workspace = true }
@@ -27,3 +28,12 @@ iceberg-storage-opendal = { workspace = true }
 # Conditional AWS Catalog Dependencies
 iceberg-catalog-glue = { workspace = true, optional = true }
 iceberg-catalog-s3tables = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+tokio = { workspace = true }
+
+[[bench]]
+name = "storage_bench"
+harness = false
+

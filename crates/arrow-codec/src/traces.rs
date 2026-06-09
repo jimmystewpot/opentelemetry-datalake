@@ -12,6 +12,7 @@ use crate::common::{convert_attributes, timestamp_to_i64, to_hex_string};
 /// # Errors
 ///
 /// Returns `PipelineError::Internal` if schema matching or record creation fails.
+#[allow(clippy::too_many_lines)]
 pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, PipelineError> {
     let mut total_records = 0;
     for r_span in &req.resource_spans {
@@ -26,9 +27,10 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
     let mut parent_span_id_builder = StringBuilder::new();
     let mut name_builder = StringBuilder::new();
     let mut kind_builder = Int32Builder::with_capacity(total_records);
-    let mut start_time_builder = TimestampNanosecondBuilder::with_capacity(total_records);
+    let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut end_time_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut attributes_builder = StringBuilder::new();
+    let mut service_name_builder = StringBuilder::new();
     let mut resource_attributes_builder = StringBuilder::new();
     let mut scope_name_builder = StringBuilder::new();
     let mut scope_version_builder = StringBuilder::new();
@@ -36,10 +38,16 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
     let mut status_message_builder = StringBuilder::new();
 
     for r_span in &req.resource_spans {
-        let resource_attrs_json = if let Some(ref res) = r_span.resource {
-            convert_attributes(&res.attributes)
+        let (resource_attrs_json, service_name) = if let Some(ref res) = r_span.resource {
+            let service_name = res
+                .attributes
+                .iter()
+                .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
+                .and_then(|kv| kv.value.as_ref())
+                .map_or_else(|| "unknown".to_string(), crate::common::any_value_to_string);
+            (convert_attributes(&res.attributes), service_name)
         } else {
-            "{}".to_string()
+            ("{}".to_string(), "unknown".to_string())
         };
 
         for s_span in &r_span.scope_spans {
@@ -56,12 +64,13 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
                 parent_span_id_builder.append_value(to_hex_string(&span.parent_span_id));
                 name_builder.append_value(span.name.as_str());
                 kind_builder.append_value(span.kind);
-                start_time_builder.append_value(timestamp_to_i64(span.start_time_unix_nano)?);
+                timestamp_builder.append_value(timestamp_to_i64(span.start_time_unix_nano)?);
                 end_time_builder.append_value(timestamp_to_i64(span.end_time_unix_nano)?);
 
                 let span_attrs_json = convert_attributes(&span.attributes);
                 attributes_builder.append_value(&span_attrs_json);
 
+                service_name_builder.append_value(&service_name);
                 resource_attributes_builder.append_value(&resource_attrs_json);
                 scope_name_builder.append_value(scope_name);
                 scope_version_builder.append_value(scope_version);
@@ -85,7 +94,7 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
         Field::new("name", DataType::Utf8, false),
         Field::new("kind", DataType::Int32, false),
         Field::new(
-            "start_time",
+            "timestamp",
             DataType::Timestamp(TimeUnit::Nanosecond, None),
             false,
         ),
@@ -95,6 +104,7 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             false,
         ),
         Field::new("attributes", DataType::Utf8, false),
+        Field::new("service_name", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
@@ -111,9 +121,10 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             Arc::new(parent_span_id_builder.finish()),
             Arc::new(name_builder.finish()),
             Arc::new(kind_builder.finish()),
-            Arc::new(start_time_builder.finish()),
+            Arc::new(timestamp_builder.finish()),
             Arc::new(end_time_builder.finish()),
             Arc::new(attributes_builder.finish()),
+            Arc::new(service_name_builder.finish()),
             Arc::new(resource_attributes_builder.finish()),
             Arc::new(scope_name_builder.finish()),
             Arc::new(scope_version_builder.finish()),
@@ -176,6 +187,6 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
 
         let schema = batch.schema();
-        assert_eq!(schema.fields().len(), 14);
+        assert_eq!(schema.fields().len(), 15);
     }
 }

@@ -5,7 +5,7 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use pipeline_core::error::PipelineError;
 use std::sync::Arc;
 
-use crate::common::{convert_attributes, timestamp_to_i64};
+use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64};
 
 /// Decodes OTLP Metrics requests into an Arrow `RecordBatch`.
 ///
@@ -48,15 +48,22 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
     let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut value_builder = Float64Builder::with_capacity(total_records);
     let mut attributes_builder = StringBuilder::new();
+    let mut service_name_builder = StringBuilder::new();
     let mut resource_attributes_builder = StringBuilder::new();
     let mut scope_name_builder = StringBuilder::new();
     let mut scope_version_builder = StringBuilder::new();
 
     for r_metric in &req.resource_metrics {
-        let resource_attrs_json = if let Some(ref res) = r_metric.resource {
-            convert_attributes(&res.attributes)
+        let (resource_attrs_json, service_name) = if let Some(ref res) = r_metric.resource {
+            let service_name = res
+                .attributes
+                .iter()
+                .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
+                .and_then(|kv| kv.value.as_ref())
+                .map_or_else(|| "unknown".to_string(), any_value_to_string);
+            (convert_attributes(&res.attributes), service_name)
         } else {
-            "{}".to_string()
+            ("{}".to_string(), "unknown".to_string())
         };
 
         for s_metric in &r_metric.scope_metrics {
@@ -90,6 +97,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 value_builder.append_value(val);
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
+                                service_name_builder.append_value(&service_name);
                                 resource_attributes_builder.append_value(&resource_attrs_json);
                                 scope_name_builder.append_value(scope_name);
                                 scope_version_builder.append_value(scope_version);
@@ -112,6 +120,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 value_builder.append_value(val);
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
+                                service_name_builder.append_value(&service_name);
                                 resource_attributes_builder.append_value(&resource_attrs_json);
                                 scope_name_builder.append_value(scope_name);
                                 scope_version_builder.append_value(scope_version);
@@ -131,6 +140,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                                 value_builder.append_value(val);
 
                                 attributes_builder.append_value(convert_attributes(&dp.attributes));
+                                service_name_builder.append_value(&service_name);
                                 resource_attributes_builder.append_value(&resource_attrs_json);
                                 scope_name_builder.append_value(scope_name);
                                 scope_version_builder.append_value(scope_version);
@@ -154,6 +164,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
         ),
         Field::new("value", DataType::Float64, false),
         Field::new("attributes", DataType::Utf8, false),
+        Field::new("service_name", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
@@ -168,6 +179,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
             Arc::new(timestamp_builder.finish()),
             Arc::new(value_builder.finish()),
             Arc::new(attributes_builder.finish()),
+            Arc::new(service_name_builder.finish()),
             Arc::new(resource_attributes_builder.finish()),
             Arc::new(scope_name_builder.finish()),
             Arc::new(scope_version_builder.finish()),
@@ -234,6 +246,6 @@ mod tests {
         assert_eq!(batch.num_rows(), 1);
 
         let schema = batch.schema();
-        assert_eq!(schema.fields().len(), 9);
+        assert_eq!(schema.fields().len(), 10);
     }
 }

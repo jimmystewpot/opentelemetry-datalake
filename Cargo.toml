@@ -3,6 +3,16 @@ name = "opentelemetry-datalake"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
+repository = { workspace = true }
+description = { workspace = true }
+homepage = { workspace = true }
+authors = { workspace = true }
+
+[package.metadata.wix]
+upgrade-guid = "2114856D-4676-4C5F-9E8D-4FFC419C8961"
+path-guid = "E7FF3F65-3358-4192-8399-B0A919F15306"
+license = false
+eula = false
 
 [workspace]
 resolver = "2"
@@ -11,9 +21,13 @@ members = [
 ]
 
 [workspace.package]
+description = "An OpenTelemetry datalake receiver streaming to Apache Iceberg"
 version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
+repository = "https://github.com/jimmystewpot/opentelemetry-datalake"
+homepage = "https://github.com/jimmystewpot/opentelemetry-datalake"
+authors = ["James Lamb"]
 
 [dependencies]
 pipeline-core = { workspace = true }
@@ -58,6 +72,7 @@ async-trait = "0.1"
 # Serialization & Config
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+uuid = { version = "1.12.1", features = ["v7"] }
 figment = { version = "0.10", features = ["env", "toml"] }
 clap = "4.5"
 
@@ -90,6 +105,11 @@ iceberg-storage-opendal = { version = "0.9.1", features = ["opendal-s3"] }
 [profile.release]
 lto = "thin"
 debug = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 
 [patch.crates-io]
 paste = { git = "https://github.com/dtolnay/paste" }

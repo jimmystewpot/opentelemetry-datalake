@@ -53,6 +53,18 @@ struct Cli {
     /// Check the configuration file for validity and exit
     #[arg(long)]
     check: bool,
+
+    /// Override gRPC bind address (e.g. 0.0.0.0:4317)
+    #[arg(long, value_name = "ADDR")]
+    grpc_addr: Option<SocketAddr>,
+
+    /// Override HTTP bind address (e.g. 0.0.0.0:4318)
+    #[arg(long, value_name = "ADDR")]
+    http_addr: Option<SocketAddr>,
+
+    /// Override dry-run mode for Iceberg sink
+    #[arg(long)]
+    dry_run: Option<bool>,
 }
 
 #[tokio::main]
@@ -100,7 +112,18 @@ async fn main() -> anyhow::Result<()> {
         figment = figment.merge(Toml::file("config.toml"));
     }
 
-    let config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
+    let mut config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
+
+    // Apply CLI overrides to configuration
+    if let Some(grpc_addr) = cli_args.grpc_addr {
+        config.server.grpc_addr = grpc_addr;
+    }
+    if let Some(http_addr) = cli_args.http_addr {
+        config.server.http_addr = http_addr;
+    }
+    if let (Some(dry_run), Some(iceberg)) = (cli_args.dry_run, &mut config.iceberg) {
+        iceberg.dry_run = dry_run;
+    }
 
     // Perform early validation checks
     if let Some(ref iceberg_cfg) = config.iceberg {

@@ -15,7 +15,7 @@ partition_granularity = "hourly"
 dry_run = false
 
 [iceberg.batching]
-max_batch_records = 5
+max_batch_records = 10000
 max_batch_interval_sec = 2
 
 [iceberg.properties]

@@ -5,6 +5,9 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$DIR/../.." && pwd)"
 
+# Kill any orphaned receiver processes
+pkill -f opentelemetry-datalake || true
+
 # 1. Detect Docker Compose command
 if docker compose version >/dev/null 2>&1; then
     DOCKER_COMPOSE="docker compose"
@@ -83,6 +86,8 @@ RECEIVER_PID=$!
 # Ensure cleanup on exit
 cleanup() {
     echo "=== Cleaning up ==="
+    echo "=== Docker Compose Logs ==="
+    $DOCKER_COMPOSE -f "$DIR/docker-compose.yml" logs --tail=100 || true
     if [ -n "${RECEIVER_PID:-}" ]; then
         echo "Stopping receiver (PID: $RECEIVER_PID)..."
         kill -SIGINT "$RECEIVER_PID" || true

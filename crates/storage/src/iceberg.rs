@@ -1,5 +1,7 @@
 use crate::{CatalogType, PartitionGranularity, SchemaMode};
-use arrow::array::{Array, ArrayRef, AsArray, StringArray};
+#[cfg(test)]
+use arrow::array::ArrayRef;
+use arrow::array::{Array, AsArray};
 use arrow::compute::{SortColumn, lexsort_to_indices};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -7,6 +9,7 @@ use chrono::{TimeZone, Utc};
 use iceberg::Catalog;
 use iceberg::CatalogBuilder;
 use iceberg::TableIdent;
+use iceberg::transaction::ApplyTransactionAction;
 use iceberg::transaction::Transaction;
 #[cfg(feature = "aws")]
 use iceberg_catalog_glue::GlueCatalogBuilder;
@@ -27,6 +30,8 @@ pub struct BatchingConfig {
     pub max_batch_size_bytes: usize,
     #[serde(default = "default_max_batch_interval_sec")]
     pub max_batch_interval_sec: u64,
+    #[serde(default)]
+    pub max_batch_records: Option<usize>,
 }
 
 impl Default for BatchingConfig {
@@ -34,6 +39,7 @@ impl Default for BatchingConfig {
         Self {
             max_batch_size_bytes: default_max_batch_size_bytes(),
             max_batch_interval_sec: default_max_batch_interval_sec(),
+            max_batch_records: None,
         }
     }
 }
@@ -107,32 +113,48 @@ fn default_log_dropped_fields() -> bool {
     true
 }
 
+struct TableBuffer {
+    signal_type: &'static str,
+    batches: Vec<RecordBatch>,
+    total_rows: usize,
+    total_bytes: usize,
+    last_flush: std::time::Instant,
+}
+
+impl TableBuffer {
+    fn new(signal_type: &'static str) -> Self {
+        Self {
+            signal_type,
+            batches: Vec::new(),
+            total_rows: 0,
+            total_bytes: 0,
+            last_flush: std::time::Instant::now(),
+        }
+    }
+}
+
 /// Apache Iceberg storage sink.
 pub struct IcebergSink {
     config: IcebergSinkConfig,
+    buffers: std::collections::HashMap<String, TableBuffer>,
 }
 
 impl IcebergSink {
     /// Creates a new `IcebergSink` from configuration.
     #[must_use]
     pub fn new(config: IcebergSinkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            buffers: std::collections::HashMap::new(),
+        }
     }
 
     /// Sorts a log batch based on the (`ServiceName`, `SeverityText`, `Timestamp`) tuple.
     pub fn sort_logs(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let resource_attrs_col = batch
-            .column_by_name("resource_attributes")
-            .ok_or_else(|| PipelineError::Internal("Missing resource_attributes".to_string()))?;
-        let resource_attrs = resource_attrs_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                PipelineError::Internal("resource_attributes column is not Utf8".to_string())
-            })?;
-
-        let service_names = extract_service_names(resource_attrs);
-        let service_name_col = Arc::new(service_names) as ArrayRef;
+        let service_name_col = batch
+            .column_by_name("service_name")
+            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
+            .clone();
 
         let severity_col = batch
             .column_by_name("severity_text")
@@ -162,20 +184,12 @@ impl IcebergSink {
         sort_batch(batch, &sort_cols)
     }
 
-    /// Sorts a metrics batch based on the (`ServiceName`, `MetricName`, `Attributes`, `TimeUnix`) tuple.
+    /// Sorts a metrics batch based on the (`ServiceName`, `MetricName`, `Attributes`, `Timestamp`) tuple.
     pub fn sort_metrics(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let resource_attrs_col = batch
-            .column_by_name("resource_attributes")
-            .ok_or_else(|| PipelineError::Internal("Missing resource_attributes".to_string()))?;
-        let resource_attrs = resource_attrs_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                PipelineError::Internal("resource_attributes column is not Utf8".to_string())
-            })?;
-
-        let service_names = extract_service_names(resource_attrs);
-        let service_name_col = Arc::new(service_names) as ArrayRef;
+        let service_name_col = batch
+            .column_by_name("service_name")
+            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
+            .clone();
 
         let name_col = batch
             .column_by_name("name")
@@ -216,18 +230,10 @@ impl IcebergSink {
 
     /// Sorts a traces batch based on the (`ServiceName`, `SpanName`, `Timestamp`) tuple.
     pub fn sort_traces(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let resource_attrs_col = batch
-            .column_by_name("resource_attributes")
-            .ok_or_else(|| PipelineError::Internal("Missing resource_attributes".to_string()))?;
-        let resource_attrs = resource_attrs_col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                PipelineError::Internal("resource_attributes column is not Utf8".to_string())
-            })?;
-
-        let service_names = extract_service_names(resource_attrs);
-        let service_name_col = Arc::new(service_names) as ArrayRef;
+        let service_name_col = batch
+            .column_by_name("service_name")
+            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
+            .clone();
 
         let name_col = batch
             .column_by_name("name")
@@ -235,8 +241,8 @@ impl IcebergSink {
             .clone();
 
         let timestamp_col = batch
-            .column_by_name("start_time")
-            .ok_or_else(|| PipelineError::Internal("Missing start_time".to_string()))?
+            .column_by_name("timestamp")
+            .ok_or_else(|| PipelineError::Internal("Missing timestamp".to_string()))?
             .clone();
 
         let sort_cols = vec![
@@ -305,24 +311,26 @@ impl IcebergSink {
                 let schema = table.current_schema_ref();
                 let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
                     .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-
                 let mut final_columns = Vec::new();
                 let mut final_fields = Vec::new();
                 let mut dropped_fields = Vec::new();
 
                 for field in batch.schema().fields() {
-                    if arrow_schema.field_with_name(field.name()).is_ok() {
-                        let col = batch
-                            .column_by_name(field.name())
-                            .ok_or_else(|| {
-                                PipelineError::Internal(format!(
-                                    "Column {} missing from batch",
-                                    field.name()
-                                ))
-                            })?
-                            .clone();
-                        final_columns.push(col);
-                        final_fields.push(field.clone());
+                    if let Ok(table_field) = arrow_schema.field_with_name(field.name()) {
+                        let col = batch.column_by_name(field.name()).ok_or_else(|| {
+                            PipelineError::Internal(format!(
+                                "Column {} missing from batch",
+                                field.name()
+                            ))
+                        })?;
+                        let casted_col = if col.data_type() == table_field.data_type() {
+                            col.clone()
+                        } else {
+                            arrow::compute::cast(col, table_field.data_type())
+                                .map_err(PipelineError::Arrow)?
+                        };
+                        final_columns.push(casted_col);
+                        final_fields.push(table_field.clone());
                     } else {
                         dropped_fields.push(field.name().clone());
                     }
@@ -340,28 +348,6 @@ impl IcebergSink {
             }
         }
     }
-}
-
-/// Helper function to extract `service.name` from `resource_attributes` JSON strings.
-fn extract_service_names(resource_attrs: &StringArray) -> StringArray {
-    let mut builder = arrow::array::StringBuilder::new();
-    for i in 0..resource_attrs.len() {
-        if resource_attrs.is_null(i) {
-            builder.append_value("unknown");
-        } else {
-            let json_str = resource_attrs.value(i);
-            let service_name = serde_json::from_str::<serde_json::Value>(json_str)
-                .ok()
-                .and_then(|v| {
-                    v.get(opentelemetry_semantic_conventions::resource::SERVICE_NAME)
-                        .and_then(serde_json::Value::as_str)
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            builder.append_value(service_name);
-        }
-    }
-    builder.finish()
 }
 
 /// Helper function to lexically sort a `RecordBatch` by sort columns.
@@ -417,14 +403,33 @@ pub fn partition_batch(
     timestamp_col_name: &str,
     granularity: PartitionGranularity,
 ) -> Result<Vec<(String, RecordBatch)>, PipelineError> {
-    let ts_array = batch
+    let ts_col = batch
         .column_by_name(timestamp_col_name)
-        .ok_or_else(|| PipelineError::Internal(format!("Missing {timestamp_col_name}")))?
-        .as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+        .ok_or_else(|| PipelineError::Internal(format!("Missing {timestamp_col_name}")))?;
+
+    let mut timestamps_nanos = Vec::with_capacity(batch.num_rows());
+    match ts_col.data_type() {
+        arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
+            let ts_array = ts_col.as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+            for i in 0..batch.num_rows() {
+                timestamps_nanos.push(ts_array.value(i));
+            }
+        }
+        arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
+            let ts_array = ts_col.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
+            for i in 0..batch.num_rows() {
+                timestamps_nanos.push(ts_array.value(i) * 1000);
+            }
+        }
+        other => {
+            return Err(PipelineError::Internal(format!(
+                "Unexpected timestamp column datatype: {other:?}"
+            )));
+        }
+    }
 
     let mut partitions: HashMap<String, Vec<u32>> = HashMap::new();
-    for i in 0..batch.num_rows() {
-        let val = ts_array.value(i);
+    for (i, &val) in timestamps_nanos.iter().enumerate() {
         let path = get_partition_path(val, granularity)?;
         let idx = u32::try_from(i).map_err(|e| PipelineError::Internal(e.to_string()))?;
         partitions.entry(path).or_default().push(idx);
@@ -454,11 +459,12 @@ impl IcebergSink {
     async fn load_table(
         &self,
         catalog: Option<&Arc<dyn Catalog>>,
+        table_name: &str,
     ) -> Result<Option<iceberg::table::Table>, PipelineError> {
         let Some(cat) = catalog else {
             return Ok(None);
         };
-        let table_ident = TableIdent::from_strs(self.config.table_identifier.split('.'))
+        let table_ident = TableIdent::from_strs(table_name.split('.'))
             .map_err(|e| PipelineError::Storage(Box::new(e)))?;
         let table = cat
             .load_table(&table_ident)
@@ -467,54 +473,182 @@ impl IcebergSink {
         Ok(Some(table))
     }
 
-    /// Processes a single signal batch through the full pipeline:
-    /// schema mode → sort → partition → commit.
-    ///
-    /// This is the unified handler for all three signal types, eliminating
-    /// the previously triplicated match arms in `run()`.
-    async fn process_signal(
-        &self,
-        batch: RecordBatch,
-        sort_fn: fn(&IcebergSink, &RecordBatch) -> Result<RecordBatch, PipelineError>,
-        timestamp_col: &str,
-        signal_name: &str,
+    /// Flushes the buffered data for the specified table.
+    async fn flush_table(
+        &mut self,
+        table_name: &str,
         catalog: Option<&Arc<dyn Catalog>>,
     ) -> Result<(), PipelineError> {
-        let loaded_table = self.load_table(catalog).await?;
-        let filtered_batch = self.apply_schema_mode(batch, loaded_table.as_ref())?;
-        let sorted_batch = sort_fn(self, &filtered_batch)?;
+        let Some(buffer) = self.buffers.get_mut(table_name) else {
+            return Ok(());
+        };
+
+        if buffer.batches.is_empty() {
+            buffer.last_flush = std::time::Instant::now();
+            return Ok(());
+        }
+
+        let batches_to_flush = std::mem::take(&mut buffer.batches);
+        let signal_type = buffer.signal_type;
+        buffer.total_rows = 0;
+        buffer.total_bytes = 0;
+        buffer.last_flush = std::time::Instant::now();
+
+        // Concatenate batches
+        let schema = batches_to_flush[0].schema();
+        let combined_batch = arrow::compute::concat_batches(&schema, &batches_to_flush)
+            .map_err(PipelineError::Arrow)?;
+
+        info!(
+            "Flushing {} accumulated records for {} to table {}",
+            combined_batch.num_rows(),
+            signal_type,
+            table_name
+        );
+
+        let loaded_table = self.load_table(catalog, table_name).await?;
+        let final_batch = self.apply_schema_mode(combined_batch, loaded_table.as_ref())?;
+
+        // Sort batch based on signal type
+        let sorted_batch = match signal_type {
+            "logs" => self.sort_logs(&final_batch)?,
+            "metrics" => self.sort_metrics(&final_batch)?,
+            "traces" => self.sort_traces(&final_batch)?,
+            _ => final_batch,
+        };
+
+        let timestamp_col = "timestamp";
+
+        // Partition the batch
         let sub_batches = partition_batch(
             &sorted_batch,
             timestamp_col,
             self.config.partition_granularity,
         )?;
 
-        for (path, sub_batch) in sub_batches {
-            info!(
-                "Writing sorted {} batch (rows: {}) to Iceberg partition: {}{}",
-                signal_name,
-                sub_batch.num_rows(),
-                self.config.warehouse,
-                path
-            );
-
-            if let Some(cat) = catalog {
-                if let Some(ref table) = loaded_table {
-                    let tx = Transaction::new(table);
-                    tx.commit(cat.as_ref())
-                        .await
-                        .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                    info!(
-                        "Committed ACID transaction for table: {}",
-                        self.config.table_identifier
-                    );
-                }
-            } else {
-                info!("Simulating ACID transaction commit for partition: {}", path);
+        if let Some(ref table) = loaded_table {
+            let mut all_data_files = Vec::new();
+            for (path, sub_batch) in sub_batches {
+                info!(
+                    "Writing sorted {} batch (rows: {}) to Iceberg partition: {}{}",
+                    signal_type,
+                    sub_batch.num_rows(),
+                    self.config.warehouse,
+                    path
+                );
+                let data_files = write_batch_to_table(table, sub_batch).await?;
+                all_data_files.extend(data_files);
             }
+
+            if let (Some(cat), false) = (catalog, all_data_files.is_empty()) {
+                let tx = Transaction::new(table);
+                let action = tx.fast_append().add_data_files(all_data_files);
+                let tx = action
+                    .apply(tx)
+                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+                tx.commit(cat.as_ref())
+                    .await
+                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+                info!(
+                    "Committed ACID transaction with data files for table: {}",
+                    table_name
+                );
+            }
+        } else {
+            for (path, sub_batch) in sub_batches {
+                info!(
+                    "Simulating partition batch write (rows: {}) for partition: {}",
+                    sub_batch.num_rows(),
+                    path
+                );
+            }
+            info!(
+                "Simulating ACID transaction commit for table: {}",
+                table_name
+            );
         }
 
         Ok(())
+    }
+}
+
+async fn write_batch_to_table(
+    table: &iceberg::table::Table,
+    batch: RecordBatch,
+) -> Result<Vec<iceberg::spec::DataFile>, PipelineError> {
+    use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use iceberg::writer::file_writer::ParquetWriterBuilder;
+    use iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    use parquet::file::properties::WriterProperties;
+    use uuid::Uuid;
+
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+        .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+    let file_prefix = format!("part-{}", Uuid::now_v7());
+    let file_name_generator =
+        DefaultFileNameGenerator::new(file_prefix, None, iceberg::spec::DataFileFormat::Parquet);
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.current_schema_ref().clone(),
+    );
+
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
+        table.file_io().clone(),
+        location_generator.clone(),
+        file_name_generator.clone(),
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+
+    let mut data_file_writer = data_file_writer_builder
+        .build(None)
+        .await
+        .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+
+    data_file_writer
+        .write(batch)
+        .await
+        .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+
+    let data_files = data_file_writer
+        .close()
+        .await
+        .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+
+    Ok(data_files)
+}
+
+impl IcebergSink {
+    fn should_flush(&self, table_name: &str) -> bool {
+        let Some(buffer) = self.buffers.get(table_name) else {
+            return false;
+        };
+        if buffer.batches.is_empty() {
+            return false;
+        }
+        let batching = self.config.batching.as_ref();
+        let max_records = batching.and_then(|b| b.max_batch_records);
+        let max_size =
+            batching.map_or_else(default_max_batch_size_bytes, |b| b.max_batch_size_bytes);
+        let max_interval =
+            batching.map_or_else(default_max_batch_interval_sec, |b| b.max_batch_interval_sec);
+
+        if max_records.is_some_and(|m| buffer.total_rows >= m) {
+            return true;
+        }
+        if buffer.total_bytes >= max_size {
+            return true;
+        }
+        if buffer.last_flush.elapsed().as_secs() >= max_interval {
+            return true;
+        }
+        false
     }
 }
 
@@ -576,40 +710,48 @@ impl Sink for IcebergSink {
             }
         }
 
-        while let Some(signal) = input.recv().await {
-            match signal {
-                SignalBatch::Logs(batch) => {
-                    self.process_signal(
-                        batch,
-                        Self::sort_logs,
-                        "timestamp",
-                        "logs",
-                        catalog.as_ref(),
-                    )
-                    .await?;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        let table_name = self.config.table_identifier.clone();
+
+        loop {
+            tokio::select! {
+                maybe_signal = input.recv() => {
+                    match maybe_signal {
+                        Some(signal) => {
+                            let signal_type = match &signal {
+                                SignalBatch::Logs(_) => "logs",
+                                SignalBatch::Metrics(_) => "metrics",
+                                SignalBatch::Traces(_) => "traces",
+                            };
+
+                            let buffer = self.buffers.entry(table_name.clone()).or_insert_with(|| TableBuffer::new(signal_type));
+                            let batch = match signal {
+                                SignalBatch::Logs(b) | SignalBatch::Metrics(b) | SignalBatch::Traces(b) => b,
+                            };
+
+                            buffer.total_rows += batch.num_rows();
+                            buffer.total_bytes += batch.get_array_memory_size();
+                            buffer.batches.push(batch);
+
+                            if self.should_flush(&table_name) {
+                                self.flush_table(&table_name, catalog.as_ref()).await?;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
                 }
-                SignalBatch::Metrics(batch) => {
-                    self.process_signal(
-                        batch,
-                        Self::sort_metrics,
-                        "timestamp",
-                        "metrics",
-                        catalog.as_ref(),
-                    )
-                    .await?;
-                }
-                SignalBatch::Traces(batch) => {
-                    self.process_signal(
-                        batch,
-                        Self::sort_traces,
-                        "start_time",
-                        "traces",
-                        catalog.as_ref(),
-                    )
-                    .await?;
+                _ = interval.tick() => {
+                    if self.should_flush(&table_name) {
+                        self.flush_table(&table_name, catalog.as_ref()).await?;
+                    }
                 }
             }
         }
+
+        info!("Performing final flush of buffered data before termination...");
+        self.flush_table(&table_name, catalog.as_ref()).await?;
 
         info!("IcebergSink task terminated gracefully.");
         Ok(())
@@ -632,6 +774,7 @@ mod tests {
                 false,
             ),
             Field::new("severity_text", DataType::Utf8, false),
+            Field::new("service_name", DataType::Utf8, false),
             Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
@@ -643,13 +786,19 @@ mod tests {
 
         let sev_array = Arc::new(StringArray::from(vec!["INFO", "ERROR", "WARN"])) as ArrayRef;
 
+        let service_array = Arc::new(StringArray::from(vec![
+            "service-a",
+            "service-b",
+            "service-a",
+        ])) as ArrayRef;
+
         let res_array = Arc::new(StringArray::from(vec![
             r#"{"service.name":"service-a"}"#,
             r#"{"service.name":"service-b"}"#,
             r#"{"service.name":"service-a"}"#,
         ])) as ArrayRef;
 
-        RecordBatch::try_new(schema, vec![ts_array, sev_array, res_array]).unwrap()
+        RecordBatch::try_new(schema, vec![ts_array, sev_array, service_array, res_array]).unwrap()
     }
 
     fn make_dry_run_config(schema_mode: SchemaMode) -> IcebergSinkConfig {
@@ -666,6 +815,7 @@ mod tests {
     fn test_logs_sorting() {
         let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
         let batch = make_test_logs_batch();
+        println!("Test batch schema: {:?}", batch.schema());
         let sorted = sink.sort_logs(&batch).unwrap();
 
         let res_col = sorted
@@ -713,7 +863,7 @@ mod tests {
           "location": "s3://bucket/test/location",
           "last-sequence-number": 0,
           "last-updated-ms": 1602638573000,
-          "last-column-id": 3,
+          "last-column-id": 4,
           "current-schema-id": 0,
           "schemas": [
             {
@@ -722,6 +872,7 @@ mod tests {
               "fields": [
                 { "id": 1, "name": "timestamp", "required": true, "type": "timestamp_ns" },
                 { "id": 2, "name": "severity_text", "required": false, "type": "string" },
+                { "id": 4, "name": "service_name", "required": false, "type": "string" },
                 { "id": 3, "name": "resource_attributes", "required": false, "type": "string" }
               ]
             }
