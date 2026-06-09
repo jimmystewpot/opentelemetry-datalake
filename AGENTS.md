@@ -19,30 +19,34 @@ opentelemetry-datalake/
 ├── LICENSE
 ├── README.md
 ├── AGENTS.md                  # This file
+├── src/
+│   └── main.rs                # Entry point and pipeline orchestration
 ├── crates/
-│   ├── core/                  # Core pipeline orchestration, traits, and types
+│   ├── core/                  # Core pipeline traits, types, and telemetry
 │   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, pipeline.rs, error.rs}
+│   │   └── src/{lib.rs, pipeline.rs, config.rs, error.rs, telemetry.rs}
 │   ├── otlp-receiver/         # gRPC and HTTP/JSON OTLP ingestion endpoints
 │   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, grpc.rs, http.rs}
-│   ├── arrow-codec/           # Maps OTLP Protobuf/Arrow schemas & batching
+│   │   └── src/lib.rs
+│   ├── arrow-codec/           # Maps OTLP Protobuf to Arrow schemas & batching
 │   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, encoder.rs, schema.rs}
-│   └── storage/               # Open Table Format sink implementations
+│   │   └── src/{lib.rs, common.rs, compliance.rs, logs.rs, metrics.rs, traces.rs}
+│   ├── storage/               # Open Table Format sink implementations (Iceberg)
+│   │   ├── Cargo.toml
+│   │   └── src/{lib.rs, iceberg.rs}
+│   ├── kafka-sink/            # Kafka sink implementation
+│   │   ├── Cargo.toml
+│   │   └── src/lib.rs
+│   └── noop-transformer/      # Example/Pass-through transformer
 │       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs          # Sink registry and common writer traits
-│           ├── delta.rs        # Delta Lake writer integration
-│           ├── iceberg.rs      # Apache Iceberg writer integration
-│           ├── hudi.rs         # Apache Hudi writer integration
-│           └── paimon.rs       # Apache Paimon writer integration
-├── benches/                   # Criterion-based microbenchmarks for hot paths
-│   ├── ingestion_bench.rs
-│   └── storage_bench.rs
+│       └── src/lib.rs
 └── docs/                      # Documentation and specifications
-    ├── buffer.md              # Buffer behavior, events, and metrics specification
-    └── instrumentation.md     # Pipeline telemetry & event naming standards
+    ├── ARCHITECTURE.md        # High-level architecture overview
+    ├── buffer.md              # Buffer behavior and metrics specification
+    ├── components.md          # Component behavior (sources, transforms, sinks)
+    ├── configuration.md       # Configuration reference
+    ├── instrumentation.md     # Pipeline telemetry & logging standards
+    └── lakehouse.md           # Lakehouse integration specification
 ```
 
 ---
@@ -53,33 +57,29 @@ Agents must strictly use the specific library ecosystem outlined below. Do not i
 
 ### 1. High-Performance Processing & Memory Layout
 
-*   **In-Memory Format**: **Apache Arrow (Rust Native)** via the `arrow` and `arrow-flight` crates. Data processing, transformations, and batching MUST happen natively inside Arrow Arrays (e.g., `PrimitiveArray`, `StringArray`) and `RecordBatch` structures to leverage vectorized CPU operations and SIMD optimization.
-*   **Serialization/Deserialization**: `prost` for compiling and decoding high-throughput OTLP Protobuf payloads.
-*   **JSON Handling**: Avoid using `serde_json` directly for high-throughput telemetry data processing where Arrow native methods or `arrow-json` exist. Standard `serde` is permitted and recommended for configuration parsing and startup/setup paths.
+*   **In-Memory Format**: **Apache Arrow (Rust Native)** via the `arrow` crate. Data processing, transformations, and batching MUST happen natively inside Arrow Arrays and `RecordBatch` structures.
+*   **Serialization/Deserialization**: `prost` for decoding OTLP Protobuf payloads.
+*   **OTLP Definitions**: `opentelemetry-proto` for standard OTLP message definitions.
 
 ### 2. Async Runtime & Networking
 
-*   **Async Engine**: `tokio` (multi-threaded feature flag enabled).
-*   **Network Protocol Engine**: `tonic` for high-performance, low-latency gRPC OTLP ingestion, and `axum` for HTTP/JSON OTLP ingestion.
-*   **Network Transport**: `hyper` handles underlying HTTP primitives.
+*   **Async Engine**: `tokio` (full feature flag enabled).
+*   **Network Protocol Engine**: `tonic` for gRPC OTLP ingestion, and `axum` for HTTP/JSON OTLP ingestion.
 
-### 3. Open Table Format Sinks (Storage Layer)
+### 3. Storage Sinks
 
-All table interactions must use the official, native Rust implementations where available, configuration mapping must be passed safely using native configuration maps:
-
-*   **Delta Lake**: `delta-kernel-rs` or `deltalake` crate.
 *   **Apache Iceberg**: `iceberg-rust` (the official Apache Iceberg Rust implementation).
-*   **Apache Hudi / Apache Paimon**: Interfaced via native bindings or via optimized parquet streaming using `datafusion` / `object_store` matching the table specifications.
+*   **Kafka**: `rdkafka` (based on `librdkafka`).
 
 ### 4. Component Summary & Role Mapping
 
 | Component Layer | Core Crate / Technology | Architecture Role |
 | --- | --- | --- |
-| **Ingestion Edge** | `tonic` (gRPC) / `axum` (HTTP) | Non-blocking OTLP receivers accepting incoming telemetry streams. |
-| **Buffer & Codec** | `prost` + `arrow` | Translates raw proto structs into columnar `RecordBatch` layout on arrival. |
-| **Execution Engine** | `datafusion` (Optional) | Used inside `core` for memory-efficient querying, sorting, or local aggregations. |
-| **I/O & Cloud Storage** | `object_store` | Standardized async interface for AWS S3, Azure Blob, Google Cloud Storage, and local disk. |
-| **Format Writers** | `deltalake`, `iceberg`, hudi/paimon bindings | Translates standard Arrow record batches into metadata-rich ACID table commits. |
+| **Ingestion Edge** | `otlp-receiver` (`tonic`/`axum`) | Non-blocking OTLP receivers accepting incoming telemetry streams. |
+| **Codec** | `arrow-codec` (`prost` + `arrow`) | Translates raw proto structs into columnar `RecordBatch` layout on arrival. |
+| **Transformation** | `noop-transformer` | Provides a hook for data transformation/enrichment (currently no-op). |
+| **Core** | `pipeline-core` | Defines common traits (`Source`, `Transform`, `Sink`) and shared logic. |
+| **Storage Sinks** | `storage` (Iceberg), `kafka-sink` | Translates Arrow record batches into physical storage or message queues. |
 
 ---
 
@@ -244,6 +244,16 @@ To guarantee downstream data lakes remain highly structured and query-optimized,
 2. **Metadata Tagging:** Telemetry batches that pass structural validation checks must have their Arrow schema metadata injected with an `otel::compliance::status = "verified"` flag.
 3. **Quarantine Handling:** If the pipeline is configured in `strict` mode and an incoming data payload contains un-mappable, malformed, or missing required semantic fields, the batch must be diverted to a structured dead-letter path rather than risking data corruption or runtime panic in downstream ACID sinks (Delta/Iceberg).
 4. **Vectorized Operations over Loops:** When mutating schemas or fields for compliance updates, use Arrow column-backed manipulations or `datafusion` relational transformations rather than iterating through records element-by-element.
+
+### 10. Admin, Metrics & Profiling API Safeguards
+
+All agents introducing or modifying diagnostic routes must follow these architectural boundaries:
+
+1. **Port Isolation:** The introspection HTTP server (using `axum`) MUST bind to a separate configuration port from the primary data ingestion path. It MUST NOT process public traffic.
+2. **Non-Blocking Allocator Lookups:** When capturing `jemalloc` statistics via `tikv-jemalloc-ctl`, agents must advance the allocator epoch via `tikv_jemalloc_ctl::epoch::advance()` before executing reads.
+3. **Atomic Metrics Paths:** Counters evaluating incoming records per second must use `std::sync::atomic::AtomicU64` increments. Do not use blocking locks (`Mutex`) inside telemetry codecs or worker channels to update operational dashboard statistics.
+4. **Conditional Compilation for Profiling:** Because `jemalloc` profiling relies on low-level OS capabilities, the allocator selection and `pprof/heap` hooks must use target environment gates (`#[cfg(not(target_env = "msvc"))]`). Do not break local test builds on unsupported target architectures.
+
 
 ## Coding Standards & Quality Gates
 

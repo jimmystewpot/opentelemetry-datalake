@@ -1,0 +1,26 @@
+[server]
+grpc_addr = "0.0.0.0:4317"
+http_addr = "0.0.0.0:4318"
+
+[iceberg]
+catalog_type = "Rest"
+catalog_uri = "http://localhost:8181"
+warehouse = "s3://warehouse/"
+table_identifier = "default.logs"
+logs_table_identifier = "default.logs"
+traces_table_identifier = "default.traces"
+metrics_table_identifier = "default.metrics"
+schema_mode = "catalog"
+partition_granularity = "hourly"
+dry_run = false
+
+[iceberg.batching]
+max_batch_records = 5
+max_batch_interval_sec = 2
+
+[iceberg.properties]
+"s3.endpoint" = "http://localhost:9000"
+"s3.access-key-id" = "admin"
+"s3.secret-access-key" = "password"
+"s3.region" = "us-east-1"
+"s3.path-style-access" = "true"

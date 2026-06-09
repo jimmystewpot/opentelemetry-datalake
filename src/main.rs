@@ -1,3 +1,4 @@
+use clap::Parser;
 use figment::{
     Figment,
     providers::{Env, Format, Toml},
@@ -37,9 +38,41 @@ struct KafkaConfig {
     options: HashMap<String, String>,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "opentelemetry-datalake")]
+#[command(version, about = "High-performance OTLP data lakehouse receiver", long_about = None)]
+struct Cli {
+    /// Path to the configuration file (TOML format)
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<std::path::PathBuf>,
+
+    /// Set the level of logging verbosity (can be specified multiple times, e.g. -v, -vv)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Check the configuration file for validity and exit
+    #[arg(long)]
+    check: bool,
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
+    let cli_args = Cli::parse();
+
+    // Set logging verbosity based on the flag
+    if cli_args.verbose > 0 {
+        let level = match cli_args.verbose {
+            1 => "debug",
+            _ => "trace",
+        };
+        // SAFETY: This is executed at the very beginning of the program's main function
+        // before any other threads are spawned, ensuring no concurrent environment mutation occurs.
+        unsafe {
+            std::env::set_var("RUST_LOG", level);
+        }
+    }
+
     // Load configuration using Figment with fallback defaults
     let mut figment = Figment::new().merge(Toml::string(
         r#"
@@ -58,11 +91,53 @@ async fn main() -> anyhow::Result<()> {
         "#,
     ));
 
-    if std::path::Path::new("config.toml").exists() {
+    if let Some(ref path) = cli_args.config {
+        if !path.exists() {
+            anyhow::bail!("Configuration file not found: {}", path.display());
+        }
+        figment = figment.merge(Toml::file(path));
+    } else if std::path::Path::new("config.toml").exists() {
         figment = figment.merge(Toml::file("config.toml"));
     }
 
     let config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
+
+    // Perform early validation checks
+    if let Some(ref iceberg_cfg) = config.iceberg {
+        let logs_table = iceberg_cfg
+            .logs_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let traces_table = iceberg_cfg
+            .traces_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let metrics_table = iceberg_cfg
+            .metrics_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+
+        if logs_table == traces_table
+            || logs_table == metrics_table
+            || traces_table == metrics_table
+        {
+            anyhow::bail!(
+                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
+            );
+        }
+    } else if config.kafka.is_none() {
+        anyhow::bail!(
+            "Configuration validation failed: either [kafka] or [iceberg] configuration must be provided"
+        );
+    }
+
+    if cli_args.check {
+        #[allow(clippy::print_stdout)]
+        {
+            println!("Configuration is valid.");
+        }
+        return Ok(());
+    }
 
     // Initialize telemetry
     pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
@@ -128,10 +203,46 @@ async fn main() -> anyhow::Result<()> {
     let metrics_sink_handle;
 
     if let Some(ref iceberg_cfg) = config.iceberg {
-        tracing::info!("Initializing Iceberg sinks");
-        let mut logs_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
-        let mut traces_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
-        let mut metrics_sink = storage::iceberg::IcebergSink::new(iceberg_cfg.clone());
+        let logs_table = iceberg_cfg
+            .logs_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let traces_table = iceberg_cfg
+            .traces_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let metrics_table = iceberg_cfg
+            .metrics_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+
+        if logs_table == traces_table
+            || logs_table == metrics_table
+            || traces_table == metrics_table
+        {
+            return Err(anyhow::anyhow!(
+                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
+            ));
+        }
+
+        tracing::info!(
+            "Initializing Iceberg sinks. logs='{}', traces='{}', metrics='{}'",
+            logs_table,
+            traces_table,
+            metrics_table
+        );
+
+        let mut logs_cfg = iceberg_cfg.clone();
+        logs_cfg.table_identifier.clone_from(logs_table);
+        let mut logs_sink = storage::iceberg::IcebergSink::new(logs_cfg);
+
+        let mut traces_cfg = iceberg_cfg.clone();
+        traces_cfg.table_identifier.clone_from(traces_table);
+        let mut traces_sink = storage::iceberg::IcebergSink::new(traces_cfg);
+
+        let mut metrics_cfg = iceberg_cfg.clone();
+        metrics_cfg.table_identifier.clone_from(metrics_table);
+        let mut metrics_sink = storage::iceberg::IcebergSink::new(metrics_cfg);
 
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {

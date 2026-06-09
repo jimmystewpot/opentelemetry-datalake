@@ -1,1 +1,31 @@
+# Rust
 target/
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache & Compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# IDE / Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*.suo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Test Outputs & Logs
+*.log
+tests/e2e/receiver.log

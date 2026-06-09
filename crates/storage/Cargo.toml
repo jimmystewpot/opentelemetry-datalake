@@ -22,6 +22,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 
 # Conditional AWS Catalog Dependencies
 iceberg-catalog-glue = { workspace = true, optional = true }

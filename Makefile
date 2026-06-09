@@ -1,4 +1,4 @@
-.PHONY: check test fmt bench clippy all
+.PHONY: check test fmt bench clippy all e2e-test e2e-tests
 
 all: fmt clippy test bench
 
@@ -13,3 +13,8 @@ test:
 
 bench:
 	cargo bench --workspace
+
+e2e-test:
+	./tests/e2e/run.sh
+
+e2e-tests: e2e-test

@@ -257,3 +257,40 @@ jobs:
 
       - name: cargo doc
         run: cargo doc --no-deps --workspace --all-features
+
+  e2e-test:
+    needs: [lint, unit-test]
+    name: End-to-End Test
+    runs-on: arc-runner-set
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake pkg-config g++ \
+            libcurl4-openssl-dev libssl-dev \
+            protobuf-compiler libsasl2-dev \
+            build-essential python3-venv
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: "e2e-test"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run E2E Test Suite
+        run: make e2e-test

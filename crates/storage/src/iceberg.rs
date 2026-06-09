@@ -53,6 +53,12 @@ pub struct IcebergSinkConfig {
     pub catalog_uri: String,
     pub warehouse: String,
     pub table_identifier: String,
+    #[serde(default)]
+    pub logs_table_identifier: Option<String>,
+    #[serde(default)]
+    pub traces_table_identifier: Option<String>,
+    #[serde(default)]
+    pub metrics_table_identifier: Option<String>,
     #[serde(default = "default_schema_mode")]
     pub schema_mode: SchemaMode,
     #[serde(default = "default_partition_granularity")]
@@ -76,6 +82,9 @@ impl Default for IcebergSinkConfig {
             catalog_uri: String::new(),
             warehouse: String::new(),
             table_identifier: String::new(),
+            logs_table_identifier: None,
+            traces_table_identifier: None,
+            metrics_table_identifier: None,
             schema_mode: default_schema_mode(),
             partition_granularity: default_partition_granularity(),
             log_dropped_fields: default_log_dropped_fields(),
@@ -528,7 +537,12 @@ impl Sink for IcebergSink {
                     for (k, v) in &self.config.properties {
                         props.insert(k.clone(), v.clone());
                     }
+                    let storage_factory = iceberg_storage_opendal::OpenDalStorageFactory::S3 {
+                        configured_scheme: "s3".to_string(),
+                        customized_credential_load: None,
+                    };
                     let cat = RestCatalogBuilder::default()
+                        .with_storage_factory(Arc::new(storage_factory))
                         .load(&self.config.table_identifier, props)
                         .await
                         .map_err(|e| PipelineError::Storage(Box::new(e)))?;
