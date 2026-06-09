@@ -274,7 +274,7 @@ jobs:
             cmake pkg-config g++ \
             libcurl4-openssl-dev libssl-dev \
             protobuf-compiler libsasl2-dev \
-            build-essential python3-venv
+            build-essential python3-venv docker-compose-v2 docker.io
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
