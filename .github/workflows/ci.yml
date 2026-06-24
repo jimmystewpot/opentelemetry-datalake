@@ -24,7 +24,7 @@ jobs:
     runs-on: arc-runner-set
     if: github.actor != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -38,7 +38,7 @@ jobs:
     needs: [fmt]
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -72,7 +72,7 @@ jobs:
     name: Unit Test
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -107,7 +107,7 @@ jobs:
     name: Code Coverage
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -149,7 +149,7 @@ jobs:
     name: Smoke Test (Integration)
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -181,7 +181,7 @@ jobs:
     name: Benchmarks
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -213,7 +213,7 @@ jobs:
     name: License & Advisory Check
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -234,7 +234,7 @@ jobs:
     name: Documentation
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -266,7 +266,7 @@ jobs:
     name: End-to-End Test
     runs-on: arc-runner-set
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
