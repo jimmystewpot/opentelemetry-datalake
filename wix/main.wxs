@@ -62,7 +62,7 @@
         Id='*'
         Name='opentelemetry-datalake'
         UpgradeCode='2114856D-4676-4C5F-9E8D-4FFC419C8961'
-        Manufacturer='jimmystewpot'
+        Manufacturer='James Lamb'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -70,7 +70,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='An OpenTelemetry datalake receiver streaming to Apache Iceberg'
-            Manufacturer='jimmystewpot'
+            Manufacturer='James Lamb'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
