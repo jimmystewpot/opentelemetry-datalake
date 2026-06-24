@@ -9,8 +9,18 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    groups:
+      arrow-iceberg:
+        patterns:
+          - "arrow*"
+          - "parquet*"
+          - "iceberg*"
+
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    exclude-paths:
+      - ".github/workflows/release.yml"
+
