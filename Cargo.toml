@@ -78,7 +78,7 @@ clap = "4.5"
 
 # Arrow
 arrow = "57.3.1"
-parquet = { version = "57.3.1", features = ["async"] }
+parquet = { version = "59.0.0", features = ["async"] }
 
 # Codec & OTLP Parsing
 prost = "0.14.4"
