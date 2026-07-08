@@ -2,6 +2,9 @@
 
 [![codecov](https://codecov.io/github/jimmystewpot/opentelemetry-datalake/graph/badge.svg?token=8WT93L06CN)](https://codecov.io/github/jimmystewpot/opentelemetry-datalake)
 [![license](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](https://opensource.org/licenses/MPL-2.0)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_opentelemetry-datalake&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_opentelemetry-datalake)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_opentelemetry-datalake&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_opentelemetry-datalake)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_opentelemetry-datalake&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_opentelemetry-datalake)
 
 `opentelemetry-datalake` is an ultra-high-performance, horizontally scalable OpenTelemetry (OTLP) receiver pipeline written in Rust. It ingests OTLP metrics, traces, and logs, decodes them into memory-efficient **Apache Arrow** formats, and channels them through to a downstream data lake sink (such as Kafka or ACID table formats like Delta Lake, Iceberg, and Hudi).
 
