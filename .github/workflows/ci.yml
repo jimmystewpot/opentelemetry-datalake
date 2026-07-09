@@ -104,8 +104,7 @@ jobs:
   coverage:
     needs: [lint, unit-test]
     name: Code Coverage
-    runs-on: arc-runner-set
-    if: github.actor != 'dependabot[bot]'
+    runs-on: ${{ github.actor == 'dependabot[bot]' && 'ubuntu-latest' || 'arc-runner-set' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
