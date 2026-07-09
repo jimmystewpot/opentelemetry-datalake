@@ -267,4 +267,87 @@ mod tests {
             assert!(engine.is_schema_compliant(&b.schema()));
         }
     }
+
+    /// Malformed JSON in resource_attributes must cause the compliance
+    /// check to return false (non-compliant) instead of panicking.
+    #[test]
+    fn test_compliance_engine_malformed_json() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::Utf8, false),
+        ]));
+
+        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#])) as ArrayRef;
+        let res_array = Arc::new(StringArray::from(vec!["not valid json {{{"])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![attrs_array, res_array]).unwrap();
+
+        let engine = ComplianceEngine::new(ComplianceMode::Quarantine, HashMap::new());
+        let output = engine.assess_and_remap(batch).unwrap();
+        assert!(
+            matches!(output, ComplianceOutput::Quarantined(_)),
+            "Malformed JSON should be quarantined, not panic"
+        );
+    }
+
+    /// Null entries in resource_attributes must be treated as non-compliant.
+    #[test]
+    fn test_compliance_engine_null_attributes() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes", DataType::Utf8, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
+        ]));
+
+        let attrs_array = Arc::new(StringArray::from(vec![Some("{}")])) as ArrayRef;
+        let res_array = Arc::new(StringArray::from(vec![None::<&str>])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![attrs_array, res_array]).unwrap();
+
+        let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
+        let result = engine.assess_and_remap(batch);
+        assert!(
+            result.is_err(),
+            "Null resource_attributes should fail strict compliance"
+        );
+    }
+
+    /// A batch with both compliant and non-compliant rows must be
+    /// rejected as a whole under Strict mode — no partial passes.
+    #[test]
+    fn test_compliance_engine_multi_row_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::Utf8, false),
+        ]));
+
+        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#, r#"{}"#])) as ArrayRef;
+        let res_array = Arc::new(StringArray::from(vec![
+            r#"{"service.name":"svc-a"}"#,
+            // Second row is missing service.name
+            r#"{"host.name":"host-1"}"#,
+        ])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![attrs_array, res_array]).unwrap();
+
+        let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
+        let result = engine.assess_and_remap(batch);
+        assert!(
+            result.is_err(),
+            "Mixed compliance batch should fail in Strict mode"
+        );
+    }
+
+    /// Off mode must bypass all compliance checks and return Compliant
+    /// even for completely non-compliant payloads.
+    #[test]
+    fn test_compliance_engine_off_mode_bypass() {
+        let batch = make_test_batch(None, None);
+        let engine = ComplianceEngine::new(ComplianceMode::Off, HashMap::new());
+
+        let output = engine.assess_and_remap(batch).unwrap();
+        assert!(
+            matches!(output, ComplianceOutput::Compliant(_)),
+            "Off mode should always return Compliant"
+        );
+    }
 }

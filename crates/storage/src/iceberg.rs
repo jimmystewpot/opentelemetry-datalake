@@ -956,4 +956,167 @@ mod tests {
             .to_string();
         assert!(err_mismatch.contains("Schema mismatch for field 'timestamp'"));
     }
+
+    /// get_partition_path must produce correct hourly partition paths.
+    #[test]
+    fn test_partition_path_hourly() {
+        // 2024-06-09T00:00:00Z in nanos
+        let ts_nanos: i64 = 1_717_891_200_000_000_000;
+        let path = get_partition_path(ts_nanos, PartitionGranularity::Hourly).unwrap();
+        assert_eq!(path, "year=2024/month=06/day=09/hour=00/");
+    }
+
+    /// get_partition_path must produce correct daily partition paths.
+    #[test]
+    fn test_partition_path_daily() {
+        let ts_nanos: i64 = 1_717_891_200_000_000_000;
+        let path = get_partition_path(ts_nanos, PartitionGranularity::Daily).unwrap();
+        assert_eq!(path, "year=2024/month=06/day=09/");
+    }
+
+    /// partition_batch with microsecond timestamps should correctly convert
+    /// and produce valid partitions.
+    #[test]
+    fn test_partition_batch_microsecond_timestamps() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        // Two timestamps in different hours
+        let ts_array = Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+            1_717_891_200_000_000, // 2024-06-09T00:00:00Z
+            1_717_894_800_000_000, // 2024-06-09T01:00:00Z
+        ])) as ArrayRef;
+        let data_array = Arc::new(arrow::array::StringArray::from(vec!["a", "b"])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![ts_array, data_array]).unwrap();
+        let partitions =
+            partition_batch(&batch, "timestamp", PartitionGranularity::Hourly).unwrap();
+        assert_eq!(
+            partitions.len(),
+            2,
+            "Two distinct hours should produce two partitions"
+        );
+    }
+
+    /// partition_batch must fail gracefully when the timestamp column
+    /// uses an unsupported data type.
+    #[test]
+    fn test_partition_batch_unsupported_timestamp_type() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Utf8, false),
+            Field::new("data", DataType::Utf8, false),
+        ]));
+
+        let ts_array =
+            Arc::new(arrow::array::StringArray::from(vec!["not-a-timestamp"])) as ArrayRef;
+        let data_array = Arc::new(arrow::array::StringArray::from(vec!["a"])) as ArrayRef;
+
+        let batch = RecordBatch::try_new(schema, vec![ts_array, data_array]).unwrap();
+        let result = partition_batch(&batch, "timestamp", PartitionGranularity::Hourly);
+        assert!(
+            result.is_err(),
+            "Unsupported timestamp type should produce an error"
+        );
+    }
+
+    /// partition_batch must fail when the timestamp column doesn't exist.
+    #[test]
+    fn test_partition_batch_missing_timestamp_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
+        let data_array = Arc::new(arrow::array::StringArray::from(vec!["a"])) as ArrayRef;
+        let batch = RecordBatch::try_new(schema, vec![data_array]).unwrap();
+
+        let result = partition_batch(&batch, "timestamp", PartitionGranularity::Daily);
+        assert!(
+            result.is_err(),
+            "Missing timestamp column should produce an error"
+        );
+    }
+
+    /// Flushing an empty buffer in dry_run mode must succeed without
+    /// panicking or producing errors.
+    #[tokio::test]
+    async fn test_iceberg_sink_empty_flush() {
+        let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        // Flush without any buffered data should be a no-op
+        let result = sink.flush_table(&"db.tbl".to_string(), None).await;
+        assert!(result.is_ok(), "Empty flush should succeed gracefully");
+    }
+
+    /// should_flush must return false when the buffer is empty,
+    /// even if other thresholds are exceeded.
+    #[test]
+    fn test_should_flush_empty_buffer() {
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        assert!(
+            !sink.should_flush("db.tbl"),
+            "should_flush on non-existent buffer must return false"
+        );
+    }
+
+    /// should_flush must trigger when the record count exceeds the
+    /// configured max_batch_records threshold.
+    #[test]
+    fn test_should_flush_record_threshold() {
+        let mut config = make_dry_run_config(SchemaMode::Fixed);
+        config.batching = Some(BatchingConfig {
+            max_batch_records: Some(2),
+            max_batch_size_bytes: usize::MAX,
+            max_batch_interval_sec: u64::MAX,
+        });
+
+        let mut sink = IcebergSink::new(config);
+        let batch = make_test_logs_batch(); // 3 rows
+        let table_name = "db.tbl".to_string();
+
+        let buffer = sink
+            .buffers
+            .entry(table_name.clone())
+            .or_insert_with(|| TableBuffer::new("logs"));
+        buffer.total_rows = batch.num_rows();
+        buffer.total_bytes = batch.get_array_memory_size();
+        buffer.batches.push(batch);
+
+        assert!(
+            sink.should_flush(&table_name),
+            "should_flush must trigger when total_rows >= max_batch_records"
+        );
+    }
+
+    /// Multiple batches accumulating in the buffer must all be flushed
+    /// together and the buffer must be empty afterwards in dry_run mode.
+    #[tokio::test]
+    async fn test_iceberg_sink_multi_batch_accumulation() {
+        let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let (tx, rx) = mpsc::channel(10);
+
+        // Send multiple batches
+        for _ in 0..3 {
+            tx.send(SignalBatch::Logs(make_test_logs_batch()))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        let result = sink.run(rx).await;
+        assert!(result.is_ok(), "Multi-batch dry_run should succeed");
+
+        // After run completes, all buffers should have been flushed
+        for buffer in sink.buffers.values() {
+            assert!(
+                buffer.batches.is_empty(),
+                "Buffer should be empty after final flush"
+            );
+            assert_eq!(
+                buffer.total_rows, 0,
+                "total_rows should be zero after flush"
+            );
+        }
+    }
 }
