@@ -18,6 +18,169 @@ use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64};
 /// Casting `AsInt(i)` values to `f64` in `decode_metrics` can lead to a loss of
 /// precision for integers whose absolute values exceed 2^53.
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+struct MetricsRecordBuilder {
+    name: StringBuilder,
+    desc: StringBuilder,
+    unit: StringBuilder,
+    timestamp: TimestampNanosecondBuilder,
+    value: Float64Builder,
+    attributes: StringBuilder,
+    service_name: StringBuilder,
+    resource_attributes: StringBuilder,
+    scope_name: StringBuilder,
+    scope_version: StringBuilder,
+}
+
+struct MetricContext<'a> {
+    service_name: &'a str,
+    resource_attributes: &'a str,
+    scope_name: &'a str,
+    scope_version: &'a str,
+}
+
+struct MetricMeta<'a> {
+    name: &'a str,
+    desc: &'a str,
+    unit: &'a str,
+}
+
+impl MetricsRecordBuilder {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            name: StringBuilder::new(),
+            desc: StringBuilder::new(),
+            unit: StringBuilder::new(),
+            timestamp: TimestampNanosecondBuilder::with_capacity(capacity),
+            value: Float64Builder::with_capacity(capacity),
+            attributes: StringBuilder::new(),
+            service_name: StringBuilder::new(),
+            resource_attributes: StringBuilder::new(),
+            scope_name: StringBuilder::new(),
+            scope_version: StringBuilder::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_record(
+        &mut self,
+        name: &str,
+        desc: &str,
+        unit: &str,
+        timestamp_unix_nano: u64,
+        value: f64,
+        attributes: &str,
+        service_name: &str,
+        resource_attributes: &str,
+        scope_name: &str,
+        scope_version: &str,
+    ) -> Result<(), PipelineError> {
+        self.name.append_value(name);
+        self.desc.append_value(desc);
+        self.unit.append_value(unit);
+        self.timestamp
+            .append_value(timestamp_to_i64(timestamp_unix_nano)?);
+        self.value.append_value(value);
+        self.attributes.append_value(attributes);
+        self.service_name.append_value(service_name);
+        self.resource_attributes.append_value(resource_attributes);
+        self.scope_name.append_value(scope_name);
+        self.scope_version.append_value(scope_version);
+        Ok(())
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn process_gauge(
+    builder: &mut MetricsRecordBuilder,
+    gauge: &opentelemetry_proto::tonic::metrics::v1::Gauge,
+    meta: &MetricMeta<'_>,
+    ctx: &MetricContext<'_>,
+) -> Result<(), PipelineError> {
+    for dp in &gauge.data_points {
+        let val = match dp.value {
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                d,
+            )) => d,
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => {
+                i as f64
+            }
+            None => 0.0,
+        };
+        builder.append_record(
+            meta.name,
+            meta.desc,
+            meta.unit,
+            dp.time_unix_nano,
+            val,
+            &convert_attributes(&dp.attributes),
+            ctx.service_name,
+            ctx.resource_attributes,
+            ctx.scope_name,
+            ctx.scope_version,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn process_sum(
+    builder: &mut MetricsRecordBuilder,
+    sum: &opentelemetry_proto::tonic::metrics::v1::Sum,
+    meta: &MetricMeta<'_>,
+    ctx: &MetricContext<'_>,
+) -> Result<(), PipelineError> {
+    for dp in &sum.data_points {
+        let val = match dp.value {
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                d,
+            )) => d,
+            Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => {
+                i as f64
+            }
+            None => 0.0,
+        };
+        builder.append_record(
+            meta.name,
+            meta.desc,
+            meta.unit,
+            dp.time_unix_nano,
+            val,
+            &convert_attributes(&dp.attributes),
+            ctx.service_name,
+            ctx.resource_attributes,
+            ctx.scope_name,
+            ctx.scope_version,
+        )?;
+    }
+    Ok(())
+}
+
+fn process_histogram(
+    builder: &mut MetricsRecordBuilder,
+    hist: &opentelemetry_proto::tonic::metrics::v1::Histogram,
+    meta: &MetricMeta<'_>,
+    ctx: &MetricContext<'_>,
+) -> Result<(), PipelineError> {
+    for dp in &hist.data_points {
+        #[allow(clippy::cast_precision_loss)]
+        let val = dp.sum.unwrap_or(dp.count as f64);
+        builder.append_record(
+            meta.name,
+            meta.desc,
+            meta.unit,
+            dp.time_unix_nano,
+            val,
+            &convert_attributes(&dp.attributes),
+            ctx.service_name,
+            ctx.resource_attributes,
+            ctx.scope_name,
+            ctx.scope_version,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, PipelineError> {
     // Count total data points first to set builder capacity
     let mut total_records = 0;
@@ -42,16 +205,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
         }
     }
 
-    let mut name_builder = StringBuilder::new();
-    let mut desc_builder = StringBuilder::new();
-    let mut unit_builder = StringBuilder::new();
-    let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
-    let mut value_builder = Float64Builder::with_capacity(total_records);
-    let mut attributes_builder = StringBuilder::new();
-    let mut service_name_builder = StringBuilder::new();
-    let mut resource_attributes_builder = StringBuilder::new();
-    let mut scope_name_builder = StringBuilder::new();
-    let mut scope_version_builder = StringBuilder::new();
+    let mut builder = MetricsRecordBuilder::with_capacity(total_records);
 
     for r_metric in &req.resource_metrics {
         let (resource_attrs_json, service_name) = if let Some(ref res) = r_metric.resource {
@@ -73,78 +227,30 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                 ("", "")
             };
 
+            let ctx = MetricContext {
+                service_name: &service_name,
+                resource_attributes: &resource_attrs_json,
+                scope_name,
+                scope_version,
+            };
+
             for metric in &s_metric.metrics {
-                let name = metric.name.as_str();
-                let desc = metric.description.as_str();
-                let unit = metric.unit.as_str();
+                let meta = MetricMeta {
+                    name: metric.name.as_str(),
+                    desc: metric.description.as_str(),
+                    unit: metric.unit.as_str(),
+                };
 
                 if let Some(ref data) = metric.data {
                     match data {
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge) => {
-                            for dp in &gauge.data_points {
-                                name_builder.append_value(name);
-                                desc_builder.append_value(desc);
-                                unit_builder.append_value(unit);
-                                timestamp_builder
-                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
-
-                                let val = match dp.value {
-                                    Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(d)) => d,
-                                    // NOTE: Potential precision loss for integer values exceeding 2^53.
-                                    Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => i as f64,
-                                    None => 0.0,
-                                };
-                                value_builder.append_value(val);
-
-                                attributes_builder.append_value(convert_attributes(&dp.attributes));
-                                service_name_builder.append_value(&service_name);
-                                resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(scope_name);
-                                scope_version_builder.append_value(scope_version);
-                            }
+                            process_gauge(&mut builder, gauge, &meta, &ctx)?;
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
-                            for dp in &sum.data_points {
-                                name_builder.append_value(name);
-                                desc_builder.append_value(desc);
-                                unit_builder.append_value(unit);
-                                timestamp_builder
-                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
-
-                                let val = match dp.value {
-                                    Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(d)) => d,
-                                    // NOTE: Potential precision loss for integer values exceeding 2^53.
-                                    Some(opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(i)) => i as f64,
-                                    None => 0.0,
-                                };
-                                value_builder.append_value(val);
-
-                                attributes_builder.append_value(convert_attributes(&dp.attributes));
-                                service_name_builder.append_value(&service_name);
-                                resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(scope_name);
-                                scope_version_builder.append_value(scope_version);
-                            }
+                            process_sum(&mut builder, sum, &meta, &ctx)?;
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
-                            for dp in &hist.data_points {
-                                name_builder.append_value(name);
-                                desc_builder.append_value(desc);
-                                unit_builder.append_value(unit);
-                                timestamp_builder
-                                    .append_value(timestamp_to_i64(dp.time_unix_nano)?);
-
-                                // Use sum as value if available, otherwise fallback to count
-                                #[allow(clippy::cast_precision_loss)]
-                                let val = dp.sum.unwrap_or(dp.count as f64);
-                                value_builder.append_value(val);
-
-                                attributes_builder.append_value(convert_attributes(&dp.attributes));
-                                service_name_builder.append_value(&service_name);
-                                resource_attributes_builder.append_value(&resource_attrs_json);
-                                scope_name_builder.append_value(scope_name);
-                                scope_version_builder.append_value(scope_version);
-                            }
+                            process_histogram(&mut builder, hist, &meta, &ctx)?;
                         }
                         _ => {}
                     }
@@ -173,16 +279,16 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(name_builder.finish()),
-            Arc::new(desc_builder.finish()),
-            Arc::new(unit_builder.finish()),
-            Arc::new(timestamp_builder.finish()),
-            Arc::new(value_builder.finish()),
-            Arc::new(attributes_builder.finish()),
-            Arc::new(service_name_builder.finish()),
-            Arc::new(resource_attributes_builder.finish()),
-            Arc::new(scope_name_builder.finish()),
-            Arc::new(scope_version_builder.finish()),
+            Arc::new(builder.name.finish()),
+            Arc::new(builder.desc.finish()),
+            Arc::new(builder.unit.finish()),
+            Arc::new(builder.timestamp.finish()),
+            Arc::new(builder.value.finish()),
+            Arc::new(builder.attributes.finish()),
+            Arc::new(builder.service_name.finish()),
+            Arc::new(builder.resource_attributes.finish()),
+            Arc::new(builder.scope_name.finish()),
+            Arc::new(builder.scope_version.finish()),
         ],
     )
     .map_err(PipelineError::Arrow)
