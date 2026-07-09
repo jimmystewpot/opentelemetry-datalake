@@ -77,8 +77,8 @@ figment = { version = "0.10", features = ["env", "toml"] }
 clap = "4.5"
 
 # Arrow
-arrow = "57.3.1"
-parquet = { version = "57.3.1", features = ["async"] }
+arrow = "58"
+parquet = { version = "58", features = ["async"] }
 
 # Codec & OTLP Parsing
 prost = "0.14.4"
@@ -96,11 +96,11 @@ criterion = { version = "0.8.2", features = ["async_tokio"] }
 
 # Storage & Iceberg Catalogs
 chrono = { version = "0.4.38", features = ["serde"] }
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-catalog-glue = "0.9.1"
-iceberg-catalog-s3tables = "0.9.1"
-iceberg-storage-opendal = { version = "0.9.1", features = ["opendal-s3"] }
+iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }  
+iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
 
 [profile.release]
 lto = "thin"
