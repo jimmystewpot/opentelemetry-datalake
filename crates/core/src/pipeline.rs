@@ -107,4 +107,69 @@ mod tests {
         assert!(rx1.recv().await.is_some());
         assert!(rx2.recv().await.is_some());
     }
+
+    /// Fanout with zero outputs must be rejected to prevent silent data loss.
+    #[test]
+    fn test_fanout_empty_outputs() {
+        let outputs: Vec<PipelineSender> = vec![];
+        let result = Fanout::try_new(outputs);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal(_)),
+            "Expected Internal error for empty outputs, got: {err}"
+        );
+    }
+
+    /// When a downstream receiver is dropped, Fanout::send must return
+    /// DownstreamClosed so the upstream can propagate backpressure.
+    #[tokio::test]
+    async fn test_fanout_downstream_closed() {
+        let (tx1, rx1) = mpsc::channel(10);
+        let (tx2, _rx2) = mpsc::channel(10);
+        let fanout = Fanout::try_new(vec![tx1, tx2]).unwrap();
+
+        // Drop the first receiver to simulate a downstream failure.
+        drop(rx1);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))]).unwrap();
+        let signal = SignalBatch::Metrics(batch);
+
+        let result = fanout.send(signal).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), PipelineError::DownstreamClosed),
+            "Expected DownstreamClosed when receiver is dropped"
+        );
+    }
+
+    /// Fanout must deliver clones to all downstreams; verify each
+    /// receiver gets its own copy of the data with correct row counts.
+    #[tokio::test]
+    async fn test_fanout_multi_receiver_data_integrity() {
+        let (tx1, mut rx1) = mpsc::channel(10);
+        let (tx2, mut rx2) = mpsc::channel(10);
+        let (tx3, mut rx3) = mpsc::channel(10);
+        let fanout = Fanout::try_new(vec![tx1, tx2, tx3]).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30, 40]))],
+        )
+        .unwrap();
+        let signal = SignalBatch::Traces(batch);
+
+        fanout.send(signal).await.unwrap();
+
+        for rx in [&mut rx1, &mut rx2, &mut rx3] {
+            let received = rx.recv().await.expect("receiver should get a batch");
+            match received {
+                SignalBatch::Traces(b) => assert_eq!(b.num_rows(), 4),
+                _ => panic!("Expected Traces signal variant"),
+            }
+        }
+    }
 }
