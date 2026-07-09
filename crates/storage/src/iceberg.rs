@@ -1047,7 +1047,7 @@ mod tests {
     async fn test_iceberg_sink_empty_flush() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
         // Flush without any buffered data should be a no-op
-        let result = sink.flush_table(&"db.tbl".to_string(), None).await;
+        let result = sink.flush_table("db.tbl", None).await;
         assert!(result.is_ok(), "Empty flush should succeed gracefully");
     }
 
