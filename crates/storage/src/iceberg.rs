@@ -586,7 +586,7 @@ async fn write_batch_to_table(
     use parquet::file::properties::WriterProperties;
     use uuid::Uuid;
 
-    let location_generator = DefaultLocationGenerator::new(table.metadata().clone())
+    let location_generator = DefaultLocationGenerator::new(table.metadata())
         .map_err(|e| PipelineError::Storage(Box::new(e)))?;
     let file_prefix = format!("part-{}", Uuid::now_v7());
     let file_name_generator =
@@ -672,7 +672,6 @@ impl Sink for IcebergSink {
                         props.insert(k.clone(), v.clone());
                     }
                     let storage_factory = iceberg_storage_opendal::OpenDalStorageFactory::S3 {
-                        configured_scheme: "s3".to_string(),
                         customized_credential_load: None,
                     };
                     let cat = RestCatalogBuilder::default()
@@ -890,11 +889,14 @@ mod tests {
         }"#;
 
         let metadata: iceberg::spec::TableMetadata = serde_json::from_str(metadata_json).unwrap();
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
         let table = iceberg::table::Table::builder()
             .metadata(metadata)
             .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
             .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
             .file_io(iceberg::io::FileIO::new_with_memory())
+            .runtime(iceberg_rt)
             .build()
             .unwrap();
 
@@ -1045,7 +1047,7 @@ mod tests {
     async fn test_iceberg_sink_empty_flush() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
         // Flush without any buffered data should be a no-op
-        let result = sink.flush_table(&"db.tbl".to_string(), None).await;
+        let result = sink.flush_table("db.tbl", None).await;
         assert!(result.is_ok(), "Empty flush should succeed gracefully");
     }
 

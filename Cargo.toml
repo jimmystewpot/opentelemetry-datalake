@@ -34,7 +34,7 @@ pipeline-core = { workspace = true }
 otlp-receiver = { workspace = true }
 noop-transformer = { workspace = true }
 kafka-sink = { workspace = true }
-storage = { workspace = true, default-features = true }
+storage = { workspace = true, features = ["aws"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -50,57 +50,57 @@ arrow-codec = { path = "crates/arrow-codec", version = "0.1.0" }
 otlp-receiver = { path = "crates/otlp-receiver", version = "0.1.0" }
 noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
-storage = { path = "crates/storage", version = "0.1.0" }
+storage = { path = "crates/storage", version = "0.1.0", default-features = false }
 
 # Async Runtime
-tokio = { version = "1.37", features = ["full"] }
+tokio = { version = "1.37", default-features = false, features = ["full"] }
 
 # Errors
 thiserror = "2.0.18"
-anyhow = "1.0"
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
 
 # Telemetry
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = "0.33.0"
-opentelemetry = { version = "0.32.0", features = ["trace", "metrics", "logs"] }
-opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic", "metrics", "logs"] }
-opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio", "trace", "metrics", "logs"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "json", "fmt", "ansi", "std", "registry"] }
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace", "metrics", "logs"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "metrics", "logs", "trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["rt-tokio", "trace", "metrics", "logs"] }
 opentelemetry-semantic-conventions = "0.32.0"
 async-trait = "0.1"
 
 # Serialization & Config
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.12.1", features = ["v7"] }
-figment = { version = "0.10", features = ["env", "toml"] }
-clap = "4.5"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+uuid = { version = "1.12.1", default-features = false, features = ["v7", "std"] }
+figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
+clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
-arrow = "57.3.1"
-parquet = { version = "57.3.1", features = ["async"] }
+arrow = { version = "58", default-features = false, features = ["json"] }
+parquet = { version = "58", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2", "lz4"] }
 
 # Codec & OTLP Parsing
-prost = "0.14.4"
-opentelemetry-proto = { version = "0.32.0", features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "serde"] }
+prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }
+opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "with-serde"] }
 
 # Networking
-tonic = "0.14.6"
-axum = "0.8.9"
+tonic = { version = "0.14.6", default-features = false, features = ["transport", "codegen", "router"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "json"] }
 
 # Sinks
-rdkafka = { version = "0.39.0", features = ["cmake-build"] }
+rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio"] }
 
 # Testing & Benchmarking
-criterion = { version = "0.8.2", features = ["async_tokio"] }
+criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 
 # Storage & Iceberg Catalogs
-chrono = { version = "0.4.38", features = ["serde"] }
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-catalog-glue = "0.9.1"
-iceberg-catalog-s3tables = "0.9.1"
-iceberg-storage-opendal = { version = "0.9.1", features = ["opendal-s3"] }
+chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde", "std"] }
+iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }  
+iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
 
 [profile.release]
 lto = "thin"

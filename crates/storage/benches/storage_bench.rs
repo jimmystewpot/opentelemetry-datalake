@@ -132,7 +132,7 @@ fn make_dry_run_config(schema_mode: SchemaMode) -> IcebergSinkConfig {
     }
 }
 
-fn build_mock_table() -> iceberg::table::Table {
+fn build_mock_table(runtime: iceberg::Runtime) -> iceberg::table::Table {
     let metadata_json = r#"{
       "format-version": 2,
       "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
@@ -171,14 +171,21 @@ fn build_mock_table() -> iceberg::table::Table {
         .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
         .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
         .file_io(iceberg::io::FileIO::new_with_memory())
+        .runtime(runtime)
         .build()
         .unwrap()
 }
 
 fn bench_storage(c: &mut Criterion) {
+    let tokio_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
+
     let sink_fixed = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
     let sink_catalog = IcebergSink::new(make_dry_run_config(SchemaMode::Catalog));
-    let mock_table = build_mock_table();
+    let mock_table = build_mock_table(iceberg_rt);
 
     // 1. Benchmark record batch sorting (size: 1000 records)
     let logs_batch = make_logs_batch_size(1000);
@@ -229,3 +236,19 @@ fn bench_storage(c: &mut Criterion) {
 
 criterion_group!(benches, bench_storage);
 criterion_main!(benches);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_mock_table_success() {
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
+        let table = build_mock_table(iceberg_rt);
+        assert_eq!(table.identifier().name(), "test1");
+    }
+}
