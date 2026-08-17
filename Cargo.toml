@@ -35,6 +35,7 @@ otlp-receiver = { workspace = true }
 noop-transformer = { workspace = true }
 kafka-sink = { workspace = true }
 storage = { workspace = true, features = ["aws"] }
+starrocks-sink = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -51,6 +52,7 @@ otlp-receiver = { path = "crates/otlp-receiver", version = "0.1.0" }
 noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0", default-features = false }
+starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
 
 # Async Runtime
 tokio = { version = "1.37", default-features = false, features = ["full"] }
@@ -74,6 +76,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "std"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 uuid = { version = "1.12.1", default-features = false, features = ["v7", "std"] }
 figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
@@ -90,6 +93,8 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "http
 
 # Sinks
 rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio"] }
+starrocks-stream-load = { version = "1.0.12", default-features = false }
+bytes = "1.6"
 
 # Testing & Benchmarking
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
