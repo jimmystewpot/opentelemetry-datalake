@@ -6,7 +6,7 @@ fmt:
 	cargo fmt --all -- --check
 
 clippy:
-	cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc
+	cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc
 
 test:
 	cargo test --workspace

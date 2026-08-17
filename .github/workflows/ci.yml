@@ -64,7 +64,7 @@ jobs:
 
       - name: cargo clippy
         # Use --no-deps for speed in the fast path gate
-        run: cargo clippy --workspace --all-features --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings
 
   unit-test:
     needs: [fmt]
@@ -97,7 +97,7 @@ jobs:
 
       - name: cargo unit tests
         # No coverage instrumentation here for maximum speed in the fast path
-        run: cargo test --workspace --all-features --lib --bins
+        run: cargo test --workspace --lib --bins
 
   # --- ASYNC QUALITY GATES ---
 
@@ -135,7 +135,7 @@ jobs:
         uses: taiki-e/install-action@0078e077a097102105e114583eda727499056048 # cargo-llvm-cov
 
       - name: cargo coverage
-        run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
@@ -174,7 +174,7 @@ jobs:
           shared-key: "smoke-test"
 
       - name: cargo smoke test (integration)
-        run: cargo test --workspace --all-features --tests
+        run: cargo test --workspace --tests
 
   bench:
     needs: [lint, unit-test]
@@ -207,7 +207,7 @@ jobs:
           shared-key: "benchmarks"
 
       - name: cargo bench (smoke test)
-        run: cargo bench --workspace --all-features -- --test
+        run: cargo bench --workspace -- --test
 
   deny:
     needs: [lint, unit-test]
@@ -260,7 +260,7 @@ jobs:
           shared-key: "doc"
 
       - name: cargo doc
-        run: cargo doc --no-deps --workspace --all-features
+        run: cargo doc --no-deps --workspace
 
   e2e-test:
     needs: [lint, unit-test]

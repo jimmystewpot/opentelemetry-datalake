@@ -76,7 +76,7 @@ serde = { version = "1.0", default-features = false, features = ["derive", "std"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 uuid = { version = "1.24.1", default-features = false, features = ["v7", "std"] }
 figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
-toml = { version = "1.1.4+spec-1.1.0", default-features = false, features = ["parse"] }
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow

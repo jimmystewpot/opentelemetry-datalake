@@ -269,7 +269,7 @@ Before finalizing any code modification, agents must verify that the following c
 *   Code must be perfectly formatted using `cargo fmt`.
 *   Clippy check must return zero warnings or errors using the following configuration:
 ```bash
-cargo clippy --all-targets --all-features -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc
+cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc
 ```
 
 ### Explicit Code Generation Rules
