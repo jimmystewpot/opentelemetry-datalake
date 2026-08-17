@@ -57,7 +57,7 @@ pub trait Sink: Send + Sync {
 }
 ```
 
-*   **Implementation**: Implemented by `IcebergSink` in `crates/storage` and `KafkaSink` in `crates/kafka-sink`.
+*   **Implementation**: Implemented by `IcebergSink` in `crates/storage`, `KafkaSink` in `crates/kafka-sink`, and `StarRocksSink` in `crates/starrocks-sink`.
 *   **Behavior**: It consumes batches from its input channel and handles the complexities of external commits (e.g., Iceberg transactions or Kafka production).
 
 ---

@@ -814,7 +814,6 @@ mod tests {
     fn test_logs_sorting() {
         let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
         let batch = make_test_logs_batch();
-        println!("Test batch schema: {:?}", batch.schema());
         let sorted = sink.sort_logs(&batch).unwrap();
 
         let res_col = sorted

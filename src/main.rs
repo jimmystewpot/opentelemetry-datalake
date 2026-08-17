@@ -17,6 +17,7 @@ struct AppConfig {
     server: ServerConfig,
     kafka: Option<KafkaConfig>,
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
+    starrocks: Option<starrocks_sink::StarRocksSinkConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -148,9 +149,9 @@ async fn main() -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
-    } else if config.kafka.is_none() {
+    } else if config.kafka.is_none() && config.starrocks.is_none() {
         anyhow::bail!(
-            "Configuration validation failed: either [kafka] or [iceberg] configuration must be provided"
+            "Configuration validation failed: one of [kafka], [iceberg], or [starrocks] configuration must be provided"
         );
     }
 
@@ -239,15 +240,6 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .unwrap_or(&iceberg_cfg.table_identifier);
 
-        if logs_table == traces_table
-            || logs_table == metrics_table
-            || traces_table == metrics_table
-        {
-            return Err(anyhow::anyhow!(
-                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
-            ));
-        }
-
         tracing::info!(
             "Initializing Iceberg sinks. logs='{}', traces='{}', metrics='{}'",
             logs_table,
@@ -325,9 +317,45 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Kafka sink error: {}", e);
             }
         });
+    } else if let Some(starrocks_cfg) = config.starrocks {
+        tracing::info!(
+            database = %starrocks_cfg.database,
+            format = %starrocks_cfg.format,
+            mode = ?starrocks_cfg.transaction_mode,
+            "Initializing StarRocks sinks"
+        );
+
+        let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
+        let shared_manager = primary_sink.manager();
+
+        let mut logs_sink = primary_sink;
+        let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
+            starrocks_cfg.clone(),
+            std::sync::Arc::clone(&shared_manager),
+        );
+        let mut metrics_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager);
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs StarRocks sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces StarRocks sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics StarRocks sink error: {}", e);
+            }
+        });
     } else {
         return Err(anyhow::anyhow!(
-            "Either [kafka] or [iceberg] configuration must be provided"
+            "One of [kafka], [iceberg], or [starrocks] configuration must be provided"
         ));
     }
 

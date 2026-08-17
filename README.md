@@ -43,14 +43,14 @@ Designed with zero-cost abstractions, lock-free concurrency, and zero-panic erro
                         |         |         |
                         v         v         v
                      +----+    +----+    +----+
-                     |Sink|    |Sink|    |Sink|  (Kafka Producer Sinks)
+                     |Sink|    |Sink|    |Sink|  (IcebergSink / KafkaSink / StarRocksSink)
                      +----+    +----+    +----+
                         |         |         |
                         +---------+---------+
                                   |
                                   v
                +------------------+-------------------+
-               |         Apache Kafka / Data Lake     |
+               |  Apache Iceberg / Kafka / StarRocks  |
                +--------------------------------------+
 ```
 
@@ -66,6 +66,7 @@ The project is structured as a Cargo virtual workspace consisting of the followi
 *   **`crates/otlp-receiver`**: Ingest layer implementing a multi-protocol OTLP receiver with Tonic (gRPC) and Axum (HTTP/JSON).
 *   **`crates/noop-transformer`**: Implementation of `Transform` that passes signal record batches directly through to the next phase of the pipeline.
 *   **`crates/kafka-sink`**: High-performance sink implementing the `Sink` trait using `rdkafka` to stream Arrow IPC or JSON payloads to Kafka brokers.
+*   **`crates/starrocks-sink`**: Sink implementing the `Sink` trait via the StarRocks HTTP Stream Load API. Supports Arrow IPC, JSON, and CSV wire formats, and V1 (at-least-once) / V2 two-phase commit (exactly-once) transaction modes. See [`docs/starrocks.md`](docs/starrocks.md).
 
 ---
 
@@ -81,11 +82,13 @@ grpc_addr = "127.0.0.1:4317"
 http_addr = "127.0.0.1:4318"
 
 [kafka]
-bootstrap_servers = "localhost:9092"
+brokers = "localhost:9092"
 logs_topic = "otlp-logs"
 traces_topic = "otlp-traces"
 metrics_topic = "otlp-metrics"
-serialization_format = "Ipc" # Options: "Ipc", "Json"
+logs_format = "json"     # Options: "json", "ipc"
+traces_format = "json"
+metrics_format = "json"
 
 [kafka.options]
 "queue.buffering.max.messages" = "100000"
@@ -97,10 +100,33 @@ service_name = "opentelemetry-datalake"
 cloud_region = "us-east-1"
 ```
 
+Or to use the StarRocks sink:
+
+```toml
+[server]
+grpc_addr = "127.0.0.1:4317"
+http_addr = "127.0.0.1:4318"
+
+[starrocks]
+frontend_urls = ["http://fe-1:8030"]
+database = "otel"
+username = "otel_writer"
+# password: set via OTEL_DATALAKE_STARROCKS__PASSWORD env var
+format = "ipc"             # Options: "ipc" (default), "json", "csv"
+transaction_mode = "v1"   # Options: "v1" (default), "v2"
+
+[starrocks.table_mapping]
+type    = "per_signal"
+logs    = "otel_logs"
+metrics = "otel_metrics"
+traces  = "otel_traces"
+```
+
 ### Environment Overrides:
-Any configuration value can be overridden using the `OTEL_DATALAKE_` environment variable prefix. For example:
-*   `OTEL_DATALAKE_KAFKA__BOOTSTRAP_SERVERS="kafka-broker:9092"`
+Any configuration value can be overridden using the `OTEL_DATALAKE_` environment variable prefix. Use double underscores (`__`) to navigate nested sections. For example:
+*   `OTEL_DATALAKE_KAFKA__BROKERS="kafka-broker:9092"`
 *   `OTEL_DATALAKE_TELEMETRY__CLOUD_REGION="us-west-2"`
+*   `OTEL_DATALAKE_STARROCKS__PASSWORD="secret"`
 
 ---
 

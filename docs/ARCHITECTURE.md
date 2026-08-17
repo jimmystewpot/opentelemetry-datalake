@@ -26,7 +26,7 @@ For general codebase rules (such as the zero-panic policy, memory layouts, and a
   [ Transform: NoopTransformer ]
     |       |       |
     v       v       v
-  [ Sink: IcebergSink OR KafkaSink ]
+  [ Sink: IcebergSink OR KafkaSink OR StarRocksSink ]
 ```
 
 The pipeline is orchestrated in `src/main.rs`, which spins up each component as an asynchronous `tokio` task and wires them together using bounded `mpsc` channels.
@@ -50,17 +50,22 @@ Transformers provide a location for data enrichment, filtering, or remapping.
 *   **Current State**: The project uses a `NoopTransformer` which passes data through without modification.
 *   **Execution**: Each transformer runs in its own task, pulling from a source channel and pushing to a sink channel.
 
-### Sinks (`storage`, `kafka-sink`)
+### Sinks (`storage`, `kafka-sink`, `starrocks-sink`)
 
 Sinks are responsible for the final delivery of data.
 
-*   **Iceberg Sink**: 
+*   **Iceberg Sink**:
     *   Accumulates batches in-memory until a size or time threshold is reached (configured in `batching`).
     *   Uses `iceberg-rust` to commit Parquet files to an Iceberg table.
     *   Supports `Fixed`, `Auto` (additive), and `Catalog` schema modes.
 *   **Kafka Sink**:
-    *   Serializes Arrow batches into JSON or Protobuf.
+    *   Serializes Arrow batches into JSON or Arrow IPC.
     *   Produces messages to configured Kafka topics using `rdkafka`.
+*   **StarRocks Sink**:
+    *   Serializes Arrow batches into Arrow IPC (recommended), JSON, or CSV.
+    *   Delivers to StarRocks via the HTTP Stream Load API using `starrocks-stream-load`.
+    *   Supports V1 (at-least-once) and V2 two-phase commit (exactly-once) transaction modes.
+    *   See [`docs/starrocks.md`](starrocks.md) for configuration and version requirements.
 
 ---
 
