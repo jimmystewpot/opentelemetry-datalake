@@ -58,7 +58,7 @@ starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
 tokio = { version = "1.37", default-features = false, features = ["full"] }
 
 # Errors
-thiserror = "2.0.18"
+thiserror = "2.0.20"
 anyhow = { version = "1.0", default-features = false, features = ["std"] }
 
 # Telemetry
@@ -74,10 +74,10 @@ async-trait = "0.1"
 # Serialization & Config
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-uuid = { version = "1.12.1", default-features = false, features = ["v7", "std"] }
+uuid = { version = "1.24.1", default-features = false, features = ["v7", "std"] }
 figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
-toml = { version = "0.8", default-features = false, features = ["parse"] }
-clap = { version = "4.5", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
+toml = { version = "1.1.4+spec-1.1.0", default-features = false, features = ["parse"] }
+clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
 arrow = { version = "58", default-features = false, features = ["json"] }
