@@ -37,6 +37,9 @@ opentelemetry-datalake/
 │   ├── kafka-sink/            # Kafka sink implementation
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs
+│   ├── starrocks-sink/        # StarRocks Stream Load sink implementation
+│   │   ├── Cargo.toml
+│   │   └── src/lib.rs
 │   └── noop-transformer/      # Example/Pass-through transformer
 │       ├── Cargo.toml
 │       └── src/lib.rs
@@ -46,7 +49,8 @@ opentelemetry-datalake/
     ├── components.md          # Component behavior (sources, transforms, sinks)
     ├── configuration.md       # Configuration reference
     ├── instrumentation.md     # Pipeline telemetry & logging standards
-    └── lakehouse.md           # Lakehouse integration specification
+    ├── lakehouse.md           # Lakehouse integration specification
+    └── starrocks.md           # StarRocks Stream Load sink operator guide
 ```
 
 ---
@@ -70,6 +74,7 @@ Agents must strictly use the specific library ecosystem outlined below. Do not i
 
 *   **Apache Iceberg**: `iceberg-rust` (the official Apache Iceberg Rust implementation).
 *   **Kafka**: `rdkafka` (based on `librdkafka`).
+*   **StarRocks**: `starrocks-stream-load` (HTTP Stream Load API). TLS backend is selectable at compile time via Cargo features (`tls-rustls` default, `tls-native-tls` opt-in). The two backends are mutually exclusive; enabling both produces a compile error.
 
 ### 4. Component Summary & Role Mapping
 
@@ -79,7 +84,7 @@ Agents must strictly use the specific library ecosystem outlined below. Do not i
 | **Codec** | `arrow-codec` (`prost` + `arrow`) | Translates raw proto structs into columnar `RecordBatch` layout on arrival. |
 | **Transformation** | `noop-transformer` | Provides a hook for data transformation/enrichment (currently no-op). |
 | **Core** | `pipeline-core` | Defines common traits (`Source`, `Transform`, `Sink`) and shared logic. |
-| **Storage Sinks** | `storage` (Iceberg), `kafka-sink` | Translates Arrow record batches into physical storage or message queues. |
+| **Storage Sinks** | `storage` (Iceberg), `kafka-sink`, `starrocks-sink` | Translates Arrow record batches into physical storage or message queues. |
 
 ---
 

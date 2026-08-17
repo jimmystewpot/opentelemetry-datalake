@@ -176,8 +176,9 @@ fn default_retry_interval_secs() -> u64 {
 /// Configuration for the `StarRocks` Stream Load sink.
 ///
 /// Credentials: `username` can be set in config; `password` should be supplied
-/// via the `DATALAKE_STARROCKS_PASSWORD` environment variable (consistent with
-/// the workspace-wide `Env::prefixed("DATALAKE_")` figment pattern).
+/// via the `OTEL_DATALAKE_STARROCKS__PASSWORD` environment variable (consistent with
+/// the workspace-wide `Env::prefixed("OTEL_DATALAKE_")` figment pattern,
+/// using `__` as the nested-key separator).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StarRocksSinkConfig {
     /// One or more `StarRocks` Frontend (FE) HTTP URLs.
@@ -193,7 +194,7 @@ pub struct StarRocksSinkConfig {
     /// `StarRocks` username.
     pub username: String,
 
-    /// `StarRocks` password. Override with `DATALAKE_STARROCKS_PASSWORD` env var.
+    /// `StarRocks` password. Override with `OTEL_DATALAKE_STARROCKS__PASSWORD` env var.
     #[serde(default)]
     pub password: Option<String>,
 

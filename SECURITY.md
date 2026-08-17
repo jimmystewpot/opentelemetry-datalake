@@ -52,6 +52,23 @@ We ask that you keep the vulnerability confidential until we have had a chance t
 - **Dependency Auditing:** We regularly audit our dependencies for known vulnerabilities using tools like `cargo-audit`.
 - **Automated Scanning:** Our CI pipeline includes static analysis and linting (Clippy) to catch common security pitfalls early.
 
+## Credential Management
+
+Sink credentials (passwords, API keys, secret access keys) **must never be stored in plaintext configuration files** committed to version control.
+
+All configuration values — including sink credentials — can be overridden at runtime using environment variables with the `OTEL_DATALAKE_` prefix. Use double underscores (`__`) to navigate nested configuration sections. For example:
+
+```shell
+# StarRocks password (overrides starrocks.password in config.toml)
+export OTEL_DATALAKE_STARROCKS__PASSWORD="your_password"
+
+# Iceberg S3 secret access key (overrides iceberg.properties."s3.secret-access-key")
+export OTEL_DATALAKE_ICEBERG__PROPERTIES__S3_SECRET_ACCESS_KEY="your_key"
+```
+
+This pattern is enforced consistently across all sink implementations. If you are adding a new sink, credentials must be `Option<String>` fields with a `#[serde(default)]` annotation and must be documented as environment-variable-injectable.
+
+
 ## Security Model
 
 `opentelemetry-datalake` is an infrastructure component. While we prioritize confidentiality and integrity, availability depends on the environment in which it is deployed. Users are responsible for:

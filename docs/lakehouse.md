@@ -146,3 +146,9 @@ Batching strategy **SHOULD** be adjusted based on the target lakehouse format's 
 * These formats are designed for high-frequency ingestion using Merge-on-Read (MoR) and often support asynchronous, background compaction that runs concurrently with writers.
 * **Guideline:** Users **MAY** configure smaller batch sizes and more aggressive intervals (e.g., < 60 seconds) to achieve lower data latency.
 * **Rationale:** Hudi and Paimon handle the accumulation of small log files more gracefully by merging them into base files in the background, making them more suitable for near-real-time telemetry requirements.
+
+---
+
+## See Also
+
+*   [`docs/starrocks.md`](starrocks.md): Configuration guide for the StarRocks OLAP sink. StarRocks uses the HTTP Stream Load API rather than an open table format, making it a high-throughput real-time OLAP option distinct from the lakehouse formats covered in this document.

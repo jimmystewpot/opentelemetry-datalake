@@ -14,6 +14,16 @@ The `starrocks-sink` crate ingests OpenTelemetry signal batches (Logs, Metrics, 
 
 ---
 
+## Wire Format Comparison
+
+| Format | `StarRocks` version | Throughput | StarRocks DDL required? | Notes |
+|---|---|---|---|---|
+| `ipc` (default) | ≥ 2.5 with Arrow BE support | Highest — zero string conversion | No | Verify BE support before using; see below |
+| `json` | Any | Medium | No | Universal fallback; larger payloads than IPC |
+| `csv` | Any | Medium | No | Simplest format; no schema metadata |
+
+---
+
 ## Arrow IPC Compatibility
 
 > **Important**: Using `format = "ipc"` requires StarRocks Backend (BE) nodes to have Arrow support compiled in and enabled.
@@ -115,13 +125,13 @@ DUPLICATE KEY(timestamp, signal_type)
 
 ## Credentials
 
-The password field should **not** be stored in plain text in `config.toml`. Supply it via environment variable using the workspace-standard prefix:
+The password field should **not** be stored in plain text in `config.toml`. Supply it via environment variable using the workspace-standard `OTEL_DATALAKE_` prefix with `__` as the nested-key separator:
 
 ```shell
-export DATALAKE_STARROCKS_PASSWORD="your_password"
+export OTEL_DATALAKE_STARROCKS__PASSWORD="your_password"
 ```
 
-The `figment` config loader merges environment variables with the `DATALAKE_` prefix after the TOML file, so the env var takes precedence.
+The `figment` config loader merges environment variables with the `OTEL_DATALAKE_` prefix after the TOML file, so the env var takes precedence.
 
 ---
 
@@ -198,5 +208,5 @@ traces  = "telemetry_traces"
 ```
 
 ```shell
-DATALAKE_STARROCKS_PASSWORD="s3cr3t" ./opentelemetry-datalake --config config.toml
+OTEL_DATALAKE_STARROCKS__PASSWORD="s3cr3t" ./opentelemetry-datalake --config config.toml
 ```

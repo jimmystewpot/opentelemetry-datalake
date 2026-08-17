@@ -9,9 +9,10 @@ The configuration is divided into several main sections:
 - `[server]`: OTLP receiver settings.
 - `[iceberg]`: Apache Iceberg storage sink settings (optional).
 - `[kafka]`: Kafka storage sink settings (optional).
+- `[starrocks]`: StarRocks Stream Load sink settings (optional).
 - `[telemetry]`: Internal self-monitoring telemetry settings (part of the core pipeline).
 
-Either `[iceberg]` or `[kafka]` must be provided.
+One of `[iceberg]`, `[kafka]`, or `[starrocks]` must be provided.
 
 ## Global Environment Overrides
 
@@ -76,6 +77,51 @@ Configures the Kafka sink.
 | `traces_format` | String | `"json"` | Serialization format for traces (`json` or `protobuf`). |
 | `metrics_format` | String | `"json"` | Serialization format for metrics (`json` or `protobuf`). |
 | `options` | Map | `{}` | Additional `librdkafka` configuration options. |
+
+---
+
+## StarRocks Section (`[starrocks]`)
+
+Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.md) for a full operator guide including Arrow IPC version requirements and V1 vs V2 trade-offs.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `frontend_urls` | `[String]` | (Required) | One or more StarRocks FE HTTP URLs. Round-robin failover is applied. |
+| `database` | String | (Required) | Target StarRocks database. |
+| `username` | String | (Required) | StarRocks username. |
+| `password` | String | `null` | StarRocks password. **Supply via `OTEL_DATALAKE_STARROCKS__PASSWORD` env var** — never in config files. |
+| `format` | String | `"ipc"` | Wire format: `"ipc"` (Arrow IPC, recommended), `"json"`, or `"csv"`. |
+| `transaction_mode` | String | `"v1"` | `"v1"` (at-least-once) or `"v2"` (exactly-once, two-phase commit). |
+| `max_payload_bytes` | Integer | `134217728` | Hard payload size limit in bytes (128 MiB). Must be ≤ BE `stream_load_max_mb`. |
+| `connect_timeout_secs` | Integer | `10` | TCP connection timeout in seconds. |
+| `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
+| `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |
+| `retry_interval_secs` | Integer | `1` | Delay between retries in seconds. |
+
+### StarRocks Table Mapping (`[starrocks.table_mapping]`)
+
+Two variants are supported. Set `type` to select.
+
+**`per_signal`** — a dedicated table per signal type (recommended):
+
+```toml
+[starrocks.table_mapping]
+type    = "per_signal"
+logs    = "otel_logs"
+metrics = "otel_metrics"
+traces  = "otel_traces"
+```
+
+**`unified`** — all signals to one table with an injected discriminator column:
+
+```toml
+[starrocks.table_mapping]
+type               = "unified"
+table              = "otel_all"
+signal_type_column = "signal_type"  # injected; values: "logs", "metrics", "traces"
+```
+
+The target table DDL must include `signal_type_column` when using `unified` mode.
 
 ---
 

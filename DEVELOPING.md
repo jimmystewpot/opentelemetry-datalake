@@ -23,8 +23,9 @@ The workspace is organized as a Cargo workspace with several crates:
 - **`crates/core`**: Core pipeline orchestration, config loading, graceful shutdown traits, and general types.
 - **`crates/otlp-receiver`**: Ingestion layer handling OTLP gRPC (`tonic`) and HTTP/JSON (`axum`) protocols.
 - **`crates/arrow-codec`**: Translation layer compiling raw Protobuf/JSON payloads directly into Apache Arrow schemas and vectorized `RecordBatch` structures. Includes compliance checking and remapping logic.
-- **`crates/storage`**: Writer layer integrating with Open Table Formats. Sub-modules exist for Delta Lake (`delta.rs`), Apache Iceberg (`iceberg.rs`), Apache Hudi (`hudi.rs`), and Apache Paimon (`paimon.rs`).
-- **`crates/kafka-sink`**: Standard secondary Kafka integration sink.
+- **`crates/storage`**: Writer layer integrating with Apache Iceberg via `iceberg-rust`. Implements schema evolution modes (`fixed`, `auto`, `catalog`) and time-based partitioning.
+- **`crates/kafka-sink`**: Kafka integration sink serializing Arrow batches to JSON or Arrow IPC using `rdkafka`.
+- **`crates/starrocks-sink`**: StarRocks Stream Load sink. Serializes Arrow batches to Arrow IPC, JSON, or CSV and delivers them via the HTTP Stream Load API. Supports V1 (at-least-once) and V2 two-phase commit (exactly-once) transaction modes. See [`docs/starrocks.md`](docs/starrocks.md).
 - **`crates/noop-transformer`**: Transformer helper used for raw pass-through in streaming pipelines.
 - **`src`**: Main application binary, routing receiver streams to sinks.
 
