@@ -240,15 +240,6 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .unwrap_or(&iceberg_cfg.table_identifier);
 
-        if logs_table == traces_table
-            || logs_table == metrics_table
-            || traces_table == metrics_table
-        {
-            return Err(anyhow::anyhow!(
-                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
-            ));
-        }
-
         tracing::info!(
             "Initializing Iceberg sinks. logs='{}', traces='{}', metrics='{}'",
             logs_table,
@@ -334,9 +325,16 @@ async fn main() -> anyhow::Result<()> {
             "Initializing StarRocks sinks"
         );
 
-        let mut logs_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
-        let mut traces_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
-        let mut metrics_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg)?;
+        let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
+        let shared_manager = primary_sink.manager();
+
+        let mut logs_sink = primary_sink;
+        let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
+            starrocks_cfg.clone(),
+            std::sync::Arc::clone(&shared_manager),
+        );
+        let mut metrics_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager);
 
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {

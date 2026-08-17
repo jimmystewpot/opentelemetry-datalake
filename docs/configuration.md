@@ -92,7 +92,7 @@ Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.m
 | `password` | String | `null` | StarRocks password. **Supply via `OTEL_DATALAKE_STARROCKS__PASSWORD` env var** — never in config files. |
 | `format` | String | `"ipc"` | Wire format: `"ipc"` (Arrow IPC, recommended), `"json"`, or `"csv"`. |
 | `transaction_mode` | String | `"v1"` | `"v1"` (at-least-once) or `"v2"` (exactly-once, two-phase commit). |
-| `max_payload_bytes` | Integer | `134217728` | Hard payload size limit in bytes (128 MiB). Must be ≤ BE `stream_load_max_mb`. |
+| `max_payload_bytes` | Integer | `104857600` | Hard payload size limit in bytes (100 MiB). Must be ≤ BE `stream_load_max_mb`. |
 | `connect_timeout_secs` | Integer | `10` | TCP connection timeout in seconds. |
 | `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
 | `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |

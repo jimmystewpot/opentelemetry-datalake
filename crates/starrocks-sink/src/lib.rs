@@ -132,7 +132,11 @@ impl TableMapping {
             } => match signal_type {
                 "metrics" => metrics,
                 "traces" => traces,
-                _ => logs,
+                "logs" => logs,
+                other => {
+                    debug_assert!(false, "unexpected signal_type: {other}");
+                    logs
+                }
             },
             Self::Unified { table, .. } => table,
         }
@@ -153,8 +157,7 @@ impl TableMapping {
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 fn default_max_payload_bytes() -> usize {
-    134_217_728 // 128 MiB — StarRocks default BE stream_load_max_mb is 100 MiB;
-    // set slightly higher to give headroom while catching runaway batches.
+    104_857_600 // 100 MiB — matches default StarRocks BE stream_load_max_mb.
 }
 
 fn default_connect_timeout_secs() -> u64 {
@@ -245,19 +248,59 @@ pub struct StarRocksSinkConfig {
 /// No internal buffer is maintained: `StarRocks` Stream Load is a streaming HTTP
 /// protocol and the SDK manages connection pooling and FE failover internally.
 /// Upstream batching is the responsibility of the pipeline channel capacity.
+use std::sync::Arc;
+
 pub struct StarRocksSink {
     config: StarRocksSinkConfig,
-    manager: StreamLoadManager,
+    manager: Arc<StreamLoadManager>,
+}
+
+impl std::fmt::Debug for StarRocksSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StarRocksSink")
+            .field("config", &self.config)
+            .field("manager", &"<StreamLoadManager>")
+            .finish()
+    }
 }
 
 impl StarRocksSink {
+    /// Creates a new `StarRocksSink` with a shared [`StreamLoadManager`].
+    #[must_use]
+    pub fn with_manager(config: StarRocksSinkConfig, manager: Arc<StreamLoadManager>) -> Self {
+        Self { config, manager }
+    }
+
+    /// Returns a reference to the underlying [`StreamLoadManager`] connection pool.
+    #[must_use]
+    pub fn manager(&self) -> Arc<StreamLoadManager> {
+        Arc::clone(&self.manager)
+    }
+
     /// Creates a new `StarRocksSink` from the provided configuration.
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] if the [`StreamLoadManager`] cannot
-    /// be initialised (e.g., invalid URL or conflicting TLS features).
+    /// Returns [`PipelineError::Internal`] if configuration validation fails or
+    /// if the [`StreamLoadManager`] cannot be initialised.
     pub fn try_new(config: StarRocksSinkConfig) -> Result<Self, PipelineError> {
+        if config.frontend_urls.is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `frontend_urls` must contain at least one FE URL"
+                    .to_string(),
+            ));
+        }
+        if config.username.trim().is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `username` must not be empty".to_string(),
+            ));
+        }
+        if config.database.trim().is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `database` must not be empty".to_string(),
+            ));
+        }
+
         let sdk_config = StreamLoadConfig::builder(
             config.frontend_urls.clone(),
             config.database.clone(),
@@ -285,7 +328,10 @@ impl StarRocksSink {
             PipelineError::Internal(format!("Failed to initialise StarRocks manager: {e}"))
         })?;
 
-        Ok(Self { config, manager })
+        Ok(Self {
+            config,
+            manager: Arc::new(manager),
+        })
     }
 
     /// Serializes a [`RecordBatch`] into [`Bytes`] using the configured format.
@@ -452,10 +498,19 @@ impl StarRocksSink {
             return Err(PipelineError::DownstreamClosed);
         }
 
-        let commit_response = self.manager.commit_transaction(label).await.map_err(|e| {
-            error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed");
-            PipelineError::DownstreamClosed
-        })?;
+        let commit_result = self.manager.commit_transaction(label).await;
+        if let Err(e) = commit_result {
+            error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
+            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+                warn!(
+                    label = label,
+                    error = %rb_err,
+                    "StarRocks V2 rollback after commit failure also failed — transaction {txn_id} may require manual resolution"
+                );
+            }
+            return Err(PipelineError::DownstreamClosed);
+        }
+        let commit_response = commit_result.map_err(|_| PipelineError::DownstreamClosed)?;
 
         info!(
             label = label,
@@ -756,5 +811,55 @@ mod tests {
             a.starts_with("otel-traces-"),
             "Label must include signal type prefix"
         );
+    }
+
+    // ── Validation & Pool Sharing ─────────────────────────────────────────────
+
+    #[test]
+    fn test_try_new_validates_empty_frontend_urls() {
+        let mut config = base_config();
+        config.frontend_urls.clear();
+        let err = StarRocksSink::try_new(config).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal(ref msg) if msg.contains("frontend_urls")),
+            "Expected empty frontend_urls error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_try_new_validates_empty_username_and_database() {
+        let mut config = base_config();
+        config.username = "  ".to_string();
+        let err = StarRocksSink::try_new(config).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal(ref msg) if msg.contains("username")),
+            "Expected empty username error, got: {err}"
+        );
+
+        let mut config2 = base_config();
+        config2.database = "".to_string();
+        let err2 = StarRocksSink::try_new(config2).unwrap_err();
+        assert!(
+            matches!(err2, PipelineError::Internal(ref msg) if msg.contains("database")),
+            "Expected empty database error, got: {err2}"
+        );
+    }
+
+    #[test]
+    fn test_with_manager_shares_underlying_arc() {
+        let config = base_config();
+        let sink1 = StarRocksSink::try_new(config.clone()).unwrap();
+        let manager_arc = sink1.manager();
+
+        let sink2 = StarRocksSink::with_manager(config, Arc::clone(&manager_arc));
+        assert!(
+            Arc::ptr_eq(&sink1.manager(), &sink2.manager()),
+            "Arc pointers must be equal when using with_manager"
+        );
+    }
+
+    #[test]
+    fn test_default_max_payload_bytes_is_100mb() {
+        assert_eq!(default_max_payload_bytes(), 104_857_600);
     }
 }
