@@ -42,8 +42,14 @@ mod tests {
     fn test_pipeline_error_display_missing_metadata() {
         let err = PipelineError::MissingMetadata("x-batch-id".to_string());
         let msg = err.to_string();
-        assert!(msg.contains("x-batch-id"), "Display must include field name: {msg}");
-        assert!(msg.contains("missing metadata"), "Display prefix must be present: {msg}");
+        assert!(
+            msg.contains("x-batch-id"),
+            "Display must include field name: {msg}"
+        );
+        assert!(
+            msg.contains("missing metadata"),
+            "Display prefix must be present: {msg}"
+        );
     }
 
     /// DownstreamClosed must display a human-readable message.
@@ -58,7 +64,10 @@ mod tests {
     fn test_pipeline_error_display_internal() {
         let err = PipelineError::Internal("something went wrong".to_string());
         let msg = err.to_string();
-        assert!(msg.contains("something went wrong"), "Display must include context: {msg}");
+        assert!(
+            msg.contains("something went wrong"),
+            "Display must include context: {msg}"
+        );
     }
 
     /// Arrow errors must be convertible to `PipelineError` via the `From` impl.

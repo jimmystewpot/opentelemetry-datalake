@@ -266,8 +266,14 @@ mod tests {
             })),
         };
         let s = any_value_to_string(&val);
-        assert!(s.contains("\"env\""), "kvlist must produce JSON with key: {s}");
-        assert!(s.contains("\"prod\""), "kvlist must produce JSON with value: {s}");
+        assert!(
+            s.contains("\"env\""),
+            "kvlist must produce JSON with key: {s}"
+        );
+        assert!(
+            s.contains("\"prod\""),
+            "kvlist must produce JSON with value: {s}"
+        );
     }
 
     /// downcast_string_array must return PipelineError::Internal when the
@@ -280,11 +286,9 @@ mod tests {
         use std::sync::Arc;
 
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _])
+                .unwrap();
         let col = batch.column(0);
         let result = downcast_string_array(col.as_ref(), "n");
         assert!(

@@ -358,9 +358,7 @@ mod tests {
     /// A Sum metric must produce one row per data point.
     #[test]
     fn test_decode_metrics_sum_type() {
-        use opentelemetry_proto::tonic::metrics::v1::{
-            NumberDataPoint, Sum, metric,
-        };
+        use opentelemetry_proto::tonic::metrics::v1::{NumberDataPoint, Sum, metric};
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -392,9 +390,7 @@ mod tests {
     /// `sum` field (or count as fallback).
     #[test]
     fn test_decode_metrics_histogram_type() {
-        use opentelemetry_proto::tonic::metrics::v1::{
-            Histogram, HistogramDataPoint, metric,
-        };
+        use opentelemetry_proto::tonic::metrics::v1::{Histogram, HistogramDataPoint, metric};
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -461,7 +457,10 @@ mod tests {
             .unwrap()
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0);
-        assert!((val - 42.0).abs() < f64::EPSILON, "AsInt must cast to f64: {val}");
+        assert!(
+            (val - 42.0).abs() < f64::EPSILON,
+            "AsInt must cast to f64: {val}"
+        );
     }
 
     /// A Gauge data point with no value set must default to 0.0.
@@ -494,7 +493,10 @@ mod tests {
             .unwrap()
             .as_primitive::<arrow::datatypes::Float64Type>()
             .value(0);
-        assert!((val - 0.0).abs() < f64::EPSILON, "None value must default to 0.0: {val}");
+        assert!(
+            (val - 0.0).abs() < f64::EPSILON,
+            "None value must default to 0.0: {val}"
+        );
     }
 
     /// When no resource is set, service_name must default to "unknown".

@@ -40,7 +40,11 @@ mod tests {
         let cfg = PipelineConfig::load("/tmp/this-file-does-not-exist-ever-12345.toml");
         // Figment's Toml::file silently ignores a missing file,
         // so config must succeed using serde defaults.
-        assert!(cfg.is_ok(), "Missing TOML file must not cause a load error: {:?}", cfg);
+        assert!(
+            cfg.is_ok(),
+            "Missing TOML file must not cause a load error: {:?}",
+            cfg
+        );
     }
 
     /// A file containing invalid TOML must return PipelineError::Configuration.

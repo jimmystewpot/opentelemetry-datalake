@@ -1137,7 +1137,10 @@ mod tests {
             Field::new("value", DataType::Float64, true),
         ]));
 
-        let ts = Arc::new(TimestampNanosecondArray::from(vec![2_000_000_000_i64, 1_000_000_000_i64]));
+        let ts = Arc::new(TimestampNanosecondArray::from(vec![
+            2_000_000_000_i64,
+            1_000_000_000_i64,
+        ]));
         let svc = Arc::new(StringArray::from(vec!["svc-b", "svc-a"]));
         let name = Arc::new(StringArray::from(vec!["cpu", "mem"]));
         let attrs = Arc::new(StringArray::from(vec!["{}", "{}"])) as ArrayRef;
@@ -1158,7 +1161,10 @@ mod tests {
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        let ts = Arc::new(TimestampNanosecondArray::from(vec![2_000_000_000_i64, 1_000_000_000_i64]));
+        let ts = Arc::new(TimestampNanosecondArray::from(vec![
+            2_000_000_000_i64,
+            1_000_000_000_i64,
+        ]));
         let svc = Arc::new(StringArray::from(vec!["svc-b", "svc-a"]));
         let name = Arc::new(StringArray::from(vec!["span-b", "span-a"]));
 
@@ -1175,7 +1181,10 @@ mod tests {
 
         // After sorting by (service_name ASC, name ASC, attributes ASC, ts ASC)
         // svc-a/mem should come first
-        let svc_col = sorted.column_by_name("service_name").unwrap().as_string::<i32>();
+        let svc_col = sorted
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>();
         assert_eq!(svc_col.value(0), "svc-a");
         assert_eq!(svc_col.value(1), "svc-b");
     }
@@ -1188,7 +1197,10 @@ mod tests {
         let batch = make_test_traces_batch();
         let sorted = sink.sort_traces(&batch).unwrap();
 
-        let svc_col = sorted.column_by_name("service_name").unwrap().as_string::<i32>();
+        let svc_col = sorted
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>();
         assert_eq!(svc_col.value(0), "svc-a");
     }
 
@@ -1197,9 +1209,11 @@ mod tests {
     #[test]
     fn test_sort_logs_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("severity_text", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "severity_text",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(arrow::array::StringArray::from(vec!["INFO"])) as ArrayRef],
@@ -1210,16 +1224,21 @@ mod tests {
         let result = sink.sort_logs(&batch);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("service_name"), "Error must name the missing column: {msg}");
+        assert!(
+            msg.contains("service_name"),
+            "Error must name the missing column: {msg}"
+        );
     }
 
     /// sort_metrics must return PipelineError::Internal when the `name` column is absent.
     #[test]
     fn test_sort_metrics_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("service_name", DataType::Utf8, true),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "service_name",
+            DataType::Utf8,
+            true,
+        )]));
         let batch = RecordBatch::try_new(
             schema,
             vec![Arc::new(arrow::array::StringArray::from(vec!["svc"])) as ArrayRef],
@@ -1286,7 +1305,10 @@ mod tests {
             .unwrap();
         drop(tx);
         let result = sink.run(rx).await;
-        assert!(result.is_ok(), "dry_run with Metrics must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "dry_run with Metrics must succeed: {result:?}"
+        );
     }
 
     /// dry_run mode with a Traces signal must complete without error.
@@ -1299,6 +1321,9 @@ mod tests {
             .unwrap();
         drop(tx);
         let result = sink.run(rx).await;
-        assert!(result.is_ok(), "dry_run with Traces must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "dry_run with Traces must succeed: {result:?}"
+        );
     }
 }

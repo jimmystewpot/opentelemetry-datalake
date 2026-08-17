@@ -169,16 +169,11 @@ mod tests {
         let fanout = Arc::new(Fanout::try_new(vec![tx]).unwrap());
 
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
-        let batch1 = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
-        let batch2 = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(vec![2]))],
-        )
-        .unwrap();
+        let batch1 =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let batch2 =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
 
         // Fill the channel
         fanout.send(SignalBatch::Metrics(batch1)).await.unwrap();
@@ -214,11 +209,9 @@ mod tests {
                 let f = Arc::clone(&fanout);
                 let s = schema.clone();
                 tokio::spawn(async move {
-                    let batch = RecordBatch::try_new(
-                        s,
-                        vec![Arc::new(Int32Array::from(vec![i as i32]))],
-                    )
-                    .unwrap();
+                    let batch =
+                        RecordBatch::try_new(s, vec![Arc::new(Int32Array::from(vec![i as i32]))])
+                            .unwrap();
                     f.send(SignalBatch::Traces(batch)).await.unwrap();
                 })
             })
@@ -232,7 +225,10 @@ mod tests {
         while rx1.try_recv().is_ok() {
             received += 1;
         }
-        assert_eq!(received, MSG_COUNT, "All concurrent messages must be received");
+        assert_eq!(
+            received, MSG_COUNT,
+            "All concurrent messages must be received"
+        );
     }
 
     /// All SignalBatch variants must be cloneable; verify that cloning

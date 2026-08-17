@@ -228,9 +228,11 @@ mod tests {
         )
         .unwrap();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("a", arrow::datatypes::DataType::Int32, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![Arc::new(arrow::array::Int32Array::from(vec![10, 20, 30]))],
@@ -242,8 +244,7 @@ mod tests {
 
         // Decode the IPC stream back
         let cursor = std::io::Cursor::new(&buffer);
-        let mut reader =
-            arrow::ipc::reader::StreamReader::try_new(cursor, None).unwrap();
+        let mut reader = arrow::ipc::reader::StreamReader::try_new(cursor, None).unwrap();
         let decoded = reader.next().unwrap().unwrap();
 
         assert_eq!(decoded.num_rows(), 3);

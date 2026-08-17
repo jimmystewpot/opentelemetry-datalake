@@ -212,10 +212,7 @@ mod tests {
         };
 
         let req = ExportLogsServiceRequest {
-            resource_logs: vec![
-                make_resource_log("svc-a"),
-                make_resource_log("svc-b"),
-            ],
+            resource_logs: vec![make_resource_log("svc-a"), make_resource_log("svc-b")],
         };
         let batch = decode_logs(&req).unwrap();
         assert_eq!(batch.num_rows(), 2);
@@ -315,10 +312,9 @@ mod tests {
             .column_by_name("scope_name")
             .unwrap()
             .as_string::<i32>();
-        let names: std::collections::HashSet<&str> =
-            (0..arrow::array::Array::len(scope_col))
-                .map(|i| scope_col.value(i))
-                .collect();
+        let names: std::collections::HashSet<&str> = (0..arrow::array::Array::len(scope_col))
+            .map(|i| scope_col.value(i))
+            .collect();
         assert!(names.contains("scope-a"));
         assert!(names.contains("scope-b"));
     }

@@ -897,9 +897,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
         let empty_batch = RecordBatch::new_empty(schema);
 
-        let result =
-            StarRocksSink::inject_signal_type_column(&empty_batch, "signal_type", "logs");
-        assert!(result.is_ok(), "inject_signal_type_column must succeed on empty batch");
+        let result = StarRocksSink::inject_signal_type_column(&empty_batch, "signal_type", "logs");
+        assert!(
+            result.is_ok(),
+            "inject_signal_type_column must succeed on empty batch"
+        );
         let batch = result.unwrap();
         assert_eq!(batch.num_rows(), 0);
         // The signal_type column must still be present
@@ -919,11 +921,9 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))])
+                .unwrap();
 
         let result =
             StarRocksSink::inject_signal_type_column(&batch, "signal_type", "metrics").unwrap();

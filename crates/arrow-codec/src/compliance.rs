@@ -355,9 +355,11 @@ mod tests {
     /// be identified as non-compliant by `is_schema_compliant`.
     #[test]
     fn test_is_schema_compliant_returns_false_for_untagged() {
-        let schema = arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("col", DataType::Utf8, false),
-        ]);
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "col",
+            DataType::Utf8,
+            false,
+        )]);
         let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
         assert!(
             !engine.is_schema_compliant(&schema),
@@ -369,9 +371,11 @@ mod tests {
     /// key — the second call must overwrite, not append.
     #[test]
     fn test_tag_schema_compliant_is_idempotent() {
-        let schema = arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("col", DataType::Utf8, false),
-        ]);
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "col",
+            DataType::Utf8,
+            false,
+        )]);
         let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
 
         // Tag once

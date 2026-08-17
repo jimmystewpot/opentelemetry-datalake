@@ -607,7 +607,10 @@ mod tests {
 
         svc.export(req).await.unwrap();
         let msg = rx.try_recv();
-        assert!(msg.is_ok(), "Non-empty logs request must push a batch to the channel");
+        assert!(
+            msg.is_ok(),
+            "Non-empty logs request must push a batch to the channel"
+        );
         assert!(
             matches!(msg.unwrap(), SignalBatch::Logs(_)),
             "Signal must be Logs variant"
@@ -638,7 +641,10 @@ mod tests {
 
         svc.export(req).await.unwrap();
         let msg = rx.try_recv();
-        assert!(msg.is_ok(), "Non-empty traces request must push a batch to the channel");
+        assert!(
+            msg.is_ok(),
+            "Non-empty traces request must push a batch to the channel"
+        );
         assert!(
             matches!(msg.unwrap(), SignalBatch::Traces(_)),
             "Signal must be Traces variant"

@@ -85,7 +85,10 @@ mod tests {
         assert_eq!(cfg.otlp_endpoint, "http://localhost:4317");
         assert_eq!(cfg.service_name, "otel-datalake");
         // REGION is unset, so region must be None.
-        assert!(cfg.region.is_none(), "region must be None when REGION env var is unset");
+        assert!(
+            cfg.region.is_none(),
+            "region must be None when REGION env var is unset"
+        );
     }
 
     /// When the REGION environment variable is set, TelemetryConfig::default()
