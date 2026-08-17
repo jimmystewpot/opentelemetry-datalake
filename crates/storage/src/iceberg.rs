@@ -1120,4 +1120,185 @@ mod tests {
             );
         }
     }
+
+    // ── Sorting ────────────────────────────────────────────────────────────────
+
+    fn make_test_metrics_batch() -> RecordBatch {
+        use arrow::array::{Float64Array, StringArray, TimestampNanosecondArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("attributes", DataType::Utf8, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let ts = Arc::new(TimestampNanosecondArray::from(vec![2_000_000_000_i64, 1_000_000_000_i64]));
+        let svc = Arc::new(StringArray::from(vec!["svc-b", "svc-a"]));
+        let name = Arc::new(StringArray::from(vec!["cpu", "mem"]));
+        let attrs = Arc::new(StringArray::from(vec!["{}", "{}"])) as ArrayRef;
+        let value = Arc::new(Float64Array::from(vec![2.0, 1.0]));
+
+        RecordBatch::try_new(schema, vec![ts, svc, name, attrs, value]).unwrap()
+    }
+
+    fn make_test_traces_batch() -> RecordBatch {
+        use arrow::array::{StringArray, TimestampNanosecondArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let ts = Arc::new(TimestampNanosecondArray::from(vec![2_000_000_000_i64, 1_000_000_000_i64]));
+        let svc = Arc::new(StringArray::from(vec!["svc-b", "svc-a"]));
+        let name = Arc::new(StringArray::from(vec!["span-b", "span-a"]));
+
+        RecordBatch::try_new(schema, vec![ts, svc, name]).unwrap()
+    }
+
+    /// sort_metrics must order rows by (service_name, name, attributes, timestamp).
+    #[test]
+    fn test_sort_metrics_produces_correct_order() {
+        use arrow::array::AsArray;
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let batch = make_test_metrics_batch();
+        let sorted = sink.sort_metrics(&batch).unwrap();
+
+        // After sorting by (service_name ASC, name ASC, attributes ASC, ts ASC)
+        // svc-a/mem should come first
+        let svc_col = sorted.column_by_name("service_name").unwrap().as_string::<i32>();
+        assert_eq!(svc_col.value(0), "svc-a");
+        assert_eq!(svc_col.value(1), "svc-b");
+    }
+
+    /// sort_traces must order rows by (service_name, span_name, timestamp).
+    #[test]
+    fn test_sort_traces_produces_correct_order() {
+        use arrow::array::AsArray;
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let batch = make_test_traces_batch();
+        let sorted = sink.sort_traces(&batch).unwrap();
+
+        let svc_col = sorted.column_by_name("service_name").unwrap().as_string::<i32>();
+        assert_eq!(svc_col.value(0), "svc-a");
+    }
+
+    /// sort_logs must return PipelineError::Internal when the batch lacks
+    /// the required `service_name` column.
+    #[test]
+    fn test_sort_logs_missing_column_returns_error() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("severity_text", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["INFO"])) as ArrayRef],
+        )
+        .unwrap();
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let result = sink.sort_logs(&batch);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("service_name"), "Error must name the missing column: {msg}");
+    }
+
+    /// sort_metrics must return PipelineError::Internal when the `name` column is absent.
+    #[test]
+    fn test_sort_metrics_missing_column_returns_error() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["svc"])) as ArrayRef],
+        )
+        .unwrap();
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let result = sink.sort_metrics(&batch);
+        assert!(result.is_err());
+    }
+
+    /// apply_schema_mode with SchemaMode::Fixed must return the batch unchanged.
+    #[test]
+    fn test_apply_schema_mode_fixed_is_passthrough() {
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let batch = make_test_logs_batch();
+        let original_schema = batch.schema();
+        let result = sink.apply_schema_mode(batch, None).unwrap();
+        assert_eq!(result.schema(), original_schema);
+    }
+
+    /// get_partition_path must handle timestamp 0 (Unix epoch) correctly.
+    #[test]
+    fn test_get_partition_path_zero_timestamp() {
+        let path = get_partition_path(0, PartitionGranularity::Hourly).unwrap();
+        assert_eq!(path, "year=1970/month=01/day=01/hour=00/");
+    }
+
+    /// should_flush must trigger when total_bytes exceeds max_batch_size_bytes.
+    #[test]
+    fn test_should_flush_byte_threshold() {
+        let mut config = make_dry_run_config(SchemaMode::Fixed);
+        config.batching = Some(BatchingConfig {
+            max_batch_records: None,
+            max_batch_size_bytes: 1, // 1 byte — any real data will exceed this
+            max_batch_interval_sec: u64::MAX,
+        });
+
+        let mut sink = IcebergSink::new(config);
+        let batch = make_test_logs_batch();
+        let table_name = "db.tbl".to_string();
+
+        let buffer = sink
+            .buffers
+            .entry(table_name.clone())
+            .or_insert_with(|| TableBuffer::new("logs"));
+        buffer.total_bytes = batch.get_array_memory_size();
+        buffer.total_rows = batch.num_rows();
+        buffer.batches.push(batch);
+
+        assert!(
+            sink.should_flush(&table_name),
+            "should_flush must trigger when total_bytes >= max_batch_size_bytes"
+        );
+    }
+
+    /// dry_run mode with a Metrics signal must complete without error.
+    #[tokio::test]
+    async fn test_iceberg_sink_run_with_metrics_batch() {
+        let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(SignalBatch::Metrics(make_test_metrics_batch()))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = sink.run(rx).await;
+        assert!(result.is_ok(), "dry_run with Metrics must succeed: {result:?}");
+    }
+
+    /// dry_run mode with a Traces signal must complete without error.
+    #[tokio::test]
+    async fn test_iceberg_sink_run_with_traces_batch() {
+        let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let (tx, rx) = mpsc::channel(10);
+        tx.send(SignalBatch::Traces(make_test_traces_batch()))
+            .await
+            .unwrap();
+        drop(tx);
+        let result = sink.run(rx).await;
+        assert!(result.is_ok(), "dry_run with Traces must succeed: {result:?}");
+    }
 }

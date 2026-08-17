@@ -202,4 +202,116 @@ mod tests {
         assert!(timestamp_to_i64(max).is_ok());
         assert!(timestamp_to_i64(max + 1).is_err());
     }
+
+    #[test]
+    fn test_any_value_to_string_int() {
+        let val = AnyValue {
+            value: Some(any_value::Value::IntValue(42)),
+        };
+        assert_eq!(any_value_to_string(&val), "42");
+    }
+
+    #[test]
+    fn test_any_value_to_string_double() {
+        let val = AnyValue {
+            value: Some(any_value::Value::DoubleValue(3.14)),
+        };
+        let s = any_value_to_string(&val);
+        assert!(s.starts_with("3.14"), "expected '3.14…', got: {s}");
+    }
+
+    #[test]
+    fn test_any_value_to_string_bool() {
+        let val_true = AnyValue {
+            value: Some(any_value::Value::BoolValue(true)),
+        };
+        let val_false = AnyValue {
+            value: Some(any_value::Value::BoolValue(false)),
+        };
+        assert_eq!(any_value_to_string(&val_true), "true");
+        assert_eq!(any_value_to_string(&val_false), "false");
+    }
+
+    #[test]
+    fn test_any_value_to_string_array() {
+        use opentelemetry_proto::tonic::common::v1::ArrayValue;
+        let val = AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: vec![
+                    AnyValue {
+                        value: Some(any_value::Value::StringValue("x".to_string())),
+                    },
+                    AnyValue {
+                        value: Some(any_value::Value::IntValue(7)),
+                    },
+                ],
+            })),
+        };
+        let s = any_value_to_string(&val);
+        assert_eq!(s, "[x,7]", "Array must be serialised as comma-list: {s}");
+    }
+
+    #[test]
+    fn test_any_value_to_string_kvlist() {
+        use opentelemetry_proto::tonic::common::v1::KeyValueList;
+        let val = AnyValue {
+            value: Some(any_value::Value::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: "env".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue("prod".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+            })),
+        };
+        let s = any_value_to_string(&val);
+        assert!(s.contains("\"env\""), "kvlist must produce JSON with key: {s}");
+        assert!(s.contains("\"prod\""), "kvlist must produce JSON with value: {s}");
+    }
+
+    /// downcast_string_array must return PipelineError::Internal when the
+    /// column is not a Utf8 StringArray.
+    #[test]
+    fn test_downcast_string_array_error_on_wrong_type() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
+        )
+        .unwrap();
+        let col = batch.column(0);
+        let result = downcast_string_array(col.as_ref(), "n");
+        assert!(
+            result.is_err(),
+            "downcast_string_array must fail for a non-string column"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("n"),
+            "Error message must reference the column name: {err}"
+        );
+    }
+
+    /// Attributes where `value` is None must be silently dropped from the
+    /// resulting JSON object.
+    #[test]
+    fn test_convert_attributes_value_none_is_omitted() {
+        let attrs = vec![KeyValue {
+            key: "dropped".to_string(),
+            value: None,
+            ..Default::default()
+        }];
+        let json = convert_attributes(&attrs);
+        // The key must not appear in the output
+        assert!(
+            !json.contains("dropped"),
+            "Attribute with None value must be omitted: {json}"
+        );
+    }
 }

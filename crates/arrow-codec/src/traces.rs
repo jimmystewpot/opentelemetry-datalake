@@ -189,4 +189,157 @@ mod tests {
         let schema = batch.schema();
         assert_eq!(schema.fields().len(), 15);
     }
+
+    /// Two spans in the same scope must both appear as rows.
+    #[test]
+    fn test_decode_traces_multiple_spans() {
+        let r_span = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![
+                    Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![1; 8],
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 2_000_000_000,
+                        ..Default::default()
+                    },
+                    Span {
+                        trace_id: vec![2; 16],
+                        span_id: vec![2; 8],
+                        start_time_unix_nano: 3_000_000_000,
+                        end_time_unix_nano: 4_000_000_000,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_traces(&ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        })
+        .unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    /// Status code and message must be stored in the appropriate columns.
+    #[test]
+    fn test_decode_traces_span_with_status() {
+        use arrow::array::AsArray;
+        use opentelemetry_proto::tonic::trace::v1::Status;
+        let r_span = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![1; 8],
+                    start_time_unix_nano: 1_000_000_000,
+                    end_time_unix_nano: 2_000_000_000,
+                    status: Some(Status {
+                        code: 2, // STATUS_CODE_ERROR
+                        message: "something failed".to_string(),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_traces(&ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        })
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let code = batch
+            .column_by_name("status_code")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::Int32Type>()
+            .value(0);
+        assert_eq!(code, 2);
+        let msg = batch
+            .column_by_name("status_message")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(msg, "something failed");
+    }
+
+    /// When no resource is set, service_name must fall back to "unknown".
+    #[test]
+    fn test_decode_traces_missing_resource_uses_unknown() {
+        use arrow::array::AsArray;
+        let r_span = ResourceSpans {
+            resource: None,
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    start_time_unix_nano: 1_000_000_000,
+                    end_time_unix_nano: 2_000_000_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_traces(&ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        })
+        .unwrap();
+        let svc = batch
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(svc, "unknown");
+    }
+
+    /// A ScopeSpans with no instrumentation scope must produce empty
+    /// scope_name and scope_version columns.
+    #[test]
+    fn test_decode_traces_no_scope_produces_empty_strings() {
+        use arrow::array::AsArray;
+        let r_span = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    start_time_unix_nano: 1_000_000_000,
+                    end_time_unix_nano: 2_000_000_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_traces(&ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        })
+        .unwrap();
+        let scope_name = batch
+            .column_by_name("scope_name")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(scope_name, "");
+    }
+
+    /// A span with start_time_unix_nano > i64::MAX must return an error.
+    #[test]
+    fn test_decode_traces_timestamp_overflow_returns_error() {
+        let r_span = ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    start_time_unix_nano: u64::MAX,
+                    end_time_unix_nano: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = decode_traces(&ExportTraceServiceRequest {
+            resource_spans: vec![r_span],
+        });
+        assert!(
+            result.is_err(),
+            "Timestamp overflow must return an error, not silently wrap"
+        );
+    }
 }

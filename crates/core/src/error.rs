@@ -32,3 +32,45 @@ pub enum PipelineError {
     #[error("downstream channel closed")]
     DownstreamClosed,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MissingMetadata must include the field name in its Display output.
+    #[test]
+    fn test_pipeline_error_display_missing_metadata() {
+        let err = PipelineError::MissingMetadata("x-batch-id".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("x-batch-id"), "Display must include field name: {msg}");
+        assert!(msg.contains("missing metadata"), "Display prefix must be present: {msg}");
+    }
+
+    /// DownstreamClosed must display a human-readable message.
+    #[test]
+    fn test_pipeline_error_display_downstream_closed() {
+        let err = PipelineError::DownstreamClosed;
+        assert_eq!(err.to_string(), "downstream channel closed");
+    }
+
+    /// Internal error must include the context string in its Display output.
+    #[test]
+    fn test_pipeline_error_display_internal() {
+        let err = PipelineError::Internal("something went wrong".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("something went wrong"), "Display must include context: {msg}");
+    }
+
+    /// Arrow errors must be convertible to `PipelineError` via the `From` impl.
+    #[test]
+    fn test_pipeline_error_from_arrow_error() {
+        let arrow_err = arrow::error::ArrowError::CastError("bad cast".to_string());
+        let err: PipelineError = arrow_err.into();
+        assert!(
+            matches!(err, PipelineError::Arrow(_)),
+            "Arrow error must convert to PipelineError::Arrow"
+        );
+        // Display must show the static message (the Arrow variant)
+        assert_eq!(err.to_string(), "arrow operation failed");
+    }
+}
