@@ -214,10 +214,10 @@ mod tests {
     #[test]
     fn test_any_value_to_string_double() {
         let val = AnyValue {
-            value: Some(any_value::Value::DoubleValue(3.14)),
+            value: Some(any_value::Value::DoubleValue(123.45)),
         };
         let s = any_value_to_string(&val);
-        assert!(s.starts_with("3.14"), "expected '3.14…', got: {s}");
+        assert!(s.starts_with("123.45"), "expected '123.45…', got: {s}");
     }
 
     #[test]

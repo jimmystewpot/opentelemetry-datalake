@@ -891,7 +891,6 @@ mod tests {
     /// column even when the input batch has zero rows.
     #[test]
     fn test_inject_signal_type_column_empty_batch() {
-        use arrow::array::AsArray;
         use arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
