@@ -137,11 +137,18 @@ jobs:
       - name: cargo coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
+      - name: Upload coverage artifact for SonarQube
+        uses: actions/upload-artifact@65c4c4a1ddef5cb38d41a7d65f5773199c0953a9 # v4.6.0
+        with:
+          name: lcov-report
+          path: lcov.info
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
+
 
   smoke-test:
     needs: [lint, unit-test]
