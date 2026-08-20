@@ -138,7 +138,7 @@ jobs:
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage artifact for SonarQube
-        uses: actions/upload-artifact@65c4c4a1ddef5cb38d41a7d65f5773199c0953a9 # v4.6.0
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lcov-report
           path: lcov.info
