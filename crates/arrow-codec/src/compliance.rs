@@ -350,4 +350,71 @@ mod tests {
             "Off mode should always return Compliant"
         );
     }
+
+    /// A schema without the `otel::compliance::status` metadata key must
+    /// be identified as non-compliant by `is_schema_compliant`.
+    #[test]
+    fn test_is_schema_compliant_returns_false_for_untagged() {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "col",
+            DataType::Utf8,
+            false,
+        )]);
+        let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
+        assert!(
+            !engine.is_schema_compliant(&schema),
+            "Schema without compliance metadata must not be considered compliant"
+        );
+    }
+
+    /// Calling `tag_schema_compliant` twice must not duplicate the metadata
+    /// key — the second call must overwrite, not append.
+    #[test]
+    fn test_tag_schema_compliant_is_idempotent() {
+        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "col",
+            DataType::Utf8,
+            false,
+        )]);
+        let engine = ComplianceEngine::new(ComplianceMode::Strict, HashMap::new());
+
+        // Tag once
+        let tagged_once = engine.tag_schema_compliant(&schema);
+        // Tag again on the already-tagged schema
+        let tagged_twice = engine.tag_schema_compliant(&tagged_once);
+
+        assert!(engine.is_schema_compliant(&tagged_once));
+        assert!(engine.is_schema_compliant(&tagged_twice));
+        // Metadata map must contain exactly one entry for the key
+        let count = tagged_twice
+            .metadata()
+            .keys()
+            .filter(|k| *k == "otel::compliance::status")
+            .count();
+        assert_eq!(count, 1, "Metadata key must not be duplicated");
+    }
+
+    /// In Remap mode, if remapping still leaves the batch non-compliant
+    /// (e.g. service.name still missing after remap), the result must be
+    /// Quarantined rather than returning an error.
+    #[test]
+    fn test_compliance_engine_remap_still_non_compliant_quarantines() {
+        // Remap maps a key that doesn't exist in the batch, so service.name
+        // still won't be present after remapping.
+        let mut mappings = HashMap::new();
+        mappings.insert(
+            "nonexistent_key".to_string(),
+            "http.request.method".to_string(),
+        );
+
+        let engine = ComplianceEngine::new(ComplianceMode::Remap, mappings);
+        // Batch has no service.name and no key that can be remapped to fix it
+        let batch = make_test_batch(None, None);
+
+        let output = engine.assess_and_remap(batch).unwrap();
+        assert!(
+            matches!(output, ComplianceOutput::Quarantined(_)),
+            "Non-compliant batch after remap must be Quarantined, not error"
+        );
+    }
 }

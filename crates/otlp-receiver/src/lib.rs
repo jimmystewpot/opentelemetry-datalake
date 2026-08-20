@@ -501,4 +501,153 @@ mod tests {
         let result: Result<ExportLogsServiceRequest, _> = decode_http_body(&headers, body);
         assert!(result.is_err(), "Invalid JSON should fail decoding");
     }
+
+    /// A non-empty traces request on a closed channel must return UNAVAILABLE.
+    #[tokio::test]
+    async fn test_grpc_traces_backpressure_on_closed_channel() {
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let (tx, rx) = mpsc::channel(10);
+        let svc = GrpcTraceService { tx };
+        drop(rx);
+
+        let req = Request::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource::default()),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 2_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        let result = svc.export(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    /// A non-empty metrics request on a closed channel must return UNAVAILABLE.
+    #[tokio::test]
+    async fn test_grpc_metrics_backpressure_on_closed_channel() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+
+        let (tx, rx) = mpsc::channel(10);
+        let svc = GrpcMetricsService { tx };
+        drop(rx);
+
+        let req = Request::new(ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("svc".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_000_000_000,
+                                value: Some(
+                                    opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                                        1.0,
+                                    ),
+                                ),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        let result = svc.export(req).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
+    }
+
+    /// A non-empty gRPC logs request must push a SignalBatch::Logs onto the channel.
+    #[tokio::test]
+    async fn test_grpc_logs_non_empty_sends_to_channel() {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let svc = GrpcLogsService { tx };
+
+        let req = Request::new(ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        svc.export(req).await.unwrap();
+        let msg = rx.try_recv();
+        assert!(
+            msg.is_ok(),
+            "Non-empty logs request must push a batch to the channel"
+        );
+        assert!(
+            matches!(msg.unwrap(), SignalBatch::Logs(_)),
+            "Signal must be Logs variant"
+        );
+    }
+
+    /// A non-empty gRPC traces request must push a SignalBatch::Traces onto the channel.
+    #[tokio::test]
+    async fn test_grpc_traces_non_empty_sends_to_channel() {
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let svc = GrpcTraceService { tx };
+
+        let req = Request::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 2_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        svc.export(req).await.unwrap();
+        let msg = rx.try_recv();
+        assert!(
+            msg.is_ok(),
+            "Non-empty traces request must push a batch to the channel"
+        );
+        assert!(
+            matches!(msg.unwrap(), SignalBatch::Traces(_)),
+            "Signal must be Traces variant"
+        );
+    }
 }

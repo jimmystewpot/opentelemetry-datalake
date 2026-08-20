@@ -176,4 +176,78 @@ mod tests {
         ipc_sink.serialize_batch(&batch, &mut buffer).unwrap();
         assert!(!buffer.is_empty());
     }
+
+    /// "ipc", "json", and mixed-case variants must all parse successfully.
+    #[test]
+    fn test_serialization_format_from_str_valid() {
+        use std::str::FromStr;
+        assert!(matches!(
+            SerializationFormat::from_str("ipc").unwrap(),
+            SerializationFormat::Ipc
+        ));
+        assert!(matches!(
+            SerializationFormat::from_str("json").unwrap(),
+            SerializationFormat::Json
+        ));
+    }
+
+    /// An unrecognised format string must return a PipelineError::Internal error.
+    #[test]
+    fn test_serialization_format_from_str_invalid() {
+        use std::str::FromStr;
+        let result = SerializationFormat::from_str("avro");
+        assert!(
+            result.is_err(),
+            "Unknown format string must return an error"
+        );
+        assert!(
+            matches!(result.unwrap_err(), PipelineError::Internal(_)),
+            "Error must be PipelineError::Internal"
+        );
+    }
+
+    /// Parsing must be case-insensitive ("IPC", "JSON" are valid).
+    #[test]
+    fn test_serialization_format_from_str_case_insensitive() {
+        use std::str::FromStr;
+        assert!(SerializationFormat::from_str("IPC").is_ok());
+        assert!(SerializationFormat::from_str("JSON").is_ok());
+        assert!(SerializationFormat::from_str("Ipc").is_ok());
+    }
+
+    /// IPC-serialized bytes must be readable back via Arrow's StreamReader,
+    /// and the decoded schema and row count must match the original batch.
+    #[test]
+    fn test_kafka_sink_ipc_round_trip() {
+        let options = HashMap::new();
+        let sink = KafkaSink::try_new(
+            "localhost:9092",
+            "test-topic",
+            SerializationFormat::Ipc,
+            &options,
+        )
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "a",
+            arrow::datatypes::DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::Int32Array::from(vec![10, 20, 30]))],
+        )
+        .unwrap();
+
+        let mut buffer = Vec::new();
+        sink.serialize_batch(&batch, &mut buffer).unwrap();
+
+        // Decode the IPC stream back
+        let cursor = std::io::Cursor::new(&buffer);
+        let mut reader = arrow::ipc::reader::StreamReader::try_new(cursor, None).unwrap();
+        let decoded = reader.next().unwrap().unwrap();
+
+        assert_eq!(decoded.num_rows(), 3);
+        assert_eq!(*decoded.schema(), *schema);
+    }
 }

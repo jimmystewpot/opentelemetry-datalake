@@ -354,4 +354,184 @@ mod tests {
         let schema = batch.schema();
         assert_eq!(schema.fields().len(), 10);
     }
+
+    /// A Sum metric must produce one row per data point.
+    #[test]
+    fn test_decode_metrics_sum_type() {
+        use opentelemetry_proto::tonic::metrics::v1::{NumberDataPoint, Sum, metric};
+        let r_metric = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "request_total".to_string(),
+                    data: Some(metric::Data::Sum(Sum {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: Some(
+                                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(100.0),
+                            ),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// A Histogram metric must produce one row per data point using the
+    /// `sum` field (or count as fallback).
+    #[test]
+    fn test_decode_metrics_histogram_type() {
+        use opentelemetry_proto::tonic::metrics::v1::{Histogram, HistogramDataPoint, metric};
+        let r_metric = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "latency_ms".to_string(),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        data_points: vec![HistogramDataPoint {
+                            time_unix_nano: 2_000_000_000,
+                            count: 5,
+                            sum: Some(250.0),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        // The value column must contain the sum (250.0)
+        use arrow::array::AsArray;
+        let val = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0);
+        assert!((val - 250.0).abs() < f64::EPSILON);
+    }
+
+    /// A Gauge data point with an integer value must be stored as f64.
+    #[test]
+    fn test_decode_metrics_gauge_as_int_value() {
+        use arrow::array::AsArray;
+        let r_metric = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "cpu_count".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: Some(
+                                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(42),
+                            ),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        let val = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0);
+        assert!(
+            (val - 42.0).abs() < f64::EPSILON,
+            "AsInt must cast to f64: {val}"
+        );
+    }
+
+    /// A Gauge data point with no value set must default to 0.0.
+    #[test]
+    fn test_decode_metrics_gauge_none_value_defaults_to_zero() {
+        use arrow::array::AsArray;
+        let r_metric = ResourceMetrics {
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "empty_gauge".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: None,
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        let val = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0);
+        assert!(
+            (val - 0.0).abs() < f64::EPSILON,
+            "None value must default to 0.0: {val}"
+        );
+    }
+
+    /// When no resource is set, service_name must default to "unknown".
+    #[test]
+    fn test_decode_metrics_missing_resource_uses_unknown() {
+        use arrow::array::AsArray;
+        let r_metric = ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "no_resource_gauge".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000_000_000,
+                            value: Some(
+                                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(1.0),
+                            ),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        let svc = batch
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(svc, "unknown");
+    }
 }

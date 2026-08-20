@@ -185,4 +185,160 @@ mod tests {
         let schema = batch.schema();
         assert_eq!(schema.fields().len(), 13);
     }
+
+    /// Two resource_logs groups each containing one log must yield 2 rows.
+    #[test]
+    fn test_decode_logs_multiple_resource_logs() {
+        let make_resource_log = |service: &str| ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: opentelemetry_semantic_conventions::resource::SERVICE_NAME.to_string(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::StringValue(service.to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_000_000_000,
+                    severity_number: 9,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![make_resource_log("svc-a"), make_resource_log("svc-b")],
+        };
+        let batch = decode_logs(&req).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+    }
+
+    /// When resource is absent, service_name must fall back to "unknown".
+    #[test]
+    fn test_decode_logs_missing_resource_uses_unknown() {
+        use arrow::array::AsArray;
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: None,
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let batch = decode_logs(&req).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let svc = batch
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(svc, "unknown");
+    }
+
+    /// A log record without a body must result in an empty string body column.
+    #[test]
+    fn test_decode_logs_missing_body_is_empty_string() {
+        use arrow::array::AsArray;
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        body: None,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let batch = decode_logs(&req).unwrap();
+        let body = batch
+            .column_by_name("body")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(body, "", "Missing log body must produce an empty string");
+    }
+
+    /// Two scope_logs under the same resource must both contribute rows,
+    /// and their scope_name values must be recorded correctly.
+    #[test]
+    fn test_decode_logs_multiple_scopes() {
+        use arrow::array::AsArray;
+        use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![
+                    ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: "scope-a".to_string(),
+                            ..Default::default()
+                        }),
+                        log_records: vec![LogRecord {
+                            time_unix_nano: 1_000,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    ScopeLogs {
+                        scope: Some(InstrumentationScope {
+                            name: "scope-b".to_string(),
+                            ..Default::default()
+                        }),
+                        log_records: vec![LogRecord {
+                            time_unix_nano: 2_000,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+        };
+        let batch = decode_logs(&req).unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let scope_col = batch
+            .column_by_name("scope_name")
+            .unwrap()
+            .as_string::<i32>();
+        let names: std::collections::HashSet<&str> = (0..arrow::array::Array::len(scope_col))
+            .map(|i| scope_col.value(i))
+            .collect();
+        assert!(names.contains("scope-a"));
+        assert!(names.contains("scope-b"));
+    }
+
+    /// A log record with a timestamp exceeding i64::MAX must propagate an error.
+    #[test]
+    fn test_decode_logs_timestamp_overflow_returns_error() {
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        // u64::MAX far exceeds i64::MAX
+                        time_unix_nano: u64::MAX,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let result = decode_logs(&req);
+        assert!(
+            result.is_err(),
+            "Timestamp overflow must return an error, not silently wrap"
+        );
+    }
 }

@@ -862,4 +862,90 @@ mod tests {
     fn test_default_max_payload_bytes_is_100mb() {
         assert_eq!(default_max_payload_bytes(), 104_857_600);
     }
+
+    /// All StarRocksFormat variants must produce expected Display strings.
+    #[test]
+    fn test_starrocks_format_display() {
+        assert_eq!(StarRocksFormat::Ipc.to_string(), "ipc");
+        assert_eq!(StarRocksFormat::Json.to_string(), "json");
+        assert_eq!(StarRocksFormat::Csv.to_string(), "csv");
+    }
+
+    /// make_label must produce distinct labels for all three signal type prefixes.
+    #[test]
+    fn test_make_label_for_all_signal_types() {
+        let logs_label = StarRocksSink::make_label("logs");
+        let metrics_label = StarRocksSink::make_label("metrics");
+        let traces_label = StarRocksSink::make_label("traces");
+
+        assert!(logs_label.starts_with("otel-logs-"));
+        assert!(metrics_label.starts_with("otel-metrics-"));
+        assert!(traces_label.starts_with("otel-traces-"));
+
+        // All labels must be unique
+        assert_ne!(logs_label, metrics_label);
+        assert_ne!(logs_label, traces_label);
+    }
+
+    /// inject_signal_type_column must successfully add a discriminator
+    /// column even when the input batch has zero rows.
+    #[test]
+    fn test_inject_signal_type_column_empty_batch() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let empty_batch = RecordBatch::new_empty(schema);
+
+        let result = StarRocksSink::inject_signal_type_column(&empty_batch, "signal_type", "logs");
+        assert!(
+            result.is_ok(),
+            "inject_signal_type_column must succeed on empty batch"
+        );
+        let batch = result.unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        // The signal_type column must still be present
+        assert!(
+            batch.column_by_name("signal_type").is_some(),
+            "signal_type column must be added even for zero-row batches"
+        );
+        // Its value array must have Utf8 type
+        let col = batch.column_by_name("signal_type").unwrap();
+        assert_eq!(*col.data_type(), DataType::Utf8);
+    }
+
+    /// inject_signal_type_column for a metrics signal must use "metrics" as the value.
+    #[test]
+    fn test_inject_signal_type_column_metrics_signal() {
+        use arrow::array::{AsArray, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))])
+                .unwrap();
+
+        let result =
+            StarRocksSink::inject_signal_type_column(&batch, "signal_type", "metrics").unwrap();
+        assert_eq!(result.num_rows(), 2);
+        let sig_col = result
+            .column_by_name("signal_type")
+            .unwrap()
+            .as_string::<i32>();
+        assert_eq!(sig_col.value(0), "metrics");
+        assert_eq!(sig_col.value(1), "metrics");
+    }
+
+    /// The PerSignal table mapping must correctly select the right table
+    /// for each signal type.
+    #[test]
+    fn test_table_mapping_per_signal_selects_correct_table() {
+        let mapping = TableMapping::PerSignal {
+            logs: "logs_tbl".to_string(),
+            metrics: "metrics_tbl".to_string(),
+            traces: "traces_tbl".to_string(),
+        };
+        assert_eq!(mapping.table_for("logs"), "logs_tbl");
+        assert_eq!(mapping.table_for("metrics"), "metrics_tbl");
+        assert_eq!(mapping.table_for("traces"), "traces_tbl");
+    }
 }
