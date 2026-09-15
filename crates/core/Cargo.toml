@@ -25,3 +25,7 @@ toml = { workspace = true }
 [[bench]]
 name = "fanout_bench"
 harness = false
+
+[[bench]]
+name = "sort_bench"
+harness = false
