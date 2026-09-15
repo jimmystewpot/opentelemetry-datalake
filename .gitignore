@@ -29,3 +29,4 @@ Thumbs.db
 # Test Outputs & Logs
 *.log
 tests/e2e/receiver.log
+lcov.info
