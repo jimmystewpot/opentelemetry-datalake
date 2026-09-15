@@ -2,7 +2,6 @@ use crate::{CatalogType, PartitionGranularity, SchemaMode};
 #[cfg(test)]
 use arrow::array::ArrayRef;
 use arrow::array::{Array, AsArray};
-use arrow::compute::{SortColumn, lexsort_to_indices};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -18,6 +17,9 @@ use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
 use pipeline_core::error::PipelineError;
 use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::sort::{
+    BatchSorter, MissingColumnAction, SignalType, SortColumnDef, SortConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,6 +81,9 @@ pub struct IcebergSinkConfig {
     /// are simulated. Used for testing without a live catalog.
     #[serde(default)]
     pub dry_run: bool,
+    /// Optional pre-sorting configuration per telemetry signal.
+    #[serde(default)]
+    pub order_by: Option<SortConfig>,
 }
 
 impl Default for IcebergSinkConfig {
@@ -97,6 +102,7 @@ impl Default for IcebergSinkConfig {
             batching: None,
             properties: HashMap::new(),
             dry_run: false,
+            order_by: None,
         }
     }
 }
@@ -137,130 +143,59 @@ impl TableBuffer {
 pub struct IcebergSink {
     config: IcebergSinkConfig,
     buffers: std::collections::HashMap<String, TableBuffer>,
+    sorter: BatchSorter,
 }
 
 impl IcebergSink {
     /// Creates a new `IcebergSink` from configuration.
     #[must_use]
     pub fn new(config: IcebergSinkConfig) -> Self {
+        let sorter = if let Some(ref sort_cfg) = config.order_by {
+            BatchSorter::from_config(sort_cfg).unwrap_or_default()
+        } else {
+            // Default legacy Iceberg sort configuration
+            let default_cfg = SortConfig {
+                on_missing_column: MissingColumnAction::Error,
+                logs: vec![
+                    SortColumnDef::Shorthand("service_name ASC".to_string()),
+                    SortColumnDef::Shorthand("severity_text ASC".to_string()),
+                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
+                ],
+                metrics: vec![
+                    SortColumnDef::Shorthand("service_name ASC".to_string()),
+                    SortColumnDef::Shorthand("name ASC".to_string()),
+                    SortColumnDef::Shorthand("attributes ASC".to_string()),
+                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
+                ],
+                traces: vec![
+                    SortColumnDef::Shorthand("service_name ASC".to_string()),
+                    SortColumnDef::Shorthand("name ASC".to_string()),
+                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
+                ],
+            };
+            BatchSorter::from_config(&default_cfg).unwrap_or_default()
+        };
+
         Self {
             config,
             buffers: std::collections::HashMap::new(),
+            sorter,
         }
     }
 
-    /// Sorts a log batch based on the (`ServiceName`, `SeverityText`, `Timestamp`) tuple.
+    /// Sorts a log batch based on the configured or default sort order.
     pub fn sort_logs(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let service_name_col = batch
-            .column_by_name("service_name")
-            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
-            .clone();
-
-        let severity_col = batch
-            .column_by_name("severity_text")
-            .ok_or_else(|| PipelineError::Internal("Missing severity_text".to_string()))?
-            .clone();
-
-        let timestamp_col = batch
-            .column_by_name("timestamp")
-            .ok_or_else(|| PipelineError::Internal("Missing timestamp".to_string()))?
-            .clone();
-
-        let sort_cols = vec![
-            SortColumn {
-                values: service_name_col,
-                options: None,
-            },
-            SortColumn {
-                values: severity_col,
-                options: None,
-            },
-            SortColumn {
-                values: timestamp_col,
-                options: None,
-            },
-        ];
-
-        sort_batch(batch, &sort_cols)
+        self.sorter.sort(batch, SignalType::Logs)
     }
 
-    /// Sorts a metrics batch based on the (`ServiceName`, `MetricName`, `Attributes`, `Timestamp`) tuple.
+    /// Sorts a metrics batch based on the configured or default sort order.
     pub fn sort_metrics(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let service_name_col = batch
-            .column_by_name("service_name")
-            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
-            .clone();
-
-        let name_col = batch
-            .column_by_name("name")
-            .ok_or_else(|| PipelineError::Internal("Missing name".to_string()))?
-            .clone();
-
-        let attributes_col = batch
-            .column_by_name("attributes")
-            .ok_or_else(|| PipelineError::Internal("Missing attributes".to_string()))?
-            .clone();
-
-        let timestamp_col = batch
-            .column_by_name("timestamp")
-            .ok_or_else(|| PipelineError::Internal("Missing timestamp".to_string()))?
-            .clone();
-
-        let sort_cols = vec![
-            SortColumn {
-                values: service_name_col,
-                options: None,
-            },
-            SortColumn {
-                values: name_col,
-                options: None,
-            },
-            SortColumn {
-                values: attributes_col,
-                options: None,
-            },
-            SortColumn {
-                values: timestamp_col,
-                options: None,
-            },
-        ];
-
-        sort_batch(batch, &sort_cols)
+        self.sorter.sort(batch, SignalType::Metrics)
     }
 
-    /// Sorts a traces batch based on the (`ServiceName`, `SpanName`, `Timestamp`) tuple.
+    /// Sorts a traces batch based on the configured or default sort order.
     pub fn sort_traces(&self, batch: &RecordBatch) -> Result<RecordBatch, PipelineError> {
-        let service_name_col = batch
-            .column_by_name("service_name")
-            .ok_or_else(|| PipelineError::Internal("Missing service_name".to_string()))?
-            .clone();
-
-        let name_col = batch
-            .column_by_name("name")
-            .ok_or_else(|| PipelineError::Internal("Missing name (span name)".to_string()))?
-            .clone();
-
-        let timestamp_col = batch
-            .column_by_name("timestamp")
-            .ok_or_else(|| PipelineError::Internal("Missing timestamp".to_string()))?
-            .clone();
-
-        let sort_cols = vec![
-            SortColumn {
-                values: service_name_col,
-                options: None,
-            },
-            SortColumn {
-                values: name_col,
-                options: None,
-            },
-            SortColumn {
-                values: timestamp_col,
-                options: None,
-            },
-        ];
-
-        sort_batch(batch, &sort_cols)
+        self.sorter.sort(batch, SignalType::Traces)
     }
 
     /// Appends `SchemaMode` compliance (including catalog-based field pruning).
@@ -348,20 +283,6 @@ impl IcebergSink {
             }
         }
     }
-}
-
-/// Helper function to lexically sort a `RecordBatch` by sort columns.
-fn sort_batch(batch: &RecordBatch, sort_cols: &[SortColumn]) -> Result<RecordBatch, PipelineError> {
-    let indices = lexsort_to_indices(sort_cols, None).map_err(PipelineError::Arrow)?;
-
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(PipelineError::Arrow)?;
-
-    RecordBatch::try_new(batch.schema(), columns).map_err(PipelineError::Arrow)
 }
 
 /// Computes partition paths according to ISO-8601 derived timestamp rules.
@@ -760,7 +681,7 @@ impl Sink for IcebergSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{AsArray, StringArray};
+    use arrow::array::{AsArray, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -831,6 +752,41 @@ mod tests {
         assert_eq!(sev_col.value(0), "INFO");
         assert_eq!(sev_col.value(1), "WARN");
         assert_eq!(sev_col.value(2), "ERROR");
+    }
+
+    #[test]
+    fn test_iceberg_sink_custom_order_by() {
+        let mut cfg = IcebergSinkConfig::default();
+        cfg.order_by = Some(pipeline_core::sort::SortConfig {
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "timestamp DESC".to_string(),
+            )],
+            ..Default::default()
+        });
+        let sink = IcebergSink::new(cfg);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["svc", "svc"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sink.sort_logs(&batch).expect("should sort");
+        let ts = sorted
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts.value(0), 20);
+        assert_eq!(ts.value(1), 10);
     }
 
     #[test]
@@ -1216,7 +1172,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow::array::StringArray::from(vec!["INFO"])) as ArrayRef],
+            vec![Arc::new(arrow::array::StringArray::from(vec!["INFO", "WARN"])) as ArrayRef],
         )
         .unwrap();
 
@@ -1241,7 +1197,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema,
-            vec![Arc::new(arrow::array::StringArray::from(vec!["svc"])) as ArrayRef],
+            vec![Arc::new(arrow::array::StringArray::from(vec!["svc", "svc2"])) as ArrayRef],
         )
         .unwrap();
 
