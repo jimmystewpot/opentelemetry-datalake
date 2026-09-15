@@ -175,7 +175,8 @@ allow = [
 # If true, workspace members are automatically allowed even when using deny-by-default
 # This is useful for organizations that want to deny all external dependencies by default
 # but allow their own workspace crates without having to explicitly list them
-allow-workspace = false
+# (allow-workspace is deprecated in cargo-deny 0.18+)
+
 # List of crates to deny
 deny = [
     #"ansi_term@0.11.0",
