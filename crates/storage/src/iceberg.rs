@@ -150,29 +150,34 @@ impl IcebergSink {
     /// Creates a new `IcebergSink` from configuration.
     #[must_use]
     pub fn new(config: IcebergSinkConfig) -> Self {
+        let default_cfg = SortConfig {
+            on_missing_column: MissingColumnAction::Error,
+            logs: vec![
+                SortColumnDef::Shorthand("service_name ASC".to_string()),
+                SortColumnDef::Shorthand("severity_text ASC".to_string()),
+                SortColumnDef::Shorthand("timestamp ASC".to_string()),
+            ],
+            metrics: vec![
+                SortColumnDef::Shorthand("service_name ASC".to_string()),
+                SortColumnDef::Shorthand("name ASC".to_string()),
+                SortColumnDef::Shorthand("attributes ASC".to_string()),
+                SortColumnDef::Shorthand("timestamp ASC".to_string()),
+            ],
+            traces: vec![
+                SortColumnDef::Shorthand("service_name ASC".to_string()),
+                SortColumnDef::Shorthand("name ASC".to_string()),
+                SortColumnDef::Shorthand("timestamp ASC".to_string()),
+            ],
+        };
+
         let sorter = if let Some(ref sort_cfg) = config.order_by {
-            BatchSorter::from_config(sort_cfg).unwrap_or_default()
+            BatchSorter::from_config(sort_cfg).unwrap_or_else(|err| {
+                tracing::error!(
+                    "Invalid Iceberg order_by configuration: {err}; falling back to default legacy sorting"
+                );
+                BatchSorter::from_config(&default_cfg).unwrap_or_default()
+            })
         } else {
-            // Default legacy Iceberg sort configuration
-            let default_cfg = SortConfig {
-                on_missing_column: MissingColumnAction::Error,
-                logs: vec![
-                    SortColumnDef::Shorthand("service_name ASC".to_string()),
-                    SortColumnDef::Shorthand("severity_text ASC".to_string()),
-                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
-                ],
-                metrics: vec![
-                    SortColumnDef::Shorthand("service_name ASC".to_string()),
-                    SortColumnDef::Shorthand("name ASC".to_string()),
-                    SortColumnDef::Shorthand("attributes ASC".to_string()),
-                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
-                ],
-                traces: vec![
-                    SortColumnDef::Shorthand("service_name ASC".to_string()),
-                    SortColumnDef::Shorthand("name ASC".to_string()),
-                    SortColumnDef::Shorthand("timestamp ASC".to_string()),
-                ],
-            };
             BatchSorter::from_config(&default_cfg).unwrap_or_default()
         };
 
@@ -756,36 +761,109 @@ mod tests {
 
     #[test]
     fn test_iceberg_sink_custom_order_by() {
-        let mut cfg = IcebergSinkConfig::default();
-        cfg.order_by = Some(pipeline_core::sort::SortConfig {
-            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
-                "timestamp DESC".to_string(),
-            )],
+        let cfg = IcebergSinkConfig {
+            order_by: Some(pipeline_core::sort::SortConfig {
+                logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                    "timestamp DESC".to_string(),
+                )],
+                metrics: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                    "timestamp DESC".to_string(),
+                )],
+                traces: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                    "timestamp DESC".to_string(),
+                )],
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let sink = IcebergSink::new(cfg);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("service_name", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8, false),
             Field::new("timestamp", DataType::Int64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(StringArray::from(vec!["svc", "svc"])),
+                Arc::new(StringArray::from(vec!["op", "op"])),
                 Arc::new(Int64Array::from(vec![10, 20])),
             ],
         )
         .unwrap();
 
-        let sorted = sink.sort_logs(&batch).expect("should sort");
+        // Verify custom order_by applied to logs
+        let sorted_logs = sink.sort_logs(&batch).expect("should sort logs");
+        let ts_logs = sorted_logs
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts_logs.value(0), 20);
+        assert_eq!(ts_logs.value(1), 10);
+
+        // Verify custom order_by applied to metrics
+        let sorted_metrics = sink.sort_metrics(&batch).expect("should sort metrics");
+        let ts_metrics = sorted_metrics
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts_metrics.value(0), 20);
+        assert_eq!(ts_metrics.value(1), 10);
+
+        // Verify custom order_by applied to traces
+        let sorted_traces = sink.sort_traces(&batch).expect("should sort traces");
+        let ts_traces = sorted_traces
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ts_traces.value(0), 20);
+        assert_eq!(ts_traces.value(1), 10);
+    }
+
+    #[test]
+    fn test_iceberg_sink_invalid_order_by_fallback() {
+        let cfg = IcebergSinkConfig {
+            order_by: Some(pipeline_core::sort::SortConfig {
+                logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                    "invalid syntax here tokens".to_string(),
+                )],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sink = IcebergSink::new(cfg);
+
+        // Fallback sorter should use legacy sort keys which require service_name, severity_text, timestamp
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_text", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["svc", "svc"])),
+                Arc::new(StringArray::from(vec!["INFO", "WARN"])),
+                Arc::new(Int64Array::from(vec![20, 10])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sink.sort_logs(&batch).expect("should sort using fallback");
         let ts = sorted
             .column_by_name("timestamp")
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ts.value(0), 20);
+        assert_eq!(ts.value(0), 20); // Sorted by service_name then severity_text (INFO then WARN)
         assert_eq!(ts.value(1), 10);
     }
 
