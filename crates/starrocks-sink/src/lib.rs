@@ -176,6 +176,25 @@ fn default_retry_interval_secs() -> u64 {
     1
 }
 
+fn default_max_batch_size_bytes() -> usize {
+    52_428_800 // 50 MiB
+}
+
+fn default_max_batch_interval_sec() -> u64 {
+    30
+}
+
+/// Configuration for buffering and accumulating batches prior to stream loading.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StarRocksBatchingConfig {
+    #[serde(default = "default_max_batch_size_bytes")]
+    pub max_batch_size_bytes: usize,
+    #[serde(default = "default_max_batch_interval_sec")]
+    pub max_batch_interval_sec: u64,
+    #[serde(default)]
+    pub max_batch_records: Option<usize>,
+}
+
 /// Configuration for the `StarRocks` Stream Load sink.
 ///
 /// Credentials: `username` can be set in config; `password` should be supplied
@@ -239,6 +258,10 @@ pub struct StarRocksSinkConfig {
     /// Optional row order configuration for incoming signal batches.
     #[serde(default)]
     pub order_by: Option<pipeline_core::sort::SortConfig>,
+
+    /// Optional batch buffering configuration for accumulating records.
+    #[serde(default)]
+    pub batching: Option<StarRocksBatchingConfig>,
 }
 
 // ─── Sink ────────────────────────────────────────────────────────────────────
@@ -556,6 +579,67 @@ impl StarRocksSink {
         );
         Ok(())
     }
+    async fn send_batch(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+        signal_type_enum: pipeline_core::sort::SignalType,
+    ) -> Result<(), PipelineError> {
+        let signal_type = match signal_type_enum {
+            pipeline_core::sort::SignalType::Logs => "logs",
+            pipeline_core::sort::SignalType::Metrics => "metrics",
+            pipeline_core::sort::SignalType::Traces => "traces",
+        };
+
+        // For Unified mapping, inject the discriminator column before serialization.
+        let batch = if let Some(col_name) = self.config.table_mapping.signal_type_column() {
+            Self::inject_signal_type_column(batch, col_name, signal_type)?
+        } else {
+            batch.clone()
+        };
+
+        let table = self.config.table_mapping.table_for(signal_type).to_owned();
+        let label = Self::make_label(signal_type);
+        let payload = self.serialize_batch(&batch)?;
+
+        match self.config.transaction_mode {
+            TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
+            TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+        }
+
+        Ok(())
+    }
+
+    async fn flush_buffer(
+        &self,
+        batches: &mut Vec<arrow::record_batch::RecordBatch>,
+        bytes: &mut usize,
+        records: &mut usize,
+        signal_type: pipeline_core::sort::SignalType,
+    ) -> Result<(), PipelineError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let schema = batches[0].schema();
+        let refs: Vec<&arrow::record_batch::RecordBatch> = batches.iter().collect();
+        let combined =
+            arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
+
+        let sorted = self.sorter.sort(&combined, signal_type)?;
+        self.send_batch(&sorted, signal_type).await?;
+
+        batches.clear();
+        *bytes = 0;
+        *records = 0;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct BufferState {
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    bytes: usize,
+    records: usize,
 }
 
 #[async_trait]
@@ -573,43 +657,68 @@ impl Sink for StarRocksSink {
             "StarRocksSink started"
         );
 
-        while let Some(signal) = input.recv().await {
-            let signal_type_enum = match &signal {
-                SignalBatch::Logs(_) => pipeline_core::sort::SignalType::Logs,
-                SignalBatch::Metrics(_) => pipeline_core::sort::SignalType::Metrics,
-                SignalBatch::Traces(_) => pipeline_core::sort::SignalType::Traces,
-            };
+        let batching = self.config.batching.clone();
+        let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);
+        let max_interval = batching
+            .as_ref()
+            .map_or(86400, |b| b.max_batch_interval_sec);
+        let max_records = batching
+            .as_ref()
+            .and_then(|b| b.max_batch_records)
+            .unwrap_or(usize::MAX);
 
-            let signal_type = match signal_type_enum {
-                pipeline_core::sort::SignalType::Logs => "logs",
-                pipeline_core::sort::SignalType::Metrics => "metrics",
-                pipeline_core::sort::SignalType::Traces => "traces",
-            };
+        let mut logs_buf = BufferState::default();
+        let mut metrics_buf = BufferState::default();
+        let mut traces_buf = BufferState::default();
 
-            let batch = match signal {
-                SignalBatch::Logs(b) | SignalBatch::Metrics(b) | SignalBatch::Traces(b) => b,
-            };
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(max_interval));
+        interval.tick().await;
 
-            if batch.num_rows() == 0 {
-                continue;
-            }
+        loop {
+            tokio::select! {
+                _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
+                    self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
+                    self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
+                    self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
+                }
+                msg = input.recv() => {
+                    if let Some(signal) = msg {
+                        let (signal_type, batch) = match signal {
+                            SignalBatch::Logs(b) => (pipeline_core::sort::SignalType::Logs, b),
+                            SignalBatch::Metrics(b) => (pipeline_core::sort::SignalType::Metrics, b),
+                            SignalBatch::Traces(b) => (pipeline_core::sort::SignalType::Traces, b),
+                        };
 
-            let batch = self.sorter.sort(&batch, signal_type_enum)?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
 
-            // For Unified mapping, inject the discriminator column before serialization.
-            let batch = if let Some(col_name) = self.config.table_mapping.signal_type_column() {
-                Self::inject_signal_type_column(&batch, col_name, signal_type)?
-            } else {
-                batch
-            };
+                        if batching.is_none() {
+                            let sorted = self.sorter.sort(&batch, signal_type)?;
+                            self.send_batch(&sorted, signal_type).await?;
+                        } else {
+                            let buf = match signal_type {
+                                pipeline_core::sort::SignalType::Logs => &mut logs_buf,
+                                pipeline_core::sort::SignalType::Metrics => &mut metrics_buf,
+                                pipeline_core::sort::SignalType::Traces => &mut traces_buf,
+                            };
 
-            let table = self.config.table_mapping.table_for(signal_type).to_owned();
-            let label = Self::make_label(signal_type);
-            let payload = self.serialize_batch(&batch)?;
+                            buf.bytes += batch.get_array_memory_size();
+                            buf.records += batch.num_rows();
+                            buf.batches.push(batch);
 
-            match self.config.transaction_mode {
-                TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
-                TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+                            if buf.bytes >= max_bytes || buf.records >= max_records {
+                                self.flush_buffer(&mut buf.batches, &mut buf.bytes, &mut buf.records, signal_type).await?;
+                                interval.reset();
+                            }
+                        }
+                    } else {
+                        self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
+                        self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
+                        self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
+                        break;
+                    }
+                }
             }
         }
 
@@ -617,7 +726,6 @@ impl Sink for StarRocksSink {
         Ok(())
     }
 }
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -668,6 +776,7 @@ mod tests {
             max_retries: default_max_retries(),
             retry_interval_secs: default_retry_interval_secs(),
             order_by: None,
+            batching: None,
         }
     }
 
@@ -1220,6 +1329,48 @@ mod tests {
         assert!(
             matches!(err_wm, PipelineError::Internal(ref msg) if msg.contains("sort column shorthand")),
             "Expected sort column shorthand error from with_manager, got: {err_wm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_batch_accumulation_flush() {
+        let mut config = base_config();
+        config.connect_timeout_secs = 0;
+        config.request_timeout_secs = 0;
+        config.max_retries = 0;
+        config.retry_interval_secs = 0;
+
+        config.batching = Some(StarRocksBatchingConfig {
+            max_batch_size_bytes: 1024 * 1024,
+            max_batch_interval_sec: 10,
+            max_batch_records: Some(4),
+        });
+
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+
+        let handle = tokio::spawn(async move { sink.run(receiver).await });
+
+        // send 3 rows
+        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
+
+        // wait a little bit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // task should still be running because it's only 3 records < 4
+        assert!(!handle.is_finished(), "Task should still be buffering");
+
+        // send 3 more rows, bringing total to 6 > 4 (max_batch_records)
+        // This should trigger flush_buffer, which hits SDK, which fails because fast timeouts + 127.0.0.1
+        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
+
+        // Wait for task to finish due to network error from flush
+        let result = handle.await.unwrap();
+
+        assert!(
+            matches!(result, Err(PipelineError::DownstreamClosed)),
+            "Task should have failed on flush attempt, got: {:?}",
+            result
         );
     }
 }
