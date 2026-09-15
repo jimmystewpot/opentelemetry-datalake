@@ -20,6 +20,7 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+toml = { workspace = true }
 
 [[bench]]
 name = "fanout_bench"
