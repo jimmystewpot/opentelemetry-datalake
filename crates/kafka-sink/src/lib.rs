@@ -58,6 +58,9 @@ pub fn extract_partition_slices(
     if num_rows == 0 {
         return Ok(slices);
     }
+    if num_rows == 1 {
+        return Ok(vec![(str_arr.value(0).to_string(), batch.clone())]);
+    }
 
     let mut start = 0;
     let mut current_val = str_arr.value(0).to_string();
@@ -181,23 +184,15 @@ impl Sink for KafkaSink {
                 self.partition_key.as_deref(),
             )?;
 
-            if let Some(ref p_key) = self.partition_key {
-                let slices = extract_partition_slices(&sorted_batch, p_key)?;
-                for (key_str, sub_batch) in slices {
-                    self.serialize_batch(&sub_batch, &mut buffer)?;
-                    let record = FutureRecord::to(&self.topic).payload(&buffer).key(&key_str);
-                    if let Err((e, _)) = self
-                        .producer
-                        .send(record, tokio::time::Duration::from_secs(5))
-                        .await
-                    {
-                        tracing::error!("Failed to send record to Kafka: {e}");
-                        return Err(PipelineError::Internal(format!("Kafka send error: {e}")));
-                    }
-                }
+            let batches_to_send = if let Some(ref p_key) = self.partition_key {
+                extract_partition_slices(&sorted_batch, p_key)?
             } else {
-                self.serialize_batch(&sorted_batch, &mut buffer)?;
-                let record = FutureRecord::to(&self.topic).payload(&buffer).key("");
+                vec![(String::new(), sorted_batch)]
+            };
+
+            for (key_str, sub_batch) in batches_to_send {
+                self.serialize_batch(&sub_batch, &mut buffer)?;
+                let record = FutureRecord::to(&self.topic).payload(&buffer).key(&key_str);
                 if let Err((e, _)) = self
                     .producer
                     .send(record, tokio::time::Duration::from_secs(5))
@@ -336,8 +331,9 @@ mod tests {
             Field::new("service_name", DataType::Utf8, false),
             Field::new("val", DataType::Int32, false),
         ]));
+
         let batch = RecordBatch::try_new(
-            schema,
+            schema.clone(),
             vec![
                 Arc::new(arrow::array::StringArray::from(vec![
                     "auth", "auth", "billing", "gateway",
@@ -355,5 +351,32 @@ mod tests {
         assert_eq!(slices[1].1.num_rows(), 1);
         assert_eq!(slices[2].0, "gateway");
         assert_eq!(slices[2].1.num_rows(), 1);
+
+        // Test empty batch
+        let empty_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(Vec::<&str>::new())),
+                Arc::new(arrow::array::Int32Array::from(Vec::<i32>::new())),
+            ],
+        )
+        .unwrap();
+        let empty_slices = extract_partition_slices(&empty_batch, "service_name").expect("slices");
+        assert!(empty_slices.is_empty());
+
+        // Test single row batch
+        let single_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["auth"])),
+                Arc::new(arrow::array::Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let single_slices =
+            extract_partition_slices(&single_batch, "service_name").expect("slices");
+        assert_eq!(single_slices.len(), 1);
+        assert_eq!(single_slices[0].0, "auth");
+        assert_eq!(single_slices[0].1.num_rows(), 1);
     }
 }
