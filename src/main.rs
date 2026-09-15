@@ -35,6 +35,11 @@ struct KafkaConfig {
     logs_format: String,
     traces_format: String,
     metrics_format: String,
+    logs_partition_key: Option<String>,
+    metrics_partition_key: Option<String>,
+    traces_partition_key: Option<String>,
+    #[serde(default)]
+    order_by: Option<pipeline_core::sort::SortConfig>,
     #[serde(default)]
     options: HashMap<String, String>,
 }
@@ -279,26 +284,35 @@ async fn main() -> anyhow::Result<()> {
     } else if let Some(ref kafka_cfg) = config.kafka {
         tracing::info!("Initializing Kafka sinks");
 
+        let sorter = if let Some(ref sort_cfg) = kafka_cfg.order_by {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)?
+        } else {
+            pipeline_core::sort::BatchSorter::default()
+        };
+
         let mut logs_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.logs_topic,
             kafka_cfg.logs_format.parse()?,
             &kafka_cfg.options,
-        )?;
+        )?
+        .with_sorting(sorter.clone(), kafka_cfg.logs_partition_key.clone());
 
         let mut traces_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.traces_topic,
             kafka_cfg.traces_format.parse()?,
             &kafka_cfg.options,
-        )?;
+        )?
+        .with_sorting(sorter.clone(), kafka_cfg.traces_partition_key.clone());
 
         let mut metrics_sink = kafka_sink::KafkaSink::try_new(
             &kafka_cfg.brokers,
             &kafka_cfg.metrics_topic,
             kafka_cfg.metrics_format.parse()?,
             &kafka_cfg.options,
-        )?;
+        )?
+        .with_sorting(sorter, kafka_cfg.metrics_partition_key.clone());
 
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {
