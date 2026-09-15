@@ -346,9 +346,9 @@ async fn main() -> anyhow::Result<()> {
         let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
             starrocks_cfg.clone(),
             std::sync::Arc::clone(&shared_manager),
-        );
+        )?;
         let mut metrics_sink =
-            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager);
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager)?;
 
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {
