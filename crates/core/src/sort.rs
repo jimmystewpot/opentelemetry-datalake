@@ -219,7 +219,10 @@ impl BatchSorter {
             if let Some(col) = batch.column_by_name(lead) {
                 sort_cols.push(SortColumn {
                     values: Arc::clone(col),
-                    options: Some(SortOptions::default()),
+                    options: Some(SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    }),
                 });
             } else {
                 match self.on_missing_column {
@@ -476,6 +479,42 @@ mod tests {
             sorter.sort(&single, SignalType::Logs).unwrap().num_rows(),
             1
         );
+
+        // Verify bypass occurs before missing column evaluation when on_missing_column is Error
+        let config_missing_err = SortConfig {
+            on_missing_column: MissingColumnAction::Error,
+            logs: vec![SortColumnDef::Shorthand("non_existent ASC".to_string())],
+            ..Default::default()
+        };
+        let sorter_err = BatchSorter::from_config(&config_missing_err).unwrap();
+        assert_eq!(
+            sorter_err
+                .sort(&empty, SignalType::Logs)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        assert_eq!(
+            sorter_err
+                .sort(&single, SignalType::Logs)
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        assert_eq!(
+            sorter_err
+                .sort_with_extra_lead_column(&empty, SignalType::Logs, Some("missing_lead"))
+                .unwrap()
+                .num_rows(),
+            0
+        );
+        assert_eq!(
+            sorter_err
+                .sort_with_extra_lead_column(&single, SignalType::Logs, Some("missing_lead"))
+                .unwrap()
+                .num_rows(),
+            1
+        );
     }
 
     #[test]
@@ -670,5 +709,43 @@ mod tests {
             ..Default::default()
         };
         assert!(BatchSorter::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_batch_sorter_lead_column_nulls_placed_last() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("lead", DataType::Utf8, true),
+            Field::new("val", DataType::Int64, true),
+        ]));
+        let lead_array = Arc::new(StringArray::from(vec![Some("b"), None, Some("a")]));
+        let val_array = Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)]));
+        let batch = RecordBatch::try_new(schema, vec![lead_array, val_array]).unwrap();
+
+        let config = SortConfig::default();
+        let sorter = BatchSorter::from_config(&config).unwrap();
+        let sorted = sorter
+            .sort_with_extra_lead_column(&batch, SignalType::Logs, Some("lead"))
+            .expect("sort with lead column ok");
+
+        let lead_out = sorted
+            .column_by_name("lead")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let val_out = sorted
+            .column_by_name("val")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // "a" (val 3), then "b" (val 1), then NULL (val 2)
+        assert_eq!(lead_out.value(0), "a");
+        assert_eq!(val_out.value(0), 3);
+        assert_eq!(lead_out.value(1), "b");
+        assert_eq!(val_out.value(1), 1);
+        assert!(lead_out.is_null(2));
+        assert_eq!(val_out.value(2), 2);
     }
 }
