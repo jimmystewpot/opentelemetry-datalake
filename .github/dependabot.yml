@@ -15,6 +15,11 @@ updates:
           - "arrow*"
           - "parquet*"
           - "iceberg*"
+    ignore:
+      - dependency-name: "arrow"
+        versions: [">= 59.0.0"]
+      - dependency-name: "parquet"
+        versions: [">= 59.0.0"]
 
 
   - package-ecosystem: "github-actions"
