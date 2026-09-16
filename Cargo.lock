@@ -1776,6 +1776,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "httpdate",
  "itoa",
  "pipeline-core",
  "reqwest 0.12.28",

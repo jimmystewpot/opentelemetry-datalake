@@ -1,7 +1,7 @@
 //! HTTP client implementation for Elasticsearch and `OpenSearch` clusters.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -244,6 +244,17 @@ struct SimulateIndexResponse {
     template: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
+/// Internal error categorized during index template existence verification across endpoints.
+#[derive(Debug)]
+enum TemplateCheckError {
+    /// Authentication or authorization failure (HTTP 401/403).
+    Auth(String),
+    /// Network connection or transport failure.
+    Transport(String),
+    /// Validation rejection (e.g. HTTP 404 template missing or empty array).
+    Validation(String),
+}
+
 /// High-performance HTTP client for Elasticsearch and `OpenSearch` clusters.
 ///
 /// Manages connection pooling, client-side round-robin endpoint selection,
@@ -254,6 +265,8 @@ pub struct HttpClient {
     client: reqwest::Client,
     /// List of normalized cluster endpoint base URLs (without trailing slashes).
     endpoints: Vec<String>,
+    /// Cooldown expiration timestamps (seconds since UNIX epoch) for each endpoint.
+    endpoint_cooldowns: Arc<Vec<AtomicU64>>,
     /// Shared atomic counter for round-robin endpoint distribution.
     current_endpoint: Arc<AtomicUsize>,
     /// Configured authentication credentials.
@@ -317,9 +330,12 @@ impl HttpClient {
 
         let client = builder.build()?;
 
+        let cooldowns = (0..endpoints.len()).map(|_| AtomicU64::new(0)).collect();
+
         Ok(Self {
             client,
             endpoints,
+            endpoint_cooldowns: Arc::new(cooldowns),
             current_endpoint: Arc::new(AtomicUsize::new(0)),
             auth: config.auth.clone(),
             #[cfg(feature = "aws")]
@@ -330,11 +346,75 @@ impl HttpClient {
         })
     }
 
-    /// Returns the next cluster endpoint base URL in round-robin sequence.
+    /// Returns the next cluster endpoint base URL in round-robin sequence,
+    /// skipping nodes that are currently in cooldown unless all nodes are in cooldown.
     #[must_use]
     pub fn next_endpoint(&self) -> &str {
-        let idx = self.current_endpoint.fetch_add(1, Ordering::Relaxed);
-        &self.endpoints[idx % self.endpoints.len()]
+        let count = self.endpoints.len();
+        if count == 0 {
+            return "";
+        }
+        if count == 1 {
+            return self.endpoints.first().map_or("", String::as_str);
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let start_idx = self.current_endpoint.fetch_add(1, Ordering::Relaxed) % count;
+
+        for offset in 0..count {
+            let candidate = (start_idx.saturating_add(offset)) % count;
+            let cooldown = self
+                .endpoint_cooldowns
+                .get(candidate)
+                .map_or(0, |a| a.load(Ordering::Relaxed));
+            if cooldown <= now {
+                return self.endpoints.get(candidate).map_or("", String::as_str);
+            }
+        }
+
+        // If all endpoints are in cooldown, fallback to round-robin start index
+        self.endpoints.get(start_idx).map_or("", String::as_str)
+    }
+
+    /// Marks an endpoint as failed, placing it into cooldown for 10 seconds.
+    pub fn mark_endpoint_failed(&self, endpoint: &str) {
+        let trimmed = endpoint.trim().trim_end_matches('/');
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let cooldown_until = now.saturating_add(10);
+
+        let atomic_opt = self
+            .endpoints
+            .iter()
+            .position(|ep| ep == trimmed)
+            .and_then(|pos| self.endpoint_cooldowns.get(pos));
+        if let Some(atomic) = atomic_opt {
+            atomic.store(cooldown_until, Ordering::Relaxed);
+            tracing::warn!(
+                endpoint = %trimmed,
+                cooldown_secs = 10,
+                "Endpoint marked as failed; placed in cooldown"
+            );
+        }
+    }
+
+    /// Returns true if the given endpoint is currently in cooldown.
+    #[must_use]
+    pub fn is_endpoint_in_cooldown(&self, endpoint: &str) -> bool {
+        let trimmed = endpoint.trim().trim_end_matches('/');
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        self.endpoints
+            .iter()
+            .position(|ep| ep == trimmed)
+            .and_then(|pos| self.endpoint_cooldowns.get(pos))
+            .is_some_and(|atomic| atomic.load(Ordering::Relaxed) > now)
     }
 
     /// Returns the slice of configured cluster endpoint base URLs.
@@ -553,10 +633,10 @@ impl HttpClient {
     /// Dispatches a single HTTP bulk request with round-robin endpoint selection, gzip compression, and authentication.
     async fn post_bulk_request(
         &self,
+        endpoint: &str,
         data_stream: &str,
         payload: &Bytes,
     ) -> Result<reqwest::Response, ElasticsearchError> {
-        let endpoint = self.next_endpoint();
         let url = format!("{endpoint}/{data_stream}/_bulk");
 
         let (body, is_gzipped) = if self.gzip_compression && !payload.is_empty() {
@@ -648,6 +728,60 @@ impl HttpClient {
         recoverable_sub_indices
     }
 
+    /// Delays between bulk retry attempts, respecting `Retry-After` if present or using backoff.
+    async fn handle_bulk_transient_delay(&self, response: &reqwest::Response, attempt: usize) {
+        if let Some(delay) = parse_retry_after(response) {
+            let capped = delay.min(Duration::from_secs(60));
+            if self.retry_interval_secs == 0 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(capped).await;
+            }
+        } else {
+            self.sleep_backoff(attempt).await;
+        }
+    }
+
+    /// Prepares the next payload and indices for retrying items that failed with 429/503.
+    fn prepare_sub_payload_retry(
+        current_payload: &Bytes,
+        final_items: &[BulkItemWrapper],
+        active_indices: &[usize],
+    ) -> Result<Option<(Bytes, Vec<usize>)>, ElasticsearchError> {
+        let recoverable_sub_indices = Self::inspect_active_items(final_items, active_indices);
+        if recoverable_sub_indices.is_empty() {
+            return Ok(None);
+        }
+        let next_payload = extract_sub_payload(current_payload, &recoverable_sub_indices)?;
+        let next_indices = recoverable_sub_indices
+            .into_iter()
+            .filter_map(|sub_idx| active_indices.get(sub_idx).copied())
+            .collect();
+        Ok(Some((next_payload, next_indices)))
+    }
+
+    /// Validates non-transient HTTP response status codes, returning errors for 401/403 or other non-success.
+    async fn check_bulk_status(
+        response: reqwest::Response,
+        attempt: usize,
+    ) -> Result<reqwest::Response, ElasticsearchError> {
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(ElasticsearchError::AuthenticationFailed(format!(
+                "HTTP {status}: {err_text}"
+            )));
+        }
+        if !status.is_success() {
+            let err_text = response.text().await.unwrap_or_default();
+            return Err(ElasticsearchError::BulkFailed {
+                retries: attempt,
+                message: format!("HTTP {status}: {err_text}"),
+            });
+        }
+        Ok(response)
+    }
+
     /// Sends a serialized NDJSON bulk payload targeting `POST /<data_stream>/_bulk`.
     ///
     /// Applies round-robin node selection, gzip compression (if enabled), authentication,
@@ -674,11 +808,16 @@ impl HttpClient {
         let mut total_took: u64 = 0;
 
         loop {
-            match self.post_bulk_request(data_stream, &current_payload).await {
+            let endpoint = self.next_endpoint();
+            match self
+                .post_bulk_request(endpoint, data_stream, &current_payload)
+                .await
+            {
                 Ok(response) => {
                     let status = response.status();
 
                     if Self::is_transient_http_status(status) {
+                        self.mark_endpoint_failed(endpoint);
                         attempt = attempt.saturating_add(1);
                         if attempt >= max_attempts {
                             return Err(ElasticsearchError::BulkFailed {
@@ -686,26 +825,11 @@ impl HttpClient {
                                 message: format!("HTTP {status} after {attempt} attempts"),
                             });
                         }
-                        self.sleep_backoff(attempt).await;
+                        self.handle_bulk_transient_delay(&response, attempt).await;
                         continue;
                     }
 
-                    if status == reqwest::StatusCode::UNAUTHORIZED
-                        || status == reqwest::StatusCode::FORBIDDEN
-                    {
-                        let err_text = response.text().await.unwrap_or_default();
-                        return Err(ElasticsearchError::AuthenticationFailed(format!(
-                            "HTTP {status}: {err_text}"
-                        )));
-                    }
-
-                    if !status.is_success() {
-                        let err_text = response.text().await.unwrap_or_default();
-                        return Err(ElasticsearchError::BulkFailed {
-                            retries: attempt,
-                            message: format!("HTTP {status}: {err_text}"),
-                        });
-                    }
+                    let response = Self::check_bulk_status(response, attempt).await?;
 
                     let bulk_resp: BulkResponse =
                         response.json().await.map_err(ElasticsearchError::Http)?;
@@ -722,40 +846,40 @@ impl HttpClient {
                         Self::merge_retry_items(&mut final_items, &active_indices, bulk_resp.items);
                     }
 
-                    let recoverable_sub_indices =
-                        Self::inspect_active_items(&final_items, &active_indices);
-
-                    if recoverable_sub_indices.is_empty() {
-                        let has_errors = final_items.iter().any(BulkItemWrapper::is_unrecoverable);
-                        return Ok(BulkResponse {
-                            took: total_took,
-                            errors: has_errors,
-                            items: final_items,
-                        });
+                    match Self::prepare_sub_payload_retry(
+                        &current_payload,
+                        &final_items,
+                        &active_indices,
+                    )? {
+                        None => {
+                            let has_errors =
+                                final_items.iter().any(BulkItemWrapper::is_unrecoverable);
+                            return Ok(BulkResponse {
+                                took: total_took,
+                                errors: has_errors,
+                                items: final_items,
+                            });
+                        }
+                        Some((next_payload, next_indices)) => {
+                            attempt = attempt.saturating_add(1);
+                            if attempt >= max_attempts {
+                                return Err(ElasticsearchError::BulkFailed {
+                                    retries: self.max_retries,
+                                    message: format!(
+                                        "{} items failed with recoverable status (429/503) after {} retries",
+                                        next_indices.len(),
+                                        self.max_retries
+                                    ),
+                                });
+                            }
+                            current_payload = next_payload;
+                            active_indices = next_indices;
+                            self.sleep_backoff(attempt).await;
+                        }
                     }
-
-                    attempt = attempt.saturating_add(1);
-                    if attempt >= max_attempts {
-                        return Err(ElasticsearchError::BulkFailed {
-                            retries: self.max_retries,
-                            message: format!(
-                                "{} items failed with recoverable status (429/503) after {} retries",
-                                recoverable_sub_indices.len(),
-                                self.max_retries
-                            ),
-                        });
-                    }
-
-                    current_payload =
-                        extract_sub_payload(&current_payload, &recoverable_sub_indices)?;
-                    active_indices = recoverable_sub_indices
-                        .into_iter()
-                        .filter_map(|sub_idx| active_indices.get(sub_idx).copied())
-                        .collect();
-
-                    self.sleep_backoff(attempt).await;
                 }
                 Err(err) => {
+                    self.mark_endpoint_failed(endpoint);
                     attempt = attempt.saturating_add(1);
                     if attempt >= max_attempts {
                         return Err(ElasticsearchError::BulkFailed {
@@ -772,152 +896,201 @@ impl HttpClient {
     /// Performs a startup cluster health check by sending `GET /`.
     ///
     /// Validates that the cluster is reachable, authenticated, and returns a valid version number.
+    /// Cycles through configured endpoints upon transport or server error, succeeding if any
+    /// endpoint responds successfully.
     pub async fn health_check(&self) -> Result<(), ElasticsearchError> {
-        let endpoint = self.next_endpoint();
-        let url = format!("{endpoint}/");
+        let mut errors = Vec::new();
+        let mut auth_error = None;
 
-        let req = self.client.get(&url);
-        let req = self.apply_auth_request(req, "GET", &url, &[]).await?;
+        for endpoint in &self.endpoints {
+            let url = format!("{endpoint}/");
+
+            let req = self.client.get(&url);
+            let req = match self.apply_auth_request(req, "GET", &url, &[]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    errors.push(format!("{endpoint}: auth signing failed: {e}"));
+                    continue;
+                }
+            };
+
+            let response = match req.send().await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    self.mark_endpoint_failed(endpoint);
+                    errors.push(format!(
+                        "failed to connect to cluster endpoint '{endpoint}': {e}"
+                    ));
+                    continue;
+                }
+            };
+
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+            {
+                self.mark_endpoint_failed(endpoint);
+                let msg = format!("health check authentication failed with HTTP {status}");
+                auth_error = Some(msg.clone());
+                errors.push(format!("{endpoint}: {msg}"));
+                continue;
+            }
+
+            if !status.is_success() {
+                self.mark_endpoint_failed(endpoint);
+                errors.push(format!(
+                    "health check against '{endpoint}' returned HTTP {status}"
+                ));
+                continue;
+            }
+
+            let info: ClusterInfo = match response.json().await {
+                Ok(info) => info,
+                Err(e) => {
+                    self.mark_endpoint_failed(endpoint);
+                    errors.push(format!(
+                        "failed to parse cluster info JSON from '{endpoint}': {e}"
+                    ));
+                    continue;
+                }
+            };
+
+            let Some(version_number) = info
+                .version
+                .map(|v| v.number)
+                .filter(|n| !n.trim().is_empty())
+            else {
+                self.mark_endpoint_failed(endpoint);
+                errors.push(format!(
+                    "cluster info from '{endpoint}' did not contain a valid version number"
+                ));
+                continue;
+            };
+
+            tracing::info!(
+                endpoint = %endpoint,
+                version = %version_number,
+                "Elasticsearch/OpenSearch cluster health check succeeded"
+            );
+
+            return Ok(());
+        }
+
+        if errors.len() == 1 {
+            if let Some(msg) = auth_error {
+                return Err(ElasticsearchError::AuthenticationFailed(msg));
+            }
+        } else if let Some(msg) = auth_error {
+            let all_auth = errors.iter().all(|e| e.contains("authentication failed"));
+            if all_auth {
+                return Err(ElasticsearchError::AuthenticationFailed(msg));
+            }
+        }
+
+        Err(ElasticsearchError::StartupValidation(format!(
+            "all cluster endpoints failed health check: {}",
+            errors.join("; ")
+        )))
+    }
+
+    /// Attempts template validation via simulate index on a single endpoint.
+    async fn check_simulate_index_template(
+        &self,
+        endpoint: &str,
+        data_stream: &str,
+    ) -> Result<bool, TemplateCheckError> {
+        let simulate_url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
+        let req = self.client.post(&simulate_url);
+        let req = self
+            .apply_auth_request(req, "POST", &simulate_url, &[])
+            .await
+            .map_err(|e| {
+                TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
+            })?;
 
         let response = req.send().await.map_err(|e| {
-            ElasticsearchError::StartupValidation(format!(
-                "failed to connect to cluster endpoint '{endpoint}': {e}"
+            TemplateCheckError::Transport(format!(
+                "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
             ))
         })?;
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ElasticsearchError::AuthenticationFailed(format!(
-                "health check authentication failed with HTTP {status}"
+            return Err(TemplateCheckError::Auth(format!(
+                "unauthorized to validate index template for '{data_stream}': HTTP {status}"
             )));
         }
 
         if !status.is_success() {
-            return Err(ElasticsearchError::StartupValidation(format!(
-                "health check against '{endpoint}' returned HTTP {status}"
-            )));
+            return Ok(false);
         }
 
-        let info: ClusterInfo = response.json().await.map_err(|e| {
-            ElasticsearchError::StartupValidation(format!(
-                "failed to parse cluster info JSON from '{endpoint}': {e}"
-            ))
-        })?;
-
-        let version_number = info
-            .version
-            .map(|v| v.number)
-            .filter(|n| !n.trim().is_empty())
-            .ok_or_else(|| {
-                ElasticsearchError::StartupValidation(format!(
-                    "cluster info from '{endpoint}' did not contain a valid version number"
-                ))
-            })?;
-
-        tracing::info!(
-            endpoint = %endpoint,
-            version = %version_number,
-            "Elasticsearch/OpenSearch cluster health check succeeded"
-        );
-
-        Ok(())
+        let parsed: Result<SimulateIndexResponse, _> = response.json().await;
+        match parsed {
+            Ok(p) if p.template.as_ref().is_some_and(|t| !t.is_empty()) => {
+                tracing::info!(
+                    endpoint = %endpoint,
+                    data_stream = %data_stream,
+                    "Index template validation succeeded via simulate_index"
+                );
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(e) => Err(TemplateCheckError::Validation(format!(
+                "failed to parse simulate index response for '{data_stream}' on '{endpoint}': {e}"
+            ))),
+        }
     }
 
-    /// Validates that a composable index template exists for the given data stream.
-    ///
-    /// First simulates index template matching via `POST /_index_template/_simulate_index/<data_stream>`
-    /// to locate any template matching the stream by `index_patterns`.
-    /// If simulation succeeds and returns a matched template, validation passes.
-    /// If simulation is unsupported (HTTP 404/405) or returns no template, falls back to
-    /// querying `GET /_index_template/<data_stream>` for exact template naming.
-    pub async fn validate_index_template(
+    /// Attempts template validation via get index template on a single endpoint.
+    async fn check_get_index_template(
         &self,
+        endpoint: &str,
         data_stream: &str,
-    ) -> Result<(), ElasticsearchError> {
-        let data_stream = data_stream.trim_matches('/');
-        let endpoint = self.next_endpoint();
-
-        // 1. Attempt POST /_index_template/_simulate_index/<data_stream> to match by index pattern
-        let simulate_url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
-        let req = self.client.post(&simulate_url);
-        let req = self
-            .apply_auth_request(req, "POST", &simulate_url, &[])
-            .await?;
-
-        match req.send().await {
-            Ok(response) => {
-                let status = response.status();
-                if status == reqwest::StatusCode::UNAUTHORIZED
-                    || status == reqwest::StatusCode::FORBIDDEN
-                {
-                    return Err(ElasticsearchError::AuthenticationFailed(format!(
-                        "unauthorized to validate index template for '{data_stream}': HTTP {status}"
-                    )));
-                }
-
-                if status.is_success() {
-                    let parsed: SimulateIndexResponse = response.json().await.map_err(|e| {
-                        ElasticsearchError::StartupValidation(format!(
-                            "failed to parse simulate index response for '{data_stream}': {e}"
-                        ))
-                    })?;
-
-                    if parsed.template.is_some_and(|template| !template.is_empty()) {
-                        tracing::info!(
-                            endpoint = %endpoint,
-                            data_stream = %data_stream,
-                            "Index template validation succeeded via simulate_index"
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-            Err(e) => {
-                return Err(ElasticsearchError::StartupValidation(format!(
-                    "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
-                )));
-            }
-        }
-
-        // 2. Fallback to GET /_index_template/<data_stream> for exact template naming
+    ) -> Result<(), TemplateCheckError> {
         let url = format!("{endpoint}/_index_template/{data_stream}");
         let req = self.client.get(&url);
-        let req = self.apply_auth_request(req, "GET", &url, &[]).await?;
+        let req = self
+            .apply_auth_request(req, "GET", &url, &[])
+            .await
+            .map_err(|e| {
+                TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
+            })?;
 
         let response = req.send().await.map_err(|e| {
-            ElasticsearchError::StartupValidation(format!(
+            TemplateCheckError::Transport(format!(
                 "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
             ))
         })?;
 
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(ElasticsearchError::StartupValidation(format!(
+            return Err(TemplateCheckError::Validation(format!(
                 "index template for data stream '{data_stream}' not found (HTTP 404)"
             )));
         }
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(ElasticsearchError::AuthenticationFailed(format!(
+            return Err(TemplateCheckError::Auth(format!(
                 "unauthorized to validate index template for '{data_stream}': HTTP {status}"
             )));
         }
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(ElasticsearchError::StartupValidation(format!(
-                "index template check for '{data_stream}' returned HTTP {status}: {body}"
+            return Err(TemplateCheckError::Transport(format!(
+                "index template check for '{data_stream}' on '{endpoint}' returned HTTP {status}: {body}"
             )));
         }
 
         let parsed: IndexTemplatesResponse = response.json().await.map_err(|e| {
-            ElasticsearchError::StartupValidation(format!(
-                "failed to parse index templates response for '{data_stream}': {e}"
+            TemplateCheckError::Transport(format!(
+                "failed to parse index templates response for '{data_stream}' on '{endpoint}': {e}"
             ))
         })?;
 
         if parsed.index_templates.is_empty() {
-            return Err(ElasticsearchError::StartupValidation(format!(
+            return Err(TemplateCheckError::Validation(format!(
                 "index template for data stream '{data_stream}' returned empty template list"
             )));
         }
@@ -927,8 +1100,81 @@ impl HttpClient {
             data_stream = %data_stream,
             "Index template validation succeeded via index_template query"
         );
-
         Ok(())
+    }
+
+    /// Validates that a composable index template exists for the given data stream.
+    ///
+    /// Iterates across configured endpoints. First simulates index template matching
+    /// via `POST /_index_template/_simulate_index/<data_stream>` to locate any template
+    /// matching the stream by `index_patterns`.
+    /// If simulation succeeds and returns a matched template, validation passes.
+    /// If simulation is unsupported (HTTP 404/405) or returns no template, falls back to
+    /// querying `GET /_index_template/<data_stream>` for exact template naming.
+    /// If transport or connection error occurs on an endpoint, fails over to the next endpoint.
+    pub async fn validate_index_template(
+        &self,
+        data_stream: &str,
+    ) -> Result<(), ElasticsearchError> {
+        let data_stream = data_stream.trim_matches('/');
+        let mut errors = Vec::new();
+        let mut auth_error = None;
+
+        for endpoint in &self.endpoints {
+            match self
+                .check_simulate_index_template(endpoint, data_stream)
+                .await
+            {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(TemplateCheckError::Auth(msg)) => {
+                    self.mark_endpoint_failed(endpoint);
+                    auth_error = Some(msg.clone());
+                    errors.push(format!("{endpoint}: {msg}"));
+                    continue;
+                }
+                Err(TemplateCheckError::Transport(msg)) => {
+                    self.mark_endpoint_failed(endpoint);
+                    errors.push(msg);
+                    continue;
+                }
+                Err(TemplateCheckError::Validation(msg)) => {
+                    errors.push(msg);
+                }
+            }
+
+            match self.check_get_index_template(endpoint, data_stream).await {
+                Ok(()) => return Ok(()),
+                Err(TemplateCheckError::Auth(msg)) => {
+                    self.mark_endpoint_failed(endpoint);
+                    auth_error = Some(msg.clone());
+                    errors.push(format!("{endpoint}: {msg}"));
+                }
+                Err(TemplateCheckError::Transport(msg)) => {
+                    self.mark_endpoint_failed(endpoint);
+                    errors.push(msg);
+                }
+                Err(TemplateCheckError::Validation(msg)) => {
+                    errors.push(msg);
+                }
+            }
+        }
+
+        if errors.len() == 1 {
+            if let Some(msg) = auth_error {
+                return Err(ElasticsearchError::AuthenticationFailed(msg));
+            }
+        } else if let Some(msg) = auth_error {
+            let all_auth = errors.iter().all(|e| e.contains("unauthorized"));
+            if all_auth {
+                return Err(ElasticsearchError::AuthenticationFailed(msg));
+            }
+        }
+
+        Err(ElasticsearchError::StartupValidation(format!(
+            "all cluster endpoints failed index template validation for '{data_stream}': {}",
+            errors.join("; ")
+        )))
     }
 
     /// Executes a jittered exponential backoff sleep.
@@ -951,6 +1197,30 @@ impl HttpClient {
         let total_backoff_ms = base_backoff.saturating_add(jitter_ms);
         tokio::time::sleep(Duration::from_millis(total_backoff_ms)).await;
     }
+
+    /// Parses the `Retry-After` HTTP header from a response if present.
+    #[must_use]
+    pub fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+        parse_retry_after(response)
+    }
+}
+
+/// Parses the `Retry-After` HTTP header from a response if present.
+///
+/// Supports both integer delay seconds (e.g. `15`) and HTTP-date formats.
+#[must_use]
+pub fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let val = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    let s = val.to_str().ok()?.trim();
+    if let Ok(seconds) = s.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    if let Ok(system_time) = httpdate::parse_http_date(s) {
+        let now = std::time::SystemTime::now();
+        let duration = system_time.duration_since(now).unwrap_or(Duration::ZERO);
+        return Some(duration);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2522,5 +2792,177 @@ mod tests {
         assert_eq!(resp.items[0].status(), Some(201));
         assert_eq!(resp.items[1].status(), Some(201));
         assert!(!resp.errors);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_succeeds_when_first_endpoint_is_unavailable() {
+        let server2 = MockServer::start().await;
+        let server1 = MockServer::start().await;
+        let uri1 = server1.uri();
+        drop(server1);
+
+        let info_json = r#"{
+            "name": "opensearch-node-2",
+            "cluster_name": "otel-cluster",
+            "version": {
+                "distribution": "opensearch",
+                "number": "2.17.0"
+            }
+        }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(info_json))
+            .mount(&server2)
+            .await;
+
+        let config = make_test_config(vec![uri1, server2.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        assert!(client.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_succeeds_when_first_endpoint_is_unavailable() {
+        let server2 = MockServer::start().await;
+        let server1 = MockServer::start().await;
+        let uri1 = server1.uri();
+        drop(server1);
+        let simulate_json = r#"{
+            "template": {
+                "settings": {
+                    "index": {
+                        "number_of_shards": "1"
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "@timestamp": { "type": "date" }
+                    }
+                }
+            },
+            "overlapping": []
+        }"#;
+
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(simulate_json))
+            .mount(&server2)
+            .await;
+
+        let config = make_test_config(vec![uri1, server2.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let res = client.validate_index_template("logs-otel-default").await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_parse_retry_after_numeric_seconds() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/retry-test"))
+            .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "15"))
+            .mount(&server)
+            .await;
+
+        let res = reqwest::get(format!("{}/retry-test", server.uri()))
+            .await
+            .unwrap();
+        let duration = parse_retry_after(&res);
+        assert_eq!(duration, Some(Duration::from_secs(15)));
+    }
+
+    #[tokio::test]
+    async fn test_parse_retry_after_http_date_and_missing() {
+        let server = MockServer::start().await;
+
+        let future_time = std::time::SystemTime::now() + Duration::from_secs(60);
+        let http_date_str = httpdate::fmt_http_date(future_time);
+
+        Mock::given(method("GET"))
+            .and(path("/date-test"))
+            .respond_with(
+                ResponseTemplate::new(503).append_header("Retry-After", http_date_str.as_str()),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/none-test"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let res_date = reqwest::get(format!("{}/date-test", server.uri()))
+            .await
+            .unwrap();
+        let duration = parse_retry_after(&res_date).unwrap();
+        assert!(duration.as_secs() >= 50 && duration.as_secs() <= 65);
+
+        let res_none = reqwest::get(format!("{}/none-test", server.uri()))
+            .await
+            .unwrap();
+        assert_eq!(parse_retry_after(&res_none), None);
+    }
+
+    #[test]
+    fn test_endpoint_cooldown_avoids_failed_endpoint() {
+        let ep1 = "http://node1:9200".to_string();
+        let ep2 = "http://node2:9200".to_string();
+        let config = make_test_config(vec![ep1.clone(), ep2.clone()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        client.mark_endpoint_failed(&ep1);
+        assert!(client.is_endpoint_in_cooldown(&ep1));
+        assert!(!client.is_endpoint_in_cooldown(&ep2));
+
+        for _ in 0..5 {
+            assert_eq!(client.next_endpoint(), ep2);
+        }
+
+        client.mark_endpoint_failed(&ep2);
+        assert!(client.is_endpoint_in_cooldown(&ep2));
+        let ep = client.next_endpoint();
+        assert!(ep == ep1 || ep == ep2);
+    }
+
+    #[tokio::test]
+    async fn test_send_bulk_multi_node_failover_on_429() {
+        let server1 = MockServer::start().await;
+        let server2 = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .append_header("Retry-After", "0")
+                    .set_body_string("cluster saturated"),
+            )
+            .mount(&server1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"took": 15, "errors": false, "items": []}"#),
+            )
+            .mount(&server2)
+            .await;
+
+        let mut config = make_test_config(vec![server1.uri(), server2.uri()]);
+        config.max_retries = 2;
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let payload = Bytes::from("{\"create\":{}}\n{\"msg\":\"failover test\"}\n");
+        let resp = client
+            .send_bulk("logs-otel-default", payload)
+            .await
+            .unwrap();
+
+        assert!(!resp.errors);
+        assert!(client.is_endpoint_in_cooldown(&server1.uri()));
+        assert!(!client.is_endpoint_in_cooldown(&server2.uri()));
     }
 }

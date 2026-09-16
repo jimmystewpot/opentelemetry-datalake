@@ -23,6 +23,7 @@ chrono = { workspace = true }
 itoa = "1"
 ryu = "1"
 flate2 = "1"
+httpdate = "1.0"
 
 # Optional AWS SigV4 signing
 aws-sigv4 = { version = "1", optional = true }
