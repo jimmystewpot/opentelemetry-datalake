@@ -42,12 +42,7 @@ pub enum ElasticsearchError {
 
 impl From<ElasticsearchError> for pipeline_core::error::PipelineError {
     fn from(err: ElasticsearchError) -> Self {
-        match err {
-            ElasticsearchError::AuthenticationFailed(_) | ElasticsearchError::BulkFailed { .. } => {
-                Self::DownstreamClosed
-            }
-            other => Self::Internal(other.to_string()),
-        }
+        Self::Storage(Box::new(err))
     }
 }
 
@@ -104,49 +99,47 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_error_conversion_downstream_closed() {
-        let auth_err = ElasticsearchError::AuthenticationFailed("unauthorized".to_string());
+    fn test_pipeline_error_conversion_preserves_root_cause_in_storage() {
+        let auth_err = ElasticsearchError::AuthenticationFailed("invalid api key 123".to_string());
         let pipeline_err: PipelineError = auth_err.into();
-        assert!(matches!(pipeline_err, PipelineError::DownstreamClosed));
+        assert!(matches!(pipeline_err, PipelineError::Storage(_)));
+        assert!(pipeline_err.to_string().contains("invalid api key 123"));
 
         let bulk_err = ElasticsearchError::BulkFailed {
             retries: 3,
-            message: "cluster saturated".to_string(),
+            message: "cluster saturated with 429".to_string(),
         };
         let pipeline_err2: PipelineError = bulk_err.into();
-        assert!(matches!(pipeline_err2, PipelineError::DownstreamClosed));
+        assert!(matches!(pipeline_err2, PipelineError::Storage(_)));
+        assert!(
+            pipeline_err2
+                .to_string()
+                .contains("cluster saturated with 429")
+        );
     }
 
     #[test]
-    fn test_pipeline_error_conversion_internal() {
+    fn test_pipeline_error_conversion_other_variants_to_storage() {
         let startup_err = ElasticsearchError::StartupValidation("missing template".to_string());
         let pipeline_err: PipelineError = startup_err.into();
-        match pipeline_err {
-            PipelineError::Internal(msg) => {
-                assert!(msg.contains("startup validation failed: missing template"));
-            }
-            other => panic!("expected PipelineError::Internal, got {other:?}"),
-        }
+        assert!(matches!(pipeline_err, PipelineError::Storage(_)));
+        assert!(pipeline_err.to_string().contains("missing template"));
 
         let serial_err = ElasticsearchError::Serialization("format issue".to_string());
         let pipeline_err2: PipelineError = serial_err.into();
-        match pipeline_err2 {
-            PipelineError::Internal(msg) => {
-                assert!(msg.contains("serialization error: format issue"));
-            }
-            other => panic!("expected PipelineError::Internal, got {other:?}"),
-        }
+        assert!(matches!(pipeline_err2, PipelineError::Storage(_)));
+        assert!(pipeline_err2.to_string().contains("format issue"));
 
         let size_err = ElasticsearchError::PayloadTooLarge {
             actual: 100,
             limit: 50,
         };
         let pipeline_err3: PipelineError = size_err.into();
-        match pipeline_err3 {
-            PipelineError::Internal(msg) => {
-                assert!(msg.contains("payload size 100 bytes exceeds limit 50 bytes"));
-            }
-            other => panic!("expected PipelineError::Internal, got {other:?}"),
-        }
+        assert!(matches!(pipeline_err3, PipelineError::Storage(_)));
+        assert!(
+            pipeline_err3
+                .to_string()
+                .contains("payload size 100 bytes exceeds limit 50 bytes")
+        );
     }
 }
