@@ -166,7 +166,8 @@ impl HttpClient {
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.request_timeout_secs))
             .tcp_keepalive(Duration::from_secs(60))
-            .tcp_nodelay(true);
+            .tcp_nodelay(true)
+            .gzip(true);
 
         if config.tls.insecure_skip_verify {
             builder = builder.danger_accept_invalid_certs(true);
@@ -222,6 +223,23 @@ impl HttpClient {
 
     /// Injects authentication credentials into an outgoing HTTP request builder.
     pub fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let default_url = self
+            .endpoints
+            .first()
+            .map_or("http://localhost:9200", |s| s.as_str());
+        self.apply_auth_request(req, "GET", default_url, &[])
+    }
+
+    /// Injects authentication credentials into an outgoing HTTP request builder with explicit
+    /// HTTP method, target URL, and body content for signature calculation.
+    #[cfg_attr(not(feature = "aws"), allow(unused_variables))]
+    pub fn apply_auth_request(
+        &self,
+        req: reqwest::RequestBuilder,
+        method: &str,
+        url: &str,
+        body: &[u8],
+    ) -> reqwest::RequestBuilder {
         match &self.auth {
             ElasticsearchAuthConfig::None => req,
             ElasticsearchAuthConfig::Basic { username, password } => {
@@ -233,23 +251,87 @@ impl HttpClient {
             ElasticsearchAuthConfig::Bearer { token } => req.bearer_auth(token),
             #[cfg(feature = "aws")]
             ElasticsearchAuthConfig::AwsSigv4 { region, service } => {
-                // When AWS feature is enabled, set custom AWS signing headers or pass-through
-                // if standard AWS environment credentials are provided.
                 if let (Ok(key), Ok(secret)) = (
                     std::env::var("AWS_ACCESS_KEY_ID"),
                     std::env::var("AWS_SECRET_ACCESS_KEY"),
                 ) {
-                    let mut r = req.header("X-Amz-Region", region.clone());
-                    r = r.header("X-Amz-Service", service.clone());
-                    if let Ok(token) = std::env::var("AWS_SESSION_TOKEN") {
-                        r = r.header("X-Amz-Security-Token", token);
-                    }
-                    r.basic_auth(key, Some(secret))
+                    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                    self.apply_aws_sigv4(
+                        req,
+                        method,
+                        url,
+                        body,
+                        region,
+                        service,
+                        &key,
+                        &secret,
+                        session_token.as_deref(),
+                    )
                 } else {
                     req
                 }
             }
         }
+    }
+
+    /// Signs an outgoing request with AWS `SigV4` using explicit credentials and adds signature headers.
+    #[cfg(feature = "aws")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_aws_sigv4(
+        &self,
+        mut req: reqwest::RequestBuilder,
+        method: &str,
+        url: &str,
+        body: &[u8],
+        region: &str,
+        service: &str,
+        access_key: &str,
+        secret_key: &str,
+        session_token: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let creds = aws_credential_types::Credentials::new(
+            access_key,
+            secret_key,
+            session_token.map(ToString::to_string),
+            None,
+            "elasticsearch-sink",
+        );
+        let identity = creds.into();
+        let signing_settings = aws_sigv4::http_request::SigningSettings::default();
+        let Ok(signing_params) = aws_sigv4::sign::v4::SigningParams::builder()
+            .identity(&identity)
+            .region(region)
+            .name(service)
+            .time(std::time::SystemTime::now())
+            .settings(signing_settings)
+            .build()
+        else {
+            return req;
+        };
+
+        let signing_params = signing_params.into();
+        let signable_body = if body.is_empty() {
+            aws_sigv4::http_request::SignableBody::Bytes(&[])
+        } else {
+            aws_sigv4::http_request::SignableBody::Bytes(body)
+        };
+
+        let Ok(signable_request) = aws_sigv4::http_request::SignableRequest::new(
+            method,
+            url,
+            std::iter::empty(),
+            signable_body,
+        ) else {
+            return req;
+        };
+
+        if let Ok(output) = aws_sigv4::http_request::sign(signable_request, &signing_params) {
+            let (instructions, _sig) = output.into_parts();
+            for (name, val) in instructions.headers() {
+                req = req.header(name, val);
+            }
+        }
+        req
     }
 
     /// Sends a serialized NDJSON bulk payload targeting `POST /<data_stream>/_bulk`.
@@ -261,6 +343,7 @@ impl HttpClient {
         data_stream: &str,
         payload: Bytes,
     ) -> Result<BulkResponse, ElasticsearchError> {
+        let data_stream = data_stream.trim_matches('/');
         let (body, is_gzipped) = if self.gzip_compression && !payload.is_empty() {
             let mut encoder =
                 flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -292,7 +375,7 @@ impl HttpClient {
                 req = req.header(CONTENT_ENCODING, "gzip");
             }
 
-            req = self.apply_auth(req);
+            req = self.apply_auth_request(req, "POST", &url, &body);
 
             match req.send().await {
                 Ok(response) => {
@@ -361,7 +444,7 @@ impl HttpClient {
         let url = format!("{endpoint}/");
 
         let req = self.client.get(&url);
-        let req = self.apply_auth(req);
+        let req = self.apply_auth_request(req, "GET", &url, &[]);
 
         let response = req.send().await.map_err(|e| {
             ElasticsearchError::StartupValidation(format!(
@@ -414,11 +497,12 @@ impl HttpClient {
         &self,
         data_stream: &str,
     ) -> Result<(), ElasticsearchError> {
+        let data_stream = data_stream.trim_matches('/');
         let endpoint = self.next_endpoint();
         let url = format!("{endpoint}/_index_template/{data_stream}");
 
         let req = self.client.get(&url);
-        let req = self.apply_auth(req);
+        let req = self.apply_auth_request(req, "GET", &url, &[]);
 
         let response = req.send().await.map_err(|e| {
             ElasticsearchError::StartupValidation(format!(
@@ -1166,5 +1250,224 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
         assert!(err.to_string().contains("empty template list"));
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn test_auth_headers_aws_sigv4() {
+        let mut config = make_test_config(vec![
+            "https://search-my-cluster.us-east-1.es.amazonaws.com".to_string(),
+        ]);
+        config.auth = ElasticsearchAuthConfig::AwsSigv4 {
+            region: "us-east-1".to_string(),
+            service: "es".to_string(),
+        };
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let req = client
+            .client
+            .post("https://search-my-cluster.us-east-1.es.amazonaws.com/logs-otel-default/_bulk");
+        let req = client.apply_aws_sigv4(
+            req,
+            "POST",
+            "https://search-my-cluster.us-east-1.es.amazonaws.com/logs-otel-default/_bulk",
+            b"{\"index\":{}}\n{\"msg\":\"hello\"}\n",
+            "us-east-1",
+            "es",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+        );
+        let request = req.build().unwrap();
+
+        let auth_hdr = request
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(auth_hdr.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+        assert!(auth_hdr.contains("/us-east-1/es/aws4_request"));
+        assert!(auth_hdr.contains("SignedHeaders="));
+        assert!(auth_hdr.contains("Signature="));
+
+        let date_hdr = request
+            .headers()
+            .get("x-amz-date")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!date_hdr.is_empty());
+        assert!(request.headers().get("x-amz-security-token").is_none());
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn test_auth_headers_aws_sigv4_with_session_token() {
+        let mut config = make_test_config(vec![
+            "https://search-my-cluster.us-east-1.es.amazonaws.com".to_string(),
+        ]);
+        config.auth = ElasticsearchAuthConfig::AwsSigv4 {
+            region: "us-east-1".to_string(),
+            service: "es".to_string(),
+        };
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let req = client
+            .client
+            .get("https://search-my-cluster.us-east-1.es.amazonaws.com/");
+        let req = client.apply_aws_sigv4(
+            req,
+            "GET",
+            "https://search-my-cluster.us-east-1.es.amazonaws.com/",
+            &[],
+            "us-east-1",
+            "es",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("AQoDYXdzEJr1EXAMPLETOKEN"),
+        );
+        let request = req.build().unwrap();
+
+        let auth_hdr = request
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(auth_hdr.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+
+        let token_hdr = request
+            .headers()
+            .get("x-amz-security-token")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(token_hdr, "AQoDYXdzEJr1EXAMPLETOKEN");
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn test_auth_headers_aws_sigv4_env_missing_passes_through() {
+        let mut config = make_test_config(vec![
+            "https://search-my-cluster.us-east-1.es.amazonaws.com".to_string(),
+        ]);
+        config.auth = ElasticsearchAuthConfig::AwsSigv4 {
+            region: "us-east-1".to_string(),
+            service: "es".to_string(),
+        };
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let req = client
+            .client
+            .get("https://search-my-cluster.us-east-1.es.amazonaws.com/");
+        // When AWS env credentials are not set, apply_auth_request leaves request untouched
+        let req = client.apply_auth(req);
+        let request = req.build().unwrap();
+
+        // If env vars were not present, no authorization header should be injected
+        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+            assert!(request.headers().get("authorization").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_bulk_data_stream_slash_sanitization() {
+        let server = MockServer::start().await;
+
+        let bulk_response_json = r#"{
+            "took": 10,
+            "errors": false,
+            "items": []
+        }"#;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(bulk_response_json))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let payload = Bytes::from("{\"index\":{}}\n{\"message\":\"test\"}\n");
+        let res = client.send_bulk("/logs-otel-default/", payload).await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_data_stream_slash_sanitization() {
+        let server = MockServer::start().await;
+
+        let template_json = r#"{
+            "index_templates": [
+                {
+                    "name": "logs-otel-default",
+                    "index_template": {
+                        "index_patterns": ["logs-otel-default*"],
+                        "data_stream": {}
+                    }
+                }
+            ]
+        }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(template_json))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let res = client.validate_index_template("/logs-otel-default/").await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_gzip_response_decompression() {
+        let server = MockServer::start().await;
+
+        let bulk_response_json = r#"{
+            "took": 25,
+            "errors": false,
+            "items": [
+                {
+                    "create": {
+                        "_index": "logs-otel-default-2026.09.16-000001",
+                        "_id": "doc_gzip",
+                        "status": 201
+                    }
+                }
+            ]
+        }"#;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, bulk_response_json.as_bytes()).unwrap();
+        let gzipped_bytes = encoder.finish().unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Encoding", "gzip")
+                    .set_body_bytes(gzipped_bytes),
+            )
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let payload = Bytes::from("{\"index\":{}}\n{\"msg\":\"hello\"}\n");
+        let resp = client
+            .send_bulk("logs-otel-default", payload)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.took, 25);
+        assert!(!resp.errors);
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].status(), Some(201));
     }
 }
