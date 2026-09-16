@@ -56,6 +56,7 @@ noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0", default-features = false }
 starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
+elasticsearch-sink = { path = "crates/elasticsearch-sink", version = "0.1.0" }
 
 # Async Runtime
 tokio = { version = "1.37", default-features = false, features = ["full"] }
