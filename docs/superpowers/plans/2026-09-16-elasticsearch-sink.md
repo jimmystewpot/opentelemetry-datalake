@@ -58,7 +58,7 @@ crates/elasticsearch-sink/
 **Interfaces:**
 - Produces: `ElasticsearchSinkConfig`, `ElasticsearchAuthConfig`, `ElasticsearchBatchingConfig`, `DataStreamMapping`, `TlsConfig`, `ElasticsearchError`
 
-- [ ] **Step 1: Create `crates/elasticsearch-sink/Cargo.toml`**
+- [x] **Step 1: Create `crates/elasticsearch-sink/Cargo.toml`**
 
 ```toml
 [package]
@@ -96,7 +96,7 @@ toml = { workspace = true }
 wiremock = "0.6"
 ```
 
-- [ ] **Step 2: Register crate in workspace root `Cargo.toml`**
+- [x] **Step 2: Register crate in workspace root `Cargo.toml`**
 
 Add to `[workspace.dependencies]` section (after line 58):
 ```toml
@@ -105,7 +105,7 @@ elasticsearch-sink = { path = "crates/elasticsearch-sink", version = "0.1.0" }
 
 Verify workspace members glob `crates/*` already covers the new crate (it does — line 20).
 
-- [ ] **Step 3: Create `crates/elasticsearch-sink/src/error.rs`**
+- [x] **Step 3: Create `crates/elasticsearch-sink/src/error.rs`**
 
 ```rust
 use thiserror::Error;
@@ -159,7 +159,7 @@ impl From<ElasticsearchError> for pipeline_core::error::PipelineError {
 }
 ```
 
-- [ ] **Step 4: Create `crates/elasticsearch-sink/src/tls.rs`**
+- [x] **Step 4: Create `crates/elasticsearch-sink/src/tls.rs`**
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -177,7 +177,7 @@ pub struct TlsConfig {
 }
 ```
 
-- [ ] **Step 5: Create `crates/elasticsearch-sink/src/config.rs`**
+- [x] **Step 5: Create `crates/elasticsearch-sink/src/config.rs`**
 
 ```rust
 use crate::tls::TlsConfig;
@@ -321,7 +321,7 @@ pub struct ElasticsearchSinkConfig {
 }
 ```
 
-- [ ] **Step 6: Create initial `crates/elasticsearch-sink/src/lib.rs`**
+- [x] **Step 6: Create initial `crates/elasticsearch-sink/src/lib.rs`**
 
 ```rust
 pub mod client;
@@ -334,7 +334,7 @@ pub use config::ElasticsearchSinkConfig;
 pub use error::ElasticsearchError;
 ```
 
-- [ ] **Step 7: Write config deserialization tests**
+- [x] **Step 7: Write config deserialization tests**
 
 Add to `crates/elasticsearch-sink/src/config.rs`:
 
@@ -400,18 +400,18 @@ mod tests {
 }
 ```
 
-- [ ] **Step 8: Run tests and verify they pass**
+- [x] **Step 8: Run tests and verify they pass**
 
 Run: `cargo test -p elasticsearch-sink`
 Expected: All 3 config tests PASS
 
-- [ ] **Step 9: Run clippy and fmt**
+- [x] **Step 9: Run clippy and fmt**
 
 Run: `cargo clippy -p elasticsearch-sink --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`
 Run: `cargo fmt --all -- --check`
 Expected: Zero warnings, zero formatting issues
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add crates/elasticsearch-sink/ Cargo.toml
@@ -429,7 +429,7 @@ git commit -m "feat(elasticsearch-sink): scaffold crate with config, error, and 
 - Consumes: `arrow::record_batch::RecordBatch`, `ElasticsearchSinkConfig.unpack_attributes` (bool), `ElasticsearchSinkConfig.max_payload_bytes` (usize)
 - Produces: `fn serialize_batch(batch: &RecordBatch, unpack_attributes: bool, max_payload_bytes: usize) -> Result<Bytes, ElasticsearchError>`
 
-- [ ] **Step 1: Write failing tests for NDJSON serialization**
+- [x] **Step 1: Write failing tests for NDJSON serialization**
 
 Add to `crates/elasticsearch-sink/src/serializer.rs`:
 
@@ -674,17 +674,17 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests and verify they pass**
+- [x] **Step 2: Run tests and verify they pass**
 
 Run: `cargo test -p elasticsearch-sink`
 Expected: All serializer tests PASS
 
-- [ ] **Step 3: Run clippy**
+- [x] **Step 3: Run clippy**
 
 Run: `cargo clippy -p elasticsearch-sink --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`
 Expected: Zero warnings
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/elasticsearch-sink/src/serializer.rs
@@ -706,7 +706,7 @@ git commit -m "feat(elasticsearch-sink): add single-pass Arrow-to-NDJSON bulk se
   - `async fn health_check(&self) -> Result<(), ElasticsearchError>`
   - `async fn validate_index_template(&self, data_stream: &str) -> Result<(), ElasticsearchError>`
 
-- [ ] **Step 1: Implement `HttpClient`**
+- [x] **Step 1: Implement `HttpClient`**
 
 Create `crates/elasticsearch-sink/src/client.rs` with:
 - `reqwest::Client` initialization with TLS, timeouts, gzip
@@ -718,7 +718,7 @@ Create `crates/elasticsearch-sink/src/client.rs` with:
 - `validate_index_template`: `GET /_index_template/<pattern>` existence check
 - Jittered exponential backoff retry loop for 429/503
 
-- [ ] **Step 2: Write tests for round-robin selection**
+- [x] **Step 2: Write tests for round-robin selection**
 
 ```rust
 #[cfg(test)]
@@ -729,16 +729,16 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p elasticsearch-sink`
 Expected: All client tests PASS
 
-- [ ] **Step 4: Run clippy**
+- [x] **Step 4: Run clippy**
 
 Run: `cargo clippy -p elasticsearch-sink --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/elasticsearch-sink/src/client.rs
@@ -756,7 +756,7 @@ git commit -m "feat(elasticsearch-sink): add HTTP/2 client with round-robin, aut
 - Consumes: `HttpClient`, `serialize_batch()`, `BatchSorter`, `ElasticsearchSinkConfig`, `PipelineReceiver`, `SignalBatch`
 - Produces: `ElasticsearchSink` implementing `pipeline_core::pipeline::Sink`
 
-- [ ] **Step 1: Implement `ElasticsearchSink` struct and `Sink` trait**
+- [x] **Step 1: Implement `ElasticsearchSink` struct and `Sink` trait**
 
 In `crates/elasticsearch-sink/src/lib.rs`, implement:
 - `ElasticsearchSink::try_new(config: ElasticsearchSinkConfig) -> Result<Self, PipelineError>`
@@ -768,7 +768,7 @@ In `crates/elasticsearch-sink/src/lib.rs`, implement:
   - `Semaphore` + `JoinSet` pipelined dispatch
   - Graceful shutdown via `join_set.join_all()`
 
-- [ ] **Step 2: Write integration test with `wiremock` mock server**
+- [x] **Step 2: Write integration test with `wiremock` mock server**
 
 ```rust
 #[cfg(test)]
@@ -780,17 +780,17 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p elasticsearch-sink`
 Expected: All tests PASS
 
-- [ ] **Step 4: Run clippy and fmt**
+- [x] **Step 4: Run clippy and fmt**
 
 Run: `cargo clippy -p elasticsearch-sink --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`
 Run: `cargo fmt --all -- --check`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/elasticsearch-sink/src/lib.rs
@@ -809,21 +809,21 @@ git commit -m "feat(elasticsearch-sink): implement Sink trait with buffering, so
 - Consumes: `ElasticsearchSink::try_new()`, `Sink::run()`
 - Produces: Full pipeline integration with Elasticsearch/OpenSearch sink option
 
-- [ ] **Step 1: Add `elasticsearch-sink` dependency to root `Cargo.toml`**
+- [x] **Step 1: Add `elasticsearch-sink` dependency to root `Cargo.toml`**
 
 Add to `[dependencies]` section (after line 38):
 ```toml
 elasticsearch-sink = { workspace = true }
 ```
 
-- [ ] **Step 2: Add `elasticsearch` config field to `AppConfig` in `src/main.rs`**
+- [x] **Step 2: Add `elasticsearch` config field to `AppConfig` in `src/main.rs`**
 
 Add after line 20 (`starrocks: Option<...>`):
 ```rust
 elasticsearch: Option<elasticsearch_sink::ElasticsearchSinkConfig>,
 ```
 
-- [ ] **Step 3: Update config validation in `src/main.rs`**
+- [x] **Step 3: Update config validation in `src/main.rs`**
 
 Update the validation check (around line 157) to include `elasticsearch`:
 ```rust
@@ -837,7 +837,7 @@ return Err(anyhow::anyhow!(
 ));
 ```
 
-- [ ] **Step 4: Add Elasticsearch sink initialization branch**
+- [x] **Step 4: Add Elasticsearch sink initialization branch**
 
 After the StarRocks branch (around line 369), add:
 ```rust
@@ -870,7 +870,7 @@ After the StarRocks branch (around line 369), add:
     });
 ```
 
-- [ ] **Step 5: Run full workspace build and tests**
+- [x] **Step 5: Run full workspace build and tests**
 
 Run: `cargo build --workspace`
 Run: `cargo test --workspace`
@@ -878,7 +878,7 @@ Run: `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::m
 Run: `cargo fmt --all -- --check`
 Expected: All pass
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml src/main.rs
