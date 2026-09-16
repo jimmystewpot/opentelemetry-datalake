@@ -6,5 +6,6 @@ pub mod error;
 pub mod serializer;
 pub mod tls;
 
+pub use client::{BulkItem, BulkItemError, BulkItemWrapper, BulkResponse, HttpClient};
 pub use config::ElasticsearchSinkConfig;
 pub use error::ElasticsearchError;
