@@ -355,6 +355,7 @@ impl ElasticsearchSink {
 
 #[async_trait]
 impl Sink for ElasticsearchSink {
+    #[allow(clippy::too_many_lines)]
     async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
         tracing::info!(
             endpoints = ?self.config.endpoints,
@@ -417,12 +418,28 @@ impl Sink for ElasticsearchSink {
                         }
 
                         if batching.is_none() {
-                            let sorted = self.sorter.sort(&batch, signal_type)?;
-                            let payload = crate::serializer::serialize_batch(
-                                &sorted,
-                                self.config.unpack_attributes,
-                                self.config.max_payload_bytes,
-                            )?;
+                            let sorter = self.sorter.clone();
+                            let unpack_attributes = self.config.unpack_attributes;
+                            let max_payload_bytes = self.config.max_payload_bytes;
+
+                            let payload = tokio::task::spawn_blocking(
+                                move || -> Result<Bytes, PipelineError> {
+                                    let sorted_batch = sorter.sort(&batch, signal_type)?;
+                                    crate::serializer::serialize_batch(
+                                        &sorted_batch,
+                                        unpack_attributes,
+                                        max_payload_bytes,
+                                    )
+                                    .map_err(PipelineError::from)
+                                },
+                            )
+                            .await
+                            .map_err(|e| {
+                                PipelineError::Internal(format!(
+                                    "Serialization task panicked: {e}"
+                                ))
+                            })??;
+
                             let target = self.data_stream_for(signal_type).to_string();
                             Self::dispatch(
                                 Arc::clone(&self.client),
@@ -430,7 +447,8 @@ impl Sink for ElasticsearchSink {
                                 &mut join_set,
                                 target,
                                 payload,
-                            ).await?;
+                            )
+                            .await?;
                         } else {
                             let buf = match signal_type {
                                 SignalType::Logs => &mut logs_buf,
@@ -1147,6 +1165,32 @@ mod tests {
                 .validated
                 .load(std::sync::atomic::Ordering::Acquire)
         );
+    }
+
+    #[tokio::test]
+    async fn test_sink_run_non_batching_offloads_serialization() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.batching = None;
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch = make_log_batch();
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        let res = sink.run(rx).await;
+        assert!(res.is_ok());
     }
 
     #[test]
