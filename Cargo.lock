@@ -1769,8 +1769,10 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "aws-config",
  "aws-credential-types",
  "aws-sigv4",
+ "aws-types",
  "bytes",
  "chrono",
  "flate2",

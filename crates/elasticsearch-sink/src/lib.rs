@@ -95,6 +95,25 @@ impl ElasticsearchSink {
         self.validated = Arc::clone(&other.validated);
     }
 
+    /// Shares the HTTP client, concurrency limiter semaphore, and validation status handle
+    /// with another sink instance to ensure unified cluster concurrency limits and connection reuse.
+    pub fn share_state_from(&mut self, other: &Self) {
+        self.client = Arc::clone(&other.client);
+        self.semaphore = Arc::clone(&other.semaphore);
+        self.validated = Arc::clone(&other.validated);
+    }
+
+    /// Shares the concurrency limiter semaphore with another sink instance.
+    pub fn share_concurrency_from(&mut self, other: &Self) {
+        self.semaphore = Arc::clone(&other.semaphore);
+    }
+
+    /// Returns a clone of the internal concurrency limiter semaphore.
+    #[must_use]
+    pub fn semaphore(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.semaphore)
+    }
+
     /// Returns a reference to the active sink configuration.
     #[must_use]
     pub fn config(&self) -> &ElasticsearchSinkConfig {
@@ -211,21 +230,35 @@ impl ElasticsearchSink {
     }
 
     /// Awaits all remaining in-flight tasks in the join set.
+    ///
+    /// Drains all tasks to completion before returning to ensure no in-flight requests are
+    /// abruptly aborted on the first failure. Retains the first encountered error.
     async fn drain_join_set(
         join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
     ) -> Result<(), PipelineError> {
+        let mut first_err = None;
         while let Some(res) = join_set.join_next().await {
             match res {
                 Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => return Err(es_err.into()),
+                Ok(Err(es_err)) => {
+                    if first_err.is_none() {
+                        first_err = Some(PipelineError::from(es_err));
+                    }
+                }
                 Err(join_err) => {
-                    return Err(PipelineError::Internal(format!(
-                        "Bulk dispatch task failed: {join_err}"
-                    )));
+                    if first_err.is_none() {
+                        first_err = Some(PipelineError::Internal(format!(
+                            "Bulk dispatch task failed: {join_err}"
+                        )));
+                    }
                 }
             }
         }
-        Ok(())
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
     }
 
     /// Concatenates accumulated batches, sorts them, serializes to NDJSON, and dispatches.
@@ -240,34 +273,46 @@ impl ElasticsearchSink {
             return Ok(());
         }
 
-        let schema = buf.batches[0].schema();
-        let refs: Vec<&RecordBatch> = buf.batches.iter().collect();
-        let combined =
-            arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
-
-        buf.batches.clear();
+        let batches = std::mem::take(&mut buf.batches);
         buf.bytes = 0;
         buf.records = 0;
 
-        if combined.num_rows() == 0 {
-            return Ok(());
+        let sorter = self.sorter.clone();
+        let unpack_attributes = self.config.unpack_attributes;
+        let max_payload_bytes = self.config.max_payload_bytes;
+
+        let payload_opt =
+            tokio::task::spawn_blocking(move || -> Result<Option<Bytes>, PipelineError> {
+                let schema = batches[0].schema();
+                let refs: Vec<&RecordBatch> = batches.iter().collect();
+                let combined =
+                    arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
+
+                if combined.num_rows() == 0 {
+                    return Ok(None);
+                }
+
+                let sorted_batch = sorter.sort(&combined, signal_type)?;
+                let payload = crate::serializer::serialize_batch(
+                    &sorted_batch,
+                    unpack_attributes,
+                    max_payload_bytes,
+                )?;
+                Ok(Some(payload))
+            })
+            .await
+            .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
+
+        if let Some(payload) = payload_opt {
+            Self::dispatch(
+                Arc::clone(&self.client),
+                Arc::clone(&self.semaphore),
+                join_set,
+                target_data_stream.to_string(),
+                payload,
+            )
+            .await?;
         }
-
-        let sorted = self.sorter.sort(&combined, signal_type)?;
-        let payload = crate::serializer::serialize_batch(
-            &sorted,
-            self.config.unpack_attributes,
-            self.config.max_payload_bytes,
-        )?;
-
-        Self::dispatch(
-            Arc::clone(&self.client),
-            Arc::clone(&self.semaphore),
-            join_set,
-            target_data_stream.to_string(),
-            payload,
-        )
-        .await?;
 
         Ok(())
     }
@@ -1002,6 +1047,102 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("max_concurrent_requests must be greater than 0")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_join_set_awaits_all_tasks_on_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let completed_tasks = Arc::new(AtomicUsize::new(0));
+
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Task 1: Fails immediately
+        join_set.spawn(async move {
+            Err(ElasticsearchError::StartupValidation(
+                "task 1 failed".to_string(),
+            ))
+        });
+
+        // Task 2: Sleeps a bit then succeeds, recording completion
+        let counter2 = Arc::clone(&completed_tasks);
+        join_set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            counter2.fetch_add(1, Ordering::SeqCst);
+            Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })
+        });
+
+        // Task 3: Sleeps a bit then succeeds, recording completion
+        let counter3 = Arc::clone(&completed_tasks);
+        join_set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            counter3.fetch_add(1, Ordering::SeqCst);
+            Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })
+        });
+
+        let err = ElasticsearchSink::drain_join_set(&mut join_set)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PipelineError::Internal(_)));
+        assert!(err.to_string().contains("task 1 failed"));
+        assert_eq!(
+            completed_tasks.load(Ordering::SeqCst),
+            2,
+            "All remaining in-flight tasks must run to completion despite earlier task failure"
+        );
+        assert!(join_set.is_empty(), "JoinSet must be empty after drain");
+    }
+
+    #[tokio::test]
+    async fn test_sink_share_state_shares_semaphore_and_validation() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.max_concurrent_requests = 5;
+
+        let logs_sink = ElasticsearchSink::try_new(config.clone()).unwrap();
+        let mut traces_sink = ElasticsearchSink::try_new(config.clone()).unwrap();
+        let mut metrics_sink = ElasticsearchSink::try_new(config).unwrap();
+
+        traces_sink.share_state_from(&logs_sink);
+        metrics_sink.share_state_from(&logs_sink);
+
+        // Verify all three share the same underlying semaphore with 5 permits
+        assert_eq!(logs_sink.semaphore().available_permits(), 5);
+        assert_eq!(traces_sink.semaphore().available_permits(), 5);
+        assert_eq!(metrics_sink.semaphore().available_permits(), 5);
+
+        // Acquiring a permit on logs_sink decreases available permits on traces and metrics
+        let _permit = logs_sink.semaphore().acquire_owned().await.unwrap();
+        assert_eq!(logs_sink.semaphore().available_permits(), 4);
+        assert_eq!(traces_sink.semaphore().available_permits(), 4);
+        assert_eq!(metrics_sink.semaphore().available_permits(), 4);
+
+        // Validate startup on logs_sink
+        logs_sink.validate_startup().await.unwrap();
+        assert!(
+            logs_sink
+                .validated
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            traces_sink
+                .validated
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            metrics_sink
+                .validated
+                .load(std::sync::atomic::Ordering::Acquire)
         );
     }
 

@@ -258,6 +258,10 @@ pub struct HttpClient {
     current_endpoint: Arc<AtomicUsize>,
     /// Configured authentication credentials.
     auth: ElasticsearchAuthConfig,
+    /// Optional AWS credentials provider for `SigV4` signing, initialized asynchronously on first use.
+    #[cfg(feature = "aws")]
+    credentials_provider:
+        Arc<tokio::sync::OnceCell<aws_credential_types::provider::SharedCredentialsProvider>>,
     /// Whether gzip compression is enabled for bulk request payloads.
     gzip_compression: bool,
     /// Maximum number of retry attempts for transient failures (429/503/network).
@@ -318,6 +322,8 @@ impl HttpClient {
             endpoints,
             current_endpoint: Arc::new(AtomicUsize::new(0)),
             auth: config.auth.clone(),
+            #[cfg(feature = "aws")]
+            credentials_provider: Arc::new(tokio::sync::OnceCell::new()),
             gzip_compression: config.gzip_compression,
             max_retries: config.max_retries,
             retry_interval_secs: config.retry_interval_secs,
@@ -349,60 +355,106 @@ impl HttpClient {
         self.gzip_compression
     }
 
+    /// Sets a custom credentials provider for AWS `SigV4` signing.
+    #[cfg(feature = "aws")]
+    #[must_use]
+    pub fn with_credentials_provider(
+        mut self,
+        provider: impl aws_credential_types::provider::ProvideCredentials + 'static,
+    ) -> Self {
+        let cell = tokio::sync::OnceCell::new();
+        let _ = cell.set(aws_credential_types::provider::SharedCredentialsProvider::new(provider));
+        self.credentials_provider = Arc::new(cell);
+        self
+    }
+
     /// Injects authentication credentials into an outgoing HTTP request builder.
-    pub fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ElasticsearchError::AuthenticationFailed`] if authentication cannot be resolved.
+    pub async fn apply_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, ElasticsearchError> {
         let default_url = self
             .endpoints
             .first()
             .map_or("http://localhost:9200", |s| s.as_str());
-        self.apply_auth_request(req, "GET", default_url, &[])
+        self.apply_auth_request(req, "GET", default_url, &[]).await
     }
 
     /// Injects authentication credentials into an outgoing HTTP request builder with explicit
     /// HTTP method, target URL, and body content for signature calculation.
-    #[cfg_attr(not(feature = "aws"), allow(unused_variables))]
-    pub fn apply_auth_request(
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ElasticsearchError::AuthenticationFailed`] if authentication cannot be resolved,
+    /// such as when AWS `SigV4` credentials cannot be discovered by the provider chain.
+    #[cfg_attr(
+        not(feature = "aws"),
+        allow(
+            unused_variables,
+            clippy::unused_async,
+            clippy::unused_async_trait_impl
+        )
+    )]
+    pub async fn apply_auth_request(
         &self,
         req: reqwest::RequestBuilder,
         method: &str,
         url: &str,
         body: &[u8],
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, ElasticsearchError> {
         match &self.auth {
-            ElasticsearchAuthConfig::None => req,
+            ElasticsearchAuthConfig::None => Ok(req),
             ElasticsearchAuthConfig::Basic { username, password } => {
-                req.basic_auth(username, password.as_deref())
+                Ok(req.basic_auth(username, password.as_deref()))
             }
             ElasticsearchAuthConfig::ApiKey { api_key } => {
-                req.header(reqwest::header::AUTHORIZATION, format!("ApiKey {api_key}"))
+                Ok(req.header(reqwest::header::AUTHORIZATION, format!("ApiKey {api_key}")))
             }
-            ElasticsearchAuthConfig::Bearer { token } => req.bearer_auth(token),
+            ElasticsearchAuthConfig::Bearer { token } => Ok(req.bearer_auth(token)),
             #[cfg(feature = "aws")]
             ElasticsearchAuthConfig::AwsSigv4 { region, service } => {
-                if let (Ok(key), Ok(secret)) = (
-                    std::env::var("AWS_ACCESS_KEY_ID"),
-                    std::env::var("AWS_SECRET_ACCESS_KEY"),
-                ) {
-                    let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-                    self.apply_aws_sigv4(
-                        req,
-                        method,
-                        url,
-                        body,
-                        region,
-                        service,
-                        &key,
-                        &secret,
-                        session_token.as_deref(),
-                    )
-                } else {
-                    req
-                }
+                use aws_credential_types::provider::ProvideCredentials;
+                let provider = self
+                    .credentials_provider
+                    .get_or_try_init(|| async {
+                        let chain = aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                            .region(aws_types::region::Region::new(region.clone()))
+                            .build()
+                            .await;
+                        Ok::<_, ElasticsearchError>(
+                            aws_credential_types::provider::SharedCredentialsProvider::new(chain),
+                        )
+                    })
+                    .await?;
+                let creds = provider.provide_credentials().await.map_err(|e| {
+                    ElasticsearchError::AuthenticationFailed(format!(
+                        "failed to resolve AWS credentials for SigV4: {e}"
+                    ))
+                })?;
+                self.apply_aws_sigv4(
+                    req,
+                    method,
+                    url,
+                    body,
+                    region,
+                    service,
+                    creds.access_key_id(),
+                    creds.secret_access_key(),
+                    creds.session_token(),
+                )
             }
         }
     }
 
     /// Signs an outgoing request with AWS `SigV4` using explicit credentials and adds signature headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ElasticsearchError::AuthenticationFailed`] if signature construction fails.
     #[cfg(feature = "aws")]
     #[allow(clippy::too_many_arguments)]
     pub fn apply_aws_sigv4(
@@ -416,7 +468,7 @@ impl HttpClient {
         access_key: &str,
         secret_key: &str,
         session_token: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> Result<reqwest::RequestBuilder, ElasticsearchError> {
         let creds = aws_credential_types::Credentials::new(
             access_key,
             secret_key,
@@ -426,16 +478,18 @@ impl HttpClient {
         );
         let identity = creds.into();
         let signing_settings = aws_sigv4::http_request::SigningSettings::default();
-        let Ok(signing_params) = aws_sigv4::sign::v4::SigningParams::builder()
+        let signing_params = aws_sigv4::sign::v4::SigningParams::builder()
             .identity(&identity)
             .region(region)
             .name(service)
             .time(std::time::SystemTime::now())
             .settings(signing_settings)
             .build()
-        else {
-            return req;
-        };
+            .map_err(|e| {
+                ElasticsearchError::AuthenticationFailed(format!(
+                    "failed to build SigV4 signing params: {e}"
+                ))
+            })?;
 
         let signing_params = signing_params.into();
         let signable_body = if body.is_empty() {
@@ -444,22 +498,29 @@ impl HttpClient {
             aws_sigv4::http_request::SignableBody::Bytes(body)
         };
 
-        let Ok(signable_request) = aws_sigv4::http_request::SignableRequest::new(
+        let signable_request = aws_sigv4::http_request::SignableRequest::new(
             method,
             url,
             std::iter::empty(),
             signable_body,
-        ) else {
-            return req;
-        };
+        )
+        .map_err(|e| {
+            ElasticsearchError::AuthenticationFailed(format!(
+                "failed to create signable request: {e}"
+            ))
+        })?;
 
-        if let Ok(output) = aws_sigv4::http_request::sign(signable_request, &signing_params) {
-            let (instructions, _sig) = output.into_parts();
-            for (name, val) in instructions.headers() {
-                req = req.header(name, val);
-            }
+        let output =
+            aws_sigv4::http_request::sign(signable_request, &signing_params).map_err(|e| {
+                ElasticsearchError::AuthenticationFailed(format!(
+                    "failed to sign SigV4 request: {e}"
+                ))
+            })?;
+        let (instructions, _sig) = output.into_parts();
+        for (name, val) in instructions.headers() {
+            req = req.header(name, val);
         }
-        req
+        Ok(req)
     }
 
     /// Returns true if an HTTP status code indicates a transient error that should be retried.
@@ -534,7 +595,7 @@ impl HttpClient {
             req = req.header(CONTENT_ENCODING, "gzip");
         }
 
-        req = self.apply_auth_request(req, "POST", &url, &body);
+        req = self.apply_auth_request(req, "POST", &url, &body).await?;
         req.send().await.map_err(ElasticsearchError::Http)
     }
 
@@ -716,7 +777,7 @@ impl HttpClient {
         let url = format!("{endpoint}/");
 
         let req = self.client.get(&url);
-        let req = self.apply_auth_request(req, "GET", &url, &[]);
+        let req = self.apply_auth_request(req, "GET", &url, &[]).await?;
 
         let response = req.send().await.map_err(|e| {
             ElasticsearchError::StartupValidation(format!(
@@ -779,7 +840,9 @@ impl HttpClient {
         // 1. Attempt POST /_index_template/_simulate_index/<data_stream> to match by index pattern
         let simulate_url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
         let req = self.client.post(&simulate_url);
-        let req = self.apply_auth_request(req, "POST", &simulate_url, &[]);
+        let req = self
+            .apply_auth_request(req, "POST", &simulate_url, &[])
+            .await?;
 
         match req.send().await {
             Ok(response) => {
@@ -819,7 +882,7 @@ impl HttpClient {
         // 2. Fallback to GET /_index_template/<data_stream> for exact template naming
         let url = format!("{endpoint}/_index_template/{data_stream}");
         let req = self.client.get(&url);
-        let req = self.apply_auth_request(req, "GET", &url, &[]);
+        let req = self.apply_auth_request(req, "GET", &url, &[]).await?;
 
         let response = req.send().await.map_err(|e| {
             ElasticsearchError::StartupValidation(format!(
@@ -982,20 +1045,20 @@ mod tests {
         assert!(err.to_string().contains("endpoint URL cannot be empty"));
     }
 
-    #[test]
-    fn test_auth_headers_none() {
+    #[tokio::test]
+    async fn test_auth_headers_none() {
         let config = make_test_config(vec!["http://localhost:9200".to_string()]);
         let client = HttpClient::try_new(&config).unwrap();
 
         let req = client.client.get("http://localhost:9200");
-        let req = client.apply_auth(req);
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
         assert!(request.headers().get("authorization").is_none());
     }
 
-    #[test]
-    fn test_auth_headers_basic() {
+    #[tokio::test]
+    async fn test_auth_headers_basic() {
         let mut config = make_test_config(vec!["http://localhost:9200".to_string()]);
         config.auth = ElasticsearchAuthConfig::Basic {
             username: "admin".to_string(),
@@ -1004,7 +1067,7 @@ mod tests {
         let client = HttpClient::try_new(&config).unwrap();
 
         let req = client.client.get("http://localhost:9200");
-        let req = client.apply_auth(req);
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request.headers().get("authorization").unwrap();
@@ -1012,8 +1075,8 @@ mod tests {
         assert_eq!(auth_hdr.to_str().unwrap(), "Basic YWRtaW46c2VjcmV0MTIz");
     }
 
-    #[test]
-    fn test_auth_headers_basic_without_password() {
+    #[tokio::test]
+    async fn test_auth_headers_basic_without_password() {
         let mut config = make_test_config(vec!["http://localhost:9200".to_string()]);
         config.auth = ElasticsearchAuthConfig::Basic {
             username: "readonly".to_string(),
@@ -1022,7 +1085,7 @@ mod tests {
         let client = HttpClient::try_new(&config).unwrap();
 
         let req = client.client.get("http://localhost:9200");
-        let req = client.apply_auth(req);
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request.headers().get("authorization").unwrap();
@@ -1030,8 +1093,8 @@ mod tests {
         assert_eq!(auth_hdr.to_str().unwrap(), "Basic cmVhZG9ubHk6");
     }
 
-    #[test]
-    fn test_auth_headers_api_key() {
+    #[tokio::test]
+    async fn test_auth_headers_api_key() {
         let mut config = make_test_config(vec!["http://localhost:9200".to_string()]);
         config.auth = ElasticsearchAuthConfig::ApiKey {
             api_key: "VnVhQ2ZHY0JDZGJrUW0tZTVhT3k6dWkybHAyYXhUTm1xWUY1QXdqd1JRdw==".to_string(),
@@ -1039,7 +1102,7 @@ mod tests {
         let client = HttpClient::try_new(&config).unwrap();
 
         let req = client.client.get("http://localhost:9200");
-        let req = client.apply_auth(req);
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request.headers().get("authorization").unwrap();
@@ -1049,8 +1112,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_auth_headers_bearer() {
+    #[tokio::test]
+    async fn test_auth_headers_bearer() {
         let mut config = make_test_config(vec!["http://localhost:9200".to_string()]);
         config.auth = ElasticsearchAuthConfig::Bearer {
             token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9".to_string(),
@@ -1058,7 +1121,7 @@ mod tests {
         let client = HttpClient::try_new(&config).unwrap();
 
         let req = client.client.get("http://localhost:9200");
-        let req = client.apply_auth(req);
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request.headers().get("authorization").unwrap();
@@ -1618,17 +1681,19 @@ mod tests {
         let req = client
             .client
             .post("https://search-my-cluster.us-east-1.es.amazonaws.com/logs-otel-default/_bulk");
-        let req = client.apply_aws_sigv4(
-            req,
-            "POST",
-            "https://search-my-cluster.us-east-1.es.amazonaws.com/logs-otel-default/_bulk",
-            b"{\"index\":{}}\n{\"msg\":\"hello\"}\n",
-            "us-east-1",
-            "es",
-            "AKIAIOSFODNN7EXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            None,
-        );
+        let req = client
+            .apply_aws_sigv4(
+                req,
+                "POST",
+                "https://search-my-cluster.us-east-1.es.amazonaws.com/logs-otel-default/_bulk",
+                b"{\"index\":{}}\n{\"msg\":\"hello\"}\n",
+                "us-east-1",
+                "es",
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                None,
+            )
+            .unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request
@@ -1667,17 +1732,19 @@ mod tests {
         let req = client
             .client
             .get("https://search-my-cluster.us-east-1.es.amazonaws.com/");
-        let req = client.apply_aws_sigv4(
-            req,
-            "GET",
-            "https://search-my-cluster.us-east-1.es.amazonaws.com/",
-            &[],
-            "us-east-1",
-            "es",
-            "AKIAIOSFODNN7EXAMPLE",
-            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            Some("AQoDYXdzEJr1EXAMPLETOKEN"),
-        );
+        let req = client
+            .apply_aws_sigv4(
+                req,
+                "GET",
+                "https://search-my-cluster.us-east-1.es.amazonaws.com/",
+                &[],
+                "us-east-1",
+                "es",
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                Some("AQoDYXdzEJr1EXAMPLETOKEN"),
+            )
+            .unwrap();
         let request = req.build().unwrap();
 
         let auth_hdr = request
@@ -1698,8 +1765,28 @@ mod tests {
     }
 
     #[cfg(feature = "aws")]
-    #[test]
-    fn test_auth_headers_aws_sigv4_env_missing_passes_through() {
+    #[derive(Debug)]
+    struct EmptyCredentialsProvider;
+
+    #[cfg(feature = "aws")]
+    impl aws_credential_types::provider::ProvideCredentials for EmptyCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            aws_credential_types::provider::future::ProvideCredentials::ready(Err(
+                aws_credential_types::provider::error::CredentialsError::not_loaded(
+                    "no credentials found in chain",
+                ),
+            ))
+        }
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_auth_headers_aws_sigv4_missing_credentials_fails() {
         let mut config = make_test_config(vec![
             "https://search-my-cluster.us-east-1.es.amazonaws.com".to_string(),
         ]);
@@ -1707,19 +1794,63 @@ mod tests {
             region: "us-east-1".to_string(),
             service: "es".to_string(),
         };
-        let client = HttpClient::try_new(&config).unwrap();
+        let client = HttpClient::try_new(&config)
+            .unwrap()
+            .with_credentials_provider(EmptyCredentialsProvider);
 
         let req = client
             .client
             .get("https://search-my-cluster.us-east-1.es.amazonaws.com/");
-        // When AWS env credentials are not set, apply_auth_request leaves request untouched
-        let req = client.apply_auth(req);
+        let err = client.apply_auth(req).await.unwrap_err();
+        assert!(matches!(err, ElasticsearchError::AuthenticationFailed(_)));
+        assert!(
+            err.to_string()
+                .contains("failed to resolve AWS credentials")
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[tokio::test]
+    async fn test_auth_headers_aws_sigv4_with_custom_provider() {
+        let mut config = make_test_config(vec![
+            "https://search-my-cluster.us-east-1.es.amazonaws.com".to_string(),
+        ]);
+        config.auth = ElasticsearchAuthConfig::AwsSigv4 {
+            region: "us-east-1".to_string(),
+            service: "es".to_string(),
+        };
+        let creds = aws_credential_types::Credentials::new(
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            Some("AQoDYXdzEJr1EXAMPLETOKEN".to_string()),
+            None,
+            "test",
+        );
+        let client = HttpClient::try_new(&config)
+            .unwrap()
+            .with_credentials_provider(creds);
+
+        let req = client
+            .client
+            .get("https://search-my-cluster.us-east-1.es.amazonaws.com/");
+        let req = client.apply_auth(req).await.unwrap();
         let request = req.build().unwrap();
 
-        // If env vars were not present, no authorization header should be injected
-        if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
-            assert!(request.headers().get("authorization").is_none());
-        }
+        let auth_hdr = request
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(auth_hdr.starts_with("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+        assert!(auth_hdr.contains("/us-east-1/es/aws4_request"));
+        let token_hdr = request
+            .headers()
+            .get("x-amz-security-token")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(token_hdr, "AQoDYXdzEJr1EXAMPLETOKEN");
     }
 
     #[tokio::test]
