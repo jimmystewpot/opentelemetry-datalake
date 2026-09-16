@@ -896,7 +896,7 @@ git commit -m "feat: wire elasticsearch-sink into pipeline orchestration"
 - Consumes: `BulkResponse.items` array with per-item status codes
 - Produces: Enhanced `send_bulk` that extracts recoverable (429/503) document failures and constructs retry sub-payloads
 
-- [ ] **Step 1: Implement partial retry logic in `send_bulk`**
+- [x] **Step 1: Implement partial retry logic in `send_bulk`**
 
 After receiving a `BulkResponse` with `errors: true`:
 1. Parse the `items` array
@@ -906,7 +906,7 @@ After receiving a `BulkResponse` with `errors: true`:
 5. Re-submit the sub-payload with backoff
 6. Log and count unrecoverable failures (400, etc.)
 
-- [ ] **Step 2: Write tests for partial retry**
+- [x] **Step 2: Write tests for partial retry**
 
 ```rust
 #[cfg(test)]
@@ -918,12 +918,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
 
 Run: `cargo test -p elasticsearch-sink`
 Expected: All tests PASS
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/elasticsearch-sink/src/client.rs
@@ -939,7 +939,7 @@ git commit -m "feat(elasticsearch-sink): add partial bulk 429/503 per-item retry
 - Verify: `cargo build --workspace` succeeds
 - Verify: All doc comments are present on public items
 
-- [ ] **Step 1: Run full verification suite**
+- [x] **Step 1: Run full verification suite**
 
 ```bash
 make all
@@ -947,13 +947,13 @@ make all
 
 Expected: `fmt`, `clippy`, `test`, `bench` all pass
 
-- [ ] **Step 2: Verify the full diff is clean**
+- [x] **Step 2: Verify the full diff is clean**
 
 ```bash
 git diff --stat origin/main..HEAD
 ```
 
-- [ ] **Step 3: Final commit if any cleanup needed**
+- [x] **Step 3: Final commit if any cleanup needed**
 
 ```bash
 git add -A

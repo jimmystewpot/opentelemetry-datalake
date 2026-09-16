@@ -173,6 +173,7 @@ pub fn extract_sub_payload(
 
     let total_items = line_ranges.len() / 2;
 
+    let mut selected_ranges = Vec::with_capacity(item_indices.len());
     let mut total_bytes: usize = 0;
     for &idx in item_indices {
         if idx >= total_items {
@@ -196,31 +197,18 @@ pub fn extract_sub_payload(
                 ))
             })?
             .1;
-        let item_len = doc_end.saturating_sub(action_start);
-        total_bytes = total_bytes.saturating_add(item_len).saturating_add(1);
+        let slice = &payload[action_start..doc_end];
+        let extra_newline = usize::from(!slice.ends_with(b"\n"));
+        total_bytes = total_bytes
+            .saturating_add(slice.len())
+            .saturating_add(extra_newline);
+        selected_ranges.push((action_start, doc_end, extra_newline > 0));
     }
 
     let mut buf = Vec::with_capacity(total_bytes);
-    for &idx in item_indices {
-        let action_start = line_ranges
-            .get(2 * idx)
-            .ok_or_else(|| {
-                ElasticsearchError::Serialization(format!(
-                    "missing action line range for item index {idx}"
-                ))
-            })?
-            .0;
-        let doc_end = line_ranges
-            .get(2 * idx + 1)
-            .ok_or_else(|| {
-                ElasticsearchError::Serialization(format!(
-                    "missing document line range for item index {idx}"
-                ))
-            })?
-            .1;
-        let slice = &payload[action_start..doc_end];
-        buf.extend_from_slice(slice);
-        if !slice.ends_with(b"\n") {
+    for (start, end, add_newline) in selected_ranges {
+        buf.extend_from_slice(&payload[start..end]);
+        if add_newline {
             buf.push(b'\n');
         }
     }
@@ -1762,10 +1750,10 @@ mod tests {
         assert_eq!(sub1.as_ref(), expected1);
 
         // Extract items 0 and 2
-        let sub02 = extract_sub_payload(payload, &[0, 2]).unwrap();
-        let expected02 = b"{\"create\":{}}\n{\"id\":\"doc0\"}\n\
-                          {\"create\":{}}\n{\"id\":\"doc2\"}\n";
-        assert_eq!(sub02.as_ref(), expected02);
+        let sub_both = extract_sub_payload(payload, &[0, 2]).unwrap();
+        let expected_both = b"{\"create\":{}}\n{\"id\":\"doc0\"}\n\
+                             {\"create\":{}}\n{\"id\":\"doc2\"}\n";
+        assert_eq!(sub_both.as_ref(), expected_both);
 
         // Extract item 2 only
         let sub2 = extract_sub_payload(payload, &[2]).unwrap();
@@ -1792,6 +1780,13 @@ mod tests {
     #[test]
     fn test_extract_sub_payload_trailing_newlines_ignored() {
         let payload = b"{\"create\":{}}\n{\"id\":\"doc0\"}\n\n\n";
+        let sub = extract_sub_payload(payload, &[0]).unwrap();
+        assert_eq!(sub.as_ref(), b"{\"create\":{}}\n{\"id\":\"doc0\"}\n");
+    }
+
+    #[test]
+    fn test_extract_sub_payload_without_terminal_newline() {
+        let payload = b"{\"create\":{}}\n{\"id\":\"doc0\"}";
         let sub = extract_sub_payload(payload, &[0]).unwrap();
         assert_eq!(sub.as_ref(), b"{\"create\":{}}\n{\"id\":\"doc0\"}\n");
     }
