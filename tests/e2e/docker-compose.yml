@@ -1,22 +1,22 @@
 services:
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: e2e-minio
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: admin
-      MINIO_ROOT_PASSWORD: password
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
     command: server /data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   mc:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: e2e-mc
     depends_on:
       minio:
