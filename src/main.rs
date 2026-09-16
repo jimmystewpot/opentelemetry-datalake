@@ -386,6 +386,16 @@ async fn main() -> anyhow::Result<()> {
         let mut traces_sink = elasticsearch_sink::ElasticsearchSink::try_new(es_cfg.clone())?;
         let mut metrics_sink = elasticsearch_sink::ElasticsearchSink::try_new(es_cfg)?;
 
+        // Validate cluster health and data stream templates before starting receiver
+        logs_sink
+            .validate_startup()
+            .await
+            .map_err(|e| anyhow::anyhow!("Elasticsearch startup validation failed: {e}"))?;
+
+        // Share the validated status to prevent duplicate HTTP checks across sink instances
+        traces_sink.share_validation_from(&logs_sink);
+        metrics_sink.share_validation_from(&logs_sink);
+
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {
                 tracing::error!("Logs Elasticsearch sink error: {}", e);

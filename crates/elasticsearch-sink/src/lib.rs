@@ -51,6 +51,7 @@ pub struct ElasticsearchSink {
     client: Arc<HttpClient>,
     sorter: BatchSorter,
     semaphore: Arc<tokio::sync::Semaphore>,
+    validated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ElasticsearchSink {
@@ -85,7 +86,13 @@ impl ElasticsearchSink {
             client: Arc::new(client),
             sorter,
             semaphore,
+            validated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
+    }
+
+    /// Shares the validation status handle with another sink instance to prevent redundant checks.
+    pub fn share_validation_from(&mut self, other: &Self) {
+        self.validated = Arc::clone(&other.validated);
     }
 
     /// Returns a reference to the active sink configuration.
@@ -117,8 +124,17 @@ impl ElasticsearchSink {
     }
 
     /// Performs startup cluster health check and index template validation if configured.
-    async fn perform_startup_validation(&self) -> Result<(), PipelineError> {
-        if !self.config.validate_on_startup {
+    ///
+    /// If `validate_on_startup` is enabled, verifies cluster health and data stream templates.
+    /// Idempotent: once successfully validated, subsequent calls are no-ops.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] if the cluster health check fails or any required index template is missing.
+    pub async fn validate_startup(&self) -> Result<(), PipelineError> {
+        if !self.config.validate_on_startup
+            || self.validated.load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(());
         }
 
@@ -133,6 +149,8 @@ impl ElasticsearchSink {
         self.client
             .validate_index_template(&self.config.data_streams.traces)
             .await?;
+        self.validated
+            .store(true, std::sync::atomic::Ordering::Release);
         tracing::info!("Elasticsearch sink startup validation passed");
         Ok(())
     }
@@ -302,7 +320,7 @@ impl Sink for ElasticsearchSink {
         );
 
         // 1. Startup validation
-        self.perform_startup_validation().await?;
+        self.validate_startup().await?;
 
         let batching = self.config.batching.clone();
         let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);

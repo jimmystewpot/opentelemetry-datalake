@@ -237,6 +237,13 @@ struct IndexTemplatesResponse {
     index_templates: Vec<serde_json::Value>,
 }
 
+/// Simulate index template response returned by `POST /_index_template/_simulate_index/<index_name>`.
+#[derive(Debug, Deserialize)]
+struct SimulateIndexResponse {
+    #[serde(default)]
+    template: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
 /// High-performance HTTP client for Elasticsearch and `OpenSearch` clusters.
 ///
 /// Manages connection pooling, client-side round-robin endpoint selection,
@@ -492,14 +499,26 @@ impl HttpClient {
         let url = format!("{endpoint}/{data_stream}/_bulk");
 
         let (body, is_gzipped) = if self.gzip_compression && !payload.is_empty() {
-            let mut encoder =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            std::io::Write::write_all(&mut encoder, payload).map_err(|e| {
-                ElasticsearchError::Serialization(format!("gzip compression failed: {e}"))
-            })?;
-            let compressed = encoder.finish().map_err(|e| {
-                ElasticsearchError::Serialization(format!("gzip compression finalize failed: {e}"))
-            })?;
+            let raw_payload = payload.clone();
+            let compressed =
+                tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ElasticsearchError> {
+                    let mut encoder =
+                        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                    std::io::Write::write_all(&mut encoder, &raw_payload).map_err(|e| {
+                        ElasticsearchError::Serialization(format!("gzip compression failed: {e}"))
+                    })?;
+                    encoder.finish().map_err(|e| {
+                        ElasticsearchError::Serialization(format!(
+                            "gzip compression finalize failed: {e}"
+                        ))
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    ElasticsearchError::Serialization(format!(
+                        "gzip compression task panicked: {e}"
+                    ))
+                })??;
             (Bytes::from(compressed), true)
         } else {
             (payload.clone(), false)
@@ -745,15 +764,60 @@ impl HttpClient {
 
     /// Validates that a composable index template exists for the given data stream.
     ///
-    /// Queries `GET /_index_template/<data_stream>` and returns an error if not found.
+    /// First simulates index template matching via `POST /_index_template/_simulate_index/<data_stream>`
+    /// to locate any template matching the stream by `index_patterns`.
+    /// If simulation succeeds and returns a matched template, validation passes.
+    /// If simulation is unsupported (HTTP 404/405) or returns no template, falls back to
+    /// querying `GET /_index_template/<data_stream>` for exact template naming.
     pub async fn validate_index_template(
         &self,
         data_stream: &str,
     ) -> Result<(), ElasticsearchError> {
         let data_stream = data_stream.trim_matches('/');
         let endpoint = self.next_endpoint();
-        let url = format!("{endpoint}/_index_template/{data_stream}");
 
+        // 1. Attempt POST /_index_template/_simulate_index/<data_stream> to match by index pattern
+        let simulate_url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
+        let req = self.client.post(&simulate_url);
+        let req = self.apply_auth_request(req, "POST", &simulate_url, &[]);
+
+        match req.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    return Err(ElasticsearchError::AuthenticationFailed(format!(
+                        "unauthorized to validate index template for '{data_stream}': HTTP {status}"
+                    )));
+                }
+
+                if status.is_success() {
+                    let parsed: SimulateIndexResponse = response.json().await.map_err(|e| {
+                        ElasticsearchError::StartupValidation(format!(
+                            "failed to parse simulate index response for '{data_stream}': {e}"
+                        ))
+                    })?;
+
+                    if parsed.template.is_some_and(|template| !template.is_empty()) {
+                        tracing::info!(
+                            endpoint = %endpoint,
+                            data_stream = %data_stream,
+                            "Index template validation succeeded via simulate_index"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(ElasticsearchError::StartupValidation(format!(
+                    "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
+                )));
+            }
+        }
+
+        // 2. Fallback to GET /_index_template/<data_stream> for exact template naming
+        let url = format!("{endpoint}/_index_template/{data_stream}");
         let req = self.client.get(&url);
         let req = self.apply_auth_request(req, "GET", &url, &[]);
 
@@ -798,7 +862,7 @@ impl HttpClient {
         tracing::info!(
             endpoint = %endpoint,
             data_stream = %data_stream,
-            "Index template validation succeeded"
+            "Index template validation succeeded via index_template query"
         );
 
         Ok(())
@@ -1438,6 +1502,40 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_via_simulate_index_pattern_match() {
+        let server = MockServer::start().await;
+
+        let simulate_json = r#"{
+            "template": {
+                "settings": {
+                    "index": {
+                        "number_of_shards": "1"
+                    }
+                },
+                "mappings": {
+                    "properties": {
+                        "@timestamp": { "type": "date" }
+                    }
+                }
+            },
+            "overlapping": []
+        }"#;
+
+        // Simulate index endpoint matches data stream pattern even when template name is different
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(simulate_json))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let res = client.validate_index_template("logs-otel-default").await;
+        assert!(res.is_ok());
     }
 
     #[tokio::test]
