@@ -6,6 +6,990 @@ pub mod error;
 pub mod serializer;
 pub mod tls;
 
+use std::sync::Arc;
+
+use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
+use bytes::Bytes;
+use pipeline_core::error::PipelineError;
+use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::sort::{BatchSorter, SignalType};
+
 pub use client::{BulkItem, BulkItemError, BulkItemWrapper, BulkResponse, HttpClient};
-pub use config::ElasticsearchSinkConfig;
+pub use config::{
+    DataStreamMapping, ElasticsearchAuthConfig, ElasticsearchBatchingConfig,
+    ElasticsearchSinkConfig,
+};
 pub use error::ElasticsearchError;
+pub use serializer::serialize_batch;
+pub use tls::TlsConfig;
+
+/// Internal accumulator for micro-batch buffering per signal type.
+#[derive(Debug, Default)]
+struct BufferState {
+    batches: Vec<RecordBatch>,
+    bytes: usize,
+    records: usize,
+}
+
+/// Elasticsearch and `OpenSearch` sink for the `opentelemetry-datalake` pipeline.
+///
+/// Ingests [`SignalBatch`] events (Logs, Metrics, Traces), accumulates them in micro-buffers
+/// per signal type, sorts them chronologically using [`BatchSorter`], serializes them into
+/// NDJSON bulk format via [`serialize_batch`], and streams them concurrently into
+/// Elasticsearch/`OpenSearch` Data Streams via HTTP/2 using [`HttpClient`].
+///
+/// # Concurrency
+///
+/// Implements [`Sink`], processing incoming batches on an asynchronous Tokio runtime.
+/// HTTP bulk requests are dispatched asynchronously into a [`tokio::task::JoinSet`], bounded
+/// by a [`tokio::sync::Semaphore`] enforcing `max_concurrent_requests`.
+/// The sink is [`Send`] and [`Sync`].
+#[derive(Debug)]
+pub struct ElasticsearchSink {
+    config: ElasticsearchSinkConfig,
+    client: Arc<HttpClient>,
+    sorter: BatchSorter,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl ElasticsearchSink {
+    /// Constructs a new `ElasticsearchSink` from configuration.
+    ///
+    /// Initializes the HTTP connection pool, pre-sorting engine, and concurrency semaphore.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError`] if:
+    /// - `max_concurrent_requests` is 0.
+    /// - Endpoint configuration is invalid.
+    /// - TLS certificate loading fails.
+    /// - Sorter configuration parsing fails.
+    pub fn try_new(config: ElasticsearchSinkConfig) -> Result<Self, PipelineError> {
+        if config.max_concurrent_requests == 0 {
+            return Err(PipelineError::Internal(
+                "max_concurrent_requests must be greater than 0".to_string(),
+            ));
+        }
+
+        let client = HttpClient::try_new(&config)?;
+        let sorter = if let Some(ref order_by) = config.order_by {
+            BatchSorter::from_config(order_by)?
+        } else {
+            BatchSorter::default()
+        };
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_requests));
+
+        Ok(Self {
+            config,
+            client: Arc::new(client),
+            sorter,
+            semaphore,
+        })
+    }
+
+    /// Returns a reference to the active sink configuration.
+    #[must_use]
+    pub fn config(&self) -> &ElasticsearchSinkConfig {
+        &self.config
+    }
+
+    /// Returns a reference to the internal [`HttpClient`].
+    #[must_use]
+    pub fn client(&self) -> &HttpClient {
+        &self.client
+    }
+
+    /// Returns a reference to the internal [`BatchSorter`].
+    #[must_use]
+    pub fn sorter(&self) -> &BatchSorter {
+        &self.sorter
+    }
+
+    /// Returns the configured data stream name for the given signal type.
+    #[must_use]
+    pub fn data_stream_for(&self, signal_type: SignalType) -> &str {
+        match signal_type {
+            SignalType::Logs => &self.config.data_streams.logs,
+            SignalType::Metrics => &self.config.data_streams.metrics,
+            SignalType::Traces => &self.config.data_streams.traces,
+        }
+    }
+
+    /// Performs startup cluster health check and index template validation if configured.
+    async fn perform_startup_validation(&self) -> Result<(), PipelineError> {
+        if !self.config.validate_on_startup {
+            return Ok(());
+        }
+
+        tracing::info!("Executing startup validation checks");
+        self.client.health_check().await?;
+        self.client
+            .validate_index_template(&self.config.data_streams.logs)
+            .await?;
+        self.client
+            .validate_index_template(&self.config.data_streams.metrics)
+            .await?;
+        self.client
+            .validate_index_template(&self.config.data_streams.traces)
+            .await?;
+        tracing::info!("Elasticsearch sink startup validation passed");
+        Ok(())
+    }
+
+    /// Dispatches a serialized payload to the target data stream using pipelined concurrency.
+    ///
+    /// Drains any completed tasks in `join_set` to detect failures early, acquires a semaphore permit,
+    /// and spawns the request into `join_set`.
+    async fn dispatch(
+        client: Arc<HttpClient>,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+        data_stream: String,
+        payload: Bytes,
+    ) -> Result<(), PipelineError> {
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        // Drain any already completed tasks in join_set to detect failures early
+        while let Some(res) = join_set.try_join_next() {
+            match res {
+                Ok(Ok(_resp)) => {}
+                Ok(Err(es_err)) => return Err(es_err.into()),
+                Err(join_err) => {
+                    return Err(PipelineError::Internal(format!(
+                        "Bulk dispatch task failed: {join_err}"
+                    )));
+                }
+            }
+        }
+
+        // If semaphore permits are exhausted, await the next completed task in join_set
+        while semaphore.available_permits() == 0 && !join_set.is_empty() {
+            if let Some(res) = join_set.join_next().await {
+                match res {
+                    Ok(Ok(_resp)) => {}
+                    Ok(Err(es_err)) => return Err(es_err.into()),
+                    Err(join_err) => {
+                        return Err(PipelineError::Internal(format!(
+                            "Bulk dispatch task failed: {join_err}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let permit = semaphore.acquire_owned().await.map_err(|e| {
+            PipelineError::Internal(format!("Failed to acquire semaphore permit: {e}"))
+        })?;
+
+        join_set.spawn(async move {
+            let _permit = permit;
+            client.send_bulk(&data_stream, payload).await
+        });
+
+        Ok(())
+    }
+
+    /// Awaits all remaining in-flight tasks in the join set.
+    async fn drain_join_set(
+        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+    ) -> Result<(), PipelineError> {
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(_resp)) => {}
+                Ok(Err(es_err)) => return Err(es_err.into()),
+                Err(join_err) => {
+                    return Err(PipelineError::Internal(format!(
+                        "Bulk dispatch task failed: {join_err}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Concatenates accumulated batches, sorts them, serializes to NDJSON, and dispatches.
+    async fn flush_buffer(
+        &self,
+        buf: &mut BufferState,
+        signal_type: SignalType,
+        target_data_stream: &str,
+        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+    ) -> Result<(), PipelineError> {
+        if buf.batches.is_empty() {
+            return Ok(());
+        }
+
+        let schema = buf.batches[0].schema();
+        let refs: Vec<&RecordBatch> = buf.batches.iter().collect();
+        let combined =
+            arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
+
+        buf.batches.clear();
+        buf.bytes = 0;
+        buf.records = 0;
+
+        if combined.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let sorted = self.sorter.sort(&combined, signal_type)?;
+        let payload = crate::serializer::serialize_batch(
+            &sorted,
+            self.config.unpack_attributes,
+            self.config.max_payload_bytes,
+        )?;
+
+        Self::dispatch(
+            Arc::clone(&self.client),
+            Arc::clone(&self.semaphore),
+            join_set,
+            target_data_stream.to_string(),
+            payload,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Flushes all active buffers across logs, metrics, and traces.
+    async fn flush_all_buffers(
+        &self,
+        logs_buf: &mut BufferState,
+        metrics_buf: &mut BufferState,
+        traces_buf: &mut BufferState,
+        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+    ) -> Result<(), PipelineError> {
+        let logs_target = self.config.data_streams.logs.clone();
+        self.flush_buffer(logs_buf, SignalType::Logs, &logs_target, join_set)
+            .await?;
+
+        let metrics_target = self.config.data_streams.metrics.clone();
+        self.flush_buffer(metrics_buf, SignalType::Metrics, &metrics_target, join_set)
+            .await?;
+
+        let traces_target = self.config.data_streams.traces.clone();
+        self.flush_buffer(traces_buf, SignalType::Traces, &traces_target, join_set)
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Sink for ElasticsearchSink {
+    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+        tracing::info!(
+            endpoints = ?self.config.endpoints,
+            logs_stream = %self.config.data_streams.logs,
+            metrics_stream = %self.config.data_streams.metrics,
+            traces_stream = %self.config.data_streams.traces,
+            "ElasticsearchSink started"
+        );
+
+        // 1. Startup validation
+        self.perform_startup_validation().await?;
+
+        let batching = self.config.batching.clone();
+        let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);
+        let max_interval = batching
+            .as_ref()
+            .map_or(86_400, |b| b.max_batch_interval_sec);
+        let max_records = batching
+            .as_ref()
+            .map_or(usize::MAX, |b| b.max_batch_records);
+
+        let mut logs_buf = BufferState::default();
+        let mut metrics_buf = BufferState::default();
+        let mut traces_buf = BufferState::default();
+
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(max_interval.max(1)));
+        interval.tick().await;
+
+        let mut join_set: tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>> =
+            tokio::task::JoinSet::new();
+
+        loop {
+            tokio::select! {
+                Some(res) = join_set.join_next(), if !join_set.is_empty() => {
+                    match res {
+                        Ok(Ok(_resp)) => {}
+                        Ok(Err(es_err)) => return Err(es_err.into()),
+                        Err(join_err) => {
+                            return Err(PipelineError::Internal(format!(
+                                "Bulk dispatch task failed: {join_err}"
+                            )));
+                        }
+                    }
+                }
+                _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
+                    self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await?;
+                }
+                msg = input.recv() => {
+                    if let Some(signal) = msg {
+                        let (signal_type, batch) = match signal {
+                            SignalBatch::Logs(b) => (SignalType::Logs, b),
+                            SignalBatch::Metrics(b) => (SignalType::Metrics, b),
+                            SignalBatch::Traces(b) => (SignalType::Traces, b),
+                        };
+
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+
+                        if batching.is_none() {
+                            let sorted = self.sorter.sort(&batch, signal_type)?;
+                            let payload = crate::serializer::serialize_batch(
+                                &sorted,
+                                self.config.unpack_attributes,
+                                self.config.max_payload_bytes,
+                            )?;
+                            let target = self.data_stream_for(signal_type).to_string();
+                            Self::dispatch(
+                                Arc::clone(&self.client),
+                                Arc::clone(&self.semaphore),
+                                &mut join_set,
+                                target,
+                                payload,
+                            ).await?;
+                        } else {
+                            let buf = match signal_type {
+                                SignalType::Logs => &mut logs_buf,
+                                SignalType::Metrics => &mut metrics_buf,
+                                SignalType::Traces => &mut traces_buf,
+                            };
+
+                            buf.bytes = buf.bytes.saturating_add(batch.get_array_memory_size());
+                            buf.records = buf.records.saturating_add(batch.num_rows());
+                            buf.batches.push(batch);
+
+                            if buf.bytes >= max_bytes || buf.records >= max_records {
+                                let target = self.data_stream_for(signal_type).to_string();
+                                self.flush_buffer(
+                                    buf,
+                                    signal_type,
+                                    &target,
+                                    &mut join_set,
+                                ).await?;
+                                interval.reset();
+                            }
+                        }
+                    } else {
+                        if batching.is_some() {
+                            self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await?;
+                        }
+
+                        Self::drain_join_set(&mut join_set).await?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        tracing::info!("ElasticsearchSink channel closed; shutdown complete");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn make_test_config(endpoint: String, validate_on_startup: bool) -> ElasticsearchSinkConfig {
+        ElasticsearchSinkConfig {
+            endpoints: vec![endpoint],
+            auth: ElasticsearchAuthConfig::None,
+            data_streams: DataStreamMapping {
+                logs: "logs-otel-default".to_string(),
+                metrics: "metrics-otel-default".to_string(),
+                traces: "traces-otel-default".to_string(),
+            },
+            tls: TlsConfig::default(),
+            unpack_attributes: true,
+            gzip_compression: false,
+            max_concurrent_requests: 4,
+            max_payload_bytes: 20_971_520,
+            connect_timeout_secs: 5,
+            request_timeout_secs: 5,
+            max_retries: 2,
+            retry_interval_secs: 0,
+            validate_on_startup,
+            batching: None,
+            order_by: None,
+        }
+    }
+
+    async fn setup_startup_validation_mocks(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": { "number": "8.12.0" }
+            })))
+            .mount(server)
+            .await;
+
+        for stream in [
+            "logs-otel-default",
+            "metrics-otel-default",
+            "traces-otel-default",
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/_index_template/{stream}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "index_templates": [{ "name": stream }]
+                })))
+                .mount(server)
+                .await;
+        }
+    }
+
+    fn make_log_batch_with_timestamps(nanos: Vec<i64>) -> RecordBatch {
+        let count = nanos.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_number", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(nanos)),
+                Arc::new(StringArray::from(vec!["frontend"; count])),
+                Arc::new(Int32Array::from(vec![9; count])),
+                Arc::new(StringArray::from(vec!["Request processed"; count])),
+                Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#; count])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_log_batch() -> RecordBatch {
+        make_log_batch_with_timestamps(vec![1_726_500_000_000_000_000])
+    }
+
+    fn make_metric_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["system.cpu.utilization"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.42])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_trace_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("span_id", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["4bf92f3577b34da6a3ce929d0e0e4736"])),
+                Arc::new(StringArray::from(vec!["00f067aa0ba902b7"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_sink_sends_valid_ndjson_to_mock_server() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(header("content-type", "application/x-ndjson"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 12,
+                "errors": false,
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch = make_log_batch();
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .expect("bulk request must be received");
+
+        let body_str = std::str::from_utf8(&bulk_req.body).unwrap();
+        let lines: Vec<&str> = body_str.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], r#"{"create":{}}"#);
+        assert!(lines[1].contains(r#""@timestamp":"#));
+        assert!(lines[1].contains(r#""service_name":"frontend""#));
+        assert!(lines[1].contains(r#""attributes":{"http.method":"GET"}"#));
+    }
+
+    #[tokio::test]
+    async fn test_sink_429_triggers_retries() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        // First bulk attempt returns 429
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second bulk attempt returns 200 OK
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 15,
+                "errors": false,
+                "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_req_count = requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .count();
+        assert_eq!(
+            bulk_req_count, 2,
+            "Bulk request should be retried after 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_exhausted_retries_produces_downstream_closed() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.max_retries = 2;
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        drop(tx);
+
+        let err = sink.run(rx).await.unwrap_err();
+        assert!(
+            matches!(err, PipelineError::DownstreamClosed),
+            "Exhausted 429 retries must produce PipelineError::DownstreamClosed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_graceful_shutdown_drains_all_in_flight_requests() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/metrics-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/traces-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        tx.send(SignalBatch::Metrics(make_metric_batch()))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Traces(make_trace_batch()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_reqs = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/_bulk"))
+            .count();
+        assert_eq!(
+            bulk_reqs, 3,
+            "All 3 in-flight requests must be drained on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_batching_accumulation_and_record_limit_flush() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 60,
+            max_batch_records: 4,
+        });
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        // Send batch 1 with 2 rows
+        let b1 = make_log_batch_with_timestamps(vec![1_000_000_000, 2_000_000_000]);
+        tx.send(SignalBatch::Logs(b1)).await.unwrap();
+
+        // Send batch 2 with 2 rows -> total 4 rows reaches max_batch_records!
+        let b2 = make_log_batch_with_timestamps(vec![3_000_000_000, 4_000_000_000]);
+        tx.send(SignalBatch::Logs(b2)).await.unwrap();
+
+        // Send batch 3 with 1 row -> stays buffered until shutdown flush
+        let b3 = make_log_batch_with_timestamps(vec![5_000_000_000]);
+        tx.send(SignalBatch::Logs(b3)).await.unwrap();
+
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .collect();
+        assert_eq!(
+            bulk_requests.len(),
+            2,
+            "Expected 2 bulk requests (threshold + shutdown flush)"
+        );
+
+        // First bulk request had 4 rows = 8 lines (action + doc)
+        let body1 = std::str::from_utf8(&bulk_requests[0].body).unwrap();
+        let lines1: Vec<&str> = body1.lines().collect();
+        assert_eq!(lines1.len(), 8);
+
+        // Second bulk request had 1 row = 2 lines
+        let body2 = std::str::from_utf8(&bulk_requests[1].body).unwrap();
+        let lines2: Vec<&str> = body2.lines().collect();
+        assert_eq!(lines2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_sink_presorts_chronologically() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "timestamp ASC".to_string(),
+            )],
+            metrics: vec![],
+            traces: vec![],
+        });
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        // Unordered timestamps: 3s, 1s, 2s
+        let batch =
+            make_log_batch_with_timestamps(vec![3_000_000_000, 1_000_000_000, 2_000_000_000]);
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .unwrap();
+
+        let body_str = std::str::from_utf8(&bulk_req.body).unwrap();
+        let lines: Vec<&str> = body_str.lines().collect();
+        assert_eq!(lines.len(), 6); // 3 docs * 2 lines
+
+        assert!(lines[1].contains("1970-01-01T00:00:01"));
+        assert!(lines[3].contains("1970-01-01T00:00:02"));
+        assert!(lines[5].contains("1970-01-01T00:00:03"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_batching_interval_timer_flush() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 1, // 1 second interval
+            max_batch_records: 1000,
+        });
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        // Send 1 batch (well below record limit of 1000)
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+
+        // Sleep 1.5 seconds to let interval timer fire and flush
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // Verify request was dispatched before channel was closed
+        let requests = server.received_requests().await.unwrap();
+        let bulk_count = requests
+            .iter()
+            .filter(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .count();
+        assert_eq!(bulk_count, 1, "Interval timer must flush buffered batch");
+
+        // Clean up channel and wait for sink task to finish
+        drop(tx);
+        run_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sink_startup_validation_fails_on_missing_index_template() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": { "number": "8.12.0" }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(10);
+        let err = sink.run(rx).await.unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal(_)),
+            "Missing index template must produce PipelineError::Internal, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_startup_validation_fails_on_unauthorized() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(10);
+        let err = sink.run(rx).await.unwrap_err();
+        assert!(
+            matches!(err, PipelineError::DownstreamClosed),
+            "401 during startup health check must produce PipelineError::DownstreamClosed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sink_with_gzip_compression() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(header("content-encoding", "gzip"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 5, "errors": false, "items": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.gzip_compression = true;
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_req = requests
+            .iter()
+            .find(|r| r.url.path() == "/logs-otel-default/_bulk")
+            .unwrap();
+
+        let mut decoder = GzDecoder::new(&bulk_req.body[..]);
+        let mut decompressed = String::new();
+        decoder.read_to_string(&mut decompressed).unwrap();
+        assert!(decompressed.contains("@timestamp"));
+        assert!(decompressed.contains("frontend"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_empty_batches_ignored() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let empty_batch = make_log_batch().slice(0, 0);
+        tx.send(SignalBatch::Logs(empty_batch)).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let bulk_count = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/_bulk"))
+            .count();
+        assert_eq!(
+            bulk_count, 0,
+            "Empty batches should not trigger bulk requests"
+        );
+    }
+
+    #[test]
+    fn test_sink_try_new_rejects_zero_max_concurrent_requests() {
+        let mut config = make_test_config("http://localhost:9200".to_string(), false);
+        config.max_concurrent_requests = 0;
+        let err = ElasticsearchSink::try_new(config).unwrap_err();
+        assert!(matches!(err, PipelineError::Internal(_)));
+        assert!(
+            err.to_string()
+                .contains("max_concurrent_requests must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_sink_getters() {
+        let config = make_test_config("http://localhost:9200".to_string(), false);
+        let sink = ElasticsearchSink::try_new(config).unwrap();
+        assert_eq!(sink.config().endpoints, vec!["http://localhost:9200"]);
+        assert_eq!(sink.client().endpoints(), &["http://localhost:9200"]);
+        assert_eq!(sink.data_stream_for(SignalType::Logs), "logs-otel-default");
+        assert_eq!(
+            sink.data_stream_for(SignalType::Metrics),
+            "metrics-otel-default"
+        );
+        assert_eq!(
+            sink.data_stream_for(SignalType::Traces),
+            "traces-otel-default"
+        );
+    }
+}
