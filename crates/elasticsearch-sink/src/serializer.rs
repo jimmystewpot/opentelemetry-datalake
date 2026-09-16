@@ -212,8 +212,17 @@ fn write_string_col(
         _ => return,
     };
     if unpack_json && (val.starts_with('{') || val.starts_with('[')) {
-        // Embed raw JSON directly without escaping
-        buf.extend_from_slice(val.as_bytes());
+        if val.contains('\n') || val.contains('\r') {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(val) {
+                let _ = serde_json::to_writer(&mut *buf, &parsed);
+            } else {
+                write_escaped_string(buf, val);
+            }
+        } else if serde_json::from_str::<serde_json::Value>(val).is_ok() {
+            buf.extend_from_slice(val.as_bytes());
+        } else {
+            write_escaped_string(buf, val);
+        }
     } else {
         write_escaped_string(buf, val);
     }
@@ -352,6 +361,74 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         // Attributes should be an escaped JSON string
         assert!(text.contains(r#""attributes":"{\"http.method\":\"GET\"}"#));
+    }
+
+    #[test]
+    fn test_serialize_multiline_json_attribute_compacted_to_single_line() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        let multiline_json = "{\n  \"error.stack\": \"line1\\nline2\",\n  \"retries\": 3\n}";
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000i64,
+                ])),
+                Arc::new(StringArray::from(vec![multiline_json])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = serialize_batch(&batch, true, 10_485_760).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Must still be exactly 2 NDJSON lines (1 action line + 1 document line)
+        assert_eq!(
+            lines.len(),
+            2,
+            "Multiline JSON must not split the NDJSON document line"
+        );
+        assert_eq!(lines[0], r#"{"create":{}}"#);
+        assert!(lines[1].contains(r#""attributes":{"#));
+        assert!(lines[1].contains(r#""retries":3"#));
+    }
+
+    #[test]
+    fn test_serialize_malformed_json_starting_with_brace_is_escaped_as_string() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        let malformed_json = "{broken json without closing brace";
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000i64,
+                ])),
+                Arc::new(StringArray::from(vec![malformed_json])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = serialize_batch(&batch, true, 10_485_760).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines.len(), 2, "Malformed JSON must not split lines");
+        // Must be safely escaped as a string
+        assert!(lines[1].contains(r#""attributes":"{broken json without closing brace""#));
     }
 
     #[test]
