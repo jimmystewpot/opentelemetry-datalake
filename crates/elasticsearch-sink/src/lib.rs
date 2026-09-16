@@ -262,17 +262,29 @@ impl ElasticsearchSink {
         traces_buf: &mut BufferState,
         join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
     ) -> Result<(), PipelineError> {
-        let logs_target = self.config.data_streams.logs.clone();
-        self.flush_buffer(logs_buf, SignalType::Logs, &logs_target, join_set)
-            .await?;
+        self.flush_buffer(
+            logs_buf,
+            SignalType::Logs,
+            self.data_stream_for(SignalType::Logs),
+            join_set,
+        )
+        .await?;
 
-        let metrics_target = self.config.data_streams.metrics.clone();
-        self.flush_buffer(metrics_buf, SignalType::Metrics, &metrics_target, join_set)
-            .await?;
+        self.flush_buffer(
+            metrics_buf,
+            SignalType::Metrics,
+            self.data_stream_for(SignalType::Metrics),
+            join_set,
+        )
+        .await?;
 
-        let traces_target = self.config.data_streams.traces.clone();
-        self.flush_buffer(traces_buf, SignalType::Traces, &traces_target, join_set)
-            .await?;
+        self.flush_buffer(
+            traces_buf,
+            SignalType::Traces,
+            self.data_stream_for(SignalType::Traces),
+            join_set,
+        )
+        .await?;
 
         Ok(())
     }
@@ -307,6 +319,7 @@ impl Sink for ElasticsearchSink {
 
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(max_interval.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
 
         let mut join_set: tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>> =
@@ -367,14 +380,12 @@ impl Sink for ElasticsearchSink {
                             buf.batches.push(batch);
 
                             if buf.bytes >= max_bytes || buf.records >= max_records {
-                                let target = self.data_stream_for(signal_type).to_string();
                                 self.flush_buffer(
                                     buf,
                                     signal_type,
-                                    &target,
+                                    self.data_stream_for(signal_type),
                                     &mut join_set,
                                 ).await?;
-                                interval.reset();
                             }
                         }
                     } else {
