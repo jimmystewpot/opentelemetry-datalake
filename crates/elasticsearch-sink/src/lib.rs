@@ -193,8 +193,12 @@ impl ElasticsearchSink {
         while let Some(res) = join_set.try_join_next() {
             match res {
                 Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => return Err(es_err.into()),
+                Ok(Err(es_err)) => {
+                    let _ = Self::drain_join_set(join_set).await;
+                    return Err(es_err.into());
+                }
                 Err(join_err) => {
+                    let _ = Self::drain_join_set(join_set).await;
                     return Err(PipelineError::Internal(format!(
                         "Bulk dispatch task failed: {join_err}"
                     )));
@@ -207,8 +211,12 @@ impl ElasticsearchSink {
             if let Some(res) = join_set.join_next().await {
                 match res {
                     Ok(Ok(_resp)) => {}
-                    Ok(Err(es_err)) => return Err(es_err.into()),
+                    Ok(Err(es_err)) => {
+                        let _ = Self::drain_join_set(join_set).await;
+                        return Err(es_err.into());
+                    }
                     Err(join_err) => {
+                        let _ = Self::drain_join_set(join_set).await;
                         return Err(PipelineError::Internal(format!(
                             "Bulk dispatch task failed: {join_err}"
                         )));
@@ -394,8 +402,12 @@ impl Sink for ElasticsearchSink {
                 Some(res) = join_set.join_next(), if !join_set.is_empty() => {
                     match res {
                         Ok(Ok(_resp)) => {}
-                        Ok(Err(es_err)) => return Err(es_err.into()),
+                        Ok(Err(es_err)) => {
+                            let _ = Self::drain_join_set(&mut join_set).await;
+                            return Err(es_err.into());
+                        }
                         Err(join_err) => {
+                            let _ = Self::drain_join_set(&mut join_set).await;
                             return Err(PipelineError::Internal(format!(
                                 "Bulk dispatch task failed: {join_err}"
                             )));
@@ -572,6 +584,33 @@ mod tests {
 
     fn make_log_batch() -> RecordBatch {
         make_log_batch_with_timestamps(vec![1_726_500_000_000_000_000])
+    }
+
+    fn make_log_batch_with_service(service_name: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_number", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec![service_name])),
+                Arc::new(Int32Array::from(vec![9])),
+                Arc::new(StringArray::from(vec!["Request processed"])),
+                Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#])),
+            ],
+        )
+        .unwrap()
     }
 
     fn make_metric_batch() -> RecordBatch {
@@ -1191,6 +1230,190 @@ mod tests {
 
         let res = sink.run(rx).await;
         assert!(res.is_ok());
+    }
+
+    struct SlowSuccessResponder {
+        completed: Arc<std::sync::atomic::AtomicBool>,
+        delay: std::time::Duration,
+    }
+
+    impl wiremock::Respond for SlowSuccessResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let completed = Arc::clone(&self.completed);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            ResponseTemplate::new(200)
+                .set_delay(self.delay)
+                .set_body_json(serde_json::json!({
+                    "took": 1,
+                    "errors": false,
+                    "items": []
+                }))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sink_run_drains_all_inflight_tasks_on_task_failure() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        // Mock 1: Fails immediately with 400 Bad Request
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service-fail")
+            })
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": {
+                    "root_cause": [{"type": "illegal_argument_exception", "reason": "bad payload"}],
+                    "type": "illegal_argument_exception",
+                    "reason": "bad payload"
+                },
+                "status": 400
+            })))
+            .mount(&server)
+            .await;
+
+        // Mock 2: Succeeds after delay (150ms)
+        let task2_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service-slow")
+            })
+            .respond_with(SlowSuccessResponder {
+                completed: Arc::clone(&task2_completed),
+                delay: std::time::Duration::from_millis(150),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.batching = None;
+        config.max_retries = 0;
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch_with_service(
+            "service-fail",
+        )))
+        .await
+        .unwrap();
+        tx.send(SignalBatch::Logs(make_log_batch_with_service(
+            "service-slow",
+        )))
+        .await
+        .unwrap();
+
+        let res = sink.run(rx).await;
+        assert!(res.is_err(), "sink.run should return error on task failure");
+        assert!(
+            task2_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "In-flight task must be drained and allowed to complete before sink.run returns on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_drains_all_inflight_tasks_on_task_failure() {
+        let server = MockServer::start().await;
+        let config = make_test_config(server.uri(), false);
+        let client = Arc::new(HttpClient::try_new(&config).unwrap());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+
+        let mut join_set = tokio::task::JoinSet::new();
+        let slow_task_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // In-flight task 1: fails immediately
+        join_set.spawn(async move {
+            Err(ElasticsearchError::StartupValidation(
+                "fast failure".to_string(),
+            ))
+        });
+
+        // In-flight task 2: slow task
+        let flag = Arc::clone(&slow_task_completed);
+        join_set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })
+        });
+
+        // Yield so task 1 finishes and task 2 starts sleeping
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let res = ElasticsearchSink::dispatch(
+            client,
+            semaphore,
+            &mut join_set,
+            "logs-otel-default".to_string(),
+            bytes::Bytes::from_static(b"dummy payload"),
+        )
+        .await;
+
+        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "dispatch must drain all remaining in-flight tasks before returning error"
+        );
+        assert!(join_set.is_empty(), "JoinSet must be drained and empty");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_drains_all_inflight_tasks_on_semaphore_exhaustion_failure() {
+        let server = MockServer::start().await;
+        let config = make_test_config(server.uri(), false);
+        let client = Arc::new(HttpClient::try_new(&config).unwrap());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut join_set = tokio::task::JoinSet::new();
+        let slow_task_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Exhaust the 1 permit
+        let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
+
+        // Task 1: fails after 10ms
+        join_set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Err(ElasticsearchError::StartupValidation(
+                "failure while waiting for permit".to_string(),
+            ))
+        });
+
+        // Task 2: slow task finishes after 50ms
+        let flag = Arc::clone(&slow_task_completed);
+        join_set.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })
+        });
+
+        let res = ElasticsearchSink::dispatch(
+            client,
+            Arc::clone(&semaphore),
+            &mut join_set,
+            "logs-otel-default".to_string(),
+            bytes::Bytes::from_static(b"dummy payload"),
+        )
+        .await;
+
+        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "dispatch must drain all remaining in-flight tasks when permits are exhausted"
+        );
+        assert!(join_set.is_empty(), "JoinSet must be drained and empty");
     }
 
     #[test]
