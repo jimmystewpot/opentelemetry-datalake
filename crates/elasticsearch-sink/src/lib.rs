@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sink_exhausted_retries_produces_downstream_closed() {
+    async fn test_sink_exhausted_retries_produces_storage_error() {
         let server = MockServer::start().await;
         setup_startup_validation_mocks(&server).await;
 
@@ -709,9 +709,10 @@ mod tests {
 
         let err = sink.run(rx).await.unwrap_err();
         assert!(
-            matches!(err, PipelineError::DownstreamClosed),
-            "Exhausted 429 retries must produce PipelineError::DownstreamClosed, got: {err:?}"
+            matches!(err, PipelineError::Storage(_)),
+            "Exhausted 429 retries must produce PipelineError::Storage, got: {err:?}"
         );
+        assert!(err.to_string().contains("HTTP 429"));
     }
 
     #[tokio::test]
@@ -949,9 +950,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(10);
         let err = sink.run(rx).await.unwrap_err();
         assert!(
-            matches!(err, PipelineError::Internal(_)),
-            "Missing index template must produce PipelineError::Internal, got: {err:?}"
+            matches!(err, PipelineError::Storage(_)),
+            "Missing index template must produce PipelineError::Storage, got: {err:?}"
         );
+        assert!(err.to_string().contains("not found"));
     }
 
     #[tokio::test]
@@ -970,9 +972,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(10);
         let err = sink.run(rx).await.unwrap_err();
         assert!(
-            matches!(err, PipelineError::DownstreamClosed),
-            "401 during startup health check must produce PipelineError::DownstreamClosed, got: {err:?}"
+            matches!(err, PipelineError::Storage(_)),
+            "401 during startup health check must produce PipelineError::Storage, got: {err:?}"
         );
+        assert!(err.to_string().contains("401 Unauthorized"));
     }
 
     #[tokio::test]
@@ -1091,7 +1094,7 @@ mod tests {
         let err = ElasticsearchSink::drain_join_set(&mut join_set)
             .await
             .unwrap_err();
-        assert!(matches!(err, PipelineError::Internal(_)));
+        assert!(matches!(err, PipelineError::Storage(_)));
         assert!(err.to_string().contains("task 1 failed"));
         assert_eq!(
             completed_tasks.load(Ordering::SeqCst),
