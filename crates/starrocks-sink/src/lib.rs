@@ -176,6 +176,25 @@ fn default_retry_interval_secs() -> u64 {
     1
 }
 
+fn default_max_batch_size_bytes() -> usize {
+    52_428_800 // 50 MiB
+}
+
+fn default_max_batch_interval_sec() -> u64 {
+    30
+}
+
+/// Configuration for buffering and accumulating batches prior to stream loading.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StarRocksBatchingConfig {
+    #[serde(default = "default_max_batch_size_bytes")]
+    pub max_batch_size_bytes: usize,
+    #[serde(default = "default_max_batch_interval_sec")]
+    pub max_batch_interval_sec: u64,
+    #[serde(default)]
+    pub max_batch_records: Option<usize>,
+}
+
 /// Configuration for the `StarRocks` Stream Load sink.
 ///
 /// Credentials: `username` can be set in config; `password` should be supplied
@@ -235,6 +254,14 @@ pub struct StarRocksSinkConfig {
     /// Delay between retries in seconds. Default: 1.
     #[serde(default = "default_retry_interval_secs")]
     pub retry_interval_secs: u64,
+
+    /// Optional row order configuration for incoming signal batches.
+    #[serde(default)]
+    pub order_by: Option<pipeline_core::sort::SortConfig>,
+
+    /// Optional batch buffering configuration for accumulating records.
+    #[serde(default)]
+    pub batching: Option<StarRocksBatchingConfig>,
 }
 
 // ─── Sink ────────────────────────────────────────────────────────────────────
@@ -253,6 +280,7 @@ use std::sync::Arc;
 pub struct StarRocksSink {
     config: StarRocksSinkConfig,
     manager: Arc<StreamLoadManager>,
+    sorter: pipeline_core::sort::BatchSorter,
 }
 
 impl std::fmt::Debug for StarRocksSink {
@@ -260,21 +288,44 @@ impl std::fmt::Debug for StarRocksSink {
         f.debug_struct("StarRocksSink")
             .field("config", &self.config)
             .field("manager", &"<StreamLoadManager>")
+            .field("sorter", &self.sorter)
             .finish()
     }
 }
 
 impl StarRocksSink {
     /// Creates a new `StarRocksSink` with a shared [`StreamLoadManager`].
-    #[must_use]
-    pub fn with_manager(config: StarRocksSinkConfig, manager: Arc<StreamLoadManager>) -> Self {
-        Self { config, manager }
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] if `order_by` configuration fails to parse.
+    pub fn with_manager(
+        config: StarRocksSinkConfig,
+        manager: Arc<StreamLoadManager>,
+    ) -> Result<Self, PipelineError> {
+        let sorter = if let Some(ref sort_cfg) = config.order_by {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)?
+        } else {
+            pipeline_core::sort::BatchSorter::default()
+        };
+
+        Ok(Self {
+            config,
+            manager,
+            sorter,
+        })
     }
 
     /// Returns a reference to the underlying [`StreamLoadManager`] connection pool.
     #[must_use]
     pub fn manager(&self) -> Arc<StreamLoadManager> {
         Arc::clone(&self.manager)
+    }
+
+    /// Returns a reference to the sink's [`pipeline_core::sort::BatchSorter`].
+    #[must_use]
+    pub fn sorter(&self) -> &pipeline_core::sort::BatchSorter {
+        &self.sorter
     }
 
     /// Creates a new `StarRocksSink` from the provided configuration.
@@ -300,6 +351,12 @@ impl StarRocksSink {
                 "StarRocks configuration error: `database` must not be empty".to_string(),
             ));
         }
+
+        let sorter = if let Some(ref sort_cfg) = config.order_by {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)?
+        } else {
+            pipeline_core::sort::BatchSorter::default()
+        };
 
         let sdk_config = StreamLoadConfig::builder(
             config.frontend_urls.clone(),
@@ -331,6 +388,7 @@ impl StarRocksSink {
         Ok(Self {
             config,
             manager: Arc::new(manager),
+            sorter,
         })
     }
 
@@ -521,6 +579,67 @@ impl StarRocksSink {
         );
         Ok(())
     }
+    async fn send_batch(
+        &self,
+        batch: &arrow::record_batch::RecordBatch,
+        signal_type_enum: pipeline_core::sort::SignalType,
+    ) -> Result<(), PipelineError> {
+        let signal_type = match signal_type_enum {
+            pipeline_core::sort::SignalType::Logs => "logs",
+            pipeline_core::sort::SignalType::Metrics => "metrics",
+            pipeline_core::sort::SignalType::Traces => "traces",
+        };
+
+        // For Unified mapping, inject the discriminator column before serialization.
+        let batch = if let Some(col_name) = self.config.table_mapping.signal_type_column() {
+            Self::inject_signal_type_column(batch, col_name, signal_type)?
+        } else {
+            batch.clone()
+        };
+
+        let table = self.config.table_mapping.table_for(signal_type).to_owned();
+        let label = Self::make_label(signal_type);
+        let payload = self.serialize_batch(&batch)?;
+
+        match self.config.transaction_mode {
+            TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
+            TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+        }
+
+        Ok(())
+    }
+
+    async fn flush_buffer(
+        &self,
+        batches: &mut Vec<arrow::record_batch::RecordBatch>,
+        bytes: &mut usize,
+        records: &mut usize,
+        signal_type: pipeline_core::sort::SignalType,
+    ) -> Result<(), PipelineError> {
+        if batches.is_empty() {
+            return Ok(());
+        }
+
+        let schema = batches[0].schema();
+        let refs: Vec<&arrow::record_batch::RecordBatch> = batches.iter().collect();
+        let combined =
+            arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
+
+        let sorted = self.sorter.sort(&combined, signal_type)?;
+        self.send_batch(&sorted, signal_type).await?;
+
+        batches.clear();
+        *bytes = 0;
+        *records = 0;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct BufferState {
+    batches: Vec<arrow::record_batch::RecordBatch>,
+    bytes: usize,
+    records: usize,
 }
 
 #[async_trait]
@@ -538,35 +657,68 @@ impl Sink for StarRocksSink {
             "StarRocksSink started"
         );
 
-        while let Some(signal) = input.recv().await {
-            let signal_type = match &signal {
-                SignalBatch::Logs(_) => "logs",
-                SignalBatch::Metrics(_) => "metrics",
-                SignalBatch::Traces(_) => "traces",
-            };
+        let batching = self.config.batching.clone();
+        let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);
+        let max_interval = batching
+            .as_ref()
+            .map_or(86400, |b| b.max_batch_interval_sec);
+        let max_records = batching
+            .as_ref()
+            .and_then(|b| b.max_batch_records)
+            .unwrap_or(usize::MAX);
 
-            let batch = match signal {
-                SignalBatch::Logs(b) | SignalBatch::Metrics(b) | SignalBatch::Traces(b) => b,
-            };
+        let mut logs_buf = BufferState::default();
+        let mut metrics_buf = BufferState::default();
+        let mut traces_buf = BufferState::default();
 
-            if batch.num_rows() == 0 {
-                continue;
-            }
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(max_interval));
+        interval.tick().await;
 
-            // For Unified mapping, inject the discriminator column before serialization.
-            let batch = if let Some(col_name) = self.config.table_mapping.signal_type_column() {
-                Self::inject_signal_type_column(&batch, col_name, signal_type)?
-            } else {
-                batch
-            };
+        loop {
+            tokio::select! {
+                _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
+                    self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
+                    self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
+                    self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
+                }
+                msg = input.recv() => {
+                    if let Some(signal) = msg {
+                        let (signal_type, batch) = match signal {
+                            SignalBatch::Logs(b) => (pipeline_core::sort::SignalType::Logs, b),
+                            SignalBatch::Metrics(b) => (pipeline_core::sort::SignalType::Metrics, b),
+                            SignalBatch::Traces(b) => (pipeline_core::sort::SignalType::Traces, b),
+                        };
 
-            let table = self.config.table_mapping.table_for(signal_type).to_owned();
-            let label = Self::make_label(signal_type);
-            let payload = self.serialize_batch(&batch)?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
 
-            match self.config.transaction_mode {
-                TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
-                TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+                        if batching.is_none() {
+                            let sorted = self.sorter.sort(&batch, signal_type)?;
+                            self.send_batch(&sorted, signal_type).await?;
+                        } else {
+                            let buf = match signal_type {
+                                pipeline_core::sort::SignalType::Logs => &mut logs_buf,
+                                pipeline_core::sort::SignalType::Metrics => &mut metrics_buf,
+                                pipeline_core::sort::SignalType::Traces => &mut traces_buf,
+                            };
+
+                            buf.bytes += batch.get_array_memory_size();
+                            buf.records += batch.num_rows();
+                            buf.batches.push(batch);
+
+                            if buf.bytes >= max_bytes || buf.records >= max_records {
+                                self.flush_buffer(&mut buf.batches, &mut buf.bytes, &mut buf.records, signal_type).await?;
+                                interval.reset();
+                            }
+                        }
+                    } else {
+                        self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
+                        self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
+                        self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
+                        break;
+                    }
+                }
             }
         }
 
@@ -574,13 +726,12 @@ impl Sink for StarRocksSink {
         Ok(())
     }
 }
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, Int32Array, StringArray};
+    use arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -624,6 +775,8 @@ mod tests {
             request_timeout_secs: default_request_timeout_secs(),
             max_retries: default_max_retries(),
             retry_interval_secs: default_retry_interval_secs(),
+            order_by: None,
+            batching: None,
         }
     }
 
@@ -777,6 +930,7 @@ mod tests {
         assert_eq!(config.max_payload_bytes, default_max_payload_bytes());
         assert!(matches!(config.format, StarRocksFormat::Ipc));
         assert!(matches!(config.transaction_mode, TransactionMode::V1));
+        assert!(config.order_by.is_none());
     }
 
     #[test]
@@ -851,7 +1005,7 @@ mod tests {
         let sink1 = StarRocksSink::try_new(config.clone()).unwrap();
         let manager_arc = sink1.manager();
 
-        let sink2 = StarRocksSink::with_manager(config, Arc::clone(&manager_arc));
+        let sink2 = StarRocksSink::with_manager(config, Arc::clone(&manager_arc)).unwrap();
         assert!(
             Arc::ptr_eq(&sink1.manager(), &sink2.manager()),
             "Arc pointers must be equal when using with_manager"
@@ -935,6 +1089,11 @@ mod tests {
         assert_eq!(sig_col.value(1), "metrics");
     }
 
+    /// Helper: alias for base_config for plan compatibility.
+    fn make_config() -> StarRocksSinkConfig {
+        base_config()
+    }
+
     /// The PerSignal table mapping must correctly select the right table
     /// for each signal type.
     #[test]
@@ -947,5 +1106,271 @@ mod tests {
         assert_eq!(mapping.table_for("logs"), "logs_tbl");
         assert_eq!(mapping.table_for("metrics"), "metrics_tbl");
         assert_eq!(mapping.table_for("traces"), "traces_tbl");
+    }
+
+    #[test]
+    fn test_starrocks_sink_pre_sorted_serialization() {
+        let mut config = make_config();
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "id DESC".to_string(),
+            )],
+            ..Default::default()
+        });
+        let sink = StarRocksSink::try_new(config).expect("try_new failed");
+
+        let schema = make_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 3, 2])),
+                Arc::new(StringArray::from(vec!["a", "c", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sink
+            .sorter()
+            .sort(&batch, pipeline_core::sort::SignalType::Logs)
+            .unwrap();
+        let id_col = sorted
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 3);
+        assert_eq!(id_col.value(1), 2);
+        assert_eq!(id_col.value(2), 1);
+    }
+
+    #[test]
+    fn test_starrocks_sink_pre_sorted_metrics_and_traces() {
+        let mut config = make_config();
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            metrics: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "id ASC".to_string(),
+            )],
+            traces: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "name DESC".to_string(),
+            )],
+            ..Default::default()
+        });
+        let sink = StarRocksSink::try_new(config).expect("try_new failed");
+
+        let schema = make_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![5, 1, 3])),
+                Arc::new(StringArray::from(vec!["alpha", "charlie", "bravo"])),
+            ],
+        )
+        .unwrap();
+
+        // Sort metrics by id ASC
+        let sorted_metrics = sink
+            .sorter()
+            .sort(&batch, pipeline_core::sort::SignalType::Metrics)
+            .unwrap();
+        let id_col = sorted_metrics
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 3);
+        assert_eq!(id_col.value(2), 5);
+
+        // Sort traces by name DESC
+        let sorted_traces = sink
+            .sorter()
+            .sort(&batch, pipeline_core::sort::SignalType::Traces)
+            .unwrap();
+        let name_col = sorted_traces
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(name_col.value(0), "charlie");
+        assert_eq!(name_col.value(1), "bravo");
+        assert_eq!(name_col.value(2), "alpha");
+    }
+
+    #[test]
+    fn test_starrocks_sink_with_manager_preserves_sorter() {
+        let mut config = make_config();
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "id DESC".to_string(),
+            )],
+            ..Default::default()
+        });
+        let sink1 = StarRocksSink::try_new(config.clone()).unwrap();
+        let sink2 = StarRocksSink::with_manager(config, sink1.manager()).unwrap();
+
+        let schema = make_schema();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![10, 30, 20])),
+                Arc::new(StringArray::from(vec!["x", "z", "y"])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sink2
+            .sorter()
+            .sort(&batch, pipeline_core::sort::SignalType::Logs)
+            .unwrap();
+        let id_col = sorted
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_col.value(0), 30);
+        assert_eq!(id_col.value(1), 20);
+        assert_eq!(id_col.value(2), 10);
+    }
+
+    #[test]
+    fn test_starrocks_sink_order_by_toml_deserialization() {
+        let toml = r#"
+            frontend_urls = ["http://fe-1:8030"]
+            database = "telemetry"
+            username = "writer"
+
+            [table_mapping]
+            type = "per_signal"
+            logs = "otel_logs"
+            metrics = "otel_metrics"
+            traces = "otel_traces"
+
+            [order_by]
+            logs = ["timestamp DESC", "service_name ASC"]
+            metrics = ["metric_name ASC"]
+        "#;
+
+        let config: StarRocksSinkConfig = toml::from_str(toml).unwrap();
+        let order_by = config
+            .order_by
+            .as_ref()
+            .expect("order_by should be present");
+        assert_eq!(order_by.logs.len(), 2);
+        assert_eq!(order_by.metrics.len(), 1);
+        assert!(order_by.traces.is_empty());
+
+        let sink =
+            StarRocksSink::try_new(config).expect("try_new should succeed with valid order_by");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("service_name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![100, 200, 100])),
+                Arc::new(StringArray::from(vec![
+                    "b_service",
+                    "a_service",
+                    "a_service",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sink
+            .sorter()
+            .sort(&batch, pipeline_core::sort::SignalType::Logs)
+            .unwrap();
+        let ts_col = sorted
+            .column_by_name("timestamp")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let svc_col = sorted
+            .column_by_name("service_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        assert_eq!(ts_col.value(0), 200);
+        assert_eq!(svc_col.value(0), "a_service");
+        assert_eq!(ts_col.value(1), 100);
+        assert_eq!(svc_col.value(1), "a_service");
+        assert_eq!(ts_col.value(2), 100);
+        assert_eq!(svc_col.value(2), "b_service");
+    }
+
+    #[test]
+    fn test_starrocks_sink_invalid_order_by_error() {
+        let mut config = make_config();
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "col ASC extra invalid token".to_string(),
+            )],
+            ..Default::default()
+        });
+
+        let err = StarRocksSink::try_new(config.clone()).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal(ref msg) if msg.contains("sort column shorthand")),
+            "Expected sort column shorthand error, got: {err}"
+        );
+
+        let primary = StarRocksSink::try_new(base_config()).unwrap();
+        let err_wm = StarRocksSink::with_manager(config, primary.manager()).unwrap_err();
+        assert!(
+            matches!(err_wm, PipelineError::Internal(ref msg) if msg.contains("sort column shorthand")),
+            "Expected sort column shorthand error from with_manager, got: {err_wm}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_batch_accumulation_flush() {
+        let mut config = base_config();
+        config.connect_timeout_secs = 0;
+        config.request_timeout_secs = 0;
+        config.max_retries = 0;
+        config.retry_interval_secs = 0;
+
+        config.batching = Some(StarRocksBatchingConfig {
+            max_batch_size_bytes: 1024 * 1024,
+            max_batch_interval_sec: 10,
+            max_batch_records: Some(4),
+        });
+
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+
+        let handle = tokio::spawn(async move { sink.run(receiver).await });
+
+        // send 3 rows
+        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
+
+        // wait a little bit
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // task should still be running because it's only 3 records < 4
+        assert!(!handle.is_finished(), "Task should still be buffering");
+
+        // send 3 more rows, bringing total to 6 > 4 (max_batch_records)
+        // This should trigger flush_buffer, which hits SDK, which fails because fast timeouts + 127.0.0.1
+        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
+
+        // Wait for task to finish due to network error from flush
+        let result = handle.await.unwrap();
+
+        assert!(
+            matches!(result, Err(PipelineError::DownstreamClosed)),
+            "Task should have failed on flush attempt, got: {:?}",
+            result
+        );
     }
 }

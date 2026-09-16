@@ -20,7 +20,12 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+toml = { workspace = true }
 
 [[bench]]
 name = "fanout_bench"
+harness = false
+
+[[bench]]
+name = "sort_bench"
 harness = false

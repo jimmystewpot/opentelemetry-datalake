@@ -33,6 +33,49 @@ pub struct KafkaSink {
     producer: FutureProducer,
     topic: String,
     format: SerializationFormat,
+    sorter: pipeline_core::sort::BatchSorter,
+    partition_key: Option<String>,
+}
+
+/// Scans a contiguous sorted partition key column and slices the batch into sub-batches.
+pub fn extract_partition_slices(
+    batch: &arrow::record_batch::RecordBatch,
+    key_column: &str,
+) -> Result<Vec<(String, arrow::record_batch::RecordBatch)>, PipelineError> {
+    let col = batch.column_by_name(key_column).ok_or_else(|| {
+        PipelineError::Internal(format!("Missing partition key column '{key_column}'"))
+    })?;
+
+    let str_arr = col
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .ok_or_else(|| {
+            PipelineError::Internal(format!("Partition key column '{key_column}' must be Utf8"))
+        })?;
+
+    let mut slices = Vec::new();
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(slices);
+    }
+    if num_rows == 1 {
+        return Ok(vec![(str_arr.value(0).to_string(), batch.clone())]);
+    }
+
+    let mut start = 0;
+    let mut current_val = str_arr.value(0).to_string();
+
+    for i in 1..num_rows {
+        let val = str_arr.value(i);
+        if val != current_val {
+            slices.push((current_val, batch.slice(start, i - start)));
+            start = i;
+            current_val = val.to_string();
+        }
+    }
+    slices.push((current_val, batch.slice(start, num_rows - start)));
+
+    Ok(slices)
 }
 
 impl KafkaSink {
@@ -61,7 +104,20 @@ impl KafkaSink {
             producer,
             topic: topic.to_string(),
             format,
+            sorter: pipeline_core::sort::BatchSorter::default(),
+            partition_key: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_sorting(
+        mut self,
+        sorter: pipeline_core::sort::BatchSorter,
+        partition_key: Option<String>,
+    ) -> Self {
+        self.sorter = sorter;
+        self.partition_key = partition_key;
+        self
     }
 
     /// Serializes an Arrow `RecordBatch` to the configured format.
@@ -108,6 +164,12 @@ impl Sink for KafkaSink {
     async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
         let mut buffer = Vec::with_capacity(8192);
         while let Some(signal) = input.recv().await {
+            let signal_type = match &signal {
+                SignalBatch::Logs(_) => pipeline_core::sort::SignalType::Logs,
+                SignalBatch::Metrics(_) => pipeline_core::sort::SignalType::Metrics,
+                SignalBatch::Traces(_) => pipeline_core::sort::SignalType::Traces,
+            };
+
             let batch = match signal {
                 SignalBatch::Logs(b) | SignalBatch::Traces(b) | SignalBatch::Metrics(b) => b,
             };
@@ -116,17 +178,29 @@ impl Sink for KafkaSink {
                 continue;
             }
 
-            self.serialize_batch(&batch, &mut buffer)?;
+            let sorted_batch = self.sorter.sort_with_extra_lead_column(
+                &batch,
+                signal_type,
+                self.partition_key.as_deref(),
+            )?;
 
-            let record = FutureRecord::to(&self.topic).payload(&buffer).key("");
+            let batches_to_send = if let Some(ref p_key) = self.partition_key {
+                extract_partition_slices(&sorted_batch, p_key)?
+            } else {
+                vec![(String::new(), sorted_batch)]
+            };
 
-            if let Err((e, _)) = self
-                .producer
-                .send(record, tokio::time::Duration::from_secs(5))
-                .await
-            {
-                tracing::error!("Failed to send record to Kafka: {e}");
-                return Err(PipelineError::Internal(format!("Kafka send error: {e}")));
+            for (key_str, sub_batch) in batches_to_send {
+                self.serialize_batch(&sub_batch, &mut buffer)?;
+                let record = FutureRecord::to(&self.topic).payload(&buffer).key(&key_str);
+                if let Err((e, _)) = self
+                    .producer
+                    .send(record, tokio::time::Duration::from_secs(5))
+                    .await
+                {
+                    tracing::error!("Failed to send record to Kafka: {e}");
+                    return Err(PipelineError::Internal(format!("Kafka send error: {e}")));
+                }
             }
         }
         Ok(())
@@ -249,5 +323,60 @@ mod tests {
 
         assert_eq!(decoded.num_rows(), 3);
         assert_eq!(*decoded.schema(), *schema);
+    }
+
+    #[test]
+    fn test_find_contiguous_partition_slices() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("val", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "auth", "auth", "billing", "gateway",
+                ])),
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .unwrap();
+
+        let slices = extract_partition_slices(&batch, "service_name").expect("slices");
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].0, "auth");
+        assert_eq!(slices[0].1.num_rows(), 2);
+        assert_eq!(slices[1].0, "billing");
+        assert_eq!(slices[1].1.num_rows(), 1);
+        assert_eq!(slices[2].0, "gateway");
+        assert_eq!(slices[2].1.num_rows(), 1);
+
+        // Test empty batch
+        let empty_batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(Vec::<&str>::new())),
+                Arc::new(arrow::array::Int32Array::from(Vec::<i32>::new())),
+            ],
+        )
+        .unwrap();
+        let empty_slices = extract_partition_slices(&empty_batch, "service_name").expect("slices");
+        assert!(empty_slices.is_empty());
+
+        // Test single row batch
+        let single_batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["auth"])),
+                Arc::new(arrow::array::Int32Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let single_slices =
+            extract_partition_slices(&single_batch, "service_name").expect("slices");
+        assert_eq!(single_slices.len(), 1);
+        assert_eq!(single_slices[0].0, "auth");
+        assert_eq!(single_slices[0].1.num_rows(), 1);
     }
 }
