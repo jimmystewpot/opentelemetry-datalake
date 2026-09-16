@@ -90,9 +90,9 @@ pub fn serialize_batch(
 /// Formats and writes an ISO 8601 UTC timestamp to the buffer.
 fn write_timestamp(buf: &mut Vec<u8>, secs: i64, subsec_nanos: u32) {
     if let Some(dt) = chrono::DateTime::from_timestamp(secs, subsec_nanos) {
+        use std::io::Write;
         buf.push(b'"');
-        let formatted = dt.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
-        buf.extend_from_slice(formatted.as_bytes());
+        let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.9fZ"));
         buf.push(b'"');
     } else {
         buf.extend_from_slice(b"null");
@@ -176,13 +176,23 @@ fn write_numeric_col(buf: &mut Vec<u8>, col: &dyn Array, row: usize, data_type: 
         }
         DataType::Float32 => {
             let arr = col.as_primitive::<arrow::datatypes::Float32Type>();
-            let mut ryu_buf = ryu::Buffer::new();
-            buf.extend_from_slice(ryu_buf.format(arr.value(row)).as_bytes());
+            let val = arr.value(row);
+            if val.is_finite() {
+                let mut ryu_buf = ryu::Buffer::new();
+                buf.extend_from_slice(ryu_buf.format(val).as_bytes());
+            } else {
+                buf.extend_from_slice(b"null");
+            }
         }
         DataType::Float64 => {
             let arr = col.as_primitive::<arrow::datatypes::Float64Type>();
-            let mut ryu_buf = ryu::Buffer::new();
-            buf.extend_from_slice(ryu_buf.format(arr.value(row)).as_bytes());
+            let val = arr.value(row);
+            if val.is_finite() {
+                let mut ryu_buf = ryu::Buffer::new();
+                buf.extend_from_slice(ryu_buf.format(val).as_bytes());
+            } else {
+                buf.extend_from_slice(b"null");
+            }
         }
         _ => {}
     }
@@ -642,5 +652,46 @@ mod tests {
                 limit
             } if actual == exact_len && limit == exact_len - 1
         ));
+    }
+
+    #[test]
+    fn test_serialize_non_finite_floats_to_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("f64_nan", DataType::Float64, false),
+            Field::new("f64_inf", DataType::Float64, false),
+            Field::new("f64_neg_inf", DataType::Float64, false),
+            Field::new("f32_nan", DataType::Float32, false),
+            Field::new("f32_inf", DataType::Float32, false),
+            Field::new("f32_neg_inf", DataType::Float32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000i64,
+                ])),
+                Arc::new(Float64Array::from(vec![f64::NAN])),
+                Arc::new(Float64Array::from(vec![f64::INFINITY])),
+                Arc::new(Float64Array::from(vec![f64::NEG_INFINITY])),
+                Arc::new(Float32Array::from(vec![f32::NAN])),
+                Arc::new(Float32Array::from(vec![f32::INFINITY])),
+                Arc::new(Float32Array::from(vec![f32::NEG_INFINITY])),
+            ],
+        )
+        .unwrap();
+
+        let bytes = serialize_batch(&batch, true, 10_485_760).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains(r#""f64_nan":null"#));
+        assert!(text.contains(r#""f64_inf":null"#));
+        assert!(text.contains(r#""f64_neg_inf":null"#));
+        assert!(text.contains(r#""f32_nan":null"#));
+        assert!(text.contains(r#""f32_inf":null"#));
+        assert!(text.contains(r#""f32_neg_inf":null"#));
     }
 }
