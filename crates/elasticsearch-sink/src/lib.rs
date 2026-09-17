@@ -604,6 +604,7 @@ mod tests {
                     "index_templates": [{
                         "name": stream,
                         "index_template": {
+                            "index_patterns": [format!("{stream}*")],
                             "data_stream": {}
                         }
                     }]

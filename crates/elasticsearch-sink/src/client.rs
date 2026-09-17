@@ -1068,7 +1068,28 @@ impl HttpClient {
             )));
         }
 
-        let has_data_stream_template = parsed.index_templates.iter().any(|entry| {
+        let matching_templates: Vec<&IndexTemplateItem> = parsed
+            .index_templates
+            .iter()
+            .filter(|entry| {
+                entry.index_template.as_ref().is_some_and(|content| {
+                    content
+                        .index_patterns
+                        .iter()
+                        .any(|pat| pattern_matches(pat, data_stream))
+                })
+            })
+            .collect();
+
+        if matching_templates.is_empty() {
+            // The template with this exact name exists but its index_patterns do not match data_stream;
+            // fall back to listing composable index templates to find the matching template.
+            return self
+                .check_list_index_templates_matching(endpoint, data_stream)
+                .await;
+        }
+
+        let has_data_stream_template = matching_templates.iter().any(|entry| {
             entry
                 .index_template
                 .as_ref()
@@ -2290,6 +2311,98 @@ mod tests {
         assert!(
             matches!(result, Err(TemplateCheckError::Validation(_))),
             "expected Validation error when no patterns match, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_exact_name_with_non_matching_patterns_falls_back_to_list() {
+        let mock_server = MockServer::start().await;
+        // Template named "logs-test-stream" exists and has data_stream, but its patterns do not match "logs-test-stream"
+        let exact_body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-test-stream",
+                "index_template": {
+                    "index_patterns": ["unrelated-stream-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-test-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
+            .mount(&mock_server)
+            .await;
+
+        // Composable templates list has a template that matches "logs-test-stream"
+        let list_body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-shared-template",
+                "index_template": {
+                    "index_patterns": ["logs-test-*"],
+                    "data_stream": {},
+                    "priority": 200,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&list_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "logs-test-stream")
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected fallback to succeed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_exact_name_with_non_matching_patterns_and_no_fallback_fails() {
+        let mock_server = MockServer::start().await;
+        // Template named "logs-test-stream" exists and has data_stream, but its patterns do not match
+        let exact_body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-test-stream",
+                "index_template": {
+                    "index_patterns": ["unrelated-stream-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-test-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
+            .mount(&mock_server)
+            .await;
+
+        // Composable templates list has no matching templates
+        let list_body = serde_json::json!({
+            "index_templates": []
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&list_body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "logs-test-stream")
+            .await;
+        assert!(
+            matches!(result, Err(TemplateCheckError::Validation(_))),
+            "expected Validation error when exact-name template patterns do not match and fallback has no matches, got: {result:?}"
         );
     }
 
