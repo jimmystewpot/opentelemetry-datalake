@@ -257,13 +257,6 @@ struct IndexTemplateContent {
     priority: Option<i64>,
 }
 
-/// Simulate index template response returned by `POST /_index_template/_simulate_index/<index_name>`.
-#[derive(Debug, Deserialize)]
-struct SimulateIndexResponse {
-    #[serde(default)]
-    template: Option<serde_json::Map<String, serde_json::Value>>,
-}
-
 /// Internal error categorized during index template existence verification across endpoints.
 #[derive(Debug)]
 enum TemplateCheckError {
@@ -1013,55 +1006,6 @@ impl HttpClient {
         )))
     }
 
-    /// Attempts template validation via simulate index on a single endpoint.
-    async fn check_simulate_index_template(
-        &self,
-        endpoint: &str,
-        data_stream: &str,
-    ) -> Result<bool, TemplateCheckError> {
-        let simulate_url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
-        let req = self.client.post(&simulate_url);
-        let req = self
-            .apply_auth_request(req, "POST", &simulate_url, &[])
-            .await
-            .map_err(|e| {
-                TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
-            })?;
-
-        let response = req.send().await.map_err(|e| {
-            TemplateCheckError::Transport(format!(
-                "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
-            ))
-        })?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to validate index template for '{data_stream}': HTTP {status}"
-            )));
-        }
-
-        if !status.is_success() {
-            return Ok(false);
-        }
-
-        let parsed: Result<SimulateIndexResponse, _> = response.json().await;
-        match parsed {
-            Ok(p) if p.template.as_ref().is_some_and(|t| !t.is_empty()) => {
-                tracing::info!(
-                    endpoint = %endpoint,
-                    data_stream = %data_stream,
-                    "Index template validation succeeded via simulate_index"
-                );
-                Ok(true)
-            }
-            Ok(_) => Ok(false),
-            Err(e) => Err(TemplateCheckError::Validation(format!(
-                "failed to parse simulate index response for '{data_stream}' on '{endpoint}': {e}"
-            ))),
-        }
-    }
-
     /// Attempts template validation via get index template on a single endpoint.
     ///
     /// First attempts exact lookup at `GET /_index_template/{data_stream}`.
@@ -1275,28 +1219,6 @@ impl HttpClient {
         let mut auth_error = None;
 
         for endpoint in &self.endpoints {
-            match self
-                .check_simulate_index_template(endpoint, data_stream)
-                .await
-            {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(TemplateCheckError::Auth(msg)) => {
-                    self.mark_endpoint_failed(endpoint);
-                    auth_error = Some(msg.clone());
-                    errors.push(format!("{endpoint}: {msg}"));
-                    continue;
-                }
-                Err(TemplateCheckError::Transport(msg)) => {
-                    self.mark_endpoint_failed(endpoint);
-                    errors.push(msg);
-                    continue;
-                }
-                Err(TemplateCheckError::Validation(msg)) => {
-                    errors.push(msg);
-                }
-            }
-
             match self.check_get_index_template(endpoint, data_stream).await {
                 Ok(()) => return Ok(()),
                 Err(TemplateCheckError::Auth(msg)) => {
@@ -2037,29 +1959,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_index_template_via_simulate_index_pattern_match() {
+    async fn test_validate_index_template_via_pattern_match() {
         let server = MockServer::start().await;
 
-        let simulate_json = r#"{
-            "template": {
-                "settings": {
-                    "index": {
-                        "number_of_shards": "1"
-                    }
-                },
-                "mappings": {
-                    "properties": {
-                        "@timestamp": { "type": "date" }
-                    }
-                }
-            },
-            "overlapping": []
-        }"#;
+        // Exact name query returns 404
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
 
-        // Simulate index endpoint matches data stream pattern even when template name is different
-        Mock::given(method("POST"))
-            .and(path("/_index_template/_simulate_index/logs-otel-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(simulate_json))
+        // Composable templates list contains pattern matching data stream
+        let templates_json = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-wildcard-template",
+                "index_template": {
+                    "index_patterns": ["logs-*-default"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": { "settings": {} }
+                }
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&templates_json))
             .mount(&server)
             .await;
 
@@ -2068,6 +1993,42 @@ mod tests {
 
         let res = client.validate_index_template("logs-otel-default").await;
         assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_rejects_non_data_stream_template() {
+        let server = MockServer::start().await;
+
+        let templates_json = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-conventional-template",
+                "index_template": {
+                    "index_patterns": ["logs-otel-default"],
+                    "priority": 100,
+                    "template": { "settings": {} }
+                    // Notice: no "data_stream" field
+                }
+            }]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&templates_json))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let err = client
+            .validate_index_template("logs-otel-default")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
+        assert!(
+            err.to_string()
+                .contains("not configured as a data-stream template")
+        );
     }
 
     #[tokio::test]
@@ -2136,54 +2097,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simulate_index_rejects_empty_template() {
-        let mock_server = MockServer::start().await;
-        let body = serde_json::json!({
-            "template": {},
-            "overlapping": []
-        });
-        Mock::given(method("POST"))
-            .and(path("/_index_template/_simulate_index/logs-test-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&mock_server)
-            .await;
-
-        let config = make_test_config(vec![mock_server.uri()]);
-        let client = HttpClient::try_new(&config).expect("client creation failed");
-        let result = client
-            .check_simulate_index_template(&mock_server.uri(), "logs-test-default")
-            .await;
-        assert!(
-            matches!(result, Ok(false)),
-            "expected Ok(false) for empty template, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_simulate_index_accepts_non_empty_template() {
-        let mock_server = MockServer::start().await;
-        let body = serde_json::json!({
-            "template": { "settings": {}, "mappings": {} },
-            "overlapping": []
-        });
-        Mock::given(method("POST"))
-            .and(path("/_index_template/_simulate_index/logs-test-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&mock_server)
-            .await;
-
-        let config = make_test_config(vec![mock_server.uri()]);
-        let client = HttpClient::try_new(&config).expect("client creation failed");
-        let result = client
-            .check_simulate_index_template(&mock_server.uri(), "logs-test-default")
-            .await;
-        assert!(
-            matches!(result, Ok(true)),
-            "expected Ok(true) for non-empty template, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_get_index_template_rejects_non_data_stream_template() {
         let mock_server = MockServer::start().await;
         let body = serde_json::json!({
@@ -2210,40 +2123,6 @@ mod tests {
         assert!(
             matches!(result, Err(TemplateCheckError::Validation(_))),
             "expected Validation error for non-data-stream template, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_simulate_index_accepts_real_elasticsearch_response() {
-        let mock_server = MockServer::start().await;
-        // Real Elasticsearch simulate_index response has template and overlapping, NO top-level data_stream field
-        let body = serde_json::json!({
-            "template": {
-                "settings": {
-                    "index": { "number_of_shards": "1" }
-                },
-                "mappings": {
-                    "properties": {
-                        "@timestamp": { "type": "date" }
-                    }
-                }
-            },
-            "overlapping": []
-        });
-        Mock::given(method("POST"))
-            .and(path("/_index_template/_simulate_index/logs-test-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
-            .mount(&mock_server)
-            .await;
-
-        let config = make_test_config(vec![mock_server.uri()]);
-        let client = HttpClient::try_new(&config).expect("client creation failed");
-        let result = client
-            .check_simulate_index_template(&mock_server.uri(), "logs-test-default")
-            .await;
-        assert!(
-            matches!(result, Ok(true)),
-            "expected Ok(true) for standard simulate_index response, got: {result:?}"
         );
     }
 
@@ -3319,25 +3198,21 @@ mod tests {
         let server1 = MockServer::start().await;
         let uri1 = server1.uri();
         drop(server1);
-        let simulate_json = r#"{
-            "template": {
-                "settings": {
-                    "index": {
-                        "number_of_shards": "1"
-                    }
-                },
-                "mappings": {
-                    "properties": {
-                        "@timestamp": { "type": "date" }
-                    }
+        let template_json = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-otel-default",
+                "index_template": {
+                    "index_patterns": ["logs-otel-default"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": { "settings": {} }
                 }
-            },
-            "overlapping": []
-        }"#;
+            }]
+        });
 
-        Mock::given(method("POST"))
-            .and(path("/_index_template/_simulate_index/logs-otel-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(simulate_json))
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&template_json))
             .mount(&server2)
             .await;
 
