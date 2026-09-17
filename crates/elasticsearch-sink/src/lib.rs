@@ -415,7 +415,10 @@ impl Sink for ElasticsearchSink {
                     }
                 }
                 _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
-                    self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await?;
+                    if let Err(e) = self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await {
+                        let _ = Self::drain_join_set(&mut join_set).await;
+                        return Err(e);
+                    }
                 }
                 msg = input.recv() => {
                     if let Some(signal) = msg {
@@ -472,18 +475,33 @@ impl Sink for ElasticsearchSink {
                             buf.records = buf.records.saturating_add(batch.num_rows());
                             buf.batches.push(batch);
 
-                            if buf.bytes >= max_bytes || buf.records >= max_records {
-                                self.flush_buffer(
-                                    buf,
-                                    signal_type,
-                                    self.data_stream_for(signal_type),
-                                    &mut join_set,
-                                ).await?;
+                            if (buf.bytes >= max_bytes || buf.records >= max_records)
+                                && let Err(e) = self
+                                    .flush_buffer(
+                                        buf,
+                                        signal_type,
+                                        self.data_stream_for(signal_type),
+                                        &mut join_set,
+                                    )
+                                    .await
+                            {
+                                let _ = Self::drain_join_set(&mut join_set).await;
+                                return Err(e);
                             }
                         }
                     } else {
-                        if batching.is_some() {
-                            self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await?;
+                        if batching.is_some()
+                            && let Err(e) = self
+                                .flush_all_buffers(
+                                    &mut logs_buf,
+                                    &mut metrics_buf,
+                                    &mut traces_buf,
+                                    &mut join_set,
+                                )
+                                .await
+                        {
+                            let _ = Self::drain_join_set(&mut join_set).await;
+                            return Err(e);
                         }
 
                         Self::drain_join_set(&mut join_set).await?;
@@ -530,6 +548,16 @@ mod tests {
             batching: None,
             order_by: None,
         }
+    }
+
+    fn make_test_config_with_batching(endpoint: String) -> ElasticsearchSinkConfig {
+        let mut config = make_test_config(endpoint, false);
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 60,
+            max_batch_records: 1,
+        });
+        config
     }
 
     async fn setup_startup_validation_mocks(server: &MockServer) {
@@ -1314,6 +1342,176 @@ mod tests {
         assert!(
             task2_completed.load(std::sync::atomic::Ordering::SeqCst),
             "In-flight task must be drained and allowed to complete before sink.run returns on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_error_drains_join_set() {
+        let server = MockServer::start().await;
+
+        let in_flight_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(SlowSuccessResponder {
+                completed: Arc::clone(&in_flight_completed),
+                delay: std::time::Duration::from_millis(150),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config_with_batching(server.uri());
+        config.max_payload_bytes = 500;
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch1 = make_log_batch();
+        tx.send(SignalBatch::Logs(batch1)).await.unwrap();
+
+        // Allow batch 1 to be dispatched into join_set and reach wiremock
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Batch 2 exceeds max_payload_bytes (1000 > 500), causing flush_buffer to error
+        let batch2 = make_log_batch_with_service(&"x".repeat(1000));
+        tx.send(SignalBatch::Logs(batch2)).await.unwrap();
+        drop(tx);
+
+        let result = sink
+            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
+            .await;
+        assert!(result.is_err(), "expected flush error to propagate");
+        assert!(
+            in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "In-flight task must be drained and allowed to complete when flush_buffer fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_flush_error_drains_join_set() {
+        let server = MockServer::start().await;
+
+        let in_flight_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(SlowSuccessResponder {
+                completed: Arc::clone(&in_flight_completed),
+                delay: std::time::Duration::from_millis(150),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config_with_batching(server.uri());
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 60,
+            max_batch_records: 10,
+        });
+        config.max_payload_bytes = 500;
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+
+        let large_metric_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let large_metric_batch = RecordBatch::try_new(
+            large_metric_schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["x".repeat(1000)])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        tx.send(SignalBatch::Metrics(large_metric_batch))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let result = sink
+            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
+            .await;
+        assert!(
+            result.is_err(),
+            "expected shutdown flush error to propagate"
+        );
+        assert!(
+            in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "In-flight task from earlier buffer must be drained when shutdown flush_all_buffers fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interval_tick_flush_error_drains_join_set() {
+        let server = MockServer::start().await;
+
+        let in_flight_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(SlowSuccessResponder {
+                completed: Arc::clone(&in_flight_completed),
+                delay: std::time::Duration::from_millis(150),
+            })
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config_with_batching(server.uri());
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 1,
+            max_batch_records: 10,
+        });
+        config.max_payload_bytes = 500;
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let run_handle = tokio::spawn(async move {
+            sink.run(pipeline_core::pipeline::PipelineReceiver::from(rx))
+                .await
+        });
+
+        tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+
+        let large_metric_schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("metric_name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+        let large_metric_batch = RecordBatch::try_new(
+            large_metric_schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["x".repeat(1000)])),
+                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
+            ],
+        )
+        .unwrap();
+        tx.send(SignalBatch::Metrics(large_metric_batch))
+            .await
+            .unwrap();
+
+        let result = run_handle.await.unwrap();
+        assert!(
+            result.is_err(),
+            "expected interval flush error to propagate"
+        );
+        assert!(
+            in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
+            "In-flight task from earlier buffer must be drained when interval tick flush_all_buffers fails"
         );
     }
 
