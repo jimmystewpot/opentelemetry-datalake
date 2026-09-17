@@ -172,52 +172,58 @@ impl ElasticsearchSink {
         Ok(())
     }
 
-    /// Dispatches a serialized payload to the target data stream using pipelined concurrency.
+    /// Dispatches a single bulk payload chunk under the concurrency semaphore.
     ///
-    /// Drains any completed tasks in `join_set` to detect failures early, acquires a semaphore permit,
-    /// and spawns the request into `join_set`.
+    /// If permits are exhausted, awaits the next completed task in `join_set`. Any error
+    /// from previously dispatched tasks is retained in `first_err` without aborting the
+    /// submission of the current chunk once a permit is freed.
     async fn dispatch(
         client: Arc<HttpClient>,
         semaphore: Arc<tokio::sync::Semaphore>,
         join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
         data_stream: String,
         payload: Bytes,
+        first_err: &mut Option<PipelineError>,
     ) -> Result<(), PipelineError> {
         if payload.is_empty() {
             return Ok(());
         }
 
-        // Drain any already completed tasks in join_set to detect failures early
+        // Drain any already completed tasks in join_set to detect completed tasks
         while let Some(res) = join_set.try_join_next() {
             match res {
                 Ok(Ok(_resp)) => {}
                 Ok(Err(es_err)) => {
-                    let _ = Self::drain_join_set(join_set).await;
-                    return Err(es_err.into());
+                    if first_err.is_none() {
+                        *first_err = Some(es_err.into());
+                    }
                 }
                 Err(join_err) => {
-                    let _ = Self::drain_join_set(join_set).await;
-                    return Err(PipelineError::Internal(format!(
-                        "Bulk dispatch task failed: {join_err}"
-                    )));
+                    if first_err.is_none() {
+                        *first_err = Some(PipelineError::Internal(format!(
+                            "Bulk dispatch task failed: {join_err}"
+                        )));
+                    }
                 }
             }
         }
 
-        // If semaphore permits are exhausted, await the next completed task in join_set
+        // If semaphore permits are exhausted, await until at least one task completes
         while semaphore.available_permits() == 0 && !join_set.is_empty() {
             if let Some(res) = join_set.join_next().await {
                 match res {
                     Ok(Ok(_resp)) => {}
                     Ok(Err(es_err)) => {
-                        let _ = Self::drain_join_set(join_set).await;
-                        return Err(es_err.into());
+                        if first_err.is_none() {
+                            *first_err = Some(es_err.into());
+                        }
                     }
                     Err(join_err) => {
-                        let _ = Self::drain_join_set(join_set).await;
-                        return Err(PipelineError::Internal(format!(
-                            "Bulk dispatch task failed: {join_err}"
-                        )));
+                        if first_err.is_none() {
+                            *first_err = Some(PipelineError::Internal(format!(
+                                "Bulk dispatch task failed: {join_err}"
+                            )));
+                        }
                     }
                 }
             }
@@ -332,6 +338,7 @@ impl ElasticsearchSink {
         .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
 
         let stream_name = target_data_stream.to_string();
+        let mut first_dispatch_error: Option<PipelineError> = None;
         for chunk in chunks {
             Self::dispatch(
                 Arc::clone(&self.client),
@@ -339,8 +346,14 @@ impl ElasticsearchSink {
                 join_set,
                 stream_name.clone(),
                 chunk,
+                &mut first_dispatch_error,
             )
             .await?;
+        }
+
+        if let Some(err) = first_dispatch_error {
+            let _ = Self::drain_join_set(join_set).await;
+            return Err(err);
         }
 
         tracing::debug!(
@@ -670,6 +683,36 @@ mod tests {
                 Arc::new(Int32Array::from(vec![9])),
                 Arc::new(StringArray::from(vec!["Request processed"])),
                 Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_multi_row_log_batch(count: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_number", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        let services: Vec<String> = (0..count).map(|i| format!("service_{i}")).collect();
+        let service_refs: Vec<&str> = services.iter().map(String::as_str).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000;
+                    count
+                ])),
+                Arc::new(StringArray::from(service_refs)),
+                Arc::new(Int32Array::from(vec![9; count])),
+                Arc::new(StringArray::from(vec!["Request processed"; count])),
+                Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#; count])),
             ],
         )
         .unwrap()
@@ -1560,19 +1603,31 @@ mod tests {
         // Yield so task 1 finishes and task 2 starts sleeping
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
+        let mut first_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             semaphore,
             &mut join_set,
             "logs-otel-default".to_string(),
             bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
         )
         .await;
 
-        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            res.is_ok(),
+            "dispatch should succeed without aborting chunk submission"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err should capture the earlier failure"
+        );
+
+        // Sinks drain remaining tasks after all chunks are dispatched
+        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "dispatch must drain all remaining in-flight tasks before returning error"
+            "drain_join_set must drain all remaining in-flight tasks"
         );
         assert!(join_set.is_empty(), "JoinSet must be drained and empty");
     }
@@ -1587,11 +1642,10 @@ mod tests {
         let mut join_set = tokio::task::JoinSet::new();
         let slow_task_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Exhaust the 1 permit
-        let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
-
-        // Task 1: fails after 10ms
+        // In-flight task 1 holds permit and fails after 10ms
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
         join_set.spawn(async move {
+            let _permit = permit;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Err(ElasticsearchError::StartupValidation(
                 "failure while waiting for permit".to_string(),
@@ -1610,19 +1664,31 @@ mod tests {
             })
         });
 
+        let mut first_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             Arc::clone(&semaphore),
             &mut join_set,
             "logs-otel-default".to_string(),
             bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
         )
         .await;
 
-        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            res.is_ok(),
+            "dispatch should succeed once permit is freed by failed task"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err should capture the failure from task 1"
+        );
+
+        // Sinks drain remaining tasks after all chunks are dispatched
+        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "dispatch must drain all remaining in-flight tasks when permits are exhausted"
+            "drain_join_set must drain all remaining in-flight tasks"
         );
         assert!(join_set.is_empty(), "JoinSet must be drained and empty");
     }
@@ -1967,5 +2033,68 @@ mod tests {
 
         handle.await.unwrap();
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_sink_dispatches_all_chunks_despite_earlier_chunk_failure() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        // First bulk request fails with 500 (exhausting retries if retried)
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service_0")
+            })
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
+            .mount(&server)
+            .await;
+
+        // Second bulk request succeeds with 200
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service_1")
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"took": 5, "errors": false, "items": []}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.max_concurrent_requests = 1; // Strict serial concurrency
+        config.max_retries = 0;
+        config.max_payload_bytes = 200; // Force splitting into multiple chunks
+
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch = make_multi_row_log_batch(2); // 2 rows, each serialized NDJSON is ~150 bytes
+        tx.send(SignalBatch::Logs(batch))
+            .await
+            .expect("send failed");
+        drop(tx);
+
+        let result = sink.run(rx).await;
+        assert!(result.is_err(), "expected error due to first chunk failure");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("failed to get received requests");
+        let bulk_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/_bulk"))
+            .collect();
+
+        assert_eq!(
+            bulk_requests.len(),
+            2,
+            "both chunks must be dispatched even when the first chunk encounters an error"
+        );
     }
 }
