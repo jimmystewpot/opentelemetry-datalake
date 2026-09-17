@@ -606,6 +606,31 @@ mod tests {
             .mount(server)
             .await;
 
+        let all_templates = [
+            "logs-otel-default",
+            "metrics-otel-default",
+            "traces-otel-default",
+        ]
+        .into_iter()
+        .map(|stream| {
+            serde_json::json!({
+                "name": stream,
+                "index_template": {
+                    "index_patterns": [format!("{stream}*")],
+                    "data_stream": {}
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "index_templates": all_templates
+            })))
+            .mount(server)
+            .await;
+
         for stream in [
             "logs-otel-default",
             "metrics-otel-default",
@@ -1097,6 +1122,12 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "version": { "number": "8.12.0" }
             })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;
 

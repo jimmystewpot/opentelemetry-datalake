@@ -1008,108 +1008,17 @@ impl HttpClient {
         )))
     }
 
-    /// Attempts template validation via get index template on a single endpoint.
-    ///
-    /// First attempts exact lookup at `GET /_index_template/{data_stream}`.
-    /// If that returns 404 (e.g. when the template name differs from the data stream name),
-    /// falls back to listing composable templates at `GET /_index_template`, matching
-    /// against `index_patterns`, selecting the highest-priority template, and validating
-    /// that it is configured with `data_stream: {}`.
+    /// Validates template compliance for `data_stream` on `endpoint` by evaluating all
+    /// composable templates, matching index patterns, sorting by priority descending,
+    /// and ensuring the winning template defines `data_stream: {}`.
     async fn check_get_index_template(
         &self,
         endpoint: &str,
         data_stream: &str,
     ) -> Result<(), TemplateCheckError> {
-        let url = format!("{endpoint}/_index_template/{data_stream}");
-        let req = self.client.get(&url);
-        let req = self
-            .apply_auth_request(req, "GET", &url, &[])
+        // Evaluate all matching templates to ensure the highest-priority winning template is a data stream
+        self.check_list_index_templates_matching(endpoint, data_stream)
             .await
-            .map_err(|e| {
-                TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
-            })?;
-
-        let response = req.send().await.map_err(|e| {
-            TemplateCheckError::Transport(format!(
-                "failed to query index template for '{data_stream}' on '{endpoint}': {e}"
-            ))
-        })?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to validate index template for '{data_stream}': HTTP {status}"
-            )));
-        }
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            // Fallback: list composable index templates and match by index_patterns
-            return self
-                .check_list_index_templates_matching(endpoint, data_stream)
-                .await;
-        }
-
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(TemplateCheckError::Transport(format!(
-                "index template check for '{data_stream}' on '{endpoint}' returned HTTP {status}: {body}"
-            )));
-        }
-
-        let parsed: IndexTemplatesResponse = response.json().await.map_err(|e| {
-            TemplateCheckError::Transport(format!(
-                "failed to parse index templates response for '{data_stream}' on '{endpoint}': {e}"
-            ))
-        })?;
-
-        if parsed.index_templates.is_empty() {
-            return Err(TemplateCheckError::Validation(format!(
-                "index template for data stream '{data_stream}' returned empty template list"
-            )));
-        }
-
-        let matching_templates: Vec<&IndexTemplateItem> = parsed
-            .index_templates
-            .iter()
-            .filter(|entry| {
-                entry.index_template.as_ref().is_some_and(|content| {
-                    content
-                        .index_patterns
-                        .iter()
-                        .any(|pat| pattern_matches(pat, data_stream))
-                })
-            })
-            .collect();
-
-        if matching_templates.is_empty() {
-            // The template with this exact name exists but its index_patterns do not match data_stream;
-            // fall back to listing composable index templates to find the matching template.
-            return self
-                .check_list_index_templates_matching(endpoint, data_stream)
-                .await;
-        }
-
-        let has_data_stream_template = matching_templates.iter().any(|entry| {
-            entry
-                .index_template
-                .as_ref()
-                .and_then(|it| it.data_stream.as_ref())
-                .is_some_and(|v| !v.is_null())
-        });
-
-        if !has_data_stream_template {
-            return Err(TemplateCheckError::Validation(format!(
-                "index template for data stream '{data_stream}' exists but is not \
-                 configured as a data-stream template (missing 'data_stream' field)"
-            )));
-        }
-
-        tracing::info!(
-            endpoint = %endpoint,
-            data_stream = %data_stream,
-            "Index template validation succeeded via index_template query"
-        );
-        Ok(())
     }
 
     /// Queries `GET /_index_template` to list composable index templates and matches against `data_stream`.
@@ -1158,6 +1067,12 @@ impl HttpClient {
                 "failed to parse index templates list response on '{endpoint}': {e}"
             ))
         })?;
+
+        if parsed.index_templates.is_empty() {
+            return Err(TemplateCheckError::Validation(format!(
+                "index template for data stream '{data_stream}' returned empty template list"
+            )));
+        }
 
         let mut matching: Vec<&IndexTemplateItem> = parsed
             .index_templates
@@ -1224,14 +1139,9 @@ impl HttpClient {
 
     /// Validates that a composable index template exists for the given data stream.
     ///
-    /// Iterates across configured endpoints. First simulates index template matching
-    /// via `POST /_index_template/_simulate_index/<data_stream>` to locate any template
-    /// matching the stream by `index_patterns`.
-    /// If simulation succeeds and returns a matched non-empty template, validation passes.
-    /// If simulation is unsupported (HTTP 404/405) or returns no template, falls back to
-    /// `check_get_index_template`, which queries `GET /_index_template/<data_stream>` and,
-    /// if not found (HTTP 404), lists composable templates via `GET /_index_template` to match
-    /// by wildcard `index_patterns`.
+    /// Iterates across configured endpoints. Evaluates all composable templates
+    /// via `GET /_index_template`, matches against `index_patterns`, sorts by
+    /// priority descending, and ensures the winning template defines `data_stream: {}`.
     /// If transport or connection error occurs on an endpoint, fails over to the next endpoint.
     pub async fn validate_index_template(
         &self,
@@ -1965,6 +1875,12 @@ mod tests {
         }"#;
 
         Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(template_json))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path("/_index_template/logs-otel-default"))
             .respond_with(ResponseTemplate::new(200).set_body_string(template_json))
             .mount(&server)
@@ -2035,6 +1951,12 @@ mod tests {
         });
 
         Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&templates_json))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path("/_index_template/logs-otel-default"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&templates_json))
             .mount(&server)
@@ -2055,8 +1977,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_validate_index_template_rejects_when_higher_priority_template_lacks_data_stream()
+    {
+        let server = MockServer::start().await;
+
+        // Composable index templates containing:
+        // 1. Template named "logs-otel-default" with data_stream: {}, priority 100, pattern "logs-otel-default*"
+        // 2. Higher-priority template "override-logs" with priority 200, NO data_stream, pattern "logs-*"
+        let templates_json = serde_json::json!({
+            "index_templates": [
+                {
+                    "name": "logs-otel-default",
+                    "index_template": {
+                        "index_patterns": ["logs-otel-default*"],
+                        "priority": 100,
+                        "data_stream": {},
+                        "template": {}
+                    }
+                },
+                {
+                    "name": "override-logs",
+                    "index_template": {
+                        "index_patterns": ["logs-*"],
+                        "priority": 200,
+                        "template": {}
+                    }
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&templates_json))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "index_templates": [{
+                    "name": "logs-otel-default",
+                    "index_template": {
+                        "index_patterns": ["logs-otel-default*"],
+                        "priority": 100,
+                        "data_stream": {},
+                        "template": {}
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let err = client
+            .validate_index_template("logs-otel-default")
+            .await
+            .expect_err("must fail because higher-priority template lacks data_stream");
+
+        assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
+        assert!(
+            err.to_string().contains("override-logs")
+                || err.to_string().contains("missing 'data_stream'"),
+            "error must mention winning template failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_validate_index_template_not_found() {
         let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/_index_template/missing-template"))
@@ -2080,6 +2076,12 @@ mod tests {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
             .and(path("/_index_template/traces-otel-default"))
             .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
             .mount(&server)
@@ -2101,6 +2103,12 @@ mod tests {
         let server = MockServer::start().await;
 
         let template_json = r#"{"index_templates": []}"#;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(template_json))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/_index_template/logs-otel-default"))
@@ -2132,6 +2140,12 @@ mod tests {
                 }
             }]
         });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
         Mock::given(method("GET"))
             .and(path("/_index_template/logs-test-default"))
             .respond_with(ResponseTemplate::new(200).set_body_json(&body))
@@ -2647,6 +2661,12 @@ mod tests {
                 }
             ]
         }"#;
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(template_json))
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/_index_template/logs-otel-default"))
@@ -3358,6 +3378,12 @@ mod tests {
                 }
             }]
         });
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&template_json))
+            .mount(&server2)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/_index_template/logs-otel-default"))
