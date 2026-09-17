@@ -40,6 +40,9 @@ opentelemetry-datalake/
 │   ├── starrocks-sink/        # StarRocks Stream Load sink implementation
 │   │   ├── Cargo.toml
 │   │   └── src/lib.rs
+│   ├── elasticsearch-sink/    # Elasticsearch & OpenSearch data streams sink implementation
+│   │   ├── Cargo.toml
+│   │   └── src/{lib.rs, client.rs, config.rs, error.rs, serializer.rs, tls.rs}
 │   └── noop-transformer/      # Example/Pass-through transformer
 │       ├── Cargo.toml
 │       └── src/lib.rs
@@ -48,6 +51,7 @@ opentelemetry-datalake/
     ├── buffer.md              # Buffer behavior and metrics specification
     ├── components.md          # Component behavior (sources, transforms, sinks)
     ├── configuration.md       # Configuration reference
+    ├── elasticsearch.md       # Elasticsearch & OpenSearch data streams sink operator guide
     ├── instrumentation.md     # Pipeline telemetry & logging standards
     ├── lakehouse.md           # Lakehouse integration specification
     └── starrocks.md           # StarRocks Stream Load sink operator guide
@@ -75,6 +79,7 @@ Agents must strictly use the specific library ecosystem outlined below. Do not i
 *   **Apache Iceberg**: `iceberg-rust` (the official Apache Iceberg Rust implementation).
 *   **Kafka**: `rdkafka` (based on `librdkafka`).
 *   **StarRocks**: `starrocks-stream-load` (HTTP Stream Load API). TLS backend is selectable at compile time via Cargo features (`tls-rustls` default, `tls-native-tls` opt-in). The two backends are mutually exclusive; enabling both produces a compile error.
+*   **Elasticsearch & OpenSearch**: `elasticsearch-sink` (HTTP/2 NDJSON Bulk API streaming into Data Streams with automated failover, index template validation, and AWS SigV4 request signing).
 
 ### 4. Component Summary & Role Mapping
 
@@ -84,7 +89,7 @@ Agents must strictly use the specific library ecosystem outlined below. Do not i
 | **Codec** | `arrow-codec` (`prost` + `arrow`) | Translates raw proto structs into columnar `RecordBatch` layout on arrival. |
 | **Transformation** | `noop-transformer` | Provides a hook for data transformation/enrichment (currently no-op). |
 | **Core** | `pipeline-core` | Defines common traits (`Source`, `Transform`, `Sink`) and shared logic. |
-| **Storage Sinks** | `storage` (Iceberg), `kafka-sink`, `starrocks-sink` | Translates Arrow record batches into physical storage or message queues. |
+| **Storage Sinks** | `storage` (Iceberg), `kafka-sink`, `starrocks-sink`, `elasticsearch-sink` | Translates Arrow record batches into physical storage, search engines, or message queues. |
 
 ---
 

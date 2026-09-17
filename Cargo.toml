@@ -36,6 +36,7 @@ noop-transformer = { workspace = true }
 kafka-sink = { workspace = true }
 storage = { workspace = true, features = ["aws"] }
 starrocks-sink = { workspace = true }
+elasticsearch-sink = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -43,6 +44,10 @@ figment = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+
+[features]
+default = []
+aws = ["elasticsearch-sink/aws"]
 
 [dev-dependencies]
 arrow = { workspace = true }
@@ -56,6 +61,7 @@ noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0", default-features = false }
 starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
+elasticsearch-sink = { path = "crates/elasticsearch-sink", version = "0.1.0" }
 
 # Async Runtime
 tokio = { version = "1.37", default-features = false, features = ["full"] }

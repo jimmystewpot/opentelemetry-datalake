@@ -18,6 +18,7 @@ struct AppConfig {
     kafka: Option<KafkaConfig>,
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
     starrocks: Option<starrocks_sink::StarRocksSinkConfig>,
+    elasticsearch: Option<elasticsearch_sink::ElasticsearchSinkConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -73,6 +74,43 @@ struct Cli {
     dry_run: Option<bool>,
 }
 
+/// Validates that required sink configuration constraints are satisfied.
+fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
+    if let Some(ref iceberg_cfg) = config.iceberg {
+        let logs_table = iceberg_cfg
+            .logs_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let traces_table = iceberg_cfg
+            .traces_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+        let metrics_table = iceberg_cfg
+            .metrics_table_identifier
+            .as_ref()
+            .unwrap_or(&iceberg_cfg.table_identifier);
+
+        if logs_table == traces_table
+            || logs_table == metrics_table
+            || traces_table == metrics_table
+        {
+            anyhow::bail!(
+                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
+            );
+        }
+    } else if let Some(ref es_cfg) = config.elasticsearch {
+        es_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if config.kafka.is_none() && config.starrocks.is_none() {
+        anyhow::bail!(
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -97,15 +135,6 @@ async fn main() -> anyhow::Result<()> {
         [server]
         grpc_addr = "127.0.0.1:4317"
         http_addr = "127.0.0.1:4318"
-
-        [kafka]
-        brokers = "localhost:9092"
-        logs_topic = "telemetry-logs"
-        traces_topic = "telemetry-traces"
-        metrics_topic = "telemetry-metrics"
-        logs_format = "json"
-        traces_format = "json"
-        metrics_format = "json"
         "#,
     ));
 
@@ -132,33 +161,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Perform early validation checks
-    if let Some(ref iceberg_cfg) = config.iceberg {
-        let logs_table = iceberg_cfg
-            .logs_table_identifier
-            .as_ref()
-            .unwrap_or(&iceberg_cfg.table_identifier);
-        let traces_table = iceberg_cfg
-            .traces_table_identifier
-            .as_ref()
-            .unwrap_or(&iceberg_cfg.table_identifier);
-        let metrics_table = iceberg_cfg
-            .metrics_table_identifier
-            .as_ref()
-            .unwrap_or(&iceberg_cfg.table_identifier);
-
-        if logs_table == traces_table
-            || logs_table == metrics_table
-            || traces_table == metrics_table
-        {
-            anyhow::bail!(
-                "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
-            );
-        }
-    } else if config.kafka.is_none() && config.starrocks.is_none() {
-        anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], or [starrocks] configuration must be provided"
-        );
-    }
+    validate_config(&config)?;
 
     if cli_args.check {
         #[allow(clippy::print_stdout)]
@@ -281,6 +284,79 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Iceberg sink error: {}", e);
             }
         });
+    } else if let Some(es_cfg) = config.elasticsearch {
+        tracing::info!(
+            endpoints = ?es_cfg.endpoints,
+            "Initializing Elasticsearch sinks"
+        );
+
+        let mut logs_sink = elasticsearch_sink::ElasticsearchSink::try_new(es_cfg.clone())?;
+        let mut traces_sink = elasticsearch_sink::ElasticsearchSink::try_new(es_cfg.clone())?;
+        let mut metrics_sink = elasticsearch_sink::ElasticsearchSink::try_new(es_cfg)?;
+
+        // Validate cluster health and data stream templates before starting receiver
+        logs_sink
+            .validate_startup()
+            .await
+            .map_err(|e| anyhow::anyhow!("Elasticsearch startup validation failed: {e}"))?;
+
+        // Share the client, concurrency limiter, and validated status across sink instances
+        traces_sink.share_state_from(&logs_sink);
+        metrics_sink.share_state_from(&logs_sink);
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs Elasticsearch sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces Elasticsearch sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics Elasticsearch sink error: {}", e);
+            }
+        });
+    } else if let Some(starrocks_cfg) = config.starrocks {
+        tracing::info!(
+            database = %starrocks_cfg.database,
+            format = %starrocks_cfg.format,
+            mode = ?starrocks_cfg.transaction_mode,
+            "Initializing StarRocks sinks"
+        );
+
+        let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
+        let shared_manager = primary_sink.manager();
+
+        let mut logs_sink = primary_sink;
+        let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
+            starrocks_cfg.clone(),
+            std::sync::Arc::clone(&shared_manager),
+        )?;
+        let mut metrics_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager)?;
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs StarRocks sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces StarRocks sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics StarRocks sink error: {}", e);
+            }
+        });
     } else if let Some(ref kafka_cfg) = config.kafka {
         tracing::info!("Initializing Kafka sinks");
 
@@ -331,45 +407,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Kafka sink error: {}", e);
             }
         });
-    } else if let Some(starrocks_cfg) = config.starrocks {
-        tracing::info!(
-            database = %starrocks_cfg.database,
-            format = %starrocks_cfg.format,
-            mode = ?starrocks_cfg.transaction_mode,
-            "Initializing StarRocks sinks"
-        );
-
-        let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
-        let shared_manager = primary_sink.manager();
-
-        let mut logs_sink = primary_sink;
-        let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
-            starrocks_cfg.clone(),
-            std::sync::Arc::clone(&shared_manager),
-        )?;
-        let mut metrics_sink =
-            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager)?;
-
-        logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs StarRocks sink error: {}", e);
-            }
-        });
-
-        traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces StarRocks sink error: {}", e);
-            }
-        });
-
-        metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics StarRocks sink error: {}", e);
-            }
-        });
     } else {
         return Err(anyhow::anyhow!(
-            "One of [kafka], [iceberg], or [starrocks] configuration must be provided"
+            "One of [iceberg], [elasticsearch], [starrocks], or [kafka] configuration must be provided"
         ));
     }
 
@@ -408,4 +448,263 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_deserializes_and_validates_with_elasticsearch() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = ["http://localhost:9200"]
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Elasticsearch config should deserialize into AppConfig");
+
+        assert!(config.elasticsearch.is_some());
+        let es = config.elasticsearch.as_ref().unwrap();
+        assert_eq!(es.endpoints, vec!["http://localhost:9200"]);
+        assert_eq!(es.data_streams.logs, "logs-otel-default");
+        assert_eq!(es.data_streams.metrics, "metrics-otel-default");
+        assert_eq!(es.data_streams.traces, "traces-otel-default");
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_deserialization_with_elasticsearch_batching_and_auth() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = ["http://node1:9200", "http://node2:9200"]
+        [elasticsearch.auth]
+        type = "api_key"
+        api_key = "secret-token"
+        [elasticsearch.data_streams]
+        logs = "custom-logs"
+        metrics = "custom-metrics"
+        traces = "custom-traces"
+        [elasticsearch.batching]
+        max_batch_size_bytes = 5242880
+        max_batch_interval_sec = 5
+        max_batch_records = 10000
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Elasticsearch full config should deserialize");
+
+        let es = config
+            .elasticsearch
+            .as_ref()
+            .expect("elasticsearch config must be present");
+        assert_eq!(es.endpoints.len(), 2);
+        assert!(matches!(
+            es.auth,
+            elasticsearch_sink::ElasticsearchAuthConfig::ApiKey { ref api_key } if api_key == "secret-token"
+        ));
+        let batching = es.batching.as_ref().expect("batching must be present");
+        assert_eq!(batching.max_batch_size_bytes, 5_242_880);
+        assert_eq!(batching.max_batch_interval_sec, 5);
+        assert_eq!(batching.max_batch_records, 10_000);
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_no_sink() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Minimal config without sinks should deserialize");
+
+        assert!(config.kafka.is_none());
+        assert!(config.iceberg.is_none());
+        assert!(config.starrocks.is_none());
+        assert!(config.elasticsearch.is_none());
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when no sink is configured");
+        assert!(
+            err.to_string()
+                .contains("one of [kafka], [iceberg], [starrocks], or [elasticsearch]"),
+            "Error message should mention all four sinks: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_succeeds_with_kafka() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "telemetry-logs"
+        traces_topic = "telemetry-traces"
+        metrics_topic = "telemetry-metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Kafka config should deserialize");
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_succeeds_with_starrocks() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_iceberg_duplicate_identifiers() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_name = "test_catalog"
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "db.telemetry"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Iceberg config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Duplicate table identifiers should fail validation");
+        assert!(
+            err.to_string()
+                .contains("Iceberg table identifiers must be distinct"),
+            "Error message should indicate duplicate table identifiers: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_with_only_elasticsearch_leaves_kafka_none() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = ["http://localhost:9200"]
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+        "#;
+
+        let figment = Figment::new()
+            .merge(Toml::string(
+                r#"
+                [server]
+                grpc_addr = "127.0.0.1:4317"
+                http_addr = "127.0.0.1:4318"
+                "#,
+            ))
+            .merge(Toml::string(toml_str));
+
+        let config: AppConfig = figment.extract().expect("Config should deserialize");
+        assert!(config.elasticsearch.is_some());
+        assert!(config.kafka.is_none());
+        assert!(config.starrocks.is_none());
+        assert!(config.iceberg.is_none());
+    }
+
+    #[test]
+    fn test_config_defaults_has_no_sinks() {
+        let figment = Figment::new().merge(Toml::string(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+            "#,
+        ));
+
+        let config: AppConfig = figment.extract().expect("Config should deserialize");
+        assert!(config.kafka.is_none());
+        assert!(config.elasticsearch.is_none());
+        assert!(config.starrocks.is_none());
+        assert!(config.iceberg.is_none());
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_invalid_elasticsearch_config() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = []
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let err = validate_config(&config).expect_err("Validation should fail for empty endpoints");
+        assert!(
+            err.to_string()
+                .contains("at least one endpoint must be configured")
+        );
+    }
 }
