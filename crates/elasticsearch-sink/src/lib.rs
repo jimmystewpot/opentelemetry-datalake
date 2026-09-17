@@ -521,6 +521,7 @@ impl Sink for ElasticsearchSink {
                                     reason = "threshold",
                                     "Buffer threshold reached, flushing"
                                 );
+                                #[allow(clippy::collapsible_if)]
                                 if let Err(e) = self
                                     .flush_buffer(
                                         buf,
@@ -536,8 +537,9 @@ impl Sink for ElasticsearchSink {
                             }
                         }
                     } else {
-                        if batching.is_some()
-                            && let Err(e) = self
+                        if batching.is_some() {
+                            #[allow(clippy::collapsible_if)]
+                            if let Err(e) = self
                                 .flush_all_buffers(
                                     &mut logs_buf,
                                     &mut metrics_buf,
@@ -545,9 +547,10 @@ impl Sink for ElasticsearchSink {
                                     &mut join_set,
                                 )
                                 .await
-                        {
-                            let _ = Self::drain_join_set(&mut join_set).await;
-                            return Err(e);
+                            {
+                                let _ = Self::drain_join_set(&mut join_set).await;
+                                return Err(e);
+                            }
                         }
 
                         Self::drain_join_set(&mut join_set).await?;
