@@ -258,6 +258,20 @@ struct IndexTemplateContent {
     priority: Option<i64>,
 }
 
+/// Data stream query response returned by `GET /_data_stream/<name>`.
+#[derive(Debug, Deserialize)]
+struct DataStreamsResponse {
+    #[serde(default)]
+    data_streams: Vec<DataStreamItem>,
+}
+
+/// Individual data stream item in `DataStreamsResponse`.
+#[derive(Debug, Deserialize)]
+struct DataStreamItem {
+    #[serde(default)]
+    name: String,
+}
+
 /// Internal error categorized during index template existence verification across endpoints.
 #[derive(Debug)]
 enum TemplateCheckError {
@@ -1086,6 +1100,18 @@ impl HttpClient {
             )));
         }
 
+        let patterns_match = matched.index_template.as_ref().is_some_and(|c| {
+            c.index_patterns
+                .iter()
+                .any(|pat| pattern_matches(pat, data_stream))
+        });
+
+        if !patterns_match {
+            return Err(TemplateCheckError::Validation(format!(
+                "scoped index template '{data_stream}' has index_patterns that do not match target data stream '{data_stream}'"
+            )));
+        }
+
         tracing::info!(
             endpoint = %endpoint,
             data_stream = %data_stream,
@@ -1132,6 +1158,19 @@ impl HttpClient {
             let body = response.text().await.unwrap_or_default();
             return Err(TemplateCheckError::Transport(format!(
                 "check data stream '{data_stream}' on '{endpoint}' returned HTTP {status}: {body}"
+            )));
+        }
+
+        let parsed: DataStreamsResponse = response.json().await.map_err(|e| {
+            TemplateCheckError::Transport(format!(
+                "failed to parse data stream '{data_stream}' response on '{endpoint}': {e}"
+            ))
+        })?;
+
+        let exists = parsed.data_streams.iter().any(|ds| ds.name == data_stream);
+        if !exists {
+            return Err(TemplateCheckError::Validation(format!(
+                "data stream response on '{endpoint}' did not contain data stream '{data_stream}'"
             )));
         }
 
@@ -2491,6 +2530,252 @@ mod tests {
             result.unwrap_err(),
             ElasticsearchError::StartupValidation(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_exact_index_template_rejects_when_patterns_do_not_match_data_stream() {
+        let server = MockServer::start().await;
+
+        // Tier 1 returns 403 Forbidden
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 2 returns 200 OK with template named "logs-otel-default" and data_stream: {},
+        // but index_patterns are disjoint: ["unrelated-stream-*"]
+        let exact_body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-otel-default",
+                "index_template": {
+                    "index_patterns": ["unrelated-stream-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
+            .mount(&server)
+            .await;
+
+        // Tier 3 returns 404 Not Found
+        Mock::given(method("GET"))
+            .and(path("/_data_stream/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let result = client.validate_index_template("logs-otel-default").await;
+        assert!(
+            result.is_err(),
+            "should fail when scoped template patterns do not match target data stream"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("has index_patterns that do not match")
+                || err_msg.contains("all validation tiers failed"),
+            "error should indicate pattern mismatch or tier failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exact_index_template_accepts_matching_multi_pattern() {
+        let server = MockServer::start().await;
+
+        // Tier 1 returns 403 Forbidden
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 2 returns 200 OK with multiple patterns where one matches logs-otel-default
+        let exact_body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-otel-default",
+                "index_template": {
+                    "index_patterns": ["legacy-logs-*", "logs-otel-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let result = client.validate_index_template("logs-otel-default").await;
+        assert!(
+            result.is_ok(),
+            "should succeed via Tier 2 when at least one pattern matches, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_falls_back_to_tier3_on_dual_403_restricted_role() {
+        let server = MockServer::start().await;
+
+        // Tier 1 returns 403 Forbidden (restricted role lacks cluster manage_index_templates)
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 2 also returns 403 Forbidden (GET /_index_template/{name} also requires manage_index_templates)
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 3 returns 200 OK because the data stream was pre-created by cluster admin
+        let data_stream_body = serde_json::json!({
+            "data_streams": [{
+                "name": "logs-otel-default",
+                "status": "GREEN"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_data_stream/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&data_stream_body))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let result = client.validate_index_template("logs-otel-default").await;
+        assert!(
+            result.is_ok(),
+            "should succeed via Tier 3 when both Tier 1 and Tier 2 return 403, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_data_stream_exists_rejects_empty_or_mismatched_payload() {
+        let server = MockServer::start().await;
+
+        // Tier 1 returns 403 Forbidden
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 2 returns 403 Forbidden
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 3 returns 200 OK but with mismatched data_streams array
+        let mismatched_body = serde_json::json!({
+            "data_streams": [{
+                "name": "other-data-stream",
+                "status": "GREEN"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_data_stream/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&mismatched_body))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let result = client.validate_index_template("logs-otel-default").await;
+        assert!(
+            result.is_err(),
+            "should fail when data stream payload does not contain target data stream"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("did not contain data stream")
+                || err_msg.contains("all validation tiers failed"),
+            "error message must describe payload mismatch, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_templates_mixed_tiers_across_signals() {
+        let server = MockServer::start().await;
+
+        // Tier 1 is blocked on reverse proxy / restricted RBAC
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // metrics-stream: Tier 2 scoped query succeeds with matching pattern!
+        let metrics_exact_body = serde_json::json!({
+            "index_templates": [{
+                "name": "metrics-stream",
+                "index_template": {
+                    "index_patterns": ["metrics-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template/metrics-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&metrics_exact_body))
+            .mount(&server)
+            .await;
+
+        // traces-stream: Tier 2 returns 404 (no scoped template). Tier 3 succeeds on active stream!
+        Mock::given(method("GET"))
+            .and(path("/_index_template/traces-stream"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+        let traces_stream_body = serde_json::json!({
+            "data_streams": [{
+                "name": "traces-stream",
+                "status": "GREEN"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_data_stream/traces-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&traces_stream_body))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        assert!(
+            client
+                .validate_index_template("metrics-stream")
+                .await
+                .is_ok(),
+            "metrics-stream should validate on Tier 2"
+        );
+        assert!(
+            client
+                .validate_index_template("traces-stream")
+                .await
+                .is_ok(),
+            "traces-stream should validate on Tier 3"
+        );
     }
 
     #[tokio::test]

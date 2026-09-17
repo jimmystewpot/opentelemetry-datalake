@@ -1160,6 +1160,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sink_startup_validation_succeeds_under_restricted_rbac_role() {
+        let server = MockServer::start().await;
+
+        // Health check
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": { "number": "8.12.0" }
+            })))
+            .mount(&server)
+            .await;
+
+        // Tier 1 returns 403 Forbidden (restricted service account lacks cluster manage_index_templates)
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        for stream in &[
+            "logs-otel-default",
+            "metrics-otel-default",
+            "traces-otel-default",
+        ] {
+            // Tier 2 returns 403 Forbidden
+            Mock::given(method("GET"))
+                .and(path(format!("/_index_template/{stream}")))
+                .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+                .mount(&server)
+                .await;
+
+            // Tier 3 returns 200 OK because data stream was pre-provisioned
+            Mock::given(method("GET"))
+                .and(path(format!("/_data_stream/{stream}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data_streams": [{
+                        "name": *stream,
+                        "status": "GREEN"
+                    }]
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        // Drop sender immediately so run() completes cleanly after startup validation
+        drop(tx);
+        let run_result = run_handle.await.expect("join failed");
+        assert!(
+            run_result.is_ok(),
+            "sink must start and shut down cleanly under restricted RBAC role with pre-created data stream, got: {run_result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_sink_with_gzip_compression() {
         let server = MockServer::start().await;
         setup_startup_validation_mocks(&server).await;

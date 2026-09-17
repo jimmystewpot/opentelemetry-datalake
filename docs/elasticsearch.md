@@ -60,8 +60,8 @@ PUT _index_template/otel_data_streams
 When `validate_on_startup = true` (the default), the sink executes a 3-tier startup verification sequence before accepting traffic:
 1. **Cluster Health (`GET /`)**: Verifies cluster connectivity and detects the engine version.
 2. **Tier 1 Composable Template Validation (`GET /_index_template`)**: Evaluates all composable index templates, matches index patterns, resolves the winning template by highest priority, and asserts that `data_stream: {}` is declared.
-3. **Tier 2 Scoped Template Fallback (`GET /_index_template/{data_stream}`)**: If Tier 1 is forbidden (HTTP 403) by restricted credentials or blocked (HTTP 404) by a reverse proxy, falls back to querying the exact data stream template.
-4. **Tier 3 Active Data Stream Fallback (`GET /_data_stream/{data_stream}`)**: If Tier 2 returns 404, verifies whether the data stream is already established and active in the cluster.
+3. **Tier 2 Scoped Template Fallback (`GET /_index_template/{data_stream}`)**: If Tier 1 is forbidden (HTTP 403) by restricted credentials or blocked (HTTP 404/405) by a reverse proxy, falls back to querying the exact data stream template, verifying that its `index_patterns` match the target stream and `data_stream: {}` is declared.
+4. **Tier 3 Active Data Stream Fallback (`GET /_data_stream/{data_stream}`)**: If Tier 2 returns 404, 403 (credentials lacking template privileges), or pattern mismatch, verifies whether the data stream is already established and active in the cluster.
 
 If all endpoints and validation tiers fail, startup aborts immediately before accepting OTLP traffic.
 
@@ -407,8 +407,13 @@ Grants permissions to query cluster templates during Tier 1 validation and inges
 }
 ```
 
-##### Restricted / Least-Privilege Role (Shared / Multi-Tenant Clusters)
-In multi-tenant or managed environments where cluster-level template inspection (`manage_index_templates`) is restricted, the sink seamlessly falls back to Tier 2 scoped lookup (`GET /_index_template/{data_stream}`) or Tier 3 data stream existence check (`GET /_data_stream/{data_stream}`):
+##### Restricted / Least-Privilege Role (Shared / Multi-Tenant Clusters with Pre-Provisioned Streams)
+In Elasticsearch, index template APIs (`GET /_index_template` and `GET /_index_template/{name}`) strictly require the cluster privilege `manage_index_templates`; index-level privileges such as `view_index_metadata` do not authorize template inspection.
+
+When cluster security policies forbid granting cluster-level privileges to application credentials:
+- Both Tier 1 and Tier 2 return HTTP 403 Forbidden.
+- The sink seamlessly falls back to **Tier 3 (`GET /_data_stream/{data_stream}`)** using the index-level `manage_data_stream` (or `view_index_metadata`) privilege.
+- **Requirement**: Target data streams must be **pre-provisioned** by an administrator or infrastructure automation before sink startup.
 
 ```json
 {
@@ -421,6 +426,9 @@ In multi-tenant or managed environments where cluster-level template inspection 
   ]
 }
 ```
+
+> [!NOTE]
+> **Reverse Proxy Multi-Tenancy**: When using reverse proxies (e.g., NGINX/Envoy) to restrict API surfaces, the upstream Elasticsearch service account typically *does* retain `manage_index_templates`, but the reverse proxy blocks `GET /_index_template` (to prevent cross-tenant enumeration) while allowlisting `GET /_index_template/{data_stream}`. In that topology, Tier 2 scoped lookup succeeds because the cluster authorizes the request.
 
 #### OpenSearch Security Action Groups Mapping
 
@@ -483,8 +491,8 @@ OpenSearch Security uses action groups instead of Elasticsearch privileges. The 
 |---|---|---|---|
 | Cluster Health & Version Probe | `monitor` | `cluster_monitor` | Required for boot-time `GET /` connectivity and engine version check. |
 | Cluster-Wide Template Inspection | `manage_index_templates` | `cluster:admin/indices/template/get` | Required for boot-time Tier 1 template priority resolution via `GET /_index_template`. |
-| Scoped Template Inspection | `view_index_metadata` | `indices_monitor` or `indices:admin/template/get` | Used during Tier 2 fallback via `GET /_index_template/{data_stream}`. |
-| Data Stream Liveness | `manage_data_stream` | `manage_data_stream` | Used during Tier 3 fallback via `GET /_data_stream/{data_stream}`. |
+| Scoped Template Inspection | `manage_index_templates` | `indices_monitor` or `indices:admin/template/get` | Used during Tier 2 fallback via `GET /_index_template/{data_stream}`. Requires cluster privilege in Elasticsearch; supported at index level in OpenSearch. |
+| Data Stream Liveness | `manage_data_stream` (or `view_index_metadata`) | `manage_data_stream` (or `indices_monitor`) | Used during Tier 3 fallback via `GET /_data_stream/{data_stream}` for pre-created streams. |
 | Bulk Data Ingestion | `write` | `write` (or `crud`) | Ingests micro-batches via `POST /{data_stream}/_bulk`. |
 | Dynamic Index Creation | `create_index`, `auto_configure` | `create_index` | Allows creation of backing indices when data streams rollover. |
 
