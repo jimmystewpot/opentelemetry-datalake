@@ -34,3 +34,4 @@ lcov.info
 # Superpowers & Agent Working Directories
 docs/superpowers/
 .superpowers/
+.worktrees/
