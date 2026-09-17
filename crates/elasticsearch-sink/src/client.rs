@@ -81,17 +81,18 @@ impl BulkItemWrapper {
         self.item().and_then(|i| i.error.as_ref())
     }
 
-    /// Returns whether this item encountered a recoverable failure (HTTP 429 or 503).
+    /// Returns whether this item encountered a recoverable failure (HTTP 429, 500, or 503).
     #[must_use]
     pub fn is_recoverable(&self) -> bool {
-        self.status().is_some_and(|s| s == 429 || s == 503)
+        self.status()
+            .is_some_and(|s| s == 429 || s == 500 || s == 503)
     }
 
-    /// Returns whether this item encountered an unrecoverable failure (HTTP >= 400 except 429 and 503).
+    /// Returns whether this item encountered an unrecoverable failure (HTTP >= 400 except 429, 500, and 503).
     #[must_use]
     pub fn is_unrecoverable(&self) -> bool {
         self.status()
-            .is_some_and(|s| s >= 400 && s != 429 && s != 503)
+            .is_some_and(|s| s >= 400 && s != 429 && s != 500 && s != 503)
     }
 }
 
@@ -109,13 +110,13 @@ pub struct BulkResponse {
 }
 
 impl BulkResponse {
-    /// Returns the number of items that encountered a recoverable failure (HTTP 429 or 503).
+    /// Returns the number of items that encountered a recoverable failure (HTTP 429, 500, or 503).
     #[must_use]
     pub fn recoverable_count(&self) -> usize {
         self.items.iter().filter(|i| i.is_recoverable()).count()
     }
 
-    /// Returns the number of items that encountered an unrecoverable failure (HTTP >= 400 except 429 and 503).
+    /// Returns the number of items that encountered an unrecoverable failure (HTTP >= 400 except 429, 500, and 503).
     #[must_use]
     pub fn unrecoverable_count(&self) -> usize {
         self.items.iter().filter(|i| i.is_unrecoverable()).count()
@@ -620,7 +621,8 @@ impl HttpClient {
     const fn is_transient_http_status(status: reqwest::StatusCode) -> bool {
         matches!(
             status,
-            reqwest::StatusCode::TOO_MANY_REQUESTS
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
                 | reqwest::StatusCode::SERVICE_UNAVAILABLE
                 | reqwest::StatusCode::BAD_GATEWAY
                 | reqwest::StatusCode::GATEWAY_TIMEOUT
@@ -755,7 +757,7 @@ impl HttpClient {
         }
     }
 
-    /// Prepares the next payload and indices for retrying items that failed with 429/503.
+    /// Prepares the next payload and indices for retrying items that failed with 429/500/503.
     fn prepare_sub_payload_retry(
         current_payload: &Bytes,
         final_items: &[BulkItemWrapper],
@@ -798,11 +800,11 @@ impl HttpClient {
     /// Sends a serialized NDJSON bulk payload targeting `POST /<data_stream>/_bulk`.
     ///
     /// Applies round-robin node selection, gzip compression (if enabled), authentication,
-    /// and a jittered exponential backoff retry loop on transient failures (429/503/network).
+    /// and a jittered exponential backoff retry loop on transient failures (429/500/503/network).
     ///
     /// When the bulk response indicates errors (`errors: true`):
     /// - Unrecoverable item failures (HTTP 400, etc.) are logged at WARN level and dropped.
-    /// - Recoverable item failures (HTTP 429, 503) are extracted by index and re-submitted
+    /// - Recoverable item failures (HTTP 429, 500, 503) are extracted by index and re-submitted
     ///   as a retry sub-payload with jittered exponential backoff and node failover.
     /// - Retries continue up to `max_retries`. If retries are exhausted and recoverable
     ///   failures remain, returns [`ElasticsearchError::BulkFailed`].
@@ -879,7 +881,7 @@ impl HttpClient {
                                 return Err(ElasticsearchError::BulkFailed {
                                     retries: self.max_retries,
                                     message: format!(
-                                        "{} items failed with recoverable status (429/503) after {} retries",
+                                        "{} items failed with recoverable status (429/500/503) after {} retries",
                                         next_indices.len(),
                                         self.max_retries
                                     ),
@@ -2751,8 +2753,42 @@ mod tests {
             update: None,
             delete: None,
         };
-        assert!(!item_500.is_recoverable());
-        assert!(item_500.is_unrecoverable());
+        assert!(item_500.is_recoverable());
+        assert!(!item_500.is_unrecoverable());
+    }
+
+    #[test]
+    fn test_is_transient_http_status() {
+        assert!(HttpClient::is_transient_http_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(HttpClient::is_transient_http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(HttpClient::is_transient_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+        assert!(HttpClient::is_transient_http_status(
+            reqwest::StatusCode::BAD_GATEWAY
+        ));
+        assert!(HttpClient::is_transient_http_status(
+            reqwest::StatusCode::GATEWAY_TIMEOUT
+        ));
+        assert!(!HttpClient::is_transient_http_status(
+            reqwest::StatusCode::OK
+        ));
+        assert!(!HttpClient::is_transient_http_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(!HttpClient::is_transient_http_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!HttpClient::is_transient_http_status(
+            reqwest::StatusCode::FORBIDDEN
+        ));
+        assert!(!HttpClient::is_transient_http_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
     }
 
     #[test]
@@ -2941,7 +2977,7 @@ mod tests {
         match err {
             ElasticsearchError::BulkFailed { retries, message } => {
                 assert_eq!(retries, 2);
-                assert!(message.contains("recoverable status (429/503) after 2 retries"));
+                assert!(message.contains("recoverable status (429/500/503) after 2 retries"));
             }
             other => panic!("expected BulkFailed, got {other:?}"),
         }
@@ -3322,6 +3358,43 @@ mod tests {
         let client = HttpClient::try_new(&config).unwrap();
 
         let payload = Bytes::from("{\"create\":{}}\n{\"msg\":\"failover test\"}\n");
+        let resp = client
+            .send_bulk("logs-otel-default", payload)
+            .await
+            .unwrap();
+
+        assert!(!resp.errors);
+        assert!(client.is_endpoint_in_cooldown(&server1.uri()));
+        assert!(!client.is_endpoint_in_cooldown(&server2.uri()));
+    }
+
+    #[tokio::test]
+    async fn test_send_bulk_multi_node_failover_on_500() {
+        let server1 = MockServer::start().await;
+        let server2 = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string(r#"{"error":"internal server error"}"#),
+            )
+            .mount(&server1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"took": 15, "errors": false, "items": []}"#),
+            )
+            .mount(&server2)
+            .await;
+
+        let mut config = make_test_config(vec![server1.uri(), server2.uri()]);
+        config.max_retries = 2;
+        let client = HttpClient::try_new(&config).unwrap();
+
+        let payload = Bytes::from("{\"create\":{}}\n{\"msg\":\"failover test 500\"}\n");
         let resp = client
             .send_bulk("logs-otel-default", payload)
             .await
