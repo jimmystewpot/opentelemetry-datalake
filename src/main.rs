@@ -98,8 +98,11 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
-    } else if config.kafka.is_none() && config.starrocks.is_none() && config.elasticsearch.is_none()
-    {
+    } else if let Some(ref es_cfg) = config.elasticsearch {
+        es_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if config.kafka.is_none() && config.starrocks.is_none() {
         anyhow::bail!(
             "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
         );
@@ -676,5 +679,32 @@ mod tests {
         assert!(config.elasticsearch.is_none());
         assert!(config.starrocks.is_none());
         assert!(config.iceberg.is_none());
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_invalid_elasticsearch_config() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = []
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let err = validate_config(&config).expect_err("Validation should fail for empty endpoints");
+        assert!(
+            err.to_string()
+                .contains("at least one endpoint must be configured")
+        );
     }
 }

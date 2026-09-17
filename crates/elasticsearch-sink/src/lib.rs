@@ -67,11 +67,9 @@ impl ElasticsearchSink {
     /// - TLS certificate loading fails.
     /// - Sorter configuration parsing fails.
     pub fn try_new(config: ElasticsearchSinkConfig) -> Result<Self, PipelineError> {
-        if config.max_concurrent_requests == 0 {
-            return Err(PipelineError::Internal(
-                "max_concurrent_requests must be greater than 0".to_string(),
-            ));
-        }
+        config
+            .validate()
+            .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
         let client = HttpClient::try_new(&config)?;
         let sorter = if let Some(ref order_by) = config.order_by {
@@ -1764,6 +1762,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn test_buffer_all_telemetry_events_and_fields() {
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::layer::SubscriberExt;

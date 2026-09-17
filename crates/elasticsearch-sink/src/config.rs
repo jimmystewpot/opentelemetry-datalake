@@ -181,6 +181,90 @@ pub struct ElasticsearchSinkConfig {
     pub order_by: Option<pipeline_core::sort::SortConfig>,
 }
 
+impl ElasticsearchSinkConfig {
+    /// Validates static configuration constraints without initiating network transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ElasticsearchError::StartupValidation`] if any configuration
+    /// constraint is violated.
+    pub fn validate(&self) -> Result<(), crate::error::ElasticsearchError> {
+        if self.endpoints.is_empty() {
+            return Err(crate::error::ElasticsearchError::StartupValidation(
+                "at least one endpoint must be configured".to_string(),
+            ));
+        }
+
+        for ep in &self.endpoints {
+            let trimmed = ep.trim().trim_end_matches('/');
+            if trimmed.is_empty() {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    "endpoint URL cannot be empty".to_string(),
+                ));
+            }
+            if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    format!("endpoint '{ep}' must start with http:// or https://"),
+                ));
+            }
+            if reqwest::Url::parse(trimmed).is_err() {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    format!("endpoint '{ep}' is not a valid URL"),
+                ));
+            }
+        }
+
+        if self.max_concurrent_requests == 0 {
+            return Err(crate::error::ElasticsearchError::StartupValidation(
+                "max_concurrent_requests must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.max_payload_bytes == 0 {
+            return Err(crate::error::ElasticsearchError::StartupValidation(
+                "max_payload_bytes must be greater than 0".to_string(),
+            ));
+        }
+
+        if self.data_streams.logs.trim().is_empty()
+            || self.data_streams.metrics.trim().is_empty()
+            || self.data_streams.traces.trim().is_empty()
+        {
+            return Err(crate::error::ElasticsearchError::StartupValidation(
+                "data stream names for logs, metrics, and traces must not be empty".to_string(),
+            ));
+        }
+
+        if let Some(ref batching) = self.batching {
+            if batching.max_batch_size_bytes == 0 {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    "batching.max_batch_size_bytes must be greater than 0".to_string(),
+                ));
+            }
+            if batching.max_batch_interval_sec == 0 {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    "batching.max_batch_interval_sec must be greater than 0".to_string(),
+                ));
+            }
+            if batching.max_batch_records == 0 {
+                return Err(crate::error::ElasticsearchError::StartupValidation(
+                    "batching.max_batch_records must be greater than 0".to_string(),
+                ));
+            }
+        }
+
+        if let Some(ref ca_path) = self.tls.ca_cert_path
+            && !std::path::Path::new(ca_path).is_file()
+        {
+            return Err(crate::error::ElasticsearchError::StartupValidation(
+                format!("CA certificate file does not exist: {ca_path}"),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +455,103 @@ mod tests {
             }
             other => panic!("expected AwsSigv4 auth, got {other:?}"),
         }
+    }
+
+    fn make_minimal_config() -> ElasticsearchSinkConfig {
+        let toml_str = r#"
+            endpoints = ["http://localhost:9200"]
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+        "#;
+        toml::from_str(toml_str).unwrap()
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_endpoints() {
+        let mut cfg = make_minimal_config();
+        cfg.endpoints.clear();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_blank_endpoint() {
+        let mut cfg = make_minimal_config();
+        cfg.endpoints = vec!["   ".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_url() {
+        let mut cfg = make_minimal_config();
+        cfg.endpoints = vec!["not a url".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_concurrency() {
+        let mut cfg = make_minimal_config();
+        cfg.max_concurrent_requests = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_data_stream_names() {
+        let mut cfg = make_minimal_config();
+        cfg.data_streams.logs = "   ".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_succeeds_for_minimal_config() {
+        let cfg = make_minimal_config();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_http_endpoint() {
+        let mut cfg = make_minimal_config();
+        cfg.endpoints = vec!["ftp://localhost:9200".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_payload_bytes() {
+        let mut cfg = make_minimal_config();
+        cfg.max_payload_bytes = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_batching_settings() {
+        let mut cfg = make_minimal_config();
+        cfg.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 0,
+            max_batch_interval_sec: 10,
+            max_batch_records: 1000,
+        });
+        assert!(cfg.validate().is_err());
+
+        cfg.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 1000,
+            max_batch_interval_sec: 0,
+            max_batch_records: 1000,
+        });
+        assert!(cfg.validate().is_err());
+
+        cfg.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 1000,
+            max_batch_interval_sec: 10,
+            max_batch_records: 0,
+        });
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_nonexistent_ca_file() {
+        let mut cfg = make_minimal_config();
+        cfg.tls.ca_cert_path = Some("/nonexistent/path/to/ca.pem".to_string());
+        assert!(cfg.validate().is_err());
     }
 }
