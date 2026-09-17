@@ -30,3 +30,7 @@ Thumbs.db
 *.log
 tests/e2e/receiver.log
 lcov.info
+
+# Superpowers & Agent Working Directories
+docs/superpowers/
+.superpowers/
