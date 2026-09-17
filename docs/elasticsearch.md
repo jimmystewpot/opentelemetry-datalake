@@ -71,22 +71,6 @@ Add an `[elasticsearch]` section to your `config.toml`. All fields with defaults
 # and automated node-cooldown failover are applied across all endpoints.
 endpoints = ["https://es01.internal:9200", "https://es02.internal:9200"]
 
-# Target data streams per signal type.
-[elasticsearch.data_streams]
-logs    = "logs-otel-default"
-metrics = "metrics-otel-default"
-traces  = "traces-otel-default"
-
-# Authentication configuration. Options: "none", "basic", "api_key", "bearer", or "aws_sigv4".
-[elasticsearch.auth]
-type = "api_key"
-api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
-
-# TLS configuration.
-[elasticsearch.tls]
-ca_cert_path = "/etc/ssl/certs/es-ca.crt"
-insecure_skip_verify = false
-
 # Unpack stringified JSON map/struct attributes into native JSON objects. Default: true.
 unpack_attributes = true
 
@@ -113,6 +97,22 @@ retry_interval_secs = 1
 
 # Perform startup cluster health and index template verification. Default: true.
 validate_on_startup = true
+
+# Target data streams per signal type.
+[elasticsearch.data_streams]
+logs    = "logs-otel-default"
+metrics = "metrics-otel-default"
+traces  = "traces-otel-default"
+
+# Authentication configuration. Options: "none", "basic", "api_key", "bearer", or "aws_sigv4".
+[elasticsearch.auth]
+type = "api_key"
+api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
+
+# TLS configuration.
+[elasticsearch.tls]
+ca_cert_path = "/etc/ssl/certs/es-ca.crt"
+insecure_skip_verify = false
 ```
 
 ---
