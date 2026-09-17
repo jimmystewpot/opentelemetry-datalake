@@ -577,7 +577,12 @@ mod tests {
             Mock::given(method("GET"))
                 .and(path(format!("/_index_template/{stream}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "index_templates": [{ "name": stream }]
+                    "index_templates": [{
+                        "name": stream,
+                        "index_template": {
+                            "data_stream": {}
+                        }
+                    }]
                 })))
                 .mount(server)
                 .await;
