@@ -21,7 +21,7 @@ pub use config::{
     ElasticsearchSinkConfig,
 };
 pub use error::ElasticsearchError;
-pub use serializer::serialize_batch;
+pub use serializer::{serialize_batch, serialize_batch_chunks};
 pub use tls::TlsConfig;
 
 /// Internal accumulator for micro-batch buffering per signal type.
@@ -267,7 +267,7 @@ impl ElasticsearchSink {
         }
     }
 
-    /// Concatenates accumulated batches, sorts them, serializes to NDJSON, and dispatches.
+    /// Concatenates accumulated batches, sorts them, serializes to NDJSON chunks, and dispatches.
     async fn flush_buffer(
         &self,
         buf: &mut BufferState,
@@ -293,7 +293,7 @@ impl ElasticsearchSink {
             "Flushing buffer"
         );
 
-        let batches = std::mem::take(&mut buf.batches);
+        let mut batches = std::mem::take(&mut buf.batches);
         buf.bytes = 0;
         buf.records = 0;
 
@@ -301,35 +301,44 @@ impl ElasticsearchSink {
         let unpack_attributes = self.config.unpack_attributes;
         let max_payload_bytes = self.config.max_payload_bytes;
 
-        let payload_opt =
-            tokio::task::spawn_blocking(move || -> Result<Option<Bytes>, PipelineError> {
-                let schema = batches[0].schema();
-                let refs: Vec<&RecordBatch> = batches.iter().collect();
-                let combined =
-                    arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
-
-                if combined.num_rows() == 0 {
-                    return Ok(None);
+        let chunks = tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>, PipelineError> {
+            let combined = if batches.len() == 1 {
+                match batches.pop() {
+                    Some(b) => b,
+                    None => return Ok(Vec::new()),
                 }
+            } else {
+                let schema = match batches.first() {
+                    Some(b) => b.schema(),
+                    None => return Ok(Vec::new()),
+                };
+                let refs: Vec<&RecordBatch> = batches.iter().collect();
+                arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?
+            };
 
-                let sorted_batch = sorter.sort(&combined, signal_type)?;
-                let payload = crate::serializer::serialize_batch(
-                    &sorted_batch,
-                    unpack_attributes,
-                    max_payload_bytes,
-                )?;
-                Ok(Some(payload))
-            })
-            .await
-            .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
+            if combined.num_rows() == 0 {
+                return Ok(Vec::new());
+            }
 
-        if let Some(payload) = payload_opt {
+            let sorted_batch = sorter.sort(&combined, signal_type)?;
+            let chunks = crate::serializer::serialize_batch_chunks(
+                &sorted_batch,
+                unpack_attributes,
+                max_payload_bytes,
+            )?;
+            Ok(chunks)
+        })
+        .await
+        .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
+
+        let stream_name = target_data_stream.to_string();
+        for chunk in chunks {
             Self::dispatch(
                 Arc::clone(&self.client),
                 Arc::clone(&self.semaphore),
                 join_set,
-                target_data_stream.to_string(),
-                payload,
+                stream_name.clone(),
+                chunk,
             )
             .await?;
         }
@@ -395,13 +404,9 @@ impl Sink for ElasticsearchSink {
         self.validate_startup().await?;
 
         let batching = self.config.batching.clone();
-        let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);
         let max_interval = batching
             .as_ref()
             .map_or(86_400, |b| b.max_batch_interval_sec);
-        let max_records = batching
-            .as_ref()
-            .map_or(usize::MAX, |b| b.max_batch_records);
 
         let mut logs_buf = BufferState::default();
         let mut metrics_buf = BufferState::default();
@@ -450,67 +455,43 @@ impl Sink for ElasticsearchSink {
                             continue;
                         }
 
-                        if batching.is_none() {
-                            let sorter = self.sorter.clone();
-                            let unpack_attributes = self.config.unpack_attributes;
-                            let max_payload_bytes = self.config.max_payload_bytes;
+                        let buf = match signal_type {
+                            SignalType::Logs => &mut logs_buf,
+                            SignalType::Metrics => &mut metrics_buf,
+                            SignalType::Traces => &mut traces_buf,
+                        };
 
-                            let payload = tokio::task::spawn_blocking(
-                                move || -> Result<Bytes, PipelineError> {
-                                    let sorted_batch = sorter.sort(&batch, signal_type)?;
-                                    crate::serializer::serialize_batch(
-                                        &sorted_batch,
-                                        unpack_attributes,
-                                        max_payload_bytes,
-                                    )
-                                    .map_err(PipelineError::from)
-                                },
-                            )
-                            .await
-                            .map_err(|e| {
-                                PipelineError::Internal(format!(
-                                    "Serialization task panicked: {e}"
-                                ))
-                            })??;
+                        let signal_label = match signal_type {
+                            SignalType::Logs => "logs",
+                            SignalType::Metrics => "metrics",
+                            SignalType::Traces => "traces",
+                        };
 
-                            let target = self.data_stream_for(signal_type).to_string();
-                            Self::dispatch(
-                                Arc::clone(&self.client),
-                                Arc::clone(&self.semaphore),
-                                &mut join_set,
-                                target,
-                                payload,
-                            )
-                            .await?;
-                        } else {
-                            let buf = match signal_type {
-                                SignalType::Logs => &mut logs_buf,
-                                SignalType::Metrics => &mut metrics_buf,
-                                SignalType::Traces => &mut traces_buf,
-                            };
+                        let batch_bytes = batch.get_array_memory_size();
+                        let batch_rows = batch.num_rows();
 
-                            let signal_label = match signal_type {
-                                SignalType::Logs => "logs",
-                                SignalType::Metrics => "metrics",
-                                SignalType::Traces => "traces",
-                            };
+                        buf.bytes = buf.bytes.saturating_add(batch_bytes);
+                        buf.records = buf.records.saturating_add(batch_rows);
+                        buf.batches.push(batch);
 
-                            let batch_bytes = batch.get_array_memory_size();
-                            let batch_rows = batch.num_rows();
+                        tracing::debug!(
+                            signal = signal_label,
+                            bytes = buf.bytes,
+                            records = buf.records,
+                            data_stream = self.data_stream_for(signal_type),
+                            "Buffer accumulated batch"
+                        );
 
-                            buf.bytes = buf.bytes.saturating_add(batch_bytes);
-                            buf.records = buf.records.saturating_add(batch_rows);
-                            buf.batches.push(batch);
+                        let should_flush = match batching.as_ref() {
+                            Some(cfg) => {
+                                buf.bytes >= cfg.max_batch_size_bytes
+                                    || buf.records >= cfg.max_batch_records
+                            }
+                            None => true,
+                        };
 
-                            tracing::debug!(
-                                signal = signal_label,
-                                bytes = buf.bytes,
-                                records = buf.records,
-                                data_stream = self.data_stream_for(signal_type),
-                                "Buffer accumulated batch"
-                            );
-
-                            if buf.bytes >= max_bytes || buf.records >= max_records {
+                        if should_flush {
+                            if batching.is_some() {
                                 tracing::debug!(
                                     signal = signal_label,
                                     bytes = buf.bytes,
@@ -519,29 +500,12 @@ impl Sink for ElasticsearchSink {
                                     reason = "threshold",
                                     "Buffer threshold reached, flushing"
                                 );
-                                #[allow(clippy::collapsible_if)]
-                                if let Err(e) = self
-                                    .flush_buffer(
-                                        buf,
-                                        signal_type,
-                                        self.data_stream_for(signal_type),
-                                        &mut join_set,
-                                    )
-                                    .await
-                                {
-                                    let _ = Self::drain_join_set(&mut join_set).await;
-                                    return Err(e);
-                                }
                             }
-                        }
-                    } else {
-                        if batching.is_some() {
-                            #[allow(clippy::collapsible_if)]
                             if let Err(e) = self
-                                .flush_all_buffers(
-                                    &mut logs_buf,
-                                    &mut metrics_buf,
-                                    &mut traces_buf,
+                                .flush_buffer(
+                                    buf,
+                                    signal_type,
+                                    self.data_stream_for(signal_type),
                                     &mut join_set,
                                 )
                                 .await
@@ -549,6 +513,19 @@ impl Sink for ElasticsearchSink {
                                 let _ = Self::drain_join_set(&mut join_set).await;
                                 return Err(e);
                             }
+                        }
+                    } else {
+                        if let Err(e) = self
+                            .flush_all_buffers(
+                                &mut logs_buf,
+                                &mut metrics_buf,
+                                &mut traces_buf,
+                                &mut join_set,
+                            )
+                            .await
+                        {
+                            let _ = Self::drain_join_set(&mut join_set).await;
+                            return Err(e);
                         }
 
                         Self::drain_join_set(&mut join_set).await?;
@@ -1416,7 +1393,14 @@ mod tests {
             .await;
 
         let mut config = make_test_config_with_batching(server.uri());
-        config.max_payload_bytes = 500;
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
+            logs: vec![],
+            metrics: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "nonexistent_sort_col ASC".to_string(),
+            )],
+            traces: vec![],
+        });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -1426,9 +1410,9 @@ mod tests {
         // Allow batch 1 to be dispatched into join_set and reach wiremock
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        // Batch 2 exceeds max_payload_bytes (1000 > 500), causing flush_buffer to error
-        let batch2 = make_log_batch_with_service(&"x".repeat(1000));
-        tx.send(SignalBatch::Logs(batch2)).await.unwrap();
+        // Batch 2 causes flush_buffer to error due to missing required sort column
+        let batch2 = make_metric_batch();
+        tx.send(SignalBatch::Metrics(batch2)).await.unwrap();
         drop(tx);
 
         let result = sink
@@ -1461,33 +1445,19 @@ mod tests {
             max_batch_interval_sec: 60,
             max_batch_records: 10,
         });
-        config.max_payload_bytes = 500;
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
+            logs: vec![],
+            metrics: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "nonexistent_sort_col ASC".to_string(),
+            )],
+            traces: vec![],
+        });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
-
-        let large_metric_schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("metric_name", DataType::Utf8, false),
-            Field::new("value", DataType::Float64, false),
-        ]));
-        let large_metric_batch = RecordBatch::try_new(
-            large_metric_schema,
-            vec![
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    1_726_500_000_000_000_000,
-                ])),
-                Arc::new(StringArray::from(vec!["x".repeat(1000)])),
-                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
-            ],
-        )
-        .unwrap();
-        tx.send(SignalBatch::Metrics(large_metric_batch))
+        tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
             .unwrap();
         drop(tx);
@@ -1525,7 +1495,14 @@ mod tests {
             max_batch_interval_sec: 1,
             max_batch_records: 10,
         });
-        config.max_payload_bytes = 500;
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
+            logs: vec![],
+            metrics: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "nonexistent_sort_col ASC".to_string(),
+            )],
+            traces: vec![],
+        });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
         let (tx, rx) = tokio::sync::mpsc::channel(10);
@@ -1535,28 +1512,7 @@ mod tests {
         });
 
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
-
-        let large_metric_schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("metric_name", DataType::Utf8, false),
-            Field::new("value", DataType::Float64, false),
-        ]));
-        let large_metric_batch = RecordBatch::try_new(
-            large_metric_schema,
-            vec![
-                Arc::new(TimestampNanosecondArray::from(vec![
-                    1_726_500_000_000_000_000,
-                ])),
-                Arc::new(StringArray::from(vec!["x".repeat(1000)])),
-                Arc::new(arrow::array::Float64Array::from(vec![1.0])),
-            ],
-        )
-        .unwrap();
-        tx.send(SignalBatch::Metrics(large_metric_batch))
+        tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
             .unwrap();
 
@@ -1912,5 +1868,103 @@ mod tests {
         assert_eq!(reset_events.len(), 1, "Expected 1 reset event");
         assert_eq!(reset_events[0].signal, "logs");
         assert_eq!(reset_events[0].data_stream, "logs-otel-default");
+    }
+
+    #[tokio::test]
+    async fn test_sink_non_batching_splits_oversized_batch_into_multiple_requests() {
+        let server = MockServer::start().await;
+
+        // Server expects 2 distinct POST bulk requests
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.batching = None; // Non-batching mode
+        config.max_payload_bytes = 200; // Small limit to force chunking (2 rows = 176 bytes)
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        // Create a batch with 4 rows that will exceed 200 bytes
+        let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 4]);
+        let bodies = StringArray::from(vec!["hello-world-data"; 4]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(timestamps), Arc::new(bodies)]).unwrap();
+
+        let handle = tokio::spawn(async move {
+            sink.run(rx).await.unwrap();
+        });
+
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        handle.await.unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_sink_batching_splits_oversized_batch_into_multiple_requests() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.batching = Some(crate::config::ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_000_000,
+            max_batch_interval_sec: 10,
+            max_batch_records: 100,
+        });
+        config.max_payload_bytes = 200;
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 4]);
+        let bodies = StringArray::from(vec!["hello-world-data"; 4]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(timestamps), Arc::new(bodies)]).unwrap();
+
+        let handle = tokio::spawn(async move {
+            sink.run(rx).await.unwrap();
+        });
+
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        handle.await.unwrap();
+        server.verify().await;
     }
 }
