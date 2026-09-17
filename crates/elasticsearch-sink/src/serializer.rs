@@ -87,6 +87,22 @@ pub fn serialize_batch(
     Ok(Bytes::from(buf))
 }
 
+/// Serializes an Arrow `RecordBatch` into bounded NDJSON bulk payloads for the Elasticsearch Bulk API.
+///
+/// Each chunk is kept strictly within `max_payload_bytes`.
+pub fn serialize_batch_chunks(
+    batch: &RecordBatch,
+    unpack_attributes: bool,
+    max_payload_bytes: usize,
+) -> Result<Vec<Bytes>, ElasticsearchError> {
+    let payload = serialize_batch(batch, unpack_attributes, max_payload_bytes)?;
+    if payload.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Ok(vec![payload])
+    }
+}
+
 /// Formats and writes an ISO 8601 UTC timestamp to the buffer.
 fn write_timestamp(buf: &mut Vec<u8>, secs: i64, subsec_nanos: u32) {
     if let Some(dt) = chrono::DateTime::from_timestamp(secs, subsec_nanos) {
