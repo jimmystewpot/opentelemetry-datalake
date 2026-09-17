@@ -738,7 +738,7 @@ impl HttpClient {
     async fn handle_bulk_transient_delay(&self, response: &reqwest::Response, attempt: usize) {
         if let Some(delay) = parse_retry_after(response) {
             let capped = delay.min(Duration::from_secs(60));
-            if self.retry_interval_secs == 0 {
+            if capped.is_zero() {
                 tokio::task::yield_now().await;
             } else {
                 tokio::time::sleep(capped).await;
@@ -3067,5 +3067,37 @@ mod tests {
         assert!(!resp.errors);
         assert!(client.is_endpoint_in_cooldown(&server1.uri()));
         assert!(!client.is_endpoint_in_cooldown(&server2.uri()));
+    }
+
+    #[tokio::test]
+    async fn test_retry_after_honored_when_retry_interval_zero() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs-test-default/_bulk"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .set_body_string("rate limited"),
+            )
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let mut config = make_test_config(vec![mock_server.uri()]);
+        config.retry_interval_secs = 0;
+        config.max_retries = 1;
+
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let start = std::time::Instant::now();
+        let result = client
+            .send_bulk("logs-test-default", Bytes::from_static(b"{}\n"))
+            .await;
+
+        assert!(result.is_err(), "expected error after retries exhausted");
+        assert!(
+            start.elapsed() >= Duration::from_millis(900),
+            "expected at least 900ms sleep honoring Retry-After: 1, got {:?}",
+            start.elapsed()
+        );
     }
 }
