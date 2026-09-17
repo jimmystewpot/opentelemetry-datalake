@@ -57,7 +57,13 @@ PUT _index_template/otel_data_streams
 }
 ```
 
-When `validate_on_startup = true` (the default), the sink validates the cluster health (`GET /`) and index template existence (`GET /_index_template/{template}`) during boot. If validation fails across all nodes, startup aborts immediately before accepting any OTLP traffic.
+When `validate_on_startup = true` (the default), the sink executes a 3-tier startup verification sequence before accepting traffic:
+1. **Cluster Health (`GET /`)**: Verifies cluster connectivity and detects the engine version.
+2. **Tier 1 Composable Template Validation (`GET /_index_template`)**: Evaluates all composable index templates, matches index patterns, resolves the winning template by highest priority, and asserts that `data_stream: {}` is declared.
+3. **Tier 2 Scoped Template Fallback (`GET /_index_template/{data_stream}`)**: If Tier 1 is forbidden (HTTP 403) by restricted credentials or blocked (HTTP 404) by a reverse proxy, falls back to querying the exact data stream template.
+4. **Tier 3 Active Data Stream Fallback (`GET /_data_stream/{data_stream}`)**: If Tier 2 returns 404, verifies whether the data stream is already established and active in the cluster.
+
+If all endpoints and validation tiers fail, startup aborts immediately before accepting OTLP traffic.
 
 ---
 
@@ -223,6 +229,264 @@ Bulk responses returning HTTP 200 OK may still contain individual record rejecti
 
 ### Clean In-Flight Task Drainage
 During shutdown or upon encountering a non-recoverable error, the sink awaits all in-flight asynchronous sibling tasks in its `JoinSet` before terminating, guaranteeing at-least-once delivery semantics without dropped batches.
+
+---
+
+## Security, RBAC & Network Architecture
+
+In production and multi-tenant enterprise deployments, the Elasticsearch or OpenSearch cluster is frequently fronted by ingress reverse proxies (such as NGINX or Envoy) and secured with fine-grained Role-Based Access Control (RBAC).
+
+### HTTP Endpoint Routing Matrix
+
+The sink strictly interacts with the following minimal set of HTTP endpoints. Network firewalls, API gateways, and reverse proxies can restrict traffic exclusively to these URIs:
+
+| Endpoint | Method | Purpose | Trigger Phase | Reverse Proxy Rule |
+|---|---|---|---|---|
+| `/` | `GET` | Cluster health & engine version detection | Boot time | Allow `GET /` |
+| `/_index_template` | `GET` | Tier 1: Cluster-wide template priority resolution | Boot time | Allow `GET /_index_template` |
+| `/_index_template/{data_stream}` | `GET` | Tier 2: Scoped template validation fallback | Boot time (fallback) | Allow `GET /_index_template/*` |
+| `/_data_stream/{data_stream}` | `GET` | Tier 3: Data stream liveness check fallback | Boot time (fallback) | Allow `GET /_data_stream/*` |
+| `/{data_stream}/_bulk` | `POST` | Micro-batched NDJSON telemetry streaming | Ingestion runtime | Allow `POST /*/_bulk` |
+
+All other Elasticsearch endpoints (such as `_search`, `_delete_by_query`, `_cluster/settings`, `_cat/*`, or document retrieval) are never called by the sink and should be blocked.
+
+### Ingress Reverse Proxy Configuration
+
+#### NGINX Reverse Proxy Allowlist
+
+The following NGINX configuration protects the cluster by restricting incoming requests exclusively to the paths and HTTP methods required by `opentelemetry-datalake`:
+
+```nginx
+upstream elasticsearch_backend {
+    server es-node-01.internal:9200;
+    server es-node-02.internal:9200;
+    server es-node-03.internal:9200;
+    keepalive 64;
+}
+
+server {
+    listen 9200 ssl http2;
+    server_name es-ingress.internal;
+
+    ssl_certificate /etc/ssl/certs/es-ingress.crt;
+    ssl_certificate_key /etc/ssl/certs/es-ingress.key;
+
+    # 1. Boot-time cluster health & version detection (exact match)
+    location = / {
+        limit_except GET { deny all; }
+        proxy_pass https://elasticsearch_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # 2. Boot-time index template inspection (Tier 1 & Tier 2)
+    location ~ ^/_index_template(/.*)?$ {
+        limit_except GET { deny all; }
+        proxy_pass https://elasticsearch_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # 3. Boot-time data stream inspection (Tier 3 fallback)
+    location ~ ^/_data_stream(/.*)?$ {
+        limit_except GET { deny all; }
+        proxy_pass https://elasticsearch_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # 4. Runtime NDJSON bulk ingestion
+    location ~ ^/([^/]+)/_bulk$ {
+        limit_except POST { deny all; }
+        proxy_pass https://elasticsearch_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        client_max_body_size 25m;
+        proxy_read_timeout 60s;
+    }
+
+    # Block all other endpoints by default
+    location / {
+        return 403 "Forbidden: Endpoint not permitted by OTLP data lake sink proxy policy\n";
+    }
+}
+```
+
+#### Envoy Proxy Allowlist
+
+The following Envoy `route_config` applies the equivalent path and method allowlist filtering:
+
+```yaml
+static_resources:
+  listeners:
+    - name: elasticsearch_ingress
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9200
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: es_ingress
+                route_config:
+                  name: es_route_allowlist
+                  virtual_hosts:
+                    - name: es_backend
+                      domains: ["*"]
+                      routes:
+                        # 1. Cluster health & version detection
+                        - match:
+                            path: "/"
+                            headers:
+                              - name: ":method"
+                                exact_match: "GET"
+                          route:
+                            cluster: elasticsearch_cluster
+
+                        # 2. Composable index templates (Tier 1 & Tier 2)
+                        - match:
+                            prefix: "/_index_template"
+                            headers:
+                              - name: ":method"
+                                exact_match: "GET"
+                          route:
+                            cluster: elasticsearch_cluster
+
+                        # 3. Data stream status (Tier 3)
+                        - match:
+                            prefix: "/_data_stream"
+                            headers:
+                              - name: ":method"
+                                exact_match: "GET"
+                          route:
+                            cluster: elasticsearch_cluster
+
+                        # 4. Runtime NDJSON bulk ingestion
+                        - match:
+                            safe_regex:
+                              google_re2: {}
+                              regex: "^/[^/]+/_bulk$"
+                            headers:
+                              - name: ":method"
+                                exact_match: "POST"
+                          route:
+                            cluster: elasticsearch_cluster
+                            timeout: 60s
+
+                        # Default: deny any unmatched routes
+                        - match:
+                            prefix: "/"
+                          direct_response:
+                            status: 403
+                            body:
+                              inline_string: "Forbidden: Endpoint not permitted for OTLP data lake sink"
+                http_filters:
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.http.router.v3.Router
+```
+
+### Role-Based Access Control (RBAC)
+
+#### Elasticsearch RBAC Role Definitions
+
+##### Standard Role (Recommended)
+Grants permissions to query cluster templates during Tier 1 validation and ingest telemetry into data streams:
+
+```json
+{
+  "cluster": ["monitor", "manage_index_templates"],
+  "indices": [
+    {
+      "names": ["logs-otel-*", "metrics-otel-*", "traces-otel-*"],
+      "privileges": ["create_index", "write", "auto_configure", "view_index_metadata"]
+    }
+  ]
+}
+```
+
+##### Restricted / Least-Privilege Role (Shared / Multi-Tenant Clusters)
+In multi-tenant or managed environments where cluster-level template inspection (`manage_index_templates`) is restricted, the sink seamlessly falls back to Tier 2 scoped lookup (`GET /_index_template/{data_stream}`) or Tier 3 data stream existence check (`GET /_data_stream/{data_stream}`):
+
+```json
+{
+  "cluster": ["monitor"],
+  "indices": [
+    {
+      "names": ["logs-otel-*", "metrics-otel-*", "traces-otel-*"],
+      "privileges": ["write", "create_index", "view_index_metadata", "manage_data_stream"]
+    }
+  ]
+}
+```
+
+#### OpenSearch Security Action Groups Mapping
+
+OpenSearch Security uses action groups instead of Elasticsearch privileges. The following role definitions correspond to the Standard and Least-Privilege tiers:
+
+##### Standard Role
+```json
+{
+  "description": "Standard OpenSearch role for OTLP data lake sink",
+  "cluster_permissions": [
+    "cluster_monitor",
+    "cluster:admin/indices/template/get"
+  ],
+  "index_permissions": [
+    {
+      "index_patterns": [
+        "logs-otel-*",
+        "metrics-otel-*",
+        "traces-otel-*"
+      ],
+      "allowed_actions": [
+        "write",
+        "create_index",
+        "indices_monitor",
+        "manage_data_stream"
+      ]
+    }
+  ]
+}
+```
+
+##### Restricted / Least-Privilege Role
+```json
+{
+  "description": "Least-privilege OpenSearch role for OTLP data lake sink (multi-tenant/restricted)",
+  "cluster_permissions": [
+    "cluster_monitor"
+  ],
+  "index_permissions": [
+    {
+      "index_patterns": [
+        "logs-otel-*",
+        "metrics-otel-*",
+        "traces-otel-*"
+      ],
+      "allowed_actions": [
+        "write",
+        "create_index",
+        "indices_monitor",
+        "manage_data_stream"
+      ]
+    }
+  ]
+}
+```
+
+##### Action Groups & Privileges Equivalence Reference
+
+| Operational Capability | Elasticsearch Privilege | OpenSearch Action Group / Permission | Description |
+|---|---|---|---|
+| Cluster Health & Version Probe | `monitor` | `cluster_monitor` | Required for boot-time `GET /` connectivity and engine version check. |
+| Cluster-Wide Template Inspection | `manage_index_templates` | `cluster:admin/indices/template/get` | Required for boot-time Tier 1 template priority resolution via `GET /_index_template`. |
+| Scoped Template Inspection | `view_index_metadata` | `indices_monitor` or `indices:admin/template/get` | Used during Tier 2 fallback via `GET /_index_template/{data_stream}`. |
+| Data Stream Liveness | `manage_data_stream` | `manage_data_stream` | Used during Tier 3 fallback via `GET /_data_stream/{data_stream}`. |
+| Bulk Data Ingestion | `write` | `write` (or `crud`) | Ingests micro-batches via `POST /{data_stream}/_bulk`. |
+| Dynamic Index Creation | `create_index`, `auto_configure` | `create_index` | Allows creation of backing indices when data streams rollover. |
 
 ---
 
