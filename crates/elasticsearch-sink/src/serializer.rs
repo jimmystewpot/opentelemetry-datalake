@@ -12,28 +12,34 @@ const BULK_ACTION: &[u8] = b"{\"create\":{}}\n";
 /// Hexadecimal digit lookup table for escaping control characters.
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
-/// Serializes an Arrow `RecordBatch` into NDJSON bulk format for the Elasticsearch Bulk API.
+/// Serializes an Arrow `RecordBatch` into bounded NDJSON bulk payloads for the Elasticsearch Bulk API.
 ///
-/// Each row produces two lines: `{"create":{}}\n` followed by the JSON document `{...}\n`.
-/// The `timestamp` column (nanosecond i64) is mapped to `@timestamp` in ISO 8601 format.
-/// Attribute columns are either unpacked as native JSON objects or preserved as strings.
-pub fn serialize_batch(
+/// Each chunk is kept strictly within `max_payload_bytes`. If adding the next row would exceed
+/// `max_payload_bytes`, the current buffer is sealed as a chunk and a new chunk begins.
+/// If an individual row exceeds `max_payload_bytes` on its own, it is logged with `tracing::error!`
+/// and skipped so it does not terminate the sink or discard adjacent rows.
+pub fn serialize_batch_chunks(
     batch: &RecordBatch,
     unpack_attributes: bool,
     max_payload_bytes: usize,
-) -> Result<Bytes, ElasticsearchError> {
+) -> Result<Vec<Bytes>, ElasticsearchError> {
     if batch.num_rows() == 0 {
-        return Ok(Bytes::new());
+        return Ok(Vec::new());
     }
 
     let mem_size = batch.get_array_memory_size();
-    let mut buf = Vec::with_capacity(mem_size.saturating_add(mem_size / 5));
+    let chunk_capacity = mem_size.min(max_payload_bytes);
+    let mut current_chunk = Vec::with_capacity(chunk_capacity);
+    let mut row_buf = Vec::with_capacity(1024);
+    let mut chunks = Vec::new();
+
     let schema = batch.schema();
     let num_rows = batch.num_rows();
 
     for row in 0..num_rows {
-        buf.extend_from_slice(BULK_ACTION);
-        buf.push(b'{');
+        row_buf.clear();
+        row_buf.extend_from_slice(BULK_ACTION);
+        row_buf.push(b'{');
 
         let mut first_field = true;
         for (col_idx, field) in schema.fields().iter().enumerate() {
@@ -52,20 +58,20 @@ pub fn serialize_batch(
             }
 
             if !first_field {
-                buf.push(b',');
+                row_buf.push(b',');
             }
             first_field = false;
 
             // Write field name
-            buf.push(b'"');
-            buf.extend_from_slice(output_name.as_bytes());
-            buf.extend_from_slice(b"\":");
+            row_buf.push(b'"');
+            row_buf.extend_from_slice(output_name.as_bytes());
+            row_buf.extend_from_slice(b"\":");
 
             // Check if this is an attribute field that should be unpacked
             let is_attr_field = name == "attributes" || name == "resource_attributes";
 
             write_value(
-                &mut buf,
+                &mut row_buf,
                 col.as_ref(),
                 row,
                 field.data_type(),
@@ -73,33 +79,57 @@ pub fn serialize_batch(
             )?;
         }
 
-        buf.extend_from_slice(b"}\n");
+        row_buf.extend_from_slice(b"}\n");
+
+        // Check single record size limit
+        if row_buf.len() > max_payload_bytes {
+            tracing::error!(
+                row,
+                record_bytes = row_buf.len(),
+                max_payload_bytes,
+                "Dropping individual telemetry record exceeding maximum payload bytes"
+            );
+            continue;
+        }
+
+        // Check if adding this row exceeds current chunk capacity
+        if current_chunk.len().saturating_add(row_buf.len()) > max_payload_bytes
+            && !current_chunk.is_empty()
+        {
+            chunks.push(Bytes::from(std::mem::take(&mut current_chunk)));
+            current_chunk = Vec::with_capacity(chunk_capacity);
+        }
+
+        current_chunk.extend_from_slice(&row_buf);
     }
 
-    let actual = buf.len();
-    if actual > max_payload_bytes {
-        return Err(ElasticsearchError::PayloadTooLarge {
-            actual,
-            limit: max_payload_bytes,
-        });
+    if !current_chunk.is_empty() {
+        chunks.push(Bytes::from(current_chunk));
     }
 
-    Ok(Bytes::from(buf))
+    Ok(chunks)
 }
 
-/// Serializes an Arrow `RecordBatch` into bounded NDJSON bulk payloads for the Elasticsearch Bulk API.
+/// Serializes an Arrow `RecordBatch` into a single NDJSON bulk payload.
 ///
-/// Each chunk is kept strictly within `max_payload_bytes`.
-pub fn serialize_batch_chunks(
+/// If the serialized batch exceeds `max_payload_bytes` across multiple chunks, returns
+/// `ElasticsearchError::PayloadTooLarge`.
+pub fn serialize_batch(
     batch: &RecordBatch,
     unpack_attributes: bool,
     max_payload_bytes: usize,
-) -> Result<Vec<Bytes>, ElasticsearchError> {
-    let payload = serialize_batch(batch, unpack_attributes, max_payload_bytes)?;
-    if payload.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Ok(vec![payload])
+) -> Result<Bytes, ElasticsearchError> {
+    let mut chunks = serialize_batch_chunks(batch, unpack_attributes, max_payload_bytes)?;
+    match chunks.len() {
+        0 => Ok(Bytes::new()),
+        1 => Ok(chunks.remove(0)),
+        _ => {
+            let actual = chunks.iter().map(Bytes::len).sum();
+            Err(ElasticsearchError::PayloadTooLarge {
+                actual,
+                limit: max_payload_bytes,
+            })
+        }
     }
 }
 
@@ -454,10 +484,47 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
+    fn make_two_row_log_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_number", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000i64,
+                    1_726_500_000_000_000_001i64,
+                ])),
+                Arc::new(StringArray::from(vec!["frontend", "frontend"])),
+                Arc::new(Int32Array::from(vec![9, 9])),
+                Arc::new(StringArray::from(vec![
+                    "Request processed",
+                    "Request processed",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    r#"{"http.method":"GET"}"#,
+                    r#"{"http.method":"GET"}"#,
+                ])),
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn test_serialize_payload_too_large() {
-        let batch = make_log_batch();
-        let result = serialize_batch(&batch, true, 10); // 10 bytes limit
+        let batch = make_two_row_log_batch();
+        let single_len = serialize_batch(&batch.slice(0, 1), true, 10_485_760)
+            .unwrap()
+            .len();
+        let result = serialize_batch(&batch, true, single_len + 5);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -727,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_serialize_exact_payload_boundary() {
-        let batch = make_log_batch();
+        let batch = make_two_row_log_batch();
         let bytes = serialize_batch(&batch, true, 10_485_760).unwrap();
         let exact_len = bytes.len();
 
@@ -786,5 +853,86 @@ mod tests {
         assert!(text.contains(r#""f32_nan":null"#));
         assert!(text.contains(r#""f32_inf":null"#));
         assert!(text.contains(r#""f32_neg_inf":null"#));
+    }
+
+    fn make_test_batch() -> RecordBatch {
+        make_log_batch()
+    }
+
+    #[test]
+    fn test_serialize_batch_chunks_single_chunk() {
+        let batch = make_test_batch();
+        let chunks = serialize_batch_chunks(&batch, true, 10_000_000)
+            .expect("should serialize into single chunk");
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].is_empty());
+    }
+
+    #[test]
+    fn test_serialize_batch_chunks_splits_oversized_batch() {
+        // Create a batch with 10 rows
+        let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 10]);
+        let values = StringArray::from(vec!["test-value-12345"; 10]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(timestamps), Arc::new(values)]).unwrap();
+
+        // Determine size of 1 row
+        let single_row_batch = batch.slice(0, 1);
+        let single_chunk = serialize_batch_chunks(&single_row_batch, true, 10_000_000).unwrap();
+        let row_len = single_chunk[0].len();
+
+        // Set max_payload_bytes to fit roughly 3 rows per chunk
+        let max_payload_bytes = row_len * 3 + 5;
+        let chunks = serialize_batch_chunks(&batch, true, max_payload_bytes).expect("should chunk");
+
+        // 10 rows with 3 rows per chunk -> 4 chunks (3, 3, 3, 1)
+        assert_eq!(chunks.len(), 4);
+        for chunk in &chunks {
+            assert!(chunk.len() <= max_payload_bytes);
+        }
+    }
+
+    #[test]
+    fn test_serialize_batch_chunks_drops_single_oversized_row() {
+        let timestamps = TimestampNanosecondArray::from(vec![
+            1_700_000_000_000_000_000i64,
+            1_700_000_000_000_000_001i64,
+            1_700_000_000_000_000_002i64,
+        ]);
+        // Middle row has massive value
+        let values = StringArray::from(vec![
+            "short",
+            "extremely-long-string-exceeding-the-limit-by-far",
+            "short",
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(timestamps), Arc::new(values)]).unwrap();
+
+        // Limit allows normal rows (~70 bytes) but rejects middle row (~110 bytes)
+        let max_payload_bytes = 85;
+        let chunks = serialize_batch_chunks(&batch, true, max_payload_bytes)
+            .expect("should succeed by skipping oversized row");
+
+        // Should have serialized row 0 and row 2, skipping row 1
+        assert_eq!(chunks.len(), 2);
+        let total_ndjson = String::from_utf8(chunks[0].to_vec()).unwrap();
+        assert!(total_ndjson.contains("short"));
+        assert!(!total_ndjson.contains("extremely-long-string"));
     }
 }
