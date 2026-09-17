@@ -45,6 +45,7 @@ const fn default_max_batch_records() -> usize {
 
 /// Data stream target names for each OTLP signal type.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DataStreamMapping {
     /// Target data stream for log records.
     pub logs: String,
@@ -56,6 +57,7 @@ pub struct DataStreamMapping {
 
 /// Micro-batch accumulation thresholds.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ElasticsearchBatchingConfig {
     /// Maximum accumulated Arrow byte size before flushing.
     #[serde(default = "default_max_batch_size_bytes")]
@@ -80,7 +82,7 @@ impl Default for ElasticsearchBatchingConfig {
 
 /// Authentication configuration for the Elasticsearch/`OpenSearch` cluster.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ElasticsearchAuthConfig {
     /// No authentication (development / private VPC).
     #[default]
@@ -121,6 +123,7 @@ fn default_aws_service() -> String {
 
 /// Top-level configuration for the Elasticsearch/`OpenSearch` sink.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ElasticsearchSinkConfig {
     /// One or more cluster node HTTP URLs for round-robin load distribution.
     pub endpoints: Vec<String>,
@@ -553,5 +556,78 @@ mod tests {
         let mut cfg = make_minimal_config();
         cfg.tls.ca_cert_path = Some("/nonexistent/path/to/ca.pem".to_string());
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_top_level_field() {
+        let toml_str = r#"
+            endpoints = ["https://es:9200"]
+            max_retrys = 5
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+        "#;
+        let result: Result<ElasticsearchSinkConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "ElasticsearchSinkConfig must reject unknown fields like max_retrys"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_data_streams_field() {
+        let toml_str = r#"
+            endpoints = ["https://es:9200"]
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+            unknown_stream = "foo"
+        "#;
+        let result: Result<ElasticsearchSinkConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "DataStreamMapping must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_batching_field() {
+        let toml_str = r#"
+            endpoints = ["https://es:9200"]
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+            [batching]
+            max_batch_records = 1000
+            unknown_batch_param = true
+        "#;
+        let result: Result<ElasticsearchSinkConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "ElasticsearchBatchingConfig must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_auth_field() {
+        let toml_str = r#"
+            endpoints = ["https://es:9200"]
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+            [auth]
+            type = "api_key"
+            api_key = "secret"
+            unknown_auth_field = "invalid"
+        "#;
+        let result: Result<ElasticsearchSinkConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "ElasticsearchAuthConfig must reject unknown fields"
+        );
     }
 }
