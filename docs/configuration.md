@@ -10,9 +10,10 @@ The configuration is divided into several main sections:
 - `[iceberg]`: Apache Iceberg storage sink settings (optional).
 - `[kafka]`: Kafka storage sink settings (optional).
 - `[starrocks]`: StarRocks Stream Load sink settings (optional).
+- `[elasticsearch]`: Elasticsearch & OpenSearch data streams sink settings (optional).
 - `[telemetry]`: Internal self-monitoring telemetry settings (part of the core pipeline).
 
-One of `[iceberg]`, `[kafka]`, or `[starrocks]` must be provided.
+One of `[iceberg]`, `[kafka]`, `[starrocks]`, or `[elasticsearch]` must be provided.
 
 ## Global Environment Overrides
 
@@ -125,6 +126,67 @@ The target table DDL must include `signal_type_column` when using `unified` mode
 
 ---
 
+## Elasticsearch Section (`[elasticsearch]`)
+
+Configures the Elasticsearch & OpenSearch data streams sink. See [`docs/elasticsearch.md`](elasticsearch.md) for an in-depth operator guide including template setup, AWS SigV4, and partial bulk retry mechanics.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `endpoints` | `[String]` | (Required) | One or more cluster node HTTP URLs. Atomic round-robin and endpoint cooldowns apply. |
+| `data_streams` | Map | (Required) | Data stream mapping for `logs`, `metrics`, and `traces`. |
+| `auth` | Map | `{ type = "none" }` | Authentication configuration (`none`, `basic`, `api_key`, `bearer`, `aws_sigv4`). |
+| `tls` | Map | `{}` | TLS configuration (`ca_cert_path`, `insecure_skip_verify`). |
+| `unpack_attributes` | Boolean | `true` | Unpack JSON-stringified map/struct attributes into native JSON objects. |
+| `gzip_compression` | Boolean | `true` | Compress bulk request payloads using gzip `Content-Encoding`. |
+| `max_concurrent_requests` | Integer | `8` | Maximum concurrent outbound bulk requests throttled by semaphore. |
+| `max_payload_bytes` | Integer | `20971520` | Maximum serialized bulk payload size in bytes (20 MiB). |
+| `connect_timeout_secs` | Integer | `10` | TCP connection timeout in seconds. |
+| `request_timeout_secs` | Integer | `30` | HTTP request timeout in seconds. |
+| `max_retries` | Integer | `3` | Maximum SDK-level retries for transient HTTP errors (429/503/network). |
+| `retry_interval_secs` | Integer | `1` | Delay between retries in seconds (overridden dynamically by `Retry-After`). |
+| `validate_on_startup` | Boolean | `true` | Validate cluster health and data stream index templates during startup. |
+| `batching` | Map | `null` | Optional micro-batch accumulation settings (see below). |
+| `order_by` | Map | `null` | Optional pre-sorting columns per signal (see below). |
+
+### Elasticsearch Data Streams (`[elasticsearch.data_streams]`)
+
+```toml
+[elasticsearch.data_streams]
+logs    = "logs-otel-default"
+metrics = "metrics-otel-default"
+traces  = "traces-otel-default"
+```
+
+### Elasticsearch Authentication (`[elasticsearch.auth]`)
+
+* **None**: `{ type = "none" }`
+* **Basic**: `{ type = "basic", username = "elastic", password = "secret" }` (Supply password via `OTEL_DATALAKE_ELASTICSEARCH__AUTH__PASSWORD` env var).
+* **API Key**: `{ type = "api_key", api_key = "<base64_encoded_api_key>" }`
+* **Bearer Token**: `{ type = "bearer", token = "<jwt_or_oauth_token>" }`
+* **AWS SigV4**: `{ type = "aws_sigv4", region = "us-east-1", service = "es" }` (Requires `--features aws`).
+
+### Elasticsearch Batching (`[elasticsearch.batching]`)
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `max_batch_size_bytes` | Integer | `10485760` | Max accumulated Arrow byte size before flushing (10 MiB). |
+| `max_batch_records` | Integer | `50000` | Max accumulated records before flushing. |
+| `max_batch_interval_sec` | Integer | `10` | Max time in seconds between flushes. |
+
+### Chronological Pre-Sorting (`[elasticsearch.order_by]`)
+
+All sinks (Iceberg, Kafka, StarRocks, and Elasticsearch) support in-memory chronological pre-sorting using `[<sink>.order_by]`:
+
+```toml
+[elasticsearch.order_by]
+logs    = ["timestamp ASC", "service_name ASC NULLS LAST"]
+metrics = ["timestamp ASC", "metric_name ASC"]
+traces  = ["timestamp ASC"]
+on_missing_column = "skip" # "skip" (default) or "error"
+```
+
+---
+
 ## Telemetry Section (`[telemetry]`)
 
 Configures how `opentelemetry-datalake` exports its own internal telemetry (self-monitoring).
@@ -168,4 +230,40 @@ partition_granularity = "hourly"
 [iceberg.batching]
 max_batch_size_bytes = 67108864
 max_batch_interval_sec = 30
+```
+
+Or to use the Elasticsearch / OpenSearch sink:
+
+```toml
+[server]
+grpc_addr = "0.0.0.0:4317"
+http_addr = "0.0.0.0:4318"
+
+[telemetry]
+otlp_endpoint = "http://localhost:4317"
+service_name = "otel-datalake"
+
+[elasticsearch]
+endpoints = ["https://es01:9200", "https://es02:9200"]
+gzip_compression = true
+max_concurrent_requests = 8
+
+[elasticsearch.data_streams]
+logs    = "logs-otel-default"
+metrics = "metrics-otel-default"
+traces  = "traces-otel-default"
+
+[elasticsearch.auth]
+type = "api_key"
+api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
+
+[elasticsearch.batching]
+max_batch_size_bytes = 10485760 # 10 MiB
+max_batch_records = 50000
+max_batch_interval_sec = 5
+
+[elasticsearch.order_by]
+logs = ["timestamp ASC", "service_name ASC"]
+metrics = ["timestamp ASC", "metric_name ASC"]
+traces = ["timestamp ASC"]
 ```

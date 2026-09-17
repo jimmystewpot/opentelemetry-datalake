@@ -6,7 +6,7 @@
 [![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_opentelemetry-datalake&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_opentelemetry-datalake)
 [![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=jimmystewpot_opentelemetry-datalake&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=jimmystewpot_opentelemetry-datalake)
 
-`opentelemetry-datalake` is an ultra-high-performance, horizontally scalable OpenTelemetry (OTLP) receiver pipeline written in Rust. It ingests OTLP metrics, traces, and logs, decodes them into memory-efficient **Apache Arrow** formats, and channels them through to a downstream data lake sink (such as Kafka or ACID table formats like Delta Lake, Iceberg, and Hudi).
+`opentelemetry-datalake` is an ultra-high-performance, horizontally scalable OpenTelemetry (OTLP) receiver pipeline written in Rust. It ingests OTLP metrics, traces, and logs, decodes them into memory-efficient **Apache Arrow** formats, and channels them through to downstream storage sinks (such as Apache Iceberg, Kafka, StarRocks, or Elasticsearch / OpenSearch).
 
 Designed with zero-cost abstractions, lock-free concurrency, and zero-panic error handling, this pipeline is engineered to ingest telemetry at maximum throughput.
 
@@ -43,14 +43,14 @@ Designed with zero-cost abstractions, lock-free concurrency, and zero-panic erro
                         |         |         |
                         v         v         v
                      +----+    +----+    +----+
-                     |Sink|    |Sink|    |Sink|  (IcebergSink / KafkaSink / StarRocksSink)
+                     |Sink|    |Sink|    |Sink|  (Iceberg / Kafka / StarRocks / Elasticsearch)
                      +----+    +----+    +----+
                         |         |         |
                         +---------+---------+
                                   |
                                   v
-               +------------------+-------------------+
-               |  Apache Iceberg / Kafka / StarRocks  |
+               +--------------------------------------+
+               | Iceberg / Kafka / StarRocks / Elastic|
                +--------------------------------------+
 ```
 
@@ -67,6 +67,7 @@ The project is structured as a Cargo virtual workspace consisting of the followi
 *   **`crates/noop-transformer`**: Implementation of `Transform` that passes signal record batches directly through to the next phase of the pipeline.
 *   **`crates/kafka-sink`**: High-performance sink implementing the `Sink` trait using `rdkafka` to stream Arrow IPC or JSON payloads to Kafka brokers.
 *   **`crates/starrocks-sink`**: Sink implementing the `Sink` trait via the StarRocks HTTP Stream Load API. Supports Arrow IPC, JSON, and CSV wire formats, and V1 (at-least-once) / V2 two-phase commit (exactly-once) transaction modes. See [`docs/starrocks.md`](docs/starrocks.md).
+*   **`crates/elasticsearch-sink`**: High-performance sink implementing the `Sink` trait to stream Arrow record batches into Elasticsearch and OpenSearch data streams via HTTP/2 NDJSON bulk operations. Supports round-robin multi-node failover, endpoint cooldowns, AWS SigV4, dynamic rate-limit backoff, and chronological pre-sorting. See [`docs/elasticsearch.md`](docs/elasticsearch.md).
 
 ---
 
@@ -122,11 +123,64 @@ metrics = "otel_metrics"
 traces  = "otel_traces"
 ```
 
+Or to use the Elasticsearch / OpenSearch sink:
+
+```toml
+[server]
+grpc_addr = "127.0.0.1:4317"
+http_addr = "127.0.0.1:4318"
+
+[elasticsearch]
+endpoints = ["https://es01:9200", "https://es02:9200"]
+gzip_compression = true
+max_concurrent_requests = 8
+
+[elasticsearch.data_streams]
+logs    = "logs-otel-default"
+metrics = "metrics-otel-default"
+traces  = "traces-otel-default"
+
+[elasticsearch.auth]
+type = "api_key"
+api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
+
+[elasticsearch.batching]
+max_batch_size_bytes = 10485760 # 10 MiB
+max_batch_records = 50000
+max_batch_interval_sec = 5
+
+[elasticsearch.order_by]
+logs = ["timestamp ASC", "service_name ASC"]
+metrics = ["timestamp ASC", "metric_name ASC"]
+traces = ["timestamp ASC"]
+```
+
 ### Environment Overrides:
 Any configuration value can be overridden using the `OTEL_DATALAKE_` environment variable prefix. Use double underscores (`__`) to navigate nested sections. For example:
 *   `OTEL_DATALAKE_KAFKA__BROKERS="kafka-broker:9092"`
 *   `OTEL_DATALAKE_TELEMETRY__CLOUD_REGION="us-west-2"`
 *   `OTEL_DATALAKE_STARROCKS__PASSWORD="secret"`
+*   `OTEL_DATALAKE_ELASTICSEARCH__AUTH__PASSWORD="secret"`
+
+---
+
+## In-Memory Batch Pre-Sorting
+
+All sinks support chronological pre-sorting powered by `pipeline_core::sort::BatchSorter`. Pre-sorting Arrow record batches chronologically before writing delivers substantial performance and compaction benefits:
+
+*   **Elasticsearch & OpenSearch**: Aligns documents with Lucene segment timestamps and terms, reducing segment fragmentation and merge I/O.
+*   **StarRocks**: Dramatically reduces primary key/duplicate key compaction overhead upon load.
+*   **Apache Iceberg**: Minimizes Parquet file min/max timestamp boundary overlap, enabling highly efficient metadata-level query pruning.
+
+```toml
+# Pre-sorting can be configured under any sink:
+# [iceberg.order_by], [kafka.order_by], [starrocks.order_by], or [elasticsearch.order_by]
+[elasticsearch.order_by]
+logs    = ["timestamp ASC", "service_name ASC NULLS LAST"]
+metrics = ["timestamp ASC", "metric_name ASC"]
+traces  = ["timestamp ASC"]
+on_missing_column = "skip" # Options: "skip" (default), "error"
+```
 
 ---
 

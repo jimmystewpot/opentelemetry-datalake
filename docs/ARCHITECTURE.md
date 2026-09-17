@@ -8,7 +8,7 @@ For general codebase rules (such as the zero-panic policy, memory layouts, and a
 
 ## Overview
 
-`opentelemetry-datalake` implements a high-performance, fixed-path telemetry pipeline. It is designed to ingest OpenTelemetry (OTLP) data via gRPC or HTTP, convert it into Apache Arrow `RecordBatch`es, and stream it into modern storage sinks like Apache Iceberg or Kafka.
+`opentelemetry-datalake` implements a high-performance, fixed-path telemetry pipeline. It is designed to ingest OpenTelemetry (OTLP) data via gRPC or HTTP, convert it into Apache Arrow `RecordBatch`es, and stream it into modern storage sinks like Apache Iceberg, Kafka, StarRocks, or Elasticsearch.
 
 ### Logical Topology (ASCII Diagram)
 ```text
@@ -26,7 +26,7 @@ For general codebase rules (such as the zero-panic policy, memory layouts, and a
   [ Transform: NoopTransformer ]
     |       |       |
     v       v       v
-  [ Sink: IcebergSink OR KafkaSink OR StarRocksSink ]
+  [ Sink: IcebergSink OR KafkaSink OR StarRocksSink OR ElasticsearchSink ]
 ```
 
 The pipeline is orchestrated in `src/main.rs`, which spins up each component as an asynchronous `tokio` task and wires them together using bounded `mpsc` channels.
@@ -50,7 +50,7 @@ Transformers provide a location for data enrichment, filtering, or remapping.
 *   **Current State**: The project uses a `NoopTransformer` which passes data through without modification.
 *   **Execution**: Each transformer runs in its own task, pulling from a source channel and pushing to a sink channel.
 
-### Sinks (`storage`, `kafka-sink`, `starrocks-sink`)
+### Sinks (`storage`, `kafka-sink`, `starrocks-sink`, `elasticsearch-sink`)
 
 Sinks are responsible for the final delivery of data.
 
@@ -66,6 +66,11 @@ Sinks are responsible for the final delivery of data.
     *   Delivers to StarRocks via the HTTP Stream Load API using `starrocks-stream-load`.
     *   Supports V1 (at-least-once) and V2 two-phase commit (exactly-once) transaction modes.
     *   See [`docs/starrocks.md`](starrocks.md) for configuration and version requirements.
+*   **Elasticsearch Sink**:
+    *   Serializes Arrow batches into NDJSON bulk format.
+    *   Streams payloads to Elasticsearch or OpenSearch data streams using HTTP/2 with persistent connection pooling and gzip compression.
+    *   Supports round-robin multi-node failover, dynamic `Retry-After` parsing, item-level partial 429/503 retries, and chronological pre-sorting.
+    *   See [`docs/elasticsearch.md`](elasticsearch.md) for configuration and operator instructions.
 
 ---
 
