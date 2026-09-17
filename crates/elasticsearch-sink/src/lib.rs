@@ -281,6 +281,20 @@ impl ElasticsearchSink {
             return Ok(());
         }
 
+        let signal_label = match signal_type {
+            SignalType::Logs => "logs",
+            SignalType::Metrics => "metrics",
+            SignalType::Traces => "traces",
+        };
+
+        tracing::debug!(
+            signal = signal_label,
+            bytes = buf.bytes,
+            records = buf.records,
+            data_stream = target_data_stream,
+            "Flushing buffer"
+        );
+
         let batches = std::mem::take(&mut buf.batches);
         buf.bytes = 0;
         buf.records = 0;
@@ -321,6 +335,12 @@ impl ElasticsearchSink {
             )
             .await?;
         }
+
+        tracing::debug!(
+            signal = signal_label,
+            data_stream = target_data_stream,
+            "Buffer flushed and reset"
+        );
 
         Ok(())
     }
@@ -471,12 +491,37 @@ impl Sink for ElasticsearchSink {
                                 SignalType::Traces => &mut traces_buf,
                             };
 
-                            buf.bytes = buf.bytes.saturating_add(batch.get_array_memory_size());
-                            buf.records = buf.records.saturating_add(batch.num_rows());
+                            let signal_label = match signal_type {
+                                SignalType::Logs => "logs",
+                                SignalType::Metrics => "metrics",
+                                SignalType::Traces => "traces",
+                            };
+
+                            let batch_bytes = batch.get_array_memory_size();
+                            let batch_rows = batch.num_rows();
+
+                            buf.bytes = buf.bytes.saturating_add(batch_bytes);
+                            buf.records = buf.records.saturating_add(batch_rows);
                             buf.batches.push(batch);
 
-                            if (buf.bytes >= max_bytes || buf.records >= max_records)
-                                && let Err(e) = self
+                            tracing::debug!(
+                                signal = signal_label,
+                                bytes = buf.bytes,
+                                records = buf.records,
+                                data_stream = self.data_stream_for(signal_type),
+                                "Buffer accumulated batch"
+                            );
+
+                            if buf.bytes >= max_bytes || buf.records >= max_records {
+                                tracing::debug!(
+                                    signal = signal_label,
+                                    bytes = buf.bytes,
+                                    records = buf.records,
+                                    data_stream = self.data_stream_for(signal_type),
+                                    reason = "threshold",
+                                    "Buffer threshold reached, flushing"
+                                );
+                                if let Err(e) = self
                                     .flush_buffer(
                                         buf,
                                         signal_type,
@@ -484,9 +529,10 @@ impl Sink for ElasticsearchSink {
                                         &mut join_set,
                                     )
                                     .await
-                            {
-                                let _ = Self::drain_join_set(&mut join_set).await;
-                                return Err(e);
+                                {
+                                    let _ = Self::drain_join_set(&mut join_set).await;
+                                    return Err(e);
+                                }
                             }
                         }
                     } else {
@@ -617,6 +663,10 @@ mod tests {
 
     fn make_log_batch() -> RecordBatch {
         make_log_batch_with_timestamps(vec![1_726_500_000_000_000_000])
+    }
+
+    fn make_test_log_batch(count: usize) -> RecordBatch {
+        make_log_batch_with_timestamps(vec![1_726_500_000_000_000_000; count])
     }
 
     fn make_log_batch_with_service(service_name: &str) -> RecordBatch {
@@ -1634,5 +1684,231 @@ mod tests {
             sink.data_stream_for(SignalType::Traces),
             "traces-otel-default"
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_accumulation_emits_debug_event() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default, Clone)]
+        struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "message" {
+                            self.0 = value.to_string();
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut v = Visitor(String::new());
+                event.record(&mut v);
+                if !v.0.is_empty() {
+                    self.0.lock().unwrap().push(v.0);
+                }
+            }
+        }
+
+        let captured = EventCapture::default();
+        let events = Arc::clone(&captured.0);
+        let subscriber = tracing_subscriber::registry().with(captured);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mock_server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config_with_batching(mock_server.uri());
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch = make_test_log_batch(1); // below threshold
+        tx.send(SignalBatch::Logs(batch)).await.unwrap();
+        drop(tx);
+
+        let _ = sink
+            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
+            .await;
+
+        let msgs = events.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| m.contains("Buffer accumulated batch")),
+            "expected 'Buffer accumulated batch' debug event; got: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_all_telemetry_events_and_fields() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default, Clone, Debug)]
+        struct EventRecord {
+            message: String,
+            signal: String,
+            bytes: u64,
+            records: u64,
+            data_stream: String,
+            reason: String,
+        }
+
+        #[derive(Default, Clone)]
+        struct EventCapture(Arc<Mutex<Vec<EventRecord>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor(EventRecord);
+                impl tracing::field::Visit for Visitor {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "message" => self.0.message = value.to_string(),
+                            "signal" => self.0.signal = value.to_string(),
+                            "data_stream" => self.0.data_stream = value.to_string(),
+                            "reason" => self.0.reason = value.to_string(),
+                            _ => {}
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        match field.name() {
+                            "message" => self.0.message = format!("{value:?}"),
+                            "signal" => self.0.signal = format!("{value:?}"),
+                            "data_stream" => self.0.data_stream = format!("{value:?}"),
+                            "reason" => self.0.reason = format!("{value:?}"),
+                            _ => {}
+                        }
+                    }
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        match field.name() {
+                            "bytes" => self.0.bytes = value,
+                            "records" => self.0.records = value,
+                            _ => {}
+                        }
+                    }
+                }
+                let mut v = Visitor(EventRecord::default());
+                event.record(&mut v);
+                if !v.0.message.is_empty() {
+                    self.0.lock().unwrap().push(v.0);
+                }
+            }
+        }
+
+        let captured = EventCapture::default();
+        let records = Arc::clone(&captured.0);
+        let subscriber = tracing_subscriber::registry().with(captured);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 1,
+                "errors": false,
+                "items": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut config = make_test_config_with_batching(mock_server.uri());
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 60,
+            max_batch_records: 2,
+        });
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        // Batch 1: 1 record -> accumulated (below threshold)
+        tx.send(SignalBatch::Logs(make_test_log_batch(1)))
+            .await
+            .unwrap();
+        // Batch 2: 1 record -> accumulated, then threshold reached (records >= 2) -> flush
+        tx.send(SignalBatch::Logs(make_test_log_batch(1)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let res = sink
+            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
+            .await;
+        assert!(res.is_ok());
+
+        let events = records.lock().unwrap();
+        // 1. Buffer accumulated batch
+        let acc_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "Buffer accumulated batch")
+            .collect();
+        assert_eq!(acc_events.len(), 2, "Expected 2 accumulation events");
+        assert_eq!(acc_events[0].signal, "logs");
+        assert_eq!(acc_events[0].data_stream, "logs-otel-default");
+        assert_eq!(acc_events[0].records, 1);
+        assert!(acc_events[0].bytes > 0);
+
+        assert_eq!(acc_events[1].signal, "logs");
+        assert_eq!(acc_events[1].data_stream, "logs-otel-default");
+        assert_eq!(acc_events[1].records, 2);
+        assert!(acc_events[1].bytes > acc_events[0].bytes);
+
+        // 2. Buffer threshold reached, flushing
+        let thresh_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "Buffer threshold reached, flushing")
+            .collect();
+        assert_eq!(thresh_events.len(), 1, "Expected 1 threshold event");
+        assert_eq!(thresh_events[0].signal, "logs");
+        assert_eq!(thresh_events[0].data_stream, "logs-otel-default");
+        assert_eq!(thresh_events[0].records, 2);
+        assert_eq!(thresh_events[0].reason, "threshold");
+
+        // 3. Flushing buffer
+        let flush_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "Flushing buffer")
+            .collect();
+        assert_eq!(flush_events.len(), 1, "Expected 1 flush event");
+        assert_eq!(flush_events[0].signal, "logs");
+        assert_eq!(flush_events[0].data_stream, "logs-otel-default");
+        assert_eq!(flush_events[0].records, 2);
+
+        // 4. Buffer flushed and reset
+        let reset_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "Buffer flushed and reset")
+            .collect();
+        assert_eq!(reset_events.len(), 1, "Expected 1 reset event");
+        assert_eq!(reset_events[0].signal, "logs");
+        assert_eq!(reset_events[0].data_stream, "logs-otel-default");
     }
 }

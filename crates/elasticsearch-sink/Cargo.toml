@@ -34,3 +34,4 @@ aws-types = { version = "1", optional = true }
 [dev-dependencies]
 toml = { workspace = true }
 wiremock = "0.6"
+tracing-subscriber = { workspace = true }
