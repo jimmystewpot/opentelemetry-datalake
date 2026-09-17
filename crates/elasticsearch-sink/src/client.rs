@@ -230,24 +230,38 @@ struct ClusterVersionInfo {
     number: String,
 }
 
-/// Composable index template query response returned by `GET /_index_template/<pattern>`.
+/// Composable index template query response returned by `GET /_index_template` or `GET /_index_template/<pattern>`.
 #[derive(Debug, Deserialize)]
 struct IndexTemplatesResponse {
     #[serde(default)]
-    index_templates: Vec<serde_json::Value>,
+    index_templates: Vec<IndexTemplateItem>,
+}
+
+/// Individual composable index template item in `IndexTemplatesResponse`.
+#[derive(Debug, Deserialize)]
+struct IndexTemplateItem {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    index_template: Option<IndexTemplateContent>,
+}
+
+/// Content of a composable index template.
+#[derive(Debug, Deserialize)]
+struct IndexTemplateContent {
+    #[serde(default)]
+    index_patterns: Vec<String>,
+    #[serde(default)]
+    data_stream: Option<serde_json::Value>,
+    #[serde(default)]
+    priority: Option<i64>,
 }
 
 /// Simulate index template response returned by `POST /_index_template/_simulate_index/<index_name>`.
-///
-/// The `data_stream` field is present **only** when the matched template has `data_stream: {}`
-/// configured, identifying it as a data-stream template rather than a conventional index template.
 #[derive(Debug, Deserialize)]
 struct SimulateIndexResponse {
     #[serde(default)]
     template: Option<serde_json::Map<String, serde_json::Value>>,
-    /// Present only if the matched template is a data-stream template.
-    #[serde(default)]
-    data_stream: Option<serde_json::Value>,
 }
 
 /// Internal error categorized during index template existence verification across endpoints.
@@ -1033,10 +1047,7 @@ impl HttpClient {
 
         let parsed: Result<SimulateIndexResponse, _> = response.json().await;
         match parsed {
-            Ok(p)
-                if p.data_stream.is_some()
-                    && p.template.as_ref().is_some_and(|t| !t.is_empty()) =>
-            {
+            Ok(p) if p.template.as_ref().is_some_and(|t| !t.is_empty()) => {
                 tracing::info!(
                     endpoint = %endpoint,
                     data_stream = %data_stream,
@@ -1052,6 +1063,12 @@ impl HttpClient {
     }
 
     /// Attempts template validation via get index template on a single endpoint.
+    ///
+    /// First attempts exact lookup at `GET /_index_template/{data_stream}`.
+    /// If that returns 404 (e.g. when the template name differs from the data stream name),
+    /// falls back to listing composable templates at `GET /_index_template`, matching
+    /// against `index_patterns`, selecting the highest-priority template, and validating
+    /// that it is configured with `data_stream: {}`.
     async fn check_get_index_template(
         &self,
         endpoint: &str,
@@ -1073,16 +1090,17 @@ impl HttpClient {
         })?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(TemplateCheckError::Validation(format!(
-                "index template for data stream '{data_stream}' not found (HTTP 404)"
-            )));
-        }
-
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(TemplateCheckError::Auth(format!(
                 "unauthorized to validate index template for '{data_stream}': HTTP {status}"
             )));
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // Fallback: list composable index templates and match by index_patterns
+            return self
+                .check_list_index_templates_matching(endpoint, data_stream)
+                .await;
         }
 
         if !status.is_success() {
@@ -1106,9 +1124,10 @@ impl HttpClient {
 
         let has_data_stream_template = parsed.index_templates.iter().any(|entry| {
             entry
-                .get("index_template")
-                .and_then(|it| it.get("data_stream"))
-                .is_some()
+                .index_template
+                .as_ref()
+                .and_then(|it| it.data_stream.as_ref())
+                .is_some_and(|v| !v.is_null())
         });
 
         if !has_data_stream_template {
@@ -1126,14 +1145,126 @@ impl HttpClient {
         Ok(())
     }
 
+    /// Queries `GET /_index_template` to list composable index templates and matches against `data_stream`.
+    async fn check_list_index_templates_matching(
+        &self,
+        endpoint: &str,
+        data_stream: &str,
+    ) -> Result<(), TemplateCheckError> {
+        let url = format!("{endpoint}/_index_template");
+        let req = self.client.get(&url);
+        let req = self
+            .apply_auth_request(req, "GET", &url, &[])
+            .await
+            .map_err(|e| {
+                TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
+            })?;
+
+        let response = req.send().await.map_err(|e| {
+            TemplateCheckError::Transport(format!(
+                "failed to list index templates on '{endpoint}': {e}"
+            ))
+        })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(TemplateCheckError::Validation(format!(
+                "index template for data stream '{data_stream}' not found (HTTP 404)"
+            )));
+        }
+
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(TemplateCheckError::Auth(format!(
+                "unauthorized to list index templates on '{endpoint}': HTTP {status}"
+            )));
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(TemplateCheckError::Transport(format!(
+                "index template list on '{endpoint}' returned HTTP {status}: {body}"
+            )));
+        }
+
+        let parsed: IndexTemplatesResponse = response.json().await.map_err(|e| {
+            TemplateCheckError::Transport(format!(
+                "failed to parse index templates list response on '{endpoint}': {e}"
+            ))
+        })?;
+
+        let mut matching: Vec<&IndexTemplateItem> = parsed
+            .index_templates
+            .iter()
+            .filter(|item| {
+                item.index_template.as_ref().is_some_and(|content| {
+                    content
+                        .index_patterns
+                        .iter()
+                        .any(|pat| pattern_matches(pat, data_stream))
+                })
+            })
+            .collect();
+
+        if matching.is_empty() {
+            return Err(TemplateCheckError::Validation(format!(
+                "no index template matches data stream '{data_stream}'"
+            )));
+        }
+
+        // Sort matching templates by priority descending (defaulting to 0)
+        matching.sort_by(|a, b| {
+            let prio_a = a
+                .index_template
+                .as_ref()
+                .and_then(|c| c.priority)
+                .unwrap_or(0);
+            let prio_b = b
+                .index_template
+                .as_ref()
+                .and_then(|c| c.priority)
+                .unwrap_or(0);
+            prio_b.cmp(&prio_a)
+        });
+
+        let winning = matching.first().ok_or_else(|| {
+            TemplateCheckError::Validation(format!(
+                "no index template matches data stream '{data_stream}'"
+            ))
+        })?;
+
+        let has_data_stream = winning
+            .index_template
+            .as_ref()
+            .and_then(|c| c.data_stream.as_ref())
+            .is_some_and(|v| !v.is_null());
+
+        if !has_data_stream {
+            return Err(TemplateCheckError::Validation(format!(
+                "matching index template '{}' for data stream '{data_stream}' is not \
+                 configured as a data-stream template (missing 'data_stream' field)",
+                winning.name
+            )));
+        }
+
+        tracing::info!(
+            endpoint = %endpoint,
+            data_stream = %data_stream,
+            template_name = %winning.name,
+            "Index template validation succeeded via index_template pattern matching"
+        );
+        Ok(())
+    }
+
     /// Validates that a composable index template exists for the given data stream.
     ///
     /// Iterates across configured endpoints. First simulates index template matching
     /// via `POST /_index_template/_simulate_index/<data_stream>` to locate any template
     /// matching the stream by `index_patterns`.
-    /// If simulation succeeds and returns a matched template, validation passes.
+    /// If simulation succeeds and returns a matched non-empty template, validation passes.
     /// If simulation is unsupported (HTTP 404/405) or returns no template, falls back to
-    /// querying `GET /_index_template/<data_stream>` for exact template naming.
+    /// `check_get_index_template`, which queries `GET /_index_template/<data_stream>` and,
+    /// if not found (HTTP 404), lists composable templates via `GET /_index_template` to match
+    /// by wildcard `index_patterns`.
     /// If transport or connection error occurs on an endpoint, fails over to the next endpoint.
     pub async fn validate_index_template(
         &self,
@@ -1244,6 +1375,51 @@ pub fn parse_retry_after(response: &reqwest::Response) -> Option<Duration> {
         return Some(duration);
     }
     None
+}
+
+fn match_recursive(
+    mut p_it: std::iter::Peekable<std::str::Chars>,
+    mut t_it: std::iter::Peekable<std::str::Chars>,
+) -> bool {
+    while let Some(&p) = p_it.peek() {
+        if p == '*' {
+            while p_it.peek() == Some(&'*') {
+                p_it.next();
+            }
+            if p_it.peek().is_none() {
+                return true;
+            }
+            while t_it.peek().is_some() {
+                if match_recursive(p_it.clone(), t_it.clone()) {
+                    return true;
+                }
+                t_it.next();
+            }
+            return match_recursive(p_it, t_it);
+        } else if p == '?' {
+            if t_it.next().is_none() {
+                return false;
+            }
+            p_it.next();
+        } else {
+            if t_it.next() != Some(p) {
+                return false;
+            }
+            p_it.next();
+        }
+    }
+    t_it.peek().is_none()
+}
+
+/// Matches a string against a wildcard pattern supporting `*` (zero or more characters)
+/// and `?` (exactly one character).
+fn pattern_matches(pattern: &str, target: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let p_chars = pattern.chars().peekable();
+    let t_chars = target.chars().peekable();
+    match_recursive(p_chars, t_chars)
 }
 
 #[cfg(test)]
@@ -1877,7 +2053,6 @@ mod tests {
                     }
                 }
             },
-            "data_stream": {},
             "overlapping": []
         }"#;
 
@@ -1961,11 +2136,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simulate_index_rejects_non_data_stream_template() {
+    async fn test_simulate_index_rejects_empty_template() {
         let mock_server = MockServer::start().await;
         let body = serde_json::json!({
-            "template": { "settings": {}, "mappings": {} }
-            // No "data_stream" key — conventional template
+            "template": {},
+            "overlapping": []
         });
         Mock::given(method("POST"))
             .and(path("/_index_template/_simulate_index/logs-test-default"))
@@ -1980,16 +2155,16 @@ mod tests {
             .await;
         assert!(
             matches!(result, Ok(false)),
-            "expected Ok(false) for non-data-stream template, got: {result:?}"
+            "expected Ok(false) for empty template, got: {result:?}"
         );
     }
 
     #[tokio::test]
-    async fn test_simulate_index_accepts_data_stream_template() {
+    async fn test_simulate_index_accepts_non_empty_template() {
         let mock_server = MockServer::start().await;
         let body = serde_json::json!({
             "template": { "settings": {}, "mappings": {} },
-            "data_stream": {}
+            "overlapping": []
         });
         Mock::given(method("POST"))
             .and(path("/_index_template/_simulate_index/logs-test-default"))
@@ -2004,7 +2179,7 @@ mod tests {
             .await;
         assert!(
             matches!(result, Ok(true)),
-            "expected Ok(true) for data-stream template, got: {result:?}"
+            "expected Ok(true) for non-empty template, got: {result:?}"
         );
     }
 
@@ -2036,6 +2211,220 @@ mod tests {
             matches!(result, Err(TemplateCheckError::Validation(_))),
             "expected Validation error for non-data-stream template, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_simulate_index_accepts_real_elasticsearch_response() {
+        let mock_server = MockServer::start().await;
+        // Real Elasticsearch simulate_index response has template and overlapping, NO top-level data_stream field
+        let body = serde_json::json!({
+            "template": {
+                "settings": {
+                    "index": { "number_of_shards": "1" }
+                },
+                "mappings": {
+                    "properties": {
+                        "@timestamp": { "type": "date" }
+                    }
+                }
+            },
+            "overlapping": []
+        });
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-test-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_simulate_index_template(&mock_server.uri(), "logs-test-default")
+            .await;
+        assert!(
+            matches!(result, Ok(true)),
+            "expected Ok(true) for standard simulate_index response, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_resolves_different_name_via_pattern() {
+        let mock_server = MockServer::start().await;
+        // Exact name lookup returns 404
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-prod-cluster1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // Listing templates via GET /_index_template returns the matching composable template
+        let body = serde_json::json!({
+            "index_templates": [{
+                "name": "corporate-logs-template",
+                "index_template": {
+                    "index_patterns": ["logs-prod-*"],
+                    "data_stream": {},
+                    "priority": 200,
+                    "template": {
+                        "settings": {}
+                    }
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "logs-prod-cluster1")
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected pattern resolution to succeed, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_rejects_pattern_match_without_data_stream() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-prod-cluster1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // Template matches pattern, but lacks data_stream
+        let body = serde_json::json!({
+            "index_templates": [{
+                "name": "regular-index-template",
+                "index_template": {
+                    "index_patterns": ["logs-prod-*"],
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "logs-prod-cluster1")
+            .await;
+        assert!(
+            matches!(result, Err(TemplateCheckError::Validation(_))),
+            "expected Validation error for matching non-data-stream template, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_priority_resolution() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_index_template/logs-prod-cluster1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        // Two templates match:
+        // lower priority (50) has no data_stream
+        // higher priority (100) has data_stream
+        let body = serde_json::json!({
+            "index_templates": [
+                {
+                    "name": "fallback-logs-template",
+                    "index_template": {
+                        "index_patterns": ["logs-*"],
+                        "priority": 50,
+                        "template": {}
+                    }
+                },
+                {
+                    "name": "specific-logs-template",
+                    "index_template": {
+                        "index_patterns": ["logs-prod-*"],
+                        "data_stream": {},
+                        "priority": 100,
+                        "template": {}
+                    }
+                }
+            ]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "logs-prod-cluster1")
+            .await;
+        assert!(
+            result.is_ok(),
+            "expected higher priority template with data_stream to win, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_index_template_no_matching_patterns() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/_index_template/traces-prod-cluster1"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let body = serde_json::json!({
+            "index_templates": [{
+                "name": "logs-template",
+                "index_template": {
+                    "index_patterns": ["logs-*"],
+                    "data_stream": {},
+                    "priority": 100,
+                    "template": {}
+                }
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(&mock_server)
+            .await;
+
+        let config = make_test_config(vec![mock_server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+        let result = client
+            .check_get_index_template(&mock_server.uri(), "traces-prod-cluster1")
+            .await;
+        assert!(
+            matches!(result, Err(TemplateCheckError::Validation(_))),
+            "expected Validation error when no patterns match, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_pattern_matches_comprehensive() {
+        assert!(pattern_matches("*", ""));
+        assert!(pattern_matches("*", "anything"));
+        assert!(pattern_matches("logs-*", "logs-otel-default"));
+        assert!(pattern_matches("*-default", "logs-otel-default"));
+        assert!(pattern_matches("logs-*-default", "logs-otel-default"));
+        assert!(pattern_matches("logs-?-default", "logs-1-default"));
+        assert!(!pattern_matches("logs-?-default", "logs-12-default"));
+        assert!(pattern_matches("exact-match", "exact-match"));
+        assert!(!pattern_matches("exact-match", "exact-match-extra"));
+        assert!(!pattern_matches("exact-match-extra", "exact-match"));
+        assert!(pattern_matches("logs-**-default", "logs-otel-default"));
     }
 
     #[cfg(feature = "aws")]
@@ -2943,7 +3332,6 @@ mod tests {
                     }
                 }
             },
-            "data_stream": {},
             "overlapping": []
         }"#;
 
