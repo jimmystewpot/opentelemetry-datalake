@@ -172,6 +172,28 @@ impl ElasticsearchSink {
         Ok(())
     }
 
+    /// Records the result of an in-flight bulk task into the first encountered error accumulator.
+    fn record_task_result(
+        res: Result<Result<BulkResponse, ElasticsearchError>, tokio::task::JoinError>,
+        first_err: &mut Option<PipelineError>,
+    ) {
+        match res {
+            Ok(Ok(_resp)) => {}
+            Ok(Err(es_err)) => {
+                if first_err.is_none() {
+                    *first_err = Some(es_err.into());
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    *first_err = Some(PipelineError::Internal(format!(
+                        "Bulk dispatch task failed: {join_err}"
+                    )));
+                }
+            }
+        }
+    }
+
     /// Dispatches a single bulk payload chunk under the concurrency semaphore.
     ///
     /// If permits are exhausted, awaits the next completed task in `join_set`. Any error
@@ -191,41 +213,13 @@ impl ElasticsearchSink {
 
         // Drain any already completed tasks in join_set to detect completed tasks
         while let Some(res) = join_set.try_join_next() {
-            match res {
-                Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => {
-                    if first_err.is_none() {
-                        *first_err = Some(es_err.into());
-                    }
-                }
-                Err(join_err) => {
-                    if first_err.is_none() {
-                        *first_err = Some(PipelineError::Internal(format!(
-                            "Bulk dispatch task failed: {join_err}"
-                        )));
-                    }
-                }
-            }
+            Self::record_task_result(res, first_err);
         }
 
         // If semaphore permits are exhausted, await until at least one task completes
         while semaphore.available_permits() == 0 && !join_set.is_empty() {
             if let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(_resp)) => {}
-                    Ok(Err(es_err)) => {
-                        if first_err.is_none() {
-                            *first_err = Some(es_err.into());
-                        }
-                    }
-                    Err(join_err) => {
-                        if first_err.is_none() {
-                            *first_err = Some(PipelineError::Internal(format!(
-                                "Bulk dispatch task failed: {join_err}"
-                            )));
-                        }
-                    }
-                }
+                Self::record_task_result(res, first_err);
             }
         }
 
@@ -250,21 +244,7 @@ impl ElasticsearchSink {
     ) -> Result<(), PipelineError> {
         let mut first_err = None;
         while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => {
-                    if first_err.is_none() {
-                        first_err = Some(PipelineError::from(es_err));
-                    }
-                }
-                Err(join_err) => {
-                    if first_err.is_none() {
-                        first_err = Some(PipelineError::Internal(format!(
-                            "Bulk dispatch task failed: {join_err}"
-                        )));
-                    }
-                }
-            }
+            Self::record_task_result(res, &mut first_err);
         }
         if let Some(err) = first_err {
             Err(err)
@@ -595,6 +575,14 @@ mod tests {
             max_batch_records: 1,
         });
         config
+    }
+
+    async fn setup_mock_client_and_semaphore() -> (Arc<HttpClient>, Arc<tokio::sync::Semaphore>) {
+        let server = MockServer::start().await;
+        let config = make_test_config(server.uri(), false);
+        let client = Arc::new(HttpClient::try_new(&config).unwrap());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        (client, semaphore)
     }
 
     async fn setup_startup_validation_mocks(server: &MockServer) {
@@ -2126,6 +2114,111 @@ mod tests {
             bulk_requests.len(),
             2,
             "both chunks must be dispatched even when the first chunk encounters an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_handles_task_join_error_panic() {
+        let (client, semaphore) = setup_mock_client_and_semaphore().await;
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Spawn a task that panics
+        join_set.spawn(async move {
+            panic!("simulated worker task panic");
+        });
+
+        // Sleep briefly so the task completes panicked
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut first_err = None;
+        let res = ElasticsearchSink::dispatch(
+            client,
+            semaphore,
+            &mut join_set,
+            "logs-otel-default".to_string(),
+            bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "dispatch should submit chunk even if earlier task panicked"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err must record task panic JoinError"
+        );
+        let err_msg = first_err.unwrap().to_string();
+        assert!(
+            err_msg.contains("Bulk dispatch task failed"),
+            "error message must describe task join failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_join_set_handles_join_error_panic() {
+        let mut join_set = tokio::task::JoinSet::new();
+        join_set.spawn(async move {
+            panic!("simulated worker panic for drain");
+        });
+
+        let res = ElasticsearchSink::drain_join_set(&mut join_set).await;
+        assert!(
+            res.is_err(),
+            "drain_join_set must return error when task panicked"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Bulk dispatch task failed"),
+            "error must describe join error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_record_task_result_unit() {
+        let mut first_err = None;
+
+        // Ok(Ok) does not record error
+        ElasticsearchSink::record_task_result(
+            Ok(Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })),
+            &mut first_err,
+        );
+        assert!(first_err.is_none());
+
+        // Ok(Err) records first error
+        ElasticsearchSink::record_task_result(
+            Ok(Err(ElasticsearchError::StartupValidation(
+                "first error".to_string(),
+            ))),
+            &mut first_err,
+        );
+        assert!(first_err.is_some());
+        assert!(
+            first_err
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("first error")
+        );
+
+        // Subsequent error does not overwrite first_err
+        ElasticsearchSink::record_task_result(
+            Ok(Err(ElasticsearchError::StartupValidation(
+                "second error".to_string(),
+            ))),
+            &mut first_err,
+        );
+        assert!(
+            first_err
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("first error")
         );
     }
 }
