@@ -134,13 +134,14 @@ fn make_dry_run_config(schema_mode: SchemaMode) -> IcebergSinkConfig {
 
 fn build_mock_table(runtime: iceberg::Runtime) -> iceberg::table::Table {
     let metadata_json = r#"{
-      "format-version": 2,
+      "format-version": 3,
       "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
       "location": "s3://bucket/test/location",
       "last-sequence-number": 0,
       "last-updated-ms": 1602638573000,
       "last-column-id": 4,
       "current-schema-id": 0,
+      "next-row-id": 0,
       "schemas": [
         {
           "type": "struct",

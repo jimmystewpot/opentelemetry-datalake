@@ -890,13 +890,14 @@ mod tests {
     #[test]
     fn test_schema_mode_auto_validation() {
         let metadata_json = r#"{
-          "format-version": 2,
+          "format-version": 3,
           "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
           "location": "s3://bucket/test/location",
           "last-sequence-number": 0,
           "last-updated-ms": 1602638573000,
           "last-column-id": 4,
           "current-schema-id": 0,
+          "next-row-id": 0,
           "schemas": [
             {
               "type": "struct",
@@ -990,6 +991,122 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_mismatch.contains("Schema mismatch for field 'timestamp'"));
+    }
+
+    #[test]
+    fn test_schema_mode_auto_validation_v2_type_mismatch() {
+        // In Iceberg v2, timestamps are microsecond precision ("timestamp").
+        let metadata_v2_json = r#"{
+          "format-version": 2,
+          "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+          "location": "s3://bucket/test/location",
+          "last-sequence-number": 0,
+          "last-updated-ms": 1602638573000,
+          "last-column-id": 4,
+          "current-schema-id": 0,
+          "schemas": [
+            {
+              "type": "struct",
+              "schema-id": 0,
+              "fields": [
+                { "id": 1, "name": "timestamp", "required": true, "type": "timestamp" },
+                { "id": 2, "name": "severity_text", "required": false, "type": "string" },
+                { "id": 4, "name": "service_name", "required": false, "type": "string" },
+                { "id": 3, "name": "resource_attributes", "required": false, "type": "string" }
+              ]
+            }
+          ],
+          "default-spec-id": 0,
+          "partition-specs": [{ "spec-id": 0, "fields": [] }],
+          "last-partition-id": 999,
+          "default-sort-order-id": 0,
+          "sort-orders": [{ "order-id": 0, "fields": [] }],
+          "properties": {},
+          "current-snapshot-id": -1,
+          "snapshots": [],
+          "snapshot-log": [],
+          "metadata-log": []
+        }"#;
+
+        let metadata: iceberg::spec::TableMetadata =
+            serde_json::from_str(metadata_v2_json).unwrap();
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
+        let table = iceberg::table::Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .runtime(iceberg_rt)
+            .build()
+            .unwrap();
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Auto));
+        // make_test_logs_batch() has Timestamp(Nanosecond), which mismatches v2 table's Timestamp(Microsecond)
+        let err = sink
+            .apply_schema_mode(make_test_logs_batch(), Some(&table))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Schema mismatch for field 'timestamp'"));
+    }
+
+    #[test]
+    fn test_schema_mode_catalog_v2_downcast() {
+        // In Iceberg v2 with SchemaMode::Catalog, nanosecond batches are downcast to microseconds.
+        let metadata_v2_json = r#"{
+          "format-version": 2,
+          "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+          "location": "s3://bucket/test/location",
+          "last-sequence-number": 0,
+          "last-updated-ms": 1602638573000,
+          "last-column-id": 4,
+          "current-schema-id": 0,
+          "schemas": [
+            {
+              "type": "struct",
+              "schema-id": 0,
+              "fields": [
+                { "id": 1, "name": "timestamp", "required": true, "type": "timestamp" },
+                { "id": 2, "name": "severity_text", "required": false, "type": "string" },
+                { "id": 4, "name": "service_name", "required": false, "type": "string" },
+                { "id": 3, "name": "resource_attributes", "required": false, "type": "string" }
+              ]
+            }
+          ],
+          "default-spec-id": 0,
+          "partition-specs": [{ "spec-id": 0, "fields": [] }],
+          "last-partition-id": 999,
+          "default-sort-order-id": 0,
+          "sort-orders": [{ "order-id": 0, "fields": [] }],
+          "properties": {},
+          "current-snapshot-id": -1,
+          "snapshots": [],
+          "snapshot-log": [],
+          "metadata-log": []
+        }"#;
+
+        let metadata: iceberg::spec::TableMetadata =
+            serde_json::from_str(metadata_v2_json).unwrap();
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
+        let table = iceberg::table::Table::builder()
+            .metadata(metadata)
+            .metadata_location("s3://bucket/test/location/metadata/v1.json".to_string())
+            .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .runtime(iceberg_rt)
+            .build()
+            .unwrap();
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Catalog));
+        let res = sink
+            .apply_schema_mode(make_test_logs_batch(), Some(&table))
+            .unwrap();
+        let ts_field = res.schema().field_with_name("timestamp").unwrap().clone();
+        assert_eq!(
+            ts_field.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     /// get_partition_path must produce correct hourly partition paths.

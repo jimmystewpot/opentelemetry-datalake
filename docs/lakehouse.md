@@ -49,6 +49,22 @@ sink:
 * **Logging:** The sink engine **MUST** log the names of any dropped fields if `log_dropped_fields` is set to `true` (default). This provides visibility into schema drift without interrupting the ingestion pipeline.
 
 
+### 3.4 Iceberg Format Versions & Timestamp Precision
+
+OpenTelemetry Protocol (OTLP) natively records all event timestamps in nanoseconds (`time_unix_nano`). Ingestion behavior depends on the target Iceberg table format version:
+
+* **Iceberg Format Version 3 (Recommended for OTLP):**
+  * Iceberg Format Version 3 natively supports nanosecond-precision timestamps (`timestamp_ns` and `timestamptz_ns`).
+  * In `auto`, `catalog`, and `fixed` modes targeting Iceberg V3 tables, OTLP nanosecond timestamps are preserved with full fidelity into Parquet files and Iceberg manifest metadata.
+  * `opentelemetry-datalake` writes append-only batches to V3 tables with automatic row lineage (`first_row_id` / `next_row_id`) tracked by the storage sink engine.
+
+* **Iceberg Format Version 2 (Legacy Compatibility):**
+  * Iceberg Format Versions 1 and 2 only support microsecond-precision timestamps (`timestamp` and `timestamptz`).
+  * When ingesting into Iceberg V2 tables:
+    * **`catalog` mode:** Incoming nanosecond timestamps are automatically downcast to microseconds (`TimeUnit::Microsecond`) via vectorized Arrow kernel casting (`arrow::compute::cast`), preserving schema compatibility at the cost of sub-microsecond precision.
+    * **`auto` mode:** Enforces strict type equality. Because `Timestamp(Nanosecond, None)` does not match the V2 table's `Timestamp(Microsecond, None)`, the sink rejects the batch with an explicit type mismatch error to prevent silent data alteration.
+    * **`fixed` mode:** Incoming batches are validated directly against the user-configured schema.
+
 ## 4. Permission & Catalog Security Model
 
 For `auto` schema evolution to operate reliably without manual intervention, the storage catalog credentials supplied to `opentelemetry-datalake` **MUST** possess specific privileges. The catalog service (e.g., AWS Glue, Iceberg REST Catalog, Hive Metastore, or Unity Catalog) **MUST** enforce and support the following capabilities:
