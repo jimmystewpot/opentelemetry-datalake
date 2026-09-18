@@ -299,10 +299,13 @@ struct SimulatedOverlapping {
 }
 
 /// Internal error categorized during index template existence verification across endpoints.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TemplateCheckError {
     /// Authentication or authorization failure (HTTP 401/403).
-    Auth(String),
+    Auth {
+        status: reqwest::StatusCode,
+        message: String,
+    },
     /// Network connection or transport failure.
     Transport(String),
     /// Validation rejection (e.g. HTTP 404 template missing or empty array).
@@ -312,7 +315,9 @@ enum TemplateCheckError {
 impl std::fmt::Display for TemplateCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Auth(msg) | Self::Transport(msg) | Self::Validation(msg) => write!(f, "{msg}"),
+            Self::Auth { message, .. } | Self::Transport(message) | Self::Validation(message) => {
+                write!(f, "{message}")
+            }
         }
     }
 }
@@ -1090,15 +1095,21 @@ impl HttpClient {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to simulate index template for '{data_stream}' on '{endpoint}': HTTP 401"
-            )));
+            return Err(TemplateCheckError::Auth {
+                status,
+                message: format!(
+                    "unauthorized to simulate index template for '{data_stream}' on '{endpoint}': HTTP 401"
+                ),
+            });
         }
 
         if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(TemplateCheckError::Auth(format!(
-                "forbidden to simulate index template for '{data_stream}' on '{endpoint}': HTTP 403"
-            )));
+            return Err(TemplateCheckError::Auth {
+                status,
+                message: format!(
+                    "forbidden to simulate index template for '{data_stream}' on '{endpoint}': HTTP 403"
+                ),
+            });
         }
 
         if status == reqwest::StatusCode::NOT_FOUND
@@ -1177,9 +1188,12 @@ impl HttpClient {
         }
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to check data stream '{data_stream}' on '{endpoint}': HTTP {status}"
-            )));
+            return Err(TemplateCheckError::Auth {
+                status,
+                message: format!(
+                    "unauthorized to check data stream '{data_stream}' on '{endpoint}': HTTP {status}"
+                ),
+            });
         }
 
         if !status.is_success() {
@@ -1231,9 +1245,14 @@ impl HttpClient {
                 // Real transport failure (e.g. timeout / connection refused) -> propagate immediately
                 return Err(TemplateCheckError::Transport(msg.clone()));
             }
-            Err(TemplateCheckError::Auth(ref msg)) if msg.contains("401") => {
+            Err(
+                err @ TemplateCheckError::Auth {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                    ..
+                },
+            ) => {
                 // 401 Unauthorized indicates invalid credentials across the board -> propagate immediately
-                return Err(TemplateCheckError::Auth(msg.clone()));
+                return Err(err);
             }
             Err(TemplateCheckError::Validation(ref msg)) if !msg.contains("(HTTP 404)") => {
                 // Tier 1 returned 200 OK and definitively rejected the template (e.g. missing data_stream,
@@ -1262,9 +1281,14 @@ impl HttpClient {
             {
                 return Err(TemplateCheckError::Transport(msg.clone()));
             }
-            Err(TemplateCheckError::Auth(ref msg)) if msg.contains("401") => {
+            Err(
+                err @ TemplateCheckError::Auth {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                    ..
+                },
+            ) => {
                 // 401 Unauthorized indicates invalid credentials across the board -> propagate immediately
-                return Err(TemplateCheckError::Auth(msg.clone()));
+                return Err(err);
             }
             Err(TemplateCheckError::Validation(ref msg))
                 if msg.contains("is not configured with 'data_stream: {}'") =>
@@ -1292,9 +1316,12 @@ impl HttpClient {
             {
                 Err(TemplateCheckError::Transport(msg.clone()))
             }
-            Err(TemplateCheckError::Auth(ref msg)) if msg.contains("401") => {
-                Err(TemplateCheckError::Auth(msg.clone()))
-            }
+            Err(
+                err @ TemplateCheckError::Auth {
+                    status: reqwest::StatusCode::UNAUTHORIZED,
+                    ..
+                },
+            ) => Err(err),
             Err(tier3_err) => {
                 tracing::debug!(
                     endpoint = %endpoint,
@@ -1341,9 +1368,12 @@ impl HttpClient {
         }
 
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to list index templates on '{endpoint}': HTTP {status}"
-            )));
+            return Err(TemplateCheckError::Auth {
+                status,
+                message: format!(
+                    "unauthorized to list index templates on '{endpoint}': HTTP {status}"
+                ),
+            });
         }
 
         if !status.is_success() {
@@ -1445,10 +1475,10 @@ impl HttpClient {
         for endpoint in &self.endpoints {
             match self.check_get_index_template(endpoint, data_stream).await {
                 Ok(()) => return Ok(()),
-                Err(TemplateCheckError::Auth(msg)) => {
+                Err(TemplateCheckError::Auth { message, .. }) => {
                     self.mark_endpoint_failed(endpoint);
-                    auth_error = Some(msg.clone());
-                    errors.push(format!("{endpoint}: {msg}"));
+                    auth_error = Some(message.clone());
+                    errors.push(format!("{endpoint}: {message}"));
                 }
                 Err(TemplateCheckError::Transport(msg)) => {
                     self.mark_endpoint_failed(endpoint);
