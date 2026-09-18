@@ -172,54 +172,54 @@ impl ElasticsearchSink {
         Ok(())
     }
 
-    /// Dispatches a serialized payload to the target data stream using pipelined concurrency.
+    /// Records the result of an in-flight bulk task into the first encountered error accumulator.
+    fn record_task_result(
+        res: Result<Result<BulkResponse, ElasticsearchError>, tokio::task::JoinError>,
+        first_err: &mut Option<PipelineError>,
+    ) {
+        match res {
+            Ok(Ok(_resp)) => {}
+            Ok(Err(es_err)) => {
+                if first_err.is_none() {
+                    *first_err = Some(es_err.into());
+                }
+            }
+            Err(join_err) => {
+                if first_err.is_none() {
+                    *first_err = Some(PipelineError::Internal(format!(
+                        "Bulk dispatch task failed: {join_err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Dispatches a single bulk payload chunk under the concurrency semaphore.
     ///
-    /// Drains any completed tasks in `join_set` to detect failures early, acquires a semaphore permit,
-    /// and spawns the request into `join_set`.
+    /// If permits are exhausted, awaits the next completed task in `join_set`. Any error
+    /// from previously dispatched tasks is retained in `first_err` without aborting the
+    /// submission of the current chunk once a permit is freed.
     async fn dispatch(
         client: Arc<HttpClient>,
         semaphore: Arc<tokio::sync::Semaphore>,
         join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
         data_stream: String,
         payload: Bytes,
+        first_err: &mut Option<PipelineError>,
     ) -> Result<(), PipelineError> {
         if payload.is_empty() {
             return Ok(());
         }
 
-        // Drain any already completed tasks in join_set to detect failures early
+        // Drain any already completed tasks in join_set to detect completed tasks
         while let Some(res) = join_set.try_join_next() {
-            match res {
-                Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => {
-                    let _ = Self::drain_join_set(join_set).await;
-                    return Err(es_err.into());
-                }
-                Err(join_err) => {
-                    let _ = Self::drain_join_set(join_set).await;
-                    return Err(PipelineError::Internal(format!(
-                        "Bulk dispatch task failed: {join_err}"
-                    )));
-                }
-            }
+            Self::record_task_result(res, first_err);
         }
 
-        // If semaphore permits are exhausted, await the next completed task in join_set
+        // If semaphore permits are exhausted, await until at least one task completes
         while semaphore.available_permits() == 0 && !join_set.is_empty() {
             if let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(_resp)) => {}
-                    Ok(Err(es_err)) => {
-                        let _ = Self::drain_join_set(join_set).await;
-                        return Err(es_err.into());
-                    }
-                    Err(join_err) => {
-                        let _ = Self::drain_join_set(join_set).await;
-                        return Err(PipelineError::Internal(format!(
-                            "Bulk dispatch task failed: {join_err}"
-                        )));
-                    }
-                }
+                Self::record_task_result(res, first_err);
             }
         }
 
@@ -244,21 +244,7 @@ impl ElasticsearchSink {
     ) -> Result<(), PipelineError> {
         let mut first_err = None;
         while let Some(res) = join_set.join_next().await {
-            match res {
-                Ok(Ok(_resp)) => {}
-                Ok(Err(es_err)) => {
-                    if first_err.is_none() {
-                        first_err = Some(PipelineError::from(es_err));
-                    }
-                }
-                Err(join_err) => {
-                    if first_err.is_none() {
-                        first_err = Some(PipelineError::Internal(format!(
-                            "Bulk dispatch task failed: {join_err}"
-                        )));
-                    }
-                }
-            }
+            Self::record_task_result(res, &mut first_err);
         }
         if let Some(err) = first_err {
             Err(err)
@@ -332,6 +318,7 @@ impl ElasticsearchSink {
         .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
 
         let stream_name = target_data_stream.to_string();
+        let mut first_dispatch_error: Option<PipelineError> = None;
         for chunk in chunks {
             Self::dispatch(
                 Arc::clone(&self.client),
@@ -339,8 +326,14 @@ impl ElasticsearchSink {
                 join_set,
                 stream_name.clone(),
                 chunk,
+                &mut first_dispatch_error,
             )
             .await?;
+        }
+
+        if let Some(err) = first_dispatch_error {
+            let _ = Self::drain_join_set(join_set).await;
+            return Err(err);
         }
 
         tracing::debug!(
@@ -584,6 +577,14 @@ mod tests {
         config
     }
 
+    async fn setup_mock_client_and_semaphore() -> (Arc<HttpClient>, Arc<tokio::sync::Semaphore>) {
+        let server = MockServer::start().await;
+        let config = make_test_config(server.uri(), false);
+        let client = Arc::new(HttpClient::try_new(&config).unwrap());
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        (client, semaphore)
+    }
+
     async fn setup_startup_validation_mocks(server: &MockServer) {
         Mock::given(method("GET"))
             .and(path("/"))
@@ -593,21 +594,42 @@ mod tests {
             .mount(server)
             .await;
 
+        let all_templates = [
+            "logs-otel-default",
+            "metrics-otel-default",
+            "traces-otel-default",
+        ]
+        .into_iter()
+        .map(|stream| {
+            serde_json::json!({
+                "name": stream,
+                "index_template": {
+                    "index_patterns": [format!("{stream}*")],
+                    "data_stream": {}
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "index_templates": all_templates
+            })))
+            .mount(server)
+            .await;
+
         for stream in [
             "logs-otel-default",
             "metrics-otel-default",
             "traces-otel-default",
         ] {
-            Mock::given(method("GET"))
-                .and(path(format!("/_index_template/{stream}")))
+            Mock::given(method("POST"))
+                .and(path(format!("/_index_template/_simulate_index/{stream}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "index_templates": [{
-                        "name": stream,
-                        "index_template": {
-                            "index_patterns": [format!("{stream}*")],
-                            "data_stream": {}
-                        }
-                    }]
+                    "template": {
+                        "data_stream": {}
+                    }
                 })))
                 .mount(server)
                 .await;
@@ -670,6 +692,36 @@ mod tests {
                 Arc::new(Int32Array::from(vec![9])),
                 Arc::new(StringArray::from(vec!["Request processed"])),
                 Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_multi_row_log_batch(count: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("severity_number", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+        ]));
+        let services: Vec<String> = (0..count).map(|i| format!("service_{i}")).collect();
+        let service_refs: Vec<&str> = services.iter().map(String::as_str).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_726_500_000_000_000_000;
+                    count
+                ])),
+                Arc::new(StringArray::from(service_refs)),
+                Arc::new(Int32Array::from(vec![9; count])),
+                Arc::new(StringArray::from(vec!["Request processed"; count])),
+                Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#; count])),
             ],
         )
         .unwrap()
@@ -1058,7 +1110,13 @@ mod tests {
             .await;
 
         Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;
@@ -1095,6 +1153,66 @@ mod tests {
             "401 during startup health check must produce PipelineError::Storage, got: {err:?}"
         );
         assert!(err.to_string().contains("401 Unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_startup_validation_succeeds_under_restricted_rbac_role() {
+        let server = MockServer::start().await;
+
+        // Health check
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "version": { "number": "8.12.0" }
+            })))
+            .mount(&server)
+            .await;
+
+        // Tier 1 returns 403 Forbidden (restricted service account lacks cluster manage_index_templates)
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        for stream in &[
+            "logs-otel-default",
+            "metrics-otel-default",
+            "traces-otel-default",
+        ] {
+            // Tier 2 returns 403 Forbidden
+            Mock::given(method("POST"))
+                .and(path(format!("/_index_template/_simulate_index/{stream}")))
+                .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+                .mount(&server)
+                .await;
+
+            // Tier 3 returns 200 OK because data stream was pre-provisioned
+            Mock::given(method("GET"))
+                .and(path(format!("/_data_stream/{stream}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data_streams": [{
+                        "name": *stream,
+                        "status": "GREEN"
+                    }]
+                })))
+                .mount(&server)
+                .await;
+        }
+
+        let config = make_test_config(server.uri(), true);
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        // Drop sender immediately so run() completes cleanly after startup validation
+        drop(tx);
+        let run_result = run_handle.await.expect("join failed");
+        assert!(
+            run_result.is_ok(),
+            "sink must start and shut down cleanly under restricted RBAC role with pre-created data stream, got: {run_result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1560,19 +1678,31 @@ mod tests {
         // Yield so task 1 finishes and task 2 starts sleeping
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
+        let mut first_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             semaphore,
             &mut join_set,
             "logs-otel-default".to_string(),
             bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
         )
         .await;
 
-        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            res.is_ok(),
+            "dispatch should succeed without aborting chunk submission"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err should capture the earlier failure"
+        );
+
+        // Sinks drain remaining tasks after all chunks are dispatched
+        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "dispatch must drain all remaining in-flight tasks before returning error"
+            "drain_join_set must drain all remaining in-flight tasks"
         );
         assert!(join_set.is_empty(), "JoinSet must be drained and empty");
     }
@@ -1587,11 +1717,10 @@ mod tests {
         let mut join_set = tokio::task::JoinSet::new();
         let slow_task_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Exhaust the 1 permit
-        let _held_permit = semaphore.clone().acquire_owned().await.unwrap();
-
-        // Task 1: fails after 10ms
+        // In-flight task 1 holds permit and fails after 10ms
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
         join_set.spawn(async move {
+            let _permit = permit;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             Err(ElasticsearchError::StartupValidation(
                 "failure while waiting for permit".to_string(),
@@ -1610,19 +1739,31 @@ mod tests {
             })
         });
 
+        let mut first_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             Arc::clone(&semaphore),
             &mut join_set,
             "logs-otel-default".to_string(),
             bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
         )
         .await;
 
-        assert!(res.is_err(), "dispatch should return error on task failure");
+        assert!(
+            res.is_ok(),
+            "dispatch should succeed once permit is freed by failed task"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err should capture the failure from task 1"
+        );
+
+        // Sinks drain remaining tasks after all chunks are dispatched
+        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "dispatch must drain all remaining in-flight tasks when permits are exhausted"
+            "drain_join_set must drain all remaining in-flight tasks"
         );
         assert!(join_set.is_empty(), "JoinSet must be drained and empty");
     }
@@ -1967,5 +2108,173 @@ mod tests {
 
         handle.await.unwrap();
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_sink_dispatches_all_chunks_despite_earlier_chunk_failure() {
+        let server = MockServer::start().await;
+        setup_startup_validation_mocks(&server).await;
+
+        // First bulk request fails with 500 (exhausting retries if retried)
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service_0")
+            })
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
+            .mount(&server)
+            .await;
+
+        // Second bulk request succeeds with 200
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| {
+                let body_str = String::from_utf8_lossy(&req.body);
+                body_str.contains("service_1")
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"took": 5, "errors": false, "items": []}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), true);
+        config.max_concurrent_requests = 1; // Strict serial concurrency
+        config.max_retries = 0;
+        config.max_payload_bytes = 200; // Force splitting into multiple chunks
+
+        let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let batch = make_multi_row_log_batch(2); // 2 rows, each serialized NDJSON is ~150 bytes
+        tx.send(SignalBatch::Logs(batch))
+            .await
+            .expect("send failed");
+        drop(tx);
+
+        let result = sink.run(rx).await;
+        assert!(result.is_err(), "expected error due to first chunk failure");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("failed to get received requests");
+        let bulk_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/_bulk"))
+            .collect();
+
+        assert_eq!(
+            bulk_requests.len(),
+            2,
+            "both chunks must be dispatched even when the first chunk encounters an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_handles_task_join_error_panic() {
+        let (client, semaphore) = setup_mock_client_and_semaphore().await;
+        let mut join_set = tokio::task::JoinSet::new();
+
+        // Spawn a task that panics
+        join_set.spawn(async move {
+            panic!("simulated worker task panic");
+        });
+
+        // Sleep briefly so the task completes panicked
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let mut first_err = None;
+        let res = ElasticsearchSink::dispatch(
+            client,
+            semaphore,
+            &mut join_set,
+            "logs-otel-default".to_string(),
+            bytes::Bytes::from_static(b"dummy payload"),
+            &mut first_err,
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "dispatch should submit chunk even if earlier task panicked"
+        );
+        assert!(
+            first_err.is_some(),
+            "first_err must record task panic JoinError"
+        );
+        let err_msg = first_err.unwrap().to_string();
+        assert!(
+            err_msg.contains("Bulk dispatch task failed"),
+            "error message must describe task join failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_join_set_handles_join_error_panic() {
+        let mut join_set = tokio::task::JoinSet::new();
+        join_set.spawn(async move {
+            panic!("simulated worker panic for drain");
+        });
+
+        let res = ElasticsearchSink::drain_join_set(&mut join_set).await;
+        assert!(
+            res.is_err(),
+            "drain_join_set must return error when task panicked"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Bulk dispatch task failed"),
+            "error must describe join error, got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_record_task_result_unit() {
+        let mut first_err = None;
+
+        // Ok(Ok) does not record error
+        ElasticsearchSink::record_task_result(
+            Ok(Ok(BulkResponse {
+                took: 1,
+                errors: false,
+                items: vec![],
+            })),
+            &mut first_err,
+        );
+        assert!(first_err.is_none());
+
+        // Ok(Err) records first error
+        ElasticsearchSink::record_task_result(
+            Ok(Err(ElasticsearchError::StartupValidation(
+                "first error".to_string(),
+            ))),
+            &mut first_err,
+        );
+        assert!(first_err.is_some());
+        assert!(
+            first_err
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("first error")
+        );
+
+        // Subsequent error does not overwrite first_err
+        ElasticsearchSink::record_task_result(
+            Ok(Err(ElasticsearchError::StartupValidation(
+                "second error".to_string(),
+            ))),
+            &mut first_err,
+        );
+        assert!(
+            first_err
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("first error")
+        );
     }
 }

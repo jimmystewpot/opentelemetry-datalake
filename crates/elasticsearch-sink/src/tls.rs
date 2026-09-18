@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// TLS configuration for the Elasticsearch/`OpenSearch` HTTP client.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to a PEM-encoded CA certificate file for custom certificate authorities.
     #[serde(default)]
@@ -45,5 +46,18 @@ mod tests {
         let tls: TlsConfig = toml::from_str(toml_str).unwrap();
         assert!(tls.ca_cert_path.is_none());
         assert!(!tls.insecure_skip_verify);
+    }
+
+    #[test]
+    fn test_tls_config_rejects_unknown_fields() {
+        let toml_str = r#"
+            ca_cert_path = "/etc/ssl/certs/custom-ca.pem"
+            unpack_attributes = true
+        "#;
+        let result: Result<TlsConfig, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "TlsConfig must reject unknown fields like unpack_attributes"
+        );
     }
 }
