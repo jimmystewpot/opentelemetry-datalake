@@ -272,6 +272,32 @@ struct DataStreamItem {
     name: String,
 }
 
+/// Simulated index template response returned by `POST /_index_template/_simulate_index/<name>`.
+#[derive(Debug, Deserialize)]
+struct SimulateIndexResponse {
+    #[serde(default)]
+    template: Option<SimulatedTemplate>,
+    #[serde(default)]
+    overlapping: Vec<SimulatedOverlapping>,
+}
+
+/// Simulated template content within `SimulateIndexResponse`.
+#[derive(Debug, Deserialize)]
+struct SimulatedTemplate {
+    #[serde(default)]
+    data_stream: Option<serde_json::Value>,
+}
+
+/// Simulated overlapping template item within `SimulateIndexResponse`.
+#[derive(Debug, Deserialize)]
+struct SimulatedOverlapping {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    index_patterns: Vec<String>,
+}
+
 /// Internal error categorized during index template existence verification across endpoints.
 #[derive(Debug)]
 enum TemplateCheckError {
@@ -1030,16 +1056,27 @@ impl HttpClient {
         )))
     }
 
-    /// Tier 2: Queries `GET /_index_template/{data_stream}` to validate a scoped template.
-    async fn check_exact_index_template(
+    /// Tier 2: Queries `POST /_index_template/_simulate_index/{data_stream}` to simulate template resolution.
+    ///
+    /// Evaluates priority and overlapping composable templates across the cluster for `data_stream`.
+    /// If the resolved winning template configures `data_stream: {}`, validation succeeds.
+    /// If the resolved template lacks `data_stream`, validation returns a `Validation` error (detecting priority shadowing).
+    /// If the simulation endpoint returns HTTP 403, 404, or 405 (e.g. `OpenSearch` or reverse proxy block),
+    /// the caller falls through to Tier 3.
+    async fn check_simulate_index_template(
         &self,
         endpoint: &str,
         data_stream: &str,
     ) -> Result<(), TemplateCheckError> {
-        let url = format!("{endpoint}/_index_template/{data_stream}");
-        let req = self.client.get(&url);
+        let url = format!("{endpoint}/_index_template/_simulate_index/{data_stream}");
+        let body_bytes = b"{}";
         let req = self
-            .apply_auth_request(req, "GET", &url, &[])
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_bytes.as_slice());
+        let req = self
+            .apply_auth_request(req, "POST", &url, body_bytes)
             .await
             .map_err(|e| {
                 TemplateCheckError::Validation(format!("{endpoint}: auth signing failed: {e}"))
@@ -1047,75 +1084,66 @@ impl HttpClient {
 
         let response = req.send().await.map_err(|e| {
             TemplateCheckError::Transport(format!(
-                "failed to get index template '{data_stream}' on '{endpoint}': {e}"
+                "failed to simulate index template for '{data_stream}' on '{endpoint}': {e}"
             ))
         })?;
 
         let status = response.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(TemplateCheckError::Validation(format!(
-                "scoped index template '{data_stream}' not found on '{endpoint}'"
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(TemplateCheckError::Auth(format!(
+                "unauthorized to simulate index template for '{data_stream}' on '{endpoint}': HTTP 401"
             )));
         }
 
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::FORBIDDEN {
             return Err(TemplateCheckError::Auth(format!(
-                "unauthorized to get index template '{data_stream}' on '{endpoint}': HTTP {status}"
+                "forbidden to simulate index template for '{data_stream}' on '{endpoint}': HTTP 403"
+            )));
+        }
+
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+        {
+            return Err(TemplateCheckError::Validation(format!(
+                "simulate index template endpoint not supported or not found for '{data_stream}' on '{endpoint}' (HTTP {status})"
             )));
         }
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             return Err(TemplateCheckError::Transport(format!(
-                "get index template '{data_stream}' on '{endpoint}' returned HTTP {status}: {body}"
+                "simulate index template for '{data_stream}' on '{endpoint}' returned HTTP {status}: {body}"
             )));
         }
 
-        let parsed: IndexTemplatesResponse = response.json().await.map_err(|e| {
+        let parsed: SimulateIndexResponse = response.json().await.map_err(|e| {
             TemplateCheckError::Transport(format!(
-                "failed to parse index template '{data_stream}' response on '{endpoint}': {e}"
+                "failed to parse simulate index template '{data_stream}' response on '{endpoint}': {e}"
             ))
         })?;
 
-        let template_opt = parsed
-            .index_templates
-            .into_iter()
-            .find(|t| t.name == data_stream);
-
-        let Some(matched) = template_opt else {
-            return Err(TemplateCheckError::Validation(format!(
-                "index template response did not contain template '{data_stream}'"
-            )));
-        };
-
-        let has_data_stream = matched
-            .index_template
+        let has_data_stream = parsed
+            .template
             .as_ref()
-            .and_then(|c| c.data_stream.as_ref())
+            .and_then(|t| t.data_stream.as_ref())
             .is_some_and(|v| !v.is_null());
 
         if !has_data_stream {
+            let overlapping_info = if parsed.overlapping.is_empty() {
+                String::new()
+            } else {
+                let names: Vec<&str> = parsed.overlapping.iter().map(|o| o.name.as_str()).collect();
+                format!("; overlapping templates: {}", names.join(", "))
+            };
             return Err(TemplateCheckError::Validation(format!(
-                "index template '{data_stream}' is not configured with 'data_stream: {{}}'"
-            )));
-        }
-
-        let patterns_match = matched.index_template.as_ref().is_some_and(|c| {
-            c.index_patterns
-                .iter()
-                .any(|pat| pattern_matches(pat, data_stream))
-        });
-
-        if !patterns_match {
-            return Err(TemplateCheckError::Validation(format!(
-                "scoped index template '{data_stream}' has index_patterns that do not match target data stream '{data_stream}'"
+                "simulated index template for '{data_stream}' on '{endpoint}' is not configured with 'data_stream: {{}}' (resolved template would create a regular index{overlapping_info})"
             )));
         }
 
         tracing::info!(
             endpoint = %endpoint,
             data_stream = %data_stream,
-            "Scoped index template validation succeeded via Tier 2 exact-name lookup"
+            "Index template validation succeeded via Tier 2 index simulation"
         );
         Ok(())
     }
@@ -1184,8 +1212,8 @@ impl HttpClient {
 
     /// Validates template compliance for `data_stream` on `endpoint` via a 3-tier sequence:
     /// - Tier 1: Cluster-wide composable template priority resolution (`GET /_index_template`).
-    /// - Tier 2: Scoped exact-name template lookup (`GET /_index_template/{data_stream}`) on 403 or 404/405 proxy block.
-    /// - Tier 3: Active data stream existence check (`GET /_data_stream/{data_stream}`) on 404 template missing or 403.
+    /// - Tier 2: Scoped template simulation (`POST /_index_template/_simulate_index/{data_stream}`) on 403 or 404/405 proxy block.
+    /// - Tier 3: Active data stream existence check (`GET /_data_stream/{data_stream}`) on simulation unsupported (404/405) or forbidden (403).
     async fn check_get_index_template(
         &self,
         endpoint: &str,
@@ -1203,6 +1231,10 @@ impl HttpClient {
                 // Real transport failure (e.g. timeout / connection refused) -> propagate immediately
                 return Err(TemplateCheckError::Transport(msg.clone()));
             }
+            Err(TemplateCheckError::Auth(ref msg)) if msg.contains("401") => {
+                // 401 Unauthorized indicates invalid credentials across the board -> propagate immediately
+                return Err(TemplateCheckError::Auth(msg.clone()));
+            }
             Err(TemplateCheckError::Validation(ref msg)) if !msg.contains("(HTTP 404)") => {
                 // Tier 1 returned 200 OK and definitively rejected the template (e.g. missing data_stream,
                 // empty template list, or pattern mismatch). Do not fall back to scoped lookup.
@@ -1219,8 +1251,11 @@ impl HttpClient {
             }
         };
 
-        // Tier 2: Scoped exact-name template lookup
-        let tier2_err = match self.check_exact_index_template(endpoint, data_stream).await {
+        // Tier 2: Scoped template simulation
+        let tier2_err = match self
+            .check_simulate_index_template(endpoint, data_stream)
+            .await
+        {
             Ok(()) => return Ok(()),
             Err(TemplateCheckError::Transport(ref msg))
                 if !msg.contains("returned HTTP 404") && !msg.contains("returned HTTP 405") =>
@@ -1234,7 +1269,8 @@ impl HttpClient {
             Err(TemplateCheckError::Validation(ref msg))
                 if msg.contains("is not configured with 'data_stream: {}'") =>
             {
-                // Exact-name template exists but is explicitly not a data stream -> propagate immediately
+                // Winning template resolved via simulation definitively does not produce a data stream.
+                // Priority shadowing detected -> propagate immediately, do not fall back.
                 return Err(TemplateCheckError::Validation(msg.clone()));
             }
             Err(err) => {
@@ -1242,7 +1278,7 @@ impl HttpClient {
                     endpoint = %endpoint,
                     data_stream = %data_stream,
                     tier2_error = %err,
-                    "Tier 2 scoped index template lookup failed; attempting Tier 3 data stream existence check"
+                    "Tier 2 index template simulation failed or unsupported; attempting Tier 3 data stream existence check"
                 );
                 err
             }
@@ -1256,6 +1292,9 @@ impl HttpClient {
             {
                 Err(TemplateCheckError::Transport(msg.clone()))
             }
+            Err(TemplateCheckError::Auth(ref msg)) if msg.contains("401") => {
+                Err(TemplateCheckError::Auth(msg.clone()))
+            }
             Err(tier3_err) => {
                 tracing::debug!(
                     endpoint = %endpoint,
@@ -1266,7 +1305,7 @@ impl HttpClient {
                 Err(TemplateCheckError::Validation(format!(
                     "all validation tiers failed for '{data_stream}' on '{endpoint}': \
                      Tier 1 (cluster-wide composable template list): {tier1_err}; \
-                     Tier 2 (scoped template lookup): {tier2_err}; \
+                     Tier 2 (index template simulation): {tier2_err}; \
                      Tier 3 (active data stream check): {tier3_err}"
                 )))
             }
@@ -2390,19 +2429,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2: GET /_index_template/logs-otel-default succeeds
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        // Tier 2: POST /_index_template/_simulate_index/logs-otel-default succeeds
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "index_templates": [{
-                    "name": "logs-otel-default",
-                    "index_template": {
-                        "index_patterns": ["logs-otel-default*"],
-                        "priority": 100,
-                        "data_stream": {},
-                        "template": {}
-                    }
-                }]
+                "template": {
+                    "data_stream": {}
+                }
             })))
             .mount(&server)
             .await;
@@ -2413,7 +2446,7 @@ mod tests {
         let result = client.validate_index_template("logs-otel-default").await;
         assert!(
             result.is_ok(),
-            "should succeed via Tier 2 scoped fallback on 403"
+            "should succeed via Tier 2 simulation fallback on 403"
         );
     }
 
@@ -2428,19 +2461,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2: GET /_index_template/logs-otel-default succeeds
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        // Tier 2: POST /_index_template/_simulate_index/logs-otel-default succeeds
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "index_templates": [{
-                    "name": "logs-otel-default",
-                    "index_template": {
-                        "index_patterns": ["logs-otel-default*"],
-                        "priority": 100,
-                        "data_stream": {},
-                        "template": {}
-                    }
-                }]
+                "template": {
+                    "data_stream": {}
+                }
             })))
             .mount(&server)
             .await;
@@ -2451,12 +2478,12 @@ mod tests {
         let result = client.validate_index_template("logs-otel-default").await;
         assert!(
             result.is_ok(),
-            "should succeed via Tier 2 scoped fallback on 404 proxy block"
+            "should succeed via Tier 2 simulation fallback on 404 proxy block"
         );
     }
 
     #[tokio::test]
-    async fn test_validate_index_template_falls_back_to_data_stream_exists_when_template_named_differently()
+    async fn test_validate_index_template_falls_back_to_data_stream_exists_when_simulation_unsupported_or_not_found()
      {
         let server = MockServer::start().await;
 
@@ -2467,9 +2494,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2 returns 404 (template named differently)
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        // Tier 2 returns 404 (simulation unsupported on OpenSearch or route blocked)
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;
@@ -2508,8 +2535,8 @@ mod tests {
             .await;
 
         // Tier 2 returns 404 Not Found
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;
@@ -2526,14 +2553,17 @@ mod tests {
 
         let result = client.validate_index_template("logs-otel-default").await;
         assert!(result.is_err(), "should fail when all tiers fail");
-        assert!(matches!(
-            result.unwrap_err(),
-            ElasticsearchError::StartupValidation(_)
-        ));
+        let err = result.unwrap_err();
+        assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Tier 1") && msg.contains("Tier 2") && msg.contains("Tier 3"),
+            "error should contain diagnostics for all tiers, got: {msg}"
+        );
     }
 
     #[tokio::test]
-    async fn test_exact_index_template_rejects_when_patterns_do_not_match_data_stream() {
+    async fn test_simulate_index_template_rejects_shadowed_non_data_stream_template() {
         let server = MockServer::start().await;
 
         // Tier 1 returns 403 Forbidden
@@ -2543,29 +2573,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2 returns 200 OK with template named "logs-otel-default" and data_stream: {},
-        // but index_patterns are disjoint: ["unrelated-stream-*"]
-        let exact_body = serde_json::json!({
-            "index_templates": [{
-                "name": "logs-otel-default",
-                "index_template": {
-                    "index_patterns": ["unrelated-stream-*"],
-                    "data_stream": {},
-                    "priority": 100,
-                    "template": {}
-                }
+        // Tier 2 simulation resolves a winning template that lacks data_stream
+        // (e.g. higher-priority conventional template 'override-logs' won)
+        let sim_body = serde_json::json!({
+            "template": {
+                "settings": {}
+            },
+            "overlapping": [{
+                "name": "override-logs",
+                "index_patterns": ["logs-*"]
             }]
         });
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
-            .mount(&server)
-            .await;
-
-        // Tier 3 returns 404 Not Found
-        Mock::given(method("GET"))
-            .and(path("/_data_stream/logs-otel-default"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sim_body))
             .mount(&server)
             .await;
 
@@ -2575,18 +2596,18 @@ mod tests {
         let result = client.validate_index_template("logs-otel-default").await;
         assert!(
             result.is_err(),
-            "should fail when scoped template patterns do not match target data stream"
+            "should fail immediately when simulated winning template lacks data_stream"
         );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("has index_patterns that do not match")
-                || err_msg.contains("all validation tiers failed"),
-            "error should indicate pattern mismatch or tier failure, got: {err_msg}"
+            err_msg.contains("is not configured with 'data_stream: {}'")
+                && err_msg.contains("override-logs"),
+            "error should indicate non-data-stream template and mention overlapping templates, got: {err_msg}"
         );
     }
 
     #[tokio::test]
-    async fn test_exact_index_template_accepts_matching_multi_pattern() {
+    async fn test_simulate_index_template_succeeds_when_winning_template_is_data_stream() {
         let server = MockServer::start().await;
 
         // Tier 1 returns 403 Forbidden
@@ -2596,21 +2617,17 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2 returns 200 OK with multiple patterns where one matches logs-otel-default
-        let exact_body = serde_json::json!({
-            "index_templates": [{
-                "name": "logs-otel-default",
-                "index_template": {
-                    "index_patterns": ["legacy-logs-*", "logs-otel-*"],
-                    "data_stream": {},
-                    "priority": 100,
-                    "template": {}
-                }
-            }]
+        // Tier 2 returns 200 OK with simulated winning template containing data_stream: {}
+        let sim_body = serde_json::json!({
+            "template": {
+                "data_stream": {},
+                "settings": {}
+            },
+            "overlapping": []
         });
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&exact_body))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sim_body))
             .mount(&server)
             .await;
 
@@ -2620,7 +2637,49 @@ mod tests {
         let result = client.validate_index_template("logs-otel-default").await;
         assert!(
             result.is_ok(),
-            "should succeed via Tier 2 when at least one pattern matches, got: {result:?}"
+            "should succeed via Tier 2 simulation when winning template is data stream, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_index_template_falls_back_to_tier3_when_simulation_method_not_allowed_405()
+     {
+        let server = MockServer::start().await;
+
+        // Tier 1 returns 403 Forbidden
+        Mock::given(method("GET"))
+            .and(path("/_index_template"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+
+        // Tier 2 returns 405 Method Not Allowed (e.g. proxy blocks POST or engine doesn't support method)
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(405).set_body_string("Method Not Allowed"))
+            .mount(&server)
+            .await;
+
+        // Tier 3 returns 200 OK with active stream
+        let ds_body = serde_json::json!({
+            "data_streams": [{
+                "name": "logs-otel-default",
+                "status": "GREEN"
+            }]
+        });
+        Mock::given(method("GET"))
+            .and(path("/_data_stream/logs-otel-default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&ds_body))
+            .mount(&server)
+            .await;
+
+        let config = make_test_config(vec![server.uri()]);
+        let client = HttpClient::try_new(&config).expect("client creation failed");
+
+        let result = client.validate_index_template("logs-otel-default").await;
+        assert!(
+            result.is_ok(),
+            "should succeed via Tier 3 fallback on simulation 405, got: {result:?}"
         );
     }
 
@@ -2635,9 +2694,9 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Tier 2 also returns 403 Forbidden (GET /_index_template/{name} also requires manage_index_templates)
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        // Tier 2 also returns 403 Forbidden (POST /_index_template/_simulate_index/{name} also requires manage_index_templates)
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .mount(&server)
             .await;
@@ -2677,8 +2736,8 @@ mod tests {
             .await;
 
         // Tier 2 returns 403 Forbidden
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
             .mount(&server)
             .await;
@@ -2723,27 +2782,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        // metrics-stream: Tier 2 scoped query succeeds with matching pattern!
-        let metrics_exact_body = serde_json::json!({
-            "index_templates": [{
-                "name": "metrics-stream",
-                "index_template": {
-                    "index_patterns": ["metrics-*"],
-                    "data_stream": {},
-                    "priority": 100,
-                    "template": {}
-                }
-            }]
+        // metrics-stream: Tier 2 simulation succeeds with data_stream: {}!
+        let metrics_sim_body = serde_json::json!({
+            "template": {
+                "data_stream": {}
+            }
         });
-        Mock::given(method("GET"))
-            .and(path("/_index_template/metrics-stream"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(&metrics_exact_body))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/metrics-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&metrics_sim_body))
             .mount(&server)
             .await;
 
-        // traces-stream: Tier 2 returns 404 (no scoped template). Tier 3 succeeds on active stream!
-        Mock::given(method("GET"))
-            .and(path("/_index_template/traces-stream"))
+        // traces-stream: Tier 2 returns 404 (no template). Tier 3 succeeds on active stream!
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/traces-stream"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;

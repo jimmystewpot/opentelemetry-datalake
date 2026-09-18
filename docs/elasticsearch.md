@@ -244,7 +244,7 @@ The sink strictly interacts with the following minimal set of HTTP endpoints. Ne
 |---|---|---|---|---|
 | `/` | `GET` | Cluster health & engine version detection | Boot time | Allow `GET /` |
 | `/_index_template` | `GET` | Tier 1: Cluster-wide template priority resolution | Boot time | Allow `GET /_index_template` |
-| `/_index_template/{data_stream}` | `GET` | Tier 2: Scoped template validation fallback | Boot time (fallback) | Allow `GET /_index_template/*` |
+| `/_index_template/_simulate_index/{data_stream}` | `POST` | Tier 2: Scoped template simulation fallback | Boot time (fallback) | Allow `POST /_index_template/_simulate_index/*` |
 | `/_data_stream/{data_stream}` | `GET` | Tier 3: Data stream liveness check fallback | Boot time (fallback) | Allow `GET /_data_stream/*` |
 | `/{data_stream}/_bulk` | `POST` | Micro-batched NDJSON telemetry streaming | Ingestion runtime | Allow `POST /*/_bulk` |
 
@@ -279,9 +279,9 @@ server {
         proxy_set_header Connection "";
     }
 
-    # 2. Boot-time index template inspection (Tier 1 & Tier 2)
+    # 2. Boot-time index template inspection & simulation (Tier 1 & Tier 2)
     location ~ ^/_index_template(/.*)?$ {
-        limit_except GET { deny all; }
+        limit_except GET POST { deny all; }
         proxy_pass https://elasticsearch_backend;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
@@ -345,12 +345,14 @@ static_resources:
                           route:
                             cluster: elasticsearch_cluster
 
-                        # 2. Composable index templates (Tier 1 & Tier 2)
+                        # 2. Composable index templates & simulation (Tier 1 & Tier 2)
                         - match:
                             prefix: "/_index_template"
                             headers:
                               - name: ":method"
-                                exact_match: "GET"
+                                safe_regex:
+                                  google_re2: {}
+                                  regex: "^(GET|POST)$"
                           route:
                             cluster: elasticsearch_cluster
 
@@ -408,12 +410,12 @@ Grants permissions to query cluster templates during Tier 1 validation and inges
 ```
 
 ##### Restricted / Least-Privilege Role (Shared / Multi-Tenant Clusters with Pre-Provisioned Streams)
-In Elasticsearch, index template APIs (`GET /_index_template` and `GET /_index_template/{name}`) strictly require the cluster privilege `manage_index_templates`; index-level privileges such as `view_index_metadata` do not authorize template inspection.
+In Elasticsearch, composable index template inspection (`GET /_index_template`) and index template simulation (`POST /_index_template/_simulate_index/{name}`) strictly require the cluster privilege `manage_index_templates`; index-level privileges such as `view_index_metadata` do not authorize template inspection or simulation.
 
 When cluster security policies forbid granting cluster-level privileges to application credentials:
-- Both Tier 1 and Tier 2 return HTTP 403 Forbidden.
+- Both Tier 1 (`GET /_index_template`) and Tier 2 (`POST /_index_template/_simulate_index/{name}`) return HTTP 403 Forbidden.
 - The sink seamlessly falls back to **Tier 3 (`GET /_data_stream/{data_stream}`)** using the index-level `manage_data_stream` (or `view_index_metadata`) privilege.
-- **Requirement**: Target data streams must be **pre-provisioned** by an administrator or infrastructure automation before sink startup.
+- **Requirement**: Target data streams must be **pre-provisioned** by an administrator or infrastructure automation before sink startup. Once a data stream already exists, runtime ingestion writes append directly to the active stream without evaluating templates, preventing priority shadowing.
 
 ```json
 {
@@ -428,7 +430,7 @@ When cluster security policies forbid granting cluster-level privileges to appli
 ```
 
 > [!NOTE]
-> **Reverse Proxy Multi-Tenancy**: When using reverse proxies (e.g., NGINX/Envoy) to restrict API surfaces, the upstream Elasticsearch service account typically *does* retain `manage_index_templates`, but the reverse proxy blocks `GET /_index_template` (to prevent cross-tenant enumeration) while allowlisting `GET /_index_template/{data_stream}`. In that topology, Tier 2 scoped lookup succeeds because the cluster authorizes the request.
+> **Reverse Proxy Multi-Tenancy**: When using reverse proxies (e.g., NGINX/Envoy) to restrict API surfaces, the upstream Elasticsearch service account typically *does* retain `manage_index_templates`, but the reverse proxy blocks `GET /_index_template` (to prevent cross-tenant enumeration) while allowlisting `POST /_index_template/_simulate_index/{data_stream}`. In that topology, Tier 2 template simulation evaluates template priority across the cluster for the target stream and detects if conventional templates shadow the stream without leaking the full cluster template catalogue.
 
 #### OpenSearch Security Action Groups Mapping
 
@@ -491,7 +493,7 @@ OpenSearch Security uses action groups instead of Elasticsearch privileges. The 
 |---|---|---|---|
 | Cluster Health & Version Probe | `monitor` | `cluster_monitor` | Required for boot-time `GET /` connectivity and engine version check. |
 | Cluster-Wide Template Inspection | `manage_index_templates` | `cluster:admin/indices/template/get` | Required for boot-time Tier 1 template priority resolution via `GET /_index_template`. |
-| Scoped Template Inspection | `manage_index_templates` | `indices_monitor` or `indices:admin/template/get` | Used during Tier 2 fallback via `GET /_index_template/{data_stream}`. Requires cluster privilege in Elasticsearch; supported at index level in OpenSearch. |
+| Scoped Template Simulation | `manage_index_templates` | Unsupported (falls to Tier 3) | Used during Tier 2 fallback via `POST /_index_template/_simulate_index/{data_stream}`. Requires `manage_index_templates` cluster privilege in Elasticsearch; unsupported in OpenSearch (which falls through to Tier 3 pre-provisioned stream validation). |
 | Data Stream Liveness | `manage_data_stream` (or `view_index_metadata`) | `manage_data_stream` (or `indices_monitor`) | Used during Tier 3 fallback via `GET /_data_stream/{data_stream}` for pre-created streams. |
 | Bulk Data Ingestion | `write` | `write` (or `crud`) | Ingests micro-batches via `POST /{data_stream}/_bulk`. |
 | Dynamic Index Creation | `create_index`, `auto_configure` | `create_index` | Allows creation of backing indices when data streams rollover. |

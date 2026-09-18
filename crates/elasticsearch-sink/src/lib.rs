@@ -624,16 +624,12 @@ mod tests {
             "metrics-otel-default",
             "traces-otel-default",
         ] {
-            Mock::given(method("GET"))
-                .and(path(format!("/_index_template/{stream}")))
+            Mock::given(method("POST"))
+                .and(path(format!("/_index_template/_simulate_index/{stream}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "index_templates": [{
-                        "name": stream,
-                        "index_template": {
-                            "index_patterns": [format!("{stream}*")],
-                            "data_stream": {}
-                        }
-                    }]
+                    "template": {
+                        "data_stream": {}
+                    }
                 })))
                 .mount(server)
                 .await;
@@ -1119,8 +1115,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        Mock::given(method("GET"))
-            .and(path("/_index_template/logs-otel-default"))
+        Mock::given(method("POST"))
+            .and(path("/_index_template/_simulate_index/logs-otel-default"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
             .mount(&server)
             .await;
@@ -1185,8 +1181,8 @@ mod tests {
             "traces-otel-default",
         ] {
             // Tier 2 returns 403 Forbidden
-            Mock::given(method("GET"))
-                .and(path(format!("/_index_template/{stream}")))
+            Mock::given(method("POST"))
+                .and(path(format!("/_index_template/_simulate_index/{stream}")))
                 .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
                 .mount(&server)
                 .await;
