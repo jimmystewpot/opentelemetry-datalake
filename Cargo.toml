@@ -85,12 +85,12 @@ serde = { version = "1.0", default-features = false, features = ["derive", "std"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 uuid = { version = "1.24.1", default-features = false, features = ["v7", "std"] }
 figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
-toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1.1.6+spec-1.1.0", default-features = false, features = ["parse", "serde"] }
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
-arrow = { version = "58", default-features = false, features = ["json"] }
-parquet = { version = "58", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2", "lz4"] }
+arrow = { version = "59", default-features = false, features = ["json"] }
+parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2", "lz4"] }
 
 # Codec & OTLP Parsing
 prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }
@@ -102,7 +102,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "http
 
 # Sinks
 rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio"] }
-starrocks-stream-load = { version = "1.0.12", default-features = false }
+starrocks-stream-load = { version = "1.0.13", default-features = false }
 bytes = "1.6"
 
 # Testing & Benchmarking
@@ -110,11 +110,11 @@ criterion = { version = "0.8.2", default-features = false, features = ["async_to
 
 # Storage & Iceberg Catalogs
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde", "std"] }
-iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
-iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
-iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }  
-iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
-iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "2454d64f8ee4fb351d0e917620e5dd1971f7eeb2" }
+iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
+iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
+iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }  
+iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
+iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
 
 [profile.release]
 lto = "thin"
