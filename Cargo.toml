@@ -18,7 +18,7 @@ eula = false
 resolver = "2"
 members = [
     "crates/*",
-    # "examples/transforms/*", # Registered when examples/transforms/pii_scrubber is created in PR 8
+    "examples/transforms/*",
 ]
 
 [workspace.package]
@@ -58,6 +58,11 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 axum = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "wasm_boundary_bench"
+harness = false
 
 [workspace.dependencies]
 # Internal Workspace Crates
