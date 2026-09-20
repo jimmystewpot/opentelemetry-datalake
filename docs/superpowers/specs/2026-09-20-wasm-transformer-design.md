@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Full Architecture, Telemetry Immutability, Noise Discard vs Audit Reject, and DLQ Topology Reviews)  
+**Status**: Final Approved Spec (Incorporating Architecture, Performance, Immutability, Symmetric DLQ, and Tooling Reviews)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,9 +15,14 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Core Telemetry Immutability**: Core OpenTelemetry identity fields (`trace_id`, `span_id` in traces; metric `name`, `type` in metrics; `timestamp` in logs) are strictly **immutable**. Dropping or nullifying immutable fields triggers a schema invariant violation. Only auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`) can be nullified or redacted.
-* **Noise Discard vs. Audit Rejection**: Distinguishes intentional noise filtering/sampling (`TransformResult::Discard`, which drops silently without rerouting) from compliance/validation rejections (`TransformResult::Reject { reason }`, which routes to `<component_id>._reroute_aborted` if configured).
-* **Unified Error Policy & Topological DLQ (`on_error`)**: Configured via a single enum: `on_error = "drop" | "reroute" | "passthrough"`. If `"reroute"`, the topology builder strictly enforces at startup that a sink is subscribed to `<component_id>._reroute_errored`. If `"passthrough"`, the worker preserves the original batch and forwards it downstream under standard channel backpressure (requiring `allow_unmasked_passthrough = true`).
+* **Core Telemetry Immutability**: Core OpenTelemetry identity fields (`trace_id`, `span_id` in traces; metric `name`, `type` in metrics; `timestamp` in logs) are strictly **immutable**. The host enforces this via an $O(1)$ check (`array.null_count() == array.len()`). Dropping or nullifying immutable fields triggers a schema invariant violation. The guest SDK also enforces this client-side to fail fast at the call site. Only auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`) can be nullified or redacted.
+* **Noise Discard vs. Audit Rejection**: Distinguishes intentional noise filtering/sampling (`TransformResult::Discard`, which drops silently without rerouting) from compliance/validation rejections (`TransformResult::Reject { reason }`, which routes to `<component_id>._reroute_rejected` if configured).
+* **Symmetric Topological DLQ Policies (`on_error` & `on_reject`)**: Clean, uniform configuration surface:
+  - `on_error = "reroute" | "drop" | "passthrough"` (routes failures to `<component_id>._reroute_errored`)
+  - `on_reject = "reroute" | "drop"` (routes policy rejections to `<component_id>._reroute_rejected`)
+  The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams.
+* **Defined 0-Batch Success Semantics**: Emitting `TransformResult::Success(vec![])` is explicitly supported as a successful no-op/buffering outcome: incoming rows are recorded, 0 outgoing rows emitted, no dead-letter streams invoked, and schema guard is bypassed.
+* **Conformity & Immutability Tooling**: `datalake-wasm test` includes automatic immutability validation against synthetic batches, catching any illegal field modifications before production deployment.
 * **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
 * **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
 * **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest. Static config values always override host environment values.
@@ -39,10 +44,10 @@ opentelemetry-datalake/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
-│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error)
+│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error, on_reject)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
-│   │       ├── guard.rs               # Invariant validation, immutability checks & schema defense
+│   │       ├── guard.rs               # Invariant validation, O(1) immutability checks & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
@@ -55,7 +60,7 @@ opentelemetry-datalake/
 │   │       ├── lib.rs                 # Public prelude, BatchTransformer trait, TransformResult
 │   │       ├── abi.rs                 # Low-level FFI exports & memory protocol (with manual escape hatch)
 │   │       ├── ipc.rs                 # Arrow IPC stream reading & writing in guest
-│   │       ├── helpers.rs             # Column nullification, projection, filtering utilities
+│   │       ├── helpers.rs             # Client-side checked column nullification, projection, filtering
 │   │       ├── metrics.rs             # Controlled guest metric API (counter, gauge, duration in nanos)
 │   │       ├── panic.rs               # Custom std::panic hook forwarding to datalake_host_log
 │   │       ├── logger.rs              # Guest tracing/log forwarder using HostLogRecord
@@ -118,8 +123,8 @@ pub struct TransformResponseHeader {
 
     /// 0 = Success (emit batches downstream)
     /// 1 = Discard (noise drop / sampling, silently dropped, never rerouted)
-    /// 2 = Reject (business validation drop, routed to _reroute_aborted if enabled)
-    /// 3 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if enabled)
+    /// 2 = Reject (business validation drop, routed to _reroute_rejected if on_reject = "reroute")
+    /// 3 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if on_error = "reroute")
     pub status: u32,
 
     /// Number of emitted Arrow IPC batches (0..N)
@@ -163,7 +168,7 @@ void datalake_host_log(uint32_t record_ptr);
 // Emits a controlled custom metric counter, gauge, or duration (histogram).
 // metric_type: 0 = Counter, 1 = Gauge, 2 = Duration
 // For metric_type = 2 (Duration), value is strictly in NANOSECONDS (u64).
-// Host automatically converts nanoseconds to seconds and records into Prometheus Histogram.
+// Host automatically converts nanoseconds to seconds (value / 1e9) and records into Prometheus Histogram.
 // name_ptr / name_len: relative metric name (e.g. "pii_redacted")
 void datalake_host_metric_emit(uint32_t metric_type, uint32_t name_ptr, uint32_t name_len, uint64_t value);
 
@@ -186,7 +191,7 @@ uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_l
 
 Designed for publishability on `crates.io`, this crate provides idiomatic, safe abstractions for writing transforms.
 
-### 4.1 Trait Definition
+### 4.1 Trait Definition & Output Semantics
 
 ```rust
 use arrow::record_batch::RecordBatch;
@@ -200,11 +205,13 @@ pub enum SignalType {
 
 pub enum TransformResult {
     /// Emit 0..N transformed RecordBatches downstream to primary sinks.
+    /// Note: Emitting vec![] is a valid success outcome: marks batch consumed, 
+    /// emits 0 rows, bypasses schema guard, and does not trigger error/reject handling.
     Success(Vec<RecordBatch>),
     /// Intentional noise filtering / sampling. Silently discarded from memory, counted in metrics, NEVER rerouted.
     Discard,
     /// Business-logic rejection (e.g. validation failure, security policy).
-    /// Routed to <component_id>._reroute_aborted if reroute_on_reject = true.
+    /// Routed to <component_id>._reroute_rejected if on_reject = "reroute".
     Reject { reason: String },
 }
 
@@ -215,6 +222,10 @@ impl TransformResult {
 
     pub fn ok_multiple(batches: Vec<RecordBatch>) -> Self {
         Self::Success(batches)
+    }
+
+    pub fn ok_empty() -> Self {
+        Self::Success(vec![])
     }
 
     pub fn discard() -> Self {
@@ -279,22 +290,25 @@ pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u3
 }
 ```
 
-### 4.4 Guest Custom Metrics & Environment Helpers
+### 4.4 Guest Custom Metrics & Client-Side Immutability Guards
 
-The SDK provides safe wrappers for metrics, logging, and environment access:
+The SDK provides safe wrappers for metrics, logging, environment access, and helpers that **fail fast at the call site** if an immutable field is targeted:
+
 ```rust
+// Client-side fail-fast: returns Err(SdkError::ImmutableFieldViolation("trace_id")) immediately!
+sdk::helpers::nullify_column(&batch, "trace_id")?; 
+
+// Valid operations on mutable auxiliary fields
+sdk::helpers::nullify_column(&batch, "scope_attributes")?;
+sdk::helpers::filter_batch(&batch, &boolean_mask)?;
+sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")?;
+
 // Custom metrics (automatically namespaced to datalake_transformers_<component_id>_*)
 sdk::metrics::counter("pii_redacted", 1);
 sdk::metrics::gauge("cache_size", 1024);
 
-// Duration helper: takes std::time::Duration, automatically extracts nanoseconds (u64)
-// and host converts to seconds in Prometheus Histogram
+// Duration helper: extracts nanoseconds (u64) from std::time::Duration
 sdk::metrics::duration("lookup_duration", elapsed_duration);
-
-// Canonical schema helpers (only valid for mutable fields)
-sdk::helpers::nullify_column(&batch, "scope_attributes")?;
-sdk::helpers::filter_batch(&batch, &boolean_mask)?;
-sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")?;
 
 // Environment access
 let env = std::env::var("APP_ENV").unwrap_or_else(|_| "unknown".to_string());
@@ -322,12 +336,12 @@ rejuvenate_threshold = "16MiB"       # Soft memory limit for instant page reclam
 rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
 init_timeout = "2s"                  # Maximum duration for datalake_init
 
-# Failure Policy (Unified Enum: "drop" | "reroute" | "passthrough")
+# Symmetric Routing Policies ("reroute" | "drop" | "passthrough")
 on_error = "reroute"                 # "reroute" requires a sink subscribed to <id>._reroute_errored
 allow_unmasked_passthrough = false   # Required only if on_error = "passthrough"
 
-# Audit Rejection Routing (TransformResult::Reject)
-reroute_on_reject = true             # Routes TransformResult::Reject to <id>._reroute_aborted
+on_reject = "reroute"                # "reroute" requires a sink subscribed to <id>._reroute_rejected
+                                     # "drop" silently discards rejects with metrics increment
 
 # Schema Guard Mode: "defensive" (backfill typed nulls) or "strict" (fail on missing columns)
 schema_guard = "defensive"
@@ -370,19 +384,25 @@ mask_credit_cards = true
    - Increments `component_discarded_rows_total{component_id="...", reason="discard"}`.
 2. **`TransformResult::Reject { reason }` (Audit Policy Drop)**:
    - Telemetry dropped due to business validation failure or security rule.
-   - If `reroute_on_reject = true`, the original batch is routed to `<component_id>._reroute_aborted`.
-   - The topology builder requires a sink subscribed to `inputs = ["<component_id>._reroute_aborted"]`.
+   - If `on_reject = "reroute"`, the original batch is routed to `<component_id>._reroute_rejected`.
+   - The topology builder requires a sink subscribed to `inputs = ["<component_id>._reroute_rejected"]`.
+   - If `on_reject = "drop"`, the batch is discarded from memory.
    - Increments `component_discarded_rows_total{component_id="...", reason="reject"}`.
 
-### 5.4 Core Telemetry Immutability & Schema Guard
+### 5.4 Core Telemetry Immutability & O(1) Schema Guard
 
 #### 5.4.1 Mandatory Immutable Core Fields
-The OpenTelemetry data model relies on immutable trace and metric identities. The host enforces that these fields cannot be dropped or nullified:
+The OpenTelemetry data model relies on immutable trace and metric identities:
 * **Traces**: `trace_id`, `span_id`.
 * **Logs**: `timestamp` (or `observed_timestamp`).
 * **Metrics**: Metric `name`, metric `type`.
 
-If an outgoing batch drops an immutable column or contains all-null values for an immutable column where the input had valid IDs, the host rejects the batch with `WasmTransformError::ImmutableFieldViolation { column }` and triggers the configured `on_error` policy.
+**O(1) Hot-Path Immutability Check**:
+To verify an immutable column has not been stripped or completely nullified, the host avoids walking bitmaps and evaluates:
+```rust
+let is_all_null = col.null_count() == col.len() && col.len() > 0;
+```
+Because Arrow arrays store `null_count` as cached metadata in `ArrayData`, this operation is strictly **$O(1)$ arithmetic**. If an immutable column is missing or `is_all_null` is true while the input batch had valid non-null entries, the host immediately rejects the batch with `WasmTransformError::ImmutableFieldViolation { column }` and triggers `on_error` handling.
 
 #### 5.4.2 Schema Guard (Defensive vs. Strict)
 For mutable fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`):
@@ -508,6 +528,7 @@ Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
    - Validates memory limits and initialization behavior.
 2. **`datalake-wasm test <path.wasm> [--signal logs|metrics|traces] [--input sample.ipc] [--env KEY=VAL]`**:
    - Executes module against synthetic or user-provided Arrow IPC streams.
+   - **Immutability Conformance Suite**: Verifies that known non-null immutable columns (`trace_id`, `timestamp`, metric `name`) remain intact and unmuted. Emits explicit failure if illegal mutation occurred.
    - Injects test environment variables into guest WASI context.
    - Enables DWARF debug info for full guest stack traces on panics.
    - Verifies handling of 0-row batches, Discard, Reject, and canonical schema invariance.
