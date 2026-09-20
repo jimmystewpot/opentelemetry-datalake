@@ -7,3 +7,4 @@ pub mod engine;
 pub mod error;
 pub mod pool;
 pub mod wasi_env;
+pub mod worker;

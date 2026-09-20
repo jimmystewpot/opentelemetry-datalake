@@ -1,0 +1,468 @@
+//! Host worker execution loop for WebAssembly transformation modules.
+//!
+//! Provides the [`WasmWorker`] execution engine which manages an isolated Wasmtime
+//! instance, serializes Arrow batches to Arrow IPC streams, invokes guest transforms
+//! over the C-ABI v1 boundary, and enforces soft rejuvenation hygiene.
+
+use crate::engine::EngineCache;
+use crate::error::WasmTransformError;
+use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use pipeline_core::config::WasmTransformerConfig;
+use pipeline_core::pipeline::SignalBatch;
+use std::sync::Arc;
+use wasmtime::{Instance, Memory, Module, Store, TypedFunc};
+
+/// The outcome of processing a batch of telemetry records through the WASM worker.
+#[derive(Debug)]
+pub enum WorkerOutcome {
+    /// Processing succeeded and produced transformed batches (or passed through).
+    Emitted(Vec<SignalBatch>),
+    /// Guest transformer explicitly discarded the batch.
+    Discarded,
+    /// Guest transformer rejected the batch with a specified reason.
+    Rejected {
+        /// Reason explaining why the batch was rejected.
+        reason: String,
+        /// Original input batch retained for DLQ routing.
+        original: SignalBatch,
+    },
+    /// Guest execution failed or returned an error status code.
+    Errored {
+        /// Reason explaining the execution error.
+        reason: String,
+        /// Original input batch retained for DLQ routing.
+        original: SignalBatch,
+    },
+}
+
+/// Internal container for guest Wasmtime execution state and exported entry points.
+struct GuestComponents {
+    store: Store<()>,
+    instance: Instance,
+    alloc_fn: TypedFunc<u32, u32>,
+    dealloc_fn: TypedFunc<(u32, u32), ()>,
+    transform_fn: TypedFunc<(u32, u32), u32>,
+    memory: Memory,
+}
+
+/// Decoded response header fields from `TransformResponseHeader` in guest memory.
+struct ParsedHeader {
+    status: u32,
+    batch_count: u32,
+    batches_ptr: u32,
+    message_ptr: u32,
+    message_len: u32,
+}
+
+/// WebAssembly transformation worker executing Whole-Batch transformations.
+///
+/// Encapsulates a Wasmtime [`Store`], [`Instance`], exported C-ABI v1 entry points,
+/// and instance-local memory. Automatically rejuvenates the guest instance upon
+/// reaching configured batch count or memory limits.
+pub struct WasmWorker {
+    /// Worker identifier within the worker pool.
+    pub id: usize,
+    engine: Arc<EngineCache>,
+    module: Arc<Module>,
+    config: WasmTransformerConfig,
+    store: Store<()>,
+    instance: Instance,
+    alloc_fn: TypedFunc<u32, u32>,
+    dealloc_fn: TypedFunc<(u32, u32), ()>,
+    transform_fn: TypedFunc<(u32, u32), u32>,
+    memory: Memory,
+    batches_processed: u64,
+    local_generation: u64,
+}
+
+impl WasmWorker {
+    /// Creates a new `WasmWorker` with its own isolated Wasmtime store and instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if instance creation fails or required
+    /// C-ABI v1 exports (`datalake_alloc`, `datalake_dealloc`, `datalake_transform`,
+    /// `memory`) are missing.
+    pub fn new(
+        id: usize,
+        engine: Arc<EngineCache>,
+        module: Arc<Module>,
+        config: WasmTransformerConfig,
+    ) -> Result<Self, WasmTransformError> {
+        let guest = Self::instantiate_guest(engine.engine(), &module)?;
+        let local_generation = engine.module_generation();
+
+        Ok(Self {
+            id,
+            engine,
+            module,
+            config,
+            store: guest.store,
+            instance: guest.instance,
+            alloc_fn: guest.alloc_fn,
+            dealloc_fn: guest.dealloc_fn,
+            transform_fn: guest.transform_fn,
+            memory: guest.memory,
+            batches_processed: 0,
+            local_generation,
+        })
+    }
+
+    /// Executes a transformation over a [`SignalBatch`].
+    ///
+    /// The incoming batch is serialized into an Arrow IPC stream, transferred into guest
+    /// memory, and processed by calling `datalake_transform`. The returned response header
+    /// is decoded to produce the corresponding [`WorkerOutcome`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if IPC serialization fails, guest execution traps,
+    /// or guest memory bounds are violated.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    pub async fn execute_batch(
+        &mut self,
+        batch: SignalBatch,
+    ) -> Result<WorkerOutcome, WasmTransformError> {
+        self.check_hot_reload()?;
+
+        let record_batch = match &batch {
+            SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
+        };
+
+        // 1. Serialize input RecordBatch to Arrow IPC Stream
+        let ipc_buf = serialize_batch_to_ipc(record_batch)?;
+        let ipc_len = u32::try_from(ipc_buf.len()).map_err(|_| {
+            WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string())
+        })?;
+
+        // 2. Allocate buffer in guest linear memory and copy payload
+        let ipc_ptr = self.alloc_fn.call(&mut self.store, ipc_len)?;
+        self.memory
+            .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
+            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+
+        // 3. Invoke datalake_transform and free input buffer
+        let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        let header_ptr = transform_res?;
+
+        // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
+        let header = self.read_response_header(header_ptr)?;
+        let message = read_guest_message(
+            &self.memory,
+            &self.store,
+            header.message_ptr,
+            header.message_len,
+        );
+
+        self.batches_processed = self.batches_processed.saturating_add(1);
+        self.check_rejuvenation()?;
+
+        // 5. Dispatch based on response status
+        self.dispatch_outcome(&header, &message, batch)
+    }
+
+    /// Rejuvenates the worker by discarding its store and creating a fresh instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
+    pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
+        let guest = Self::instantiate_guest(self.engine.engine(), &self.module)?;
+        self.store = guest.store;
+        self.instance = guest.instance;
+        self.alloc_fn = guest.alloc_fn;
+        self.dealloc_fn = guest.dealloc_fn;
+        self.transform_fn = guest.transform_fn;
+        self.memory = guest.memory;
+        self.batches_processed = 0;
+        Ok(())
+    }
+
+    /// Returns the number of batches processed by this instance since its last rejuvenation.
+    #[must_use]
+    pub fn batches_processed(&self) -> u64 {
+        self.batches_processed
+    }
+
+    /// Returns the local module generation counter observed by this worker.
+    #[must_use]
+    pub fn local_generation(&self) -> u64 {
+        self.local_generation
+    }
+
+    /// Returns a reference to the active Wasmtime [`Instance`].
+    #[must_use]
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    /// Returns a reference to the underlying [`Module`].
+    #[must_use]
+    pub fn module(&self) -> &Arc<Module> {
+        &self.module
+    }
+
+    /// Returns a reference to the [`WasmTransformerConfig`].
+    #[must_use]
+    pub fn config(&self) -> &WasmTransformerConfig {
+        &self.config
+    }
+
+    /// Checks if the engine cache has compiled a newer module generation and reloads.
+    fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
+        if self.local_generation != self.engine.module_generation()
+            && let Some(new_mod) = self.engine.module()
+        {
+            self.module = new_mod;
+            self.rejuvenate()?;
+            self.local_generation = self.engine.module_generation();
+        }
+        Ok(())
+    }
+
+    /// Reads and parses the 20-byte `TransformResponseHeader` from guest memory.
+    fn read_response_header(&self, header_ptr: u32) -> Result<ParsedHeader, WasmTransformError> {
+        let mut header_bytes = [0u8; 20];
+        self.memory
+            .read(&self.store, header_ptr as usize, &mut header_bytes)
+            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+
+        let status = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        let batch_count = u32::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+        ]);
+        let batches_ptr = u32::from_le_bytes([
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let message_ptr = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let message_len = u32::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+        ]);
+
+        Ok(ParsedHeader {
+            status,
+            batch_count,
+            batches_ptr,
+            message_ptr,
+            message_len,
+        })
+    }
+
+    /// Rejuvenates the guest instance if batch count or memory limits are exceeded.
+    fn check_rejuvenation(&mut self) -> Result<(), WasmTransformError> {
+        let memory_exceeded =
+            parse_byte_size(&self.config.rejuvenate_threshold).is_some_and(|threshold| {
+                threshold > 0 && self.memory.data_size(&self.store) >= threshold
+            });
+
+        if (self.config.rejuvenate_batches > 0
+            && self.batches_processed >= self.config.rejuvenate_batches)
+            || memory_exceeded
+        {
+            self.rejuvenate()?;
+        }
+        Ok(())
+    }
+
+    /// Dispatches the response status code into a [`WorkerOutcome`].
+    fn dispatch_outcome(
+        &self,
+        header: &ParsedHeader,
+        message: &str,
+        batch: SignalBatch,
+    ) -> Result<WorkerOutcome, WasmTransformError> {
+        match header.status {
+            0 => {
+                if header.batch_count == 0 || header.batches_ptr == 0 {
+                    Ok(WorkerOutcome::Emitted(vec![batch]))
+                } else {
+                    let out_batches = extract_output_batches(
+                        &self.memory,
+                        &self.store,
+                        header.batches_ptr,
+                        header.batch_count,
+                        &batch,
+                    )?;
+                    Ok(WorkerOutcome::Emitted(out_batches))
+                }
+            }
+            1 => Ok(WorkerOutcome::Discarded),
+            2 => {
+                let reason = if message.is_empty() {
+                    "Guest rejected batch".to_string()
+                } else {
+                    message.to_string()
+                };
+                Ok(WorkerOutcome::Rejected {
+                    reason,
+                    original: batch,
+                })
+            }
+            _ => {
+                let reason = if message.is_empty() {
+                    format!("Guest returned error status {}", header.status)
+                } else {
+                    message.to_string()
+                };
+                Ok(WorkerOutcome::Errored {
+                    reason,
+                    original: batch,
+                })
+            }
+        }
+    }
+
+    /// Helper to instantiate a guest module and extract required ABI exports.
+    fn instantiate_guest(
+        engine: &wasmtime::Engine,
+        module: &Module,
+    ) -> Result<GuestComponents, WasmTransformError> {
+        let mut store = Store::new(engine, ());
+        let instance = Instance::new(&mut store, module, &[])?;
+
+        let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
+        let dealloc_fn =
+            instance.get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")?;
+        let transform_fn =
+            instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| WasmTransformError::MissingExport("memory".into()))?;
+
+        Ok(GuestComponents {
+            store,
+            instance,
+            alloc_fn,
+            dealloc_fn,
+            transform_fn,
+            memory,
+        })
+    }
+}
+
+/// Serializes an Arrow [`RecordBatch`] to an Arrow IPC stream buffer.
+fn serialize_batch_to_ipc(record_batch: &RecordBatch) -> Result<Vec<u8>, WasmTransformError> {
+    let mut ipc_buf = Vec::with_capacity(64 * 1024);
+    let mut writer = StreamWriter::try_new(&mut ipc_buf, &record_batch.schema())
+        .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+    writer
+        .write(record_batch)
+        .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+    writer
+        .finish()
+        .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+    Ok(ipc_buf)
+}
+
+/// Reads an optional UTF-8 message string from guest memory.
+fn read_guest_message(
+    memory: &Memory,
+    store: &Store<()>,
+    message_ptr: u32,
+    message_len: u32,
+) -> String {
+    if message_len > 0 && message_ptr > 0 {
+        let mut msg_bytes = vec![0u8; message_len as usize];
+        if memory
+            .read(store, message_ptr as usize, &mut msg_bytes)
+            .is_ok()
+        {
+            String::from_utf8_lossy(&msg_bytes).into_owned()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// Extracts transformed output batches from guest memory via a `BatchDescriptor` array.
+fn extract_output_batches(
+    memory: &Memory,
+    store: &Store<()>,
+    batches_ptr: u32,
+    batch_count: u32,
+    input_batch: &SignalBatch,
+) -> Result<Vec<SignalBatch>, WasmTransformError> {
+    let descriptor_size = 8usize;
+    let mut out_batches = Vec::with_capacity(batch_count as usize);
+
+    for i in 0..batch_count {
+        let offset = (batches_ptr as usize).saturating_add(i as usize * descriptor_size);
+        let mut desc_bytes = [0u8; 8];
+        memory
+            .read(store, offset, &mut desc_bytes)
+            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+        let b_ptr =
+            u32::from_le_bytes([desc_bytes[0], desc_bytes[1], desc_bytes[2], desc_bytes[3]]);
+        let b_len =
+            u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
+
+        let mut out_ipc_bytes = vec![0u8; b_len as usize];
+        memory
+            .read(store, b_ptr as usize, &mut out_ipc_bytes)
+            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+
+        let cursor = std::io::Cursor::new(out_ipc_bytes);
+        let reader = StreamReader::try_new(cursor, None)
+            .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+        for maybe_rb in reader {
+            let rb = maybe_rb.map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+            let signal = match input_batch {
+                SignalBatch::Logs(_) => SignalBatch::Logs(rb),
+                SignalBatch::Metrics(_) => SignalBatch::Metrics(rb),
+                SignalBatch::Traces(_) => SignalBatch::Traces(rb),
+            };
+            out_batches.push(signal);
+        }
+    }
+
+    Ok(out_batches)
+}
+
+/// Parses a byte size string with standard unit suffixes into a byte count.
+fn parse_byte_size(s: &str) -> Option<usize> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("GiB") {
+        num.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024 * 1024))
+    } else if let Some(num) = trimmed.strip_suffix("MiB") {
+        num.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024))
+    } else if let Some(num) = trimmed.strip_suffix("KiB") {
+        num.trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024))
+    } else if let Some(num) = trimmed.strip_suffix('B') {
+        num.trim().parse::<usize>().ok()
+    } else {
+        trimmed.parse::<usize>().ok()
+    }
+}
