@@ -504,7 +504,7 @@ fn extract_output_batches(
 }
 
 /// Parses a byte size string with standard unit suffixes into a byte count.
-fn parse_byte_size(s: &str) -> Option<usize> {
+pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
     let trimmed = s.trim();
     if let Some(num) = trimmed.strip_suffix("GiB") {
         num.trim()

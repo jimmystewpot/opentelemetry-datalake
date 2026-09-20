@@ -19,6 +19,8 @@ struct AppConfig {
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
     starrocks: Option<starrocks_sink::StarRocksSinkConfig>,
     elasticsearch: Option<elasticsearch_sink::ElasticsearchSinkConfig>,
+    #[serde(default)]
+    pub wasm_transformer: Option<pipeline_core::config::WasmTransformerConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -199,10 +201,41 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     );
 
-    // Create Noop Transformers
-    let mut logs_transformer = noop_transformer::NoopTransformer::new();
-    let mut traces_transformer = noop_transformer::NoopTransformer::new();
-    let mut metrics_transformer = noop_transformer::NoopTransformer::new();
+    // Create Transformers (WASM if configured, otherwise Noop)
+    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
+        Box<dyn Transform>,
+        Box<dyn Transform>,
+        Box<dyn Transform>,
+    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
+        tracing::info!(
+            transformer_id = %wasm_cfg.id,
+            module_path = %wasm_cfg.module_path,
+            "Initializing 3x signal-isolated WasmTransformer instances"
+        );
+        (
+            Box::new(wasm_transformer::WasmTransformer::new(
+                wasm_cfg.clone(),
+                None,
+                None,
+            )?),
+            Box::new(wasm_transformer::WasmTransformer::new(
+                wasm_cfg.clone(),
+                None,
+                None,
+            )?),
+            Box::new(wasm_transformer::WasmTransformer::new(
+                wasm_cfg.clone(),
+                None,
+                None,
+            )?),
+        )
+    } else {
+        (
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+        )
+    };
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
@@ -706,5 +739,60 @@ mod tests {
             err.to_string()
                 .contains("at least one endpoint must be configured")
         );
+    }
+
+    #[test]
+    fn test_app_config_deserializes_wasm_transformer() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [wasm_transformer]
+        id = "audit_pipeline"
+        type = "wasm"
+        module_path = "transforms/audit.wasm"
+        on_error = "passthrough"
+        on_reject = "drop"
+        concurrency = 8
+        worker_channel_capacity = 2
+        max_memory = "128MiB"
+        rejuvenate_threshold = "32MiB"
+        rejuvenate_batches = 50000
+        init_timeout = "5s"
+        allow_unmasked_passthrough = true
+        schema_guard = "strict"
+        env_whitelist = ["REGION", "ENV"]
+        enable_sighup = true
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize with wasm_transformer");
+
+        assert!(config.wasm_transformer.is_some());
+        let wasm = config.wasm_transformer.unwrap();
+        assert_eq!(wasm.id, "audit_pipeline");
+        assert_eq!(wasm.r#type, "wasm");
+        assert_eq!(wasm.module_path, "transforms/audit.wasm");
+        assert_eq!(
+            wasm.on_error,
+            pipeline_core::config::OnErrorPolicy::Passthrough
+        );
+        assert_eq!(wasm.on_reject, pipeline_core::config::OnRejectPolicy::Drop);
+        assert_eq!(wasm.concurrency, 8);
+        assert_eq!(wasm.worker_channel_capacity, 2);
+        assert_eq!(wasm.max_memory, "128MiB");
+        assert_eq!(wasm.rejuvenate_threshold, "32MiB");
+        assert_eq!(wasm.rejuvenate_batches, 50000);
+        assert_eq!(wasm.init_timeout, "5s");
+        assert!(wasm.allow_unmasked_passthrough);
+        assert_eq!(
+            wasm.schema_guard,
+            pipeline_core::config::SchemaGuardMode::Strict
+        );
+        assert_eq!(wasm.env_whitelist, vec!["REGION", "ENV"]);
+        assert!(wasm.enable_sighup);
     }
 }

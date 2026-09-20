@@ -34,6 +34,7 @@ authors = ["James Lamb"]
 pipeline-core = { workspace = true }
 otlp-receiver = { workspace = true }
 noop-transformer = { workspace = true }
+wasm-transformer = { workspace = true }
 kafka-sink = { workspace = true }
 storage = { workspace = true, features = ["aws"] }
 starrocks-sink = { workspace = true }
@@ -52,6 +53,9 @@ aws = ["elasticsearch-sink/aws"]
 
 [dev-dependencies]
 arrow = { workspace = true }
+wat = "1.220"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [workspace.dependencies]
 # Internal Workspace Crates
@@ -59,6 +63,7 @@ pipeline-core = { path = "crates/core", version = "0.1.0" }
 arrow-codec = { path = "crates/arrow-codec", version = "0.1.0" }
 otlp-receiver = { path = "crates/otlp-receiver", version = "0.1.0" }
 noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
+wasm-transformer = { path = "crates/wasm-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0", default-features = false }
 starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
@@ -102,7 +107,7 @@ dashmap = { version = "6.0", default-features = false }
 
 # Cryptography (SHA-256 module integrity)
 sha2 = { version = "0.10", default-features = false }
-hex = { version = "0.4", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Codec & OTLP Parsing
 prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }

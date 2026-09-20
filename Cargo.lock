@@ -3831,16 +3831,20 @@ dependencies = [
  "clap",
  "elasticsearch-sink",
  "figment",
+ "hex",
  "kafka-sink",
  "noop-transformer",
  "otlp-receiver",
  "pipeline-core",
  "serde",
+ "sha2 0.10.9",
  "starrocks-sink",
  "storage",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasm-transformer",
+ "wat",
 ]
 
 [[package]]
