@@ -28,6 +28,156 @@ impl PipelineConfig {
     }
 }
 
+/// Routing policy when a WebAssembly transformation fails or encounters an unhandled error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnErrorPolicy {
+    /// Reroute the erroneous batch to the Dead Letter Queue (DLQ).
+    Reroute,
+    /// Silently drop the erroneous batch.
+    Drop,
+    /// Forward the original input batch untransformed.
+    Passthrough,
+}
+
+// Explicit impl prevents variant-reordering fragility
+#[allow(clippy::derivable_impls)]
+impl Default for OnErrorPolicy {
+    fn default() -> Self {
+        Self::Reroute
+    }
+}
+
+/// Routing policy when a WebAssembly transformation explicitly rejects a record or batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRejectPolicy {
+    /// Reroute the rejected batch to the Dead Letter Queue (DLQ).
+    Reroute,
+    /// Silently drop the rejected batch.
+    Drop,
+}
+
+// Explicit impl prevents variant-reordering fragility
+#[allow(clippy::derivable_impls)]
+impl Default for OnRejectPolicy {
+    fn default() -> Self {
+        Self::Reroute
+    }
+}
+
+/// Enforcement mode for Arrow schema changes produced by WebAssembly transforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaGuardMode {
+    /// Allow backward-compatible schema mutations (e.g. adding nullable columns).
+    #[default]
+    Defensive,
+    /// Forbid any schema deviations from the original incoming Arrow schema.
+    Strict,
+}
+
+fn default_max_execution_duration() -> String {
+    "500ms".into()
+}
+
+fn default_drain_timeout() -> String {
+    "10s".into()
+}
+
+const fn default_max_batch_rows() -> usize {
+    5000
+}
+
+const fn default_concurrency() -> usize {
+    4
+}
+
+const fn default_worker_channel_capacity() -> usize {
+    1
+}
+
+fn default_max_memory() -> String {
+    "64MiB".into()
+}
+
+fn default_rejuvenate_threshold() -> String {
+    "16MiB".into()
+}
+
+const fn default_rejuvenate_batches() -> u64 {
+    10_000
+}
+
+fn default_init_timeout() -> String {
+    "2s".into()
+}
+
+/// Configuration for a WebAssembly (WASM) transformer runtime and isolation sandbox.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct WasmTransformerConfig {
+    /// Unique identifier for this transformer instance.
+    pub id: String,
+    /// Component type (must be "wasm").
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Path to the compiled `.wasm` module.
+    pub module_path: String,
+    /// Optional expected SHA-256 hash of the `.wasm` binary for integrity verification.
+    pub sha256: Option<String>,
+    /// Maximum execution duration per transform invocation before timing out.
+    #[serde(default = "default_max_execution_duration")]
+    pub max_execution_duration: String,
+    /// Maximum duration to allow in-flight batches to drain during graceful shutdown.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout: String,
+    /// Maximum number of rows to process in a single batch.
+    #[serde(default = "default_max_batch_rows")]
+    pub max_batch_rows: usize,
+    /// Number of concurrent worker instances.
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    /// Capacity of bounded worker input channels.
+    #[serde(default = "default_worker_channel_capacity")]
+    pub worker_channel_capacity: usize,
+    /// Maximum linear memory allocation allowed per worker instance.
+    #[serde(default = "default_max_memory")]
+    pub max_memory: String,
+    /// Memory threshold triggering worker rejuvenation (clean restart).
+    #[serde(default = "default_rejuvenate_threshold")]
+    pub rejuvenate_threshold: String,
+    /// Number of batches processed after which worker rejuvenation is triggered.
+    #[serde(default = "default_rejuvenate_batches")]
+    pub rejuvenate_batches: u64,
+    /// Timeout duration for worker instance initialization and compilation.
+    #[serde(default = "default_init_timeout")]
+    pub init_timeout: String,
+    /// Policy governing behavior on execution failure or guest panic.
+    #[serde(default)]
+    pub on_error: OnErrorPolicy,
+    /// Whether unmasked input batches are allowed through when passthrough is enabled.
+    #[serde(default)]
+    pub allow_unmasked_passthrough: bool,
+    /// Policy governing behavior on explicit record rejection.
+    #[serde(default)]
+    pub on_reject: OnRejectPolicy,
+    /// Schema validation and enforcement mode.
+    #[serde(default)]
+    pub schema_guard: SchemaGuardMode,
+    /// Whitelist of host environment variable names forwarded to guest instances.
+    #[serde(default)]
+    pub env_whitelist: Vec<String>,
+    /// Static key-value environment variables injected into guest instances.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Arbitrary guest configuration passed as JSON.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
+    /// Whether to reload the WASM module on receiving a SIGHUP signal.
+    #[serde(default)]
+    pub enable_sighup: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

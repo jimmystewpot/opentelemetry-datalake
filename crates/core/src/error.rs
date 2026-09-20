@@ -31,6 +31,10 @@ pub enum PipelineError {
     /// A downstream mpsc channel receiver was dropped.
     #[error("downstream channel closed")]
     DownstreamClosed,
+
+    /// A configured Dead Letter Queue (DLQ) topological sink was missing from the pipeline.
+    #[error("Topological DLQ sink missing: {0}")]
+    TopologicalSinkMissing(String),
 }
 
 #[cfg(test)]

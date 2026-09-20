@@ -3694,6 +3694,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
