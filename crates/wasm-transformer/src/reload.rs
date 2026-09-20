@@ -65,3 +65,35 @@ pub fn spawn_sighup_listener(
         None
     }
 }
+
+/// Request body for the WASM hot-reload REST endpoint.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WasmReloadRequest {
+    /// Filesystem path to the new WebAssembly module.
+    pub module_path: String,
+}
+
+/// Handler for the WASM hot-reload REST endpoint.
+///
+/// Extracts the JSON payload containing `module_path`, emits a security audit warning,
+/// and returns an acceptance response.
+pub async fn wasm_reload_handler(
+    axum::Json(payload): axum::Json<WasmReloadRequest>,
+) -> axum::Json<serde_json::Value> {
+    tracing::warn!(
+        path = %payload.module_path,
+        "SECURITY AUDIT: REST hot-reload endpoint invoked"
+    );
+    axum::Json(serde_json::json!({
+        "status": "reload accepted",
+        "path": payload.module_path,
+    }))
+}
+
+/// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.
+pub fn build_admin_router() -> axum::Router {
+    axum::Router::new().route(
+        "/api/v1/transforms/wasm/reload",
+        axum::routing::post(wasm_reload_handler),
+    )
+}

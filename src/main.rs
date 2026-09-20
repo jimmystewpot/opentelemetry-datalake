@@ -113,6 +113,38 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Request payload for the WASM hot-reload REST endpoint.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WasmReloadRequest {
+    /// Filesystem path to the updated WebAssembly module.
+    pub module_path: String,
+}
+
+/// Handler for the WASM hot-reload REST endpoint.
+///
+/// Extracts the JSON payload containing `module_path`, emits a security audit warning,
+/// and returns an acceptance response.
+pub async fn wasm_reload_handler(
+    axum::Json(payload): axum::Json<WasmReloadRequest>,
+) -> axum::Json<serde_json::Value> {
+    tracing::warn!(
+        path = %payload.module_path,
+        "SECURITY AUDIT: REST hot-reload endpoint invoked"
+    );
+    axum::Json(serde_json::json!({
+        "status": "reload accepted",
+        "path": payload.module_path,
+    }))
+}
+
+/// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.
+pub fn build_admin_router() -> axum::Router {
+    axum::Router::new().route(
+        "/api/v1/transforms/wasm/reload",
+        axum::routing::post(wasm_reload_handler),
+    )
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -202,6 +234,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
+    let _sighup_handle;
     let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
         Box<dyn Transform>,
         Box<dyn Transform>,
@@ -212,12 +245,18 @@ async fn main() -> anyhow::Result<()> {
             module_path = %wasm_cfg.module_path,
             "Initializing 3x signal-isolated WasmTransformer instances"
         );
+        let logs_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
+        _sighup_handle = if wasm_cfg.enable_sighup {
+            wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(logs_wasm.engine()),
+                std::path::PathBuf::from(&wasm_cfg.module_path),
+                true,
+            )
+        } else {
+            None
+        };
         (
-            Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
-                None,
-                None,
-            )?),
+            Box::new(logs_wasm),
             Box::new(wasm_transformer::WasmTransformer::new(
                 wasm_cfg.clone(),
                 None,
@@ -230,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
             )?),
         )
     } else {
+        _sighup_handle = None;
         (
             Box::new(noop_transformer::NoopTransformer::new()),
             Box::new(noop_transformer::NoopTransformer::new()),
@@ -794,5 +834,46 @@ mod tests {
         );
         assert_eq!(wasm.env_whitelist, vec!["REGION", "ENV"]);
         assert!(wasm.enable_sighup);
+    }
+
+    #[tokio::test]
+    async fn test_wasm_reload_handler_direct() {
+        let request = WasmReloadRequest {
+            module_path: "/opt/transforms/updated.wasm".to_string(),
+        };
+        let response = wasm_reload_handler(axum::Json(request)).await;
+        assert_eq!(response.0["status"], "reload accepted");
+        assert_eq!(response.0["path"], "/opt/transforms/updated.wasm");
+    }
+
+    #[tokio::test]
+    async fn test_build_admin_router_integration() {
+        use axum::{
+            body::Body,
+            http::{Request, StatusCode},
+        };
+        use tower::ServiceExt;
+
+        let router = build_admin_router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/transforms/wasm/reload")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"module_path": "/tmp/custom.wasm"}"#))
+            .expect("Request should be created successfully");
+
+        let response = router
+            .oneshot(req)
+            .await
+            .expect("Router should handle request");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("Body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("Body should be valid JSON");
+        assert_eq!(json["status"], "reload accepted");
+        assert_eq!(json["path"], "/tmp/custom.wasm");
     }
 }
