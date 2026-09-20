@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Worker Join/Drain, Least-Loaded Dispatch, Init-Phase Enforcement, Clean Header, and Signal Architecture)  
+**Status**: Final Approved Spec (Incorporating Worker Join/Drain, Least-Loaded Dispatch, Init-Phase Enforcement, Security Auditing, and Ops UX)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -24,8 +24,8 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 * **Symmetric Topological DLQ Policies (`on_error` & `on_reject`)**: Clean, uniform configuration surface:
   - `on_error = "reroute" | "drop" | "passthrough"` (routes failures to `<component_id>._reroute_errored`)
   - `on_reject = "reroute" | "drop"` (routes policy rejections to `<component_id>._reroute_rejected`)
-  The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams.
-* **Least-Loaded Dispatcher with Full Worker Join Synchronization**: A lightweight async dispatcher task reads from the single `input: PipelineReceiver` and dispatches batches to workers using non-blocking `try_send` across idle channels before falling back to round-robin backpressure. On completion/shutdown, `transform()` awaits all worker `JoinHandle`s to guarantee complete drain and capture worker panics.
+  The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams. If `on_error = "passthrough"` is configured, an explicit startup security audit warning is emitted to prevent accidental leakage of un-sanitized PII.
+* **Least-Loaded Dispatcher with Full Worker Join Synchronization**: A lightweight async dispatcher task reads from the single `input: PipelineReceiver` and dispatches batches to workers using non-blocking `try_send` across idle channels before falling back to round-robin backpressure. Configurable `worker_channel_capacity = 1` enforces strict single-batch queueing. On completion/shutdown, `transform()` awaits all worker `JoinHandle`s to guarantee complete drain and capture worker panics.
 * **Seamless `Transform` Trait Integration & Per-Signal Pipelines**: `WasmTransformer` implements the standard `pipeline_core::pipeline::Transform` trait for signal-isolated pipelines (`Logs`, `Metrics`, `Traces`). Secondary reroute channels (`_reroute_errored` and `_reroute_rejected`) are held as internal struct state injected at construction time.
 * **Full IEEE 754 `f64` Gauge Precision via Bitcast**: The controlled host metric ABI passes gauges as IEEE 754 64-bit float bit patterns (`f64::to_bits()` / `f64::from_bits()`), supporting fractional, positive, negative, and zero values. The host uses a concurrent read-optimized registry (`DashMap`) to avoid hot-path lock contention.
 * **Graceful Shutdown with Drain Guards**: On `SIGTERM` / `SIGINT`, upstream closes ingress, workers drain all queued batches in channel buffers, complete in-flight batches up to `max_execution_duration`, and exit cleanly. Secondary reroute sends use a bounded timeout (`shutdown_reroute_timeout = 2s`) to prevent stalled dead-letter sinks from blocking process termination.
@@ -36,11 +36,11 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 * **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
 * **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge` as `f64`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
 * **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transforms.env]` are exposed to the guest. Static config values always override host environment values.
-* **Deterministic Hot-Reload Generation Fencing**: A monotonic `module_generation` counter is verified by workers at every batch boundary. When a hot-reload occurs, workers finish their active batch, detect the generation mismatch, and immediately drain and reload their instance in $\approx 10\,\mu\text{s}$, eliminating zombie worker drift.
+* **Deterministic Hot-Reload Generation Fencing & Configurable Signals**: A monotonic `module_generation` counter is verified by workers at every batch boundary. Hot-reloading supports REST API triggering (`POST /api/v1/transforms/wasm/reload`) and opt-in signal triggering (`enable_sighup = false` default in containerized environments).
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
-* **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
-* **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
+* **Memory Safety via Wasmtime Pooling Allocator & OOM Telemetry**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat. Any guest OOM trap logs exact byte consumption versus limit to aid debugging.
+* **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading without dropping active gRPC/HTTP ingestion streams.
 
 ---
 
@@ -358,6 +358,7 @@ max_execution_duration = "500ms"
 drain_timeout = "10s"                # Maximum time to drain in-flight batches during graceful shutdown
 max_batch_rows = 5000                # Invariant boundary limit; reject if exceeded
 concurrency = 4                      # Number of worker tasks / pooling slots
+worker_channel_capacity = 1          # 1 = strict least-loaded dispatch; 2 = default buffering
 max_memory = "64MiB"                 # Virtual memory slot size (recommended: 64MiB)
 rejuvenate_threshold = "16MiB"       # Soft memory limit for instant page reclamation
 rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
@@ -389,6 +390,11 @@ TRANSFORM_VERSION = "1.2.0"
 [pipeline.transforms.config]
 environment = "production"
 redact_sensitive_fields = true
+
+# Hot reload signal configuration
+[pipeline.transforms.reload]
+enable_sighup = false                # Opt-in signal reload (default false in containerized environments)
+enable_api = true                    # REST API reload endpoint POST /api/v1/transforms/wasm/reload
 ```
 
 ### 5.2 Least-Loaded Dispatcher & Worker Join Synchronization
@@ -411,12 +417,13 @@ impl Transform for WasmTransformer {
         output: PipelineSender,
     ) -> Result<(), PipelineError> {
         let concurrency = self.config.concurrency;
+        let queue_cap = self.config.worker_channel_capacity;
         let mut worker_txs = Vec::with_capacity(concurrency);
         let mut worker_handles = Vec::with_capacity(concurrency);
 
         // 1. Spawn N independent worker tasks, tracking their JoinHandles
         for worker_id in 0..concurrency {
-            let (worker_tx, worker_rx) = mpsc::channel::<SignalBatch>(2);
+            let (worker_tx, worker_rx) = mpsc::channel::<SignalBatch>(queue_cap);
             worker_txs.push(worker_tx);
 
             let worker_output = output.clone();
@@ -477,13 +484,17 @@ impl Transform for WasmTransformer {
 }
 ```
 
-### 5.3 Failure Policies & Backpressure Semantics
+### 5.3 Failure Policies & Security Audit Semantics
 
 1. **`on_error = "reroute"` (Default Recommended)**:
    - When a batch execution fails (timeout, panic, trap, IPC decode error, or unhandled guest `Err`), the pristine original batch is routed to `<component_id>._reroute_errored`.
    - The topology builder asserts at startup that a sink is subscribed to `inputs = ["<component_id>._reroute_errored"]`. If missing, startup fails immediately.
 2. **`on_error = "passthrough"` (Fail-Open)**:
    - Requires `allow_unmasked_passthrough = true` in configuration.
+   - **Startup Security Warning**: The host verifies and logs an explicit security alert at initialization:
+     ```text
+     WARN wasm_host: Transform 'pii_scrubber' configured with on_error = 'passthrough'. Failed batches will bypass transformation and emit raw un-sanitized telemetry downstream [component_id="pii_scrubber"]
+     ```
    - When a transform fails, the worker **preserves the original batch in memory** and forwards it to the primary `output.send(batch).await`.
    - The worker **blocks under backpressure** until downstream sinks accept the batch. If downstream is stalled, backpressure propagates upstream to the OTLP receiver, which returns `503 Service Unavailable` to the caller. No data is dropped.
 3. **`on_error = "drop"` (Fail-Closed)**:
@@ -643,6 +654,9 @@ During rolling deployments or process termination (`SIGTERM` / `SIGINT`):
      }
      ```
    - Maximum lag before running new code is exactly 1 batch per worker. Zero zombie drift.
+4. **Trigger Mechanisms**:
+   - **REST API**: `POST /api/v1/transforms/wasm/reload` triggers module recompilation and atomic generation advance.
+   - **Signal**: If `enable_sighup = true` in config, receipt of `SIGHUP` triggers the same workflow.
 
 ---
 
@@ -668,6 +682,10 @@ During rolling deployments or process termination (`SIGTERM` / `SIGINT`):
   ```text
   ERROR wasm_guest: Guest panic in transforms/pii.rs:42: called `Option::unwrap()` on a `None` value [component_id="pii_scrubber", component_type="wasm", component_kind="transform", signal="logs", instance_id=2]
   ```
+* **OOM Diagnostic Logs**: When an instance traps due to memory allocation failure, host logs exact byte usage vs limit:
+  ```text
+  ERROR wasm_host: Instance 2 trapped with OOM during transform (memory usage: 67,108,864 bytes, max_memory limit: 64MiB) [component_id="pii_scrubber", instance_id=2]
+  ```
 
 ---
 
@@ -688,6 +706,12 @@ Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
    - Verifies handling of 0-row batches, Discard, Reject, and canonical schema invariance.
 3. **`datalake-wasm bench <path.wasm> [--rows 10000] [--concurrency 4]`**:
    - Measures batch transformation latency distribution (p50, p95, p99), throughput (rows/sec), and peak memory.
+   - Prints benchmark result with clear disclaimer distinguishing in-memory boundary latency from end-to-end network pipeline throughput:
+     ```text
+     [BENCHMARK RESULT]
+     WASM Execution Throughput: 485,200 rows/sec (p50: 0.8ms, p95: 1.4ms, p99: 2.1ms)
+     Note: Benchmark measures in-memory WASM boundary throughput. End-to-end pipeline throughput is governed by OTLP gRPC ingestion rates and downstream storage commit latencies.
+     ```
 
 ---
 
