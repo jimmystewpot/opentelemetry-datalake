@@ -68,9 +68,14 @@ pub extern "C" fn datalake_abi_version() -> u32 {
     ABI_VERSION
 }
 
+/// Allocates a linear memory buffer of `size` bytes in the WebAssembly instance.
+///
+/// Returns the 32-bit linear address of the allocated buffer.
 #[cfg(target_arch = "wasm32")]
+#[must_use]
 // SAFETY: Exporting allocator entry point with C linkage for host buffer provisioning.
 #[unsafe(no_mangle)]
+#[allow(clippy::cast_possible_truncation)]
 pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     let mut buf = Vec::<u8>::with_capacity(size as usize);
     let ptr = buf.as_mut_ptr();
@@ -78,6 +83,7 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     ptr as usize as u32
 }
 
+/// Deallocates a buffer previously allocated by `datalake_alloc`.
 #[cfg(target_arch = "wasm32")]
 // SAFETY: Exporting deallocator entry point with C linkage for host buffer reclamation.
 #[unsafe(no_mangle)]
@@ -96,6 +102,9 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
 static NATIVE_ALLOCS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<u8>>>> =
     std::sync::Mutex::new(None);
 
+/// Allocates a mock buffer entry in the host test allocator map.
+///
+/// Returns a unique non-zero 32-bit mock handle.
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 // SAFETY: Exporting test allocator symbol with C linkage.
@@ -113,6 +122,7 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     id
 }
 
+/// Deallocates a mock buffer entry previously allocated by `datalake_alloc`.
 #[cfg(not(target_arch = "wasm32"))]
 // SAFETY: Exporting test deallocator symbol with C linkage.
 #[unsafe(no_mangle)]
