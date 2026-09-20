@@ -6,6 +6,7 @@
 pub mod engine;
 pub mod error;
 pub mod guard;
+pub mod host_calls;
 pub mod pool;
 pub mod wasi_env;
 pub mod worker;
