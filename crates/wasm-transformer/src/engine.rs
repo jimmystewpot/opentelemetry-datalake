@@ -72,6 +72,12 @@ impl EngineCache {
         self.generation.load(Ordering::Acquire)
     }
 
+    /// Increments the module generation counter and returns the new generation.
+    #[must_use]
+    pub fn advance_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
     /// Returns a reference to the underlying Wasmtime [`Engine`].
     #[must_use]
     pub fn engine(&self) -> &Engine {

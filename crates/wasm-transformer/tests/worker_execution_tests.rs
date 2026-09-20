@@ -314,20 +314,22 @@ async fn test_worker_hot_reload_on_generation_advance() {
         .await
         .unwrap();
     assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.local_generation(), 0);
 
-    // Recompile with discard module and advance generation in cache
+    // Recompile with discard module (V2) and advance generation in cache
     let _module_v2 = cache
         .compile_module(&wat::parse_str(discard_wat()).unwrap())
         .unwrap();
-    // Advance generation counter
-    cache
-        .compile_module(&wat::parse_str(discard_wat()).unwrap())
-        .unwrap();
+    let new_gen = cache.advance_generation();
+    assert_eq!(new_gen, 1);
 
-    // Next batch should detect generation mismatch and hot-reload V2
-    // Note: compile_module in engine.rs does not automatically increment generation yet,
-    // but worker.rejuvenate() can also be called explicitly or generation can be tested.
-    assert_eq!(worker.local_generation(), 0);
+    // Batch 2 should detect generation mismatch, reload module V2, and discard the batch
+    let outcome2 = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Discarded));
+    assert_eq!(worker.local_generation(), 1);
 }
 
 // Echo WAT module with batch_count = 1: sets descriptor to input IPC buffer and emits it
