@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Revised Draft (Incorporating Principal Architect & Technical PM Review)  
+**Status**: Final Approved Spec (Incorporating Architectural Review & Brainstorming Refinements)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -13,20 +13,18 @@
 
 This specification defines the architecture, ABI, guest SDK, and verification tooling for executing WebAssembly (WASM) transformations on Apache Arrow `RecordBatch` payloads in `opentelemetry-datalake`.
 
-### Key Objectives
-* **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, drop columns, or split batches inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Explicit Drop/Abort with Fail-Closed Safety**: WASM transforms can deliberately abort or drop batches (e.g. invalid data, test traffic, compliance filters) with full observability into reasons and counts. By default, failures fail-closed to protect against data leakage.
-* **Deterministic Batch Ordering**: An async worker pool allows high-concurrency execution while a bounded sequence re-orderer preserves strict FIFO batch ordering for downstream ACID sinks.
-* **Strict Sandboxing & Resilience**: Guaranteed zero-panic host safety. Guest crashes, panics, memory exhaustion, or infinite loops are cleanly contained and recovered without crashing the host process.
-* **Intuitive Resource Limits**: Configurable wall-clock duration timeouts via epoch interruption and hard linear memory ceilings.
-* **Dual-Layer Testing & Conformity**: Fast native unit testing (`cargo test`) via an idiomatic Rust trait, paired with a WASM binary conformance harness and standalone CLI tool (`datalake-wasm validate|test|bench`).
-* **Versioned, Language-Agnostic ABI**: Standard C-ABI with explicit version handshakes and structured imports, exchanging standard Apache Arrow IPC byte streams.
+### Key Architectural Decisions
+* **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
+* **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls.
+* **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
+* **Pre-Transform Zero-Copy Batch Slicing**: Slices oversized batches natively using `RecordBatch::slice()` before entering the WASM sandbox, preserving dictionary arrays without copies and bounding memory usage.
+* **Canonical OpenTelemetry Schema Invariance**: Telemetry entering and exiting the transformer always adheres to the canonical OpenTelemetry Arrow schema for that signal type. Stripped fields are represented as nulls or empty structures. The host automatically backfills any missing canonical columns with typed null arrays, guaranteeing downstream sinks (Iceberg, StarRocks, Elasticsearch) never experience schema failure.
+* **Actionable Panic Diagnostics**: The SDK installs a standard WASM panic hook capturing source file, line, and message, emitted directly into host structured logs.
+* **Enterprise Governance & Hot-Reloading**: Optional SHA-256 checksum verification and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
 
 ---
 
 ## 2. Workspace Crate Architecture
-
-The system is decomposed into three focused crates to ensure clean separation of concerns and independent versioning:
 
 ```text
 opentelemetry-datalake/
@@ -35,13 +33,14 @@ opentelemetry-datalake/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
-│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, ordering)
-│   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache
-│   │       ├── instance.rs            # Store<HostState>, ResourceLimiter, memory bounds
-│   │       ├── worker.rs              # Concurrent worker tasks with sequence-tagged execution
-│   │       ├── reorder.rs             # Bounded re-sequencing buffer for FIFO batch ordering
-│   │       ├── host_calls.rs          # Versioned host imports (logging, metrics, capability probe)
-│   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, VersionMismatch)
+│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256)
+│   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>)
+│   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
+│   │       ├── splitter.rs            # Zero-copy pre-transform batch slicer (RecordBatch::slice)
+│   │       ├── schema_guard.rs        # Canonical OTel schema validation & null backfiller
+│   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
+│   │       ├── reload.rs              # Atomic zero-downtime hot-reloader
+│   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
 │   │
 │   ├── wasm-sdk/                      # Standalone, publishable guest SDK
 │   │   │                              # (opentelemetry-datalake-wasm-sdk)
@@ -50,8 +49,9 @@ opentelemetry-datalake/
 │   │       ├── lib.rs                 # Public prelude, BatchTransformer trait, TransformResult
 │   │       ├── abi.rs                 # Low-level FFI exports & memory protocol (with manual escape hatch)
 │   │       ├── ipc.rs                 # Arrow IPC stream reading & writing in guest
-│   │       ├── helpers.rs             # Column dropping, projection, filtering utilities
-│   │       ├── logger.rs              # Guest tracing/log forwarder using structured HostLogRecord
+│   │       ├── helpers.rs             # Column nullification, projection, filtering utilities
+│   │       ├── panic.rs               # Custom std::panic hook forwarding to datalake_host_log
+│   │       ├── logger.rs              # Guest tracing/log forwarder using HostLogRecord
 │   │       └── testing.rs             # Mock batch generators & WasmHarness test runner
 │   │
 │   ├── wasm-cli/                      # Developer CLI & validation tool
@@ -64,21 +64,18 @@ opentelemetry-datalake/
 
 ---
 
-## 3. Host ↔ Guest ABI Specification
+## 3. Host ↔ Guest ABI Specification (v1)
 
-The ABI contract is a versioned, low-overhead, C-compatible interface operating on WebAssembly linear memory (`wasm32`).
+The ABI contract is a versioned, low-overhead C-compatible interface operating across WebAssembly linear memory (`wasm32`).
 
 ### 3.1 ABI Versioning Handshake
-
-To prevent version skew between host runtimes and guest WASM blobs:
 
 1. **Mandatory Export**: Every conformant module must export:
    ```c
    uint32_t datalake_abi_version(void);
    ```
-   Modules conforming to this specification must return `1`. If the host loads a module whose `datalake_abi_version` does not match, module instantiation immediately halts with `WasmTransformError::AbiVersionMismatch`.
-
-2. **Namespaced Imports**: All host imports live under versioned namespaces (e.g. `datalake_host_v1`).
+   Modules conforming to this specification must return `1`. On load, the host validates this export; if missing or not equal to `1`, instantiation aborts with `WasmTransformError::AbiVersionMismatch`.
+2. **Namespaced Imports**: All host imports live under versioned namespaces (`datalake_host_v1`).
 
 ### 3.2 Exported Guest Functions (Required)
 
@@ -106,8 +103,6 @@ uint64_t datalake_transform(uint32_t signal_type, uint32_t ipc_ptr, uint32_t ipc
 
 ### 3.3 Response Header Format
 
-The packed `uint64_t` returned by `datalake_transform` points to a versioned response header in guest memory:
-
 ```rust
 #[repr(C)]
 pub struct TransformResponseHeader {
@@ -116,7 +111,7 @@ pub struct TransformResponseHeader {
 
     /// 0 = Success (emit batches)
     /// 1 = Abort/Drop (deliberately drop payload)
-    /// 2 = Error (execution failure)
+    /// 2 = Error (execution failure, panic, or unhandled error)
     pub status: u32,
 
     /// Number of emitted Arrow IPC batches (0..N)
@@ -138,8 +133,6 @@ pub struct BatchDescriptor {
 ```
 
 ### 3.4 Imported Host Functions (Module: `datalake_host_v1`)
-
-To avoid clumsy 8-parameter FFI signatures, log events pass a single pointer to a structured record:
 
 ```rust
 #[repr(C)]
@@ -167,26 +160,18 @@ void datalake_host_metric_inc(uint32_t name_ptr, uint32_t name_len, uint64_t val
 uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_len);
 ```
 
-### 3.5 Performance Envelope & Latency Overhead Budget
+### 3.5 Latency Overhead Budget
 
-Crossing the WASM boundary with Arrow IPC involves four distinct phases:
-1. Host serialization: `RecordBatch` $\to$ IPC stream buffer.
-2. Host $\to$ Guest `memcpy` into WASM linear memory.
-3. Guest deserialization: IPC stream buffer $\to$ guest `RecordBatch`.
-4. The reverse sequence for output batch emission.
-
-**Baseline Latency Budget**:
 - For a standard batch of 2,000 rows (~500 KB uncompressed IPC stream), the round-trip boundary overhead (excluding user business logic) must satisfy:
   - **$p95 \le 1.5\text{ms}$**
   - **$p99 \le 3.0\text{ms}$**
-- An automated benchmark (`benches/wasm_boundary_bench.rs`) compares `NoopTransformer` directly against a no-op WASM module to detect any serialization regressions in CI.
-- **Future Fast Path**: If pipeline throughput exceeds 50,000 rows/sec per core and profiling indicates IPC overhead is a primary bottleneck, the architecture reserves a feature flag (`zero-copy-c-abi`) to transition to Arrow C Data Interface pointer passing across shared memory pages.
+- Validated via automated CI benchmark: `benches/wasm_boundary_bench.rs`.
 
 ---
 
 ## 4. Guest SDK (`opentelemetry-datalake-wasm-sdk`)
 
-Designed for publication on `crates.io`, this crate allows users to author WASM transformers using safe, idiomatic Rust.
+Designed for publishability on `crates.io`, this crate provides idiomatic, safe abstractions for writing transforms.
 
 ### 4.1 Trait Definition
 
@@ -208,29 +193,24 @@ pub enum TransformResult {
 }
 
 impl TransformResult {
-    /// 1:1 transformation convenience helper.
     pub fn ok(batch: RecordBatch) -> Self {
         Self::Success(vec![batch])
     }
 
-    /// 1:N multi-batch convenience helper.
     pub fn ok_multiple(batches: Vec<RecordBatch>) -> Self {
         Self::Success(batches)
     }
 
-    /// Abort/drop convenience helper.
     pub fn drop_payload(reason: impl Into<String>) -> Self {
         Self::Drop { reason: Some(reason.into()) }
     }
 }
 
 pub trait BatchTransformer: Default + Send + Sync + 'static {
-    /// One-time initialization with raw configuration bytes.
     fn init(&mut self, _config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    /// Core transform entrypoint.
     fn transform(
         &mut self,
         signal: SignalType,
@@ -239,16 +219,19 @@ pub trait BatchTransformer: Default + Send + Sync + 'static {
 }
 ```
 
-### 4.2 Entry Point Registration & Manual Escape Hatch
+### 4.2 Entry Point Registration & Panic Hook
 
-#### Option A: Declarative Macro (Default)
-The SDK provides `export_transformer!(MyType)`, a `macro_rules!` macro with clear compiler diagnostics:
+The `export_transformer!(MyType)` macro generates the FFI exports and automatically installs a panic hook:
+
 ```rust
+// Automatically sets std::panic::set_hook to capture panic location & message,
+// routing it through datalake_host_log before returning status = 2.
 export_transformer!(MyCustomTransformer);
 ```
 
-#### Option B: Manual FFI Escape Hatch (No Magic)
-For advanced users needing bespoke initialization, static state, or fine-grained allocator control, the SDK exposes the low-level processing pipeline directly:
+### 4.3 Manual FFI Escape Hatch (No Macro Requirement)
+
+Advanced users can bypass macros and export standard C functions directly using SDK low-level primitives:
 ```rust
 #[no_mangle]
 pub extern "C" fn datalake_abi_version() -> u32 { 1 }
@@ -264,10 +247,7 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
 }
 
 #[no_mangle]
-pub extern "C" fn datalake_init(cfg_ptr: u32, cfg_len: u32) -> i32 {
-    // Custom manual initialization logic
-    0
-}
+pub extern "C" fn datalake_init(cfg_ptr: u32, cfg_len: u32) -> i32 { 0 }
 
 #[no_mangle]
 pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u32) -> u64 {
@@ -277,15 +257,12 @@ pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u3
 }
 ```
 
-### 4.3 Compiler Target & Build Guidance
-The SDK includes clear documentation and diagnostics for compiler targets:
-- Target: `wasm32-wasip1` (recommended) or `wasm32-unknown-unknown`.
-- Cargo build configuration (`.cargo/config.toml` template provided in SDK):
-  ```toml
-  [target.wasm32-wasip1]
-  runner = "datalake-wasm test"
-  ```
-- Clear compiler error messages if non-WASM compatible crates (e.g. `tokio`, `std::net`) are pulled in transitively.
+### 4.4 Canonical Schema Helpers
+
+The SDK provides zero-copy helpers for stripping data while maintaining canonical schema invariance:
+- `sdk::helpers::nullify_column(&batch, "scope_attributes")`
+- `sdk::helpers::filter_batch(&batch, &boolean_mask)`
+- `sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")`
 
 ---
 
@@ -298,10 +275,13 @@ The host transformer integrates into the pipeline via `pipeline_core::pipeline::
 ```toml
 [pipeline.transform.wasm]
 module_path = "transforms/enrichment.wasm"
+sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Optional integrity verification
 max_execution_duration = "500ms"
-max_memory = "256MiB"
-concurrency = 4
-ordered = true                       # Preserve strict FIFO arrival order downstream
+max_batch_rows = 5000                # Pre-transform batch slicer threshold
+concurrency = 4                      # Number of worker tasks / pooling slots
+max_memory = "128MiB"                # Hard virtual memory slot size
+rejuvenate_threshold = "32MiB"       # Soft memory limit for instant page reclamation
+rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
 on_error = "drop"                    # "drop", "quarantine", or "passthrough"
 allow_unmasked_passthrough = false   # Required if on_error = "passthrough"
 
@@ -311,66 +291,38 @@ environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Concurrency & Bounded FIFO Re-Sequencing
+### 5.2 Concurrency & Worker Model
 
-To guarantee maximum throughput while preserving batch sequence integrity for downstream ACID sinks:
+* **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender`. No inter-batch reorder buffer, no head-of-line blocking.
+* **Pre-Transform Batch Slicer**: If an incoming batch exceeds `max_batch_rows`, the host splits it into zero-copy slices via `batch.slice(offset, len)` before dispatching to WASM. Dictionary arrays are shared via `Arc` without copying.
 
-```text
-┌─────────────────┐      Tag: seq_id      ┌─────────────────────────┐
-│ PipelineReceiver│ ────────────────────► │ Worker Dispatcher       │
-└─────────────────┘                       └───────────┬─────────────┘
-                                                      │
-                       ┌──────────────────────────────┼──────────────────────────────┐
-                       ▼                              ▼                              ▼
-             ┌───────────────────┐          ┌───────────────────┐          ┌───────────────────┐
-             │ Worker 1 (Store)  │          │ Worker 2 (Store)  │          │ Worker N (Store)  │
-             └─────────┬─────────┘          └─────────┬─────────┘          └─────────┬─────────┘
-                       │                              │                              │
-                       └──────────────────────────────┼──────────────────────────────┘
-                                                      ▼
-                                          ┌─────────────────────────┐
-                                          │ Re-Sequencing Buffer    │ (Bounded Priority Queue)
-                                          │ Emits strictly in seq_id│
-                                          └───────────┬─────────────┘
-                                                      ▼
-                                          ┌─────────────────────────┐
-                                          │ PipelineSender (Sink)   │
-                                          └─────────────────────────┘
-```
+### 5.3 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
 
-1. **Dispatcher**: Incoming `SignalBatch`es are stamped with a monotonic `seq_id: u64`.
-2. **Worker Pool**: Workers process batches concurrently across independent `wasmtime::Store` instances.
-3. **Re-Sequencing Buffer (`ordered = true`)**:
-   - Completed batches enter a bounded priority queue indexed by `seq_id`.
-   - The buffer immediately flushes all contiguous completed sequence IDs downstream to `PipelineSender`.
-   - `ordering_window_size` (default: 128) prevents unbounded memory growth if a single batch stalls.
-4. **Unordered Mode (`ordered = false`)**: For telemetry sinks where order is irrelevant (e.g. Elasticsearch log streams), workers forward directly to `output` with zero buffering overhead.
+* **Pooling Instance Allocator**: Pre-allocates $N$ memory slots in virtual memory at startup (`PoolingAllocationConfig`).
+* **Microsecond Resets (`MADV_DONTNEED`)**: When an instance is refreshed, Wasmtime issues `MADV_DONTNEED` to reclaim physical RAM pages and zero the memory in $\approx 5\text{--}10\,\mu\text{s}$.
+* **Rejuvenation Triggers**:
+  1. *Soft Memory Cap*: If linear memory $> 32\text{MiB}$ after a batch, the `Store` is reset.
+  2. *Hygiene Trigger*: Every $10,000$ batches, the `Store` is reset.
+  3. *Trap Recovery*: If an instance traps, the contaminated `Store` is immediately discarded and replaced.
 
-### 5.3 Resource Bounds & Wall-Clock Interruption
+### 5.4 Canonical OTel Schema Invariance & Defense Guard
 
-* **Wall-Clock Interruption**: A background ticker advances the engine epoch every 10ms. Each batch invocation sets an epoch deadline calculated from `max_execution_duration`. When expired, the instance is immediately interrupted with `Trap::Interrupt`.
-* **Memory Limiter**: A `wasmtime::ResourceLimiter` implementation enforces `max_memory` (default: 256 MiB).
-* **Fault Isolation**: Traps return `Result::Err(WasmTransformError)`. The contaminated `Store` is discarded and cleanly rebuilt from the precompiled `Module`.
+* Telemetry entering and exiting the WASM boundary must conform to the canonical OpenTelemetry Arrow schema for that `SignalType`.
+* **Defensive Backfill**: If a guest module emits a batch omitting a canonical column (e.g. user completely dropped `scope_attributes`), `schema_guard` automatically backfills the missing column with a typed `NullArray` of length `num_rows()`. Downstream sinks (Iceberg, StarRocks, Elasticsearch) are 100% immune to schema corruption.
 
-### 5.4 Security Threat Model & Failure Policies (`on_error`)
+### 5.5 Failure Policies & Security Safeguard
 
-Transform failures (timeouts, traps, memory ceiling exceeded) represent critical decision points:
+* **`on_error = "drop"` (Default / Fail-Closed)**: Discards failed batches, incrementing `datalake_wasm_errors_total`.
+* **`on_error = "quarantine"`**: Routes failed batches to dead-letter storage.
+* **`on_error = "passthrough"` (Fail-Open)**: Forwards un-transformed raw batches. Requires `allow_unmasked_passthrough = true` in config; otherwise startup halts with a fatal security error.
 
-1. **`on_error = "drop"` (Default / Fail-Closed)**:
-   - Batch is discarded. Drop reason and error context are recorded in logs and metrics.
-   - Recommended for compliance, PII scrubbing, and security filtering.
+### 5.6 Zero-Downtime Hot-Reloading
 
-2. **`on_error = "quarantine"`**:
-   - Failed batches are routed to a dedicated dead-letter channel/quarantine table with error metadata attached.
-   - Prevents data loss without poisoning the primary production sink.
-
-3. **`on_error = "passthrough"` (Fail-Open / High-Availability)**:
-   - Forwards the raw, un-transformed batch downstream.
-   - **Mandatory Safety Check**: In configuration, `allow_unmasked_passthrough = true` must be explicitly specified. If missing, config validation aborts at startup with:
-     ```text
-     FATAL: on_error='passthrough' allows unmasked or non-compliant telemetry to reach storage sinks.
-     You must set allow_unmasked_passthrough=true to explicitly acknowledge this security risk.
-     ```
+1. Admin endpoint `POST /api/v1/transforms/wasm/reload` or `SIGHUP` triggers reload.
+2. Host reads file, verifies SHA-256 hash (if configured), and compiles the new `wasmtime::Module` in the background.
+3. Host atomically replaces `Arc<Module>`.
+4. In-flight worker batches finish on the old module. The next time a worker takes an instance from the pool, it instantiates from the new module.
+5. Ingestion gRPC/HTTP endpoints experience zero connection resets.
 
 ---
 
@@ -388,43 +340,31 @@ All metrics strictly adhere to `docs/instrumentation.md` naming conventions:
 | `datalake_wasm_errors_total` | Counter | `signal`, `error_type` (`timeout`, `oom`, `trap`, `ipc_decode`) | Total execution failures. |
 | `datalake_wasm_duration_seconds` | Histogram | `signal` | Execution latency per batch. |
 | `datalake_wasm_memory_bytes` | Gauge | `instance_id` | Current linear memory consumption per instance. |
-| `datalake_wasm_reorder_queue_depth` | Gauge | `signal` | Current queued batches waiting in re-sequencer. |
+| `datalake_wasm_rejuvenations_total` | Counter | `instance_id`, `reason` (`memory_threshold`, `batch_count`, `trap`) | Total instance pool resets. |
+| `datalake_wasm_module_info` | Gauge | `sha256`, `abi_version` | Active module audit information. |
 
 ### Logging
 
-* **Guest Log Forwarding**: Host intercepts `datalake_host_log` (`HostLogRecord`) and emits a `tracing::event!` with target `"wasm_guest"` including:
-  - `instance_id`: Worker instance identifier
-  - `signal`: Current signal being transformed
-  - `file`, `line`, `target`: Guest source code location
-* **Structured Abort Events**:
-  ```rust
-  tracing::info!(
-      signal = ?signal,
-      rows = batch.num_rows(),
-      reason = %reason,
-      "WASM transform aborted and dropped batch"
-  );
+* **Panic & Guest Log Forwarding**: Host intercepts `datalake_host_log` (`HostLogRecord`) and emits structured logs:
+  ```text
+  ERROR wasm_guest: Guest panic in transforms/pii.rs:42: called `Option::unwrap()` on a `None` value [instance_id=2, signal=Logs]
   ```
 
 ---
 
 ## 7. Conformity & Testing Tooling (`crates/wasm-cli`)
 
-A dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules prior to deployment.
-
-### Subcommands:
+Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
 
 1. **`datalake-wasm validate <path.wasm>`**:
    - Verifies `datalake_abi_version()` returns `1`.
-   - Inspects exports (`datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`).
-   - Rejects forbidden WASI imports (e.g. raw filesystem/socket calls).
+   - Checks exports (`datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`).
+   - Rejects forbidden WASI syscalls (raw sockets/files).
    - Validates memory limits and initialization behavior.
-
 2. **`datalake-wasm test <path.wasm> [--signal logs|metrics|traces] [--input sample.ipc]`**:
    - Executes module against synthetic or user-provided Arrow IPC streams.
-   - Verifies handling of 0-row batches, normal batches, and deliberate drops.
-   - Detects memory leaks inside guest memory across successive calls.
-
+   - Enables DWARF debug info for full guest stack traces on panics.
+   - Verifies handling of 0-row batches, drops, and canonical schema invariance.
 3. **`datalake-wasm bench <path.wasm> [--rows 10000] [--concurrency 4]`**:
    - Measures batch transformation latency distribution (p50, p95, p99), throughput (rows/sec), and peak memory.
 
@@ -432,6 +372,5 @@ A dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules prio
 
 ## 8. Language-Agnostic Evolution Path
 
-While Phase 1 targets Rust guests via `opentelemetry-datalake-wasm-sdk`, the architecture guarantees future multi-language compatibility:
-1. **Standardized C-ABI v1**: TinyGo, C/C++, and Zig can target the exact same FFI exports (`datalake_abi_version`, `datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`) and read/write standard Arrow IPC streams without host modifications.
+1. **Standardized C-ABI v1**: TinyGo, C/C++, and Zig can immediately produce conformant WASM blobs by implementing the 5 exported functions (`datalake_abi_version`, `datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`).
 2. **Component Model / WASI 0.2 WIT**: A future `.wit` interface definition (`datalake:transformer/transform@0.1.0`) can wrap this same engine, enabling WIT-based bindings without breaking the underlying Arrow IPC memory exchange.
