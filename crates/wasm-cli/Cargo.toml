@@ -1,0 +1,22 @@
+[package]
+name = "datalake-wasm-tool"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "datalake-wasm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+wasmtime = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
+
+[dev-dependencies]
+wat = "1.220"
