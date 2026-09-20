@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Architecture, Performance, Immutability, Symmetric DLQ, and Tooling Reviews)  
+**Status**: Final Approved Spec (Incorporating Trait Integration, Three-Tier Immutability, f64 Bitcast Gauge, and Graceful Shutdown)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,16 +15,22 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Core Telemetry Immutability**: Core OpenTelemetry identity fields (`trace_id`, `span_id` in traces; metric `name`, `type` in metrics; `timestamp` in logs) are strictly **immutable**. The host enforces this via an $O(1)$ check (`array.null_count() == array.len()`). Dropping or nullifying immutable fields triggers a schema invariant violation. The guest SDK also enforces this client-side to fail fast at the call site. Only auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`) can be nullified or redacted.
-* **Noise Discard vs. Audit Rejection**: Distinguishes intentional noise filtering/sampling (`TransformResult::Discard`, which drops silently without rerouting) from compliance/validation rejections (`TransformResult::Reject { reason }`, which routes to `<component_id>._reroute_rejected` if configured).
+* **Three-Tier Telemetry Immutability**: Core OpenTelemetry identity fields (`trace_id`, `span_id` in traces; metric `name`, `type` in metrics; `timestamp` in logs) are protected across three tiers:
+  1. *Host Runtime*: $O(1)$ structural integrity & non-nullity check (`col.null_count() == col.len()`).
+  2. *Guest SDK*: Call-site fail-fast via immutable column checks in helper methods.
+  3. *CLI Conformance*: Full value-level byte integrity assertions in `datalake-wasm test`.
+  Auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`) remain fully mutable and nullable.
+* **Noise Discard vs. Audit Rejection**: Distinguishes intentional noise filtering/sampling (`TransformResult::Discard`, which drops silently without rerouting) from compliance/validation rejections (`TransformResult::Reject { reason }`, which routes to `<component_id>._reroute_rejected` if configured). Guest unrecoverable code errors/traps set `Error` (status 3) and route to `<component_id>._reroute_errored`.
 * **Symmetric Topological DLQ Policies (`on_error` & `on_reject`)**: Clean, uniform configuration surface:
   - `on_error = "reroute" | "drop" | "passthrough"` (routes failures to `<component_id>._reroute_errored`)
   - `on_reject = "reroute" | "drop"` (routes policy rejections to `<component_id>._reroute_rejected`)
   The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams.
-* **Defined 0-Batch Success Semantics**: Emitting `TransformResult::Success(vec![])` is explicitly supported as a successful no-op/buffering outcome: incoming rows are recorded, 0 outgoing rows emitted, no dead-letter streams invoked, and schema guard is bypassed.
-* **Conformity & Immutability Tooling**: `datalake-wasm test` includes automatic immutability validation against synthetic batches, catching any illegal field modifications before production deployment.
+* **Seamless `Transform` Trait Integration**: `WasmTransformer` implements the standard `pipeline_core::pipeline::Transform` trait without modifying its single-output method signature. Secondary reroute channels (`_reroute_errored` and `_reroute_rejected`) are held as internal struct state injected at construction time.
+* **Full IEEE 754 `f64` Gauge Precision via Bitcast**: The controlled host metric ABI passes gauges as IEEE 754 64-bit float bit patterns (`f64::to_bits()` / `f64::from_bits()`), supporting fractional, positive, negative, and zero values with zero ABI overhead.
+* **Graceful Shutdown & Pipeline Drain**: On `SIGTERM` / `SIGINT`, upstream closes ingress, workers drain all queued batches in channel buffers, complete in-flight batches up to `max_execution_duration`, and exit cleanly, with a configurable `drain_timeout` ceiling to prevent hung processes during rolling deploys.
+* **Defined 0-Batch Success Semantics**: Emitting `TransformResult::Success(vec![])` (via `TransformResult::ok_empty()`) is explicitly supported as a successful no-op/buffering outcome: incoming rows are recorded, 0 outgoing rows emitted, no dead-letter streams invoked, and schema guard is bypassed.
 * **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
-* **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
+* **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge` as `f64`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
 * **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest. Static config values always override host environment values.
 * **Deterministic Hot-Reload Generation Fencing**: A monotonic `module_generation` counter is verified by workers at every batch boundary. When a hot-reload occurs, workers finish their active batch, detect the generation mismatch, and immediately drain and reload their instance in $\approx 10\,\mu\text{s}$, eliminating zombie worker drift.
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
@@ -40,14 +46,14 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 ```text
 opentelemetry-datalake/
 ├── crates/
-│   ├── wasm-transformer/             # Host runtime transformer
+│   ├── wasm-transformer/             # Host runtime transformer implementing Transform
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
+│   │       ├── lib.rs                 # WasmTransformer struct & Transform impl with internal reroute channels
 │   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error, on_reject)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
-│   │       ├── guard.rs               # Invariant validation, O(1) immutability checks & schema defense
+│   │       ├── guard.rs               # Invariant validation, O(1) structural integrity & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
@@ -61,7 +67,7 @@ opentelemetry-datalake/
 │   │       ├── abi.rs                 # Low-level FFI exports & memory protocol (with manual escape hatch)
 │   │       ├── ipc.rs                 # Arrow IPC stream reading & writing in guest
 │   │       ├── helpers.rs             # Client-side checked column nullification, projection, filtering
-│   │       ├── metrics.rs             # Controlled guest metric API (counter, gauge, duration in nanos)
+│   │       ├── metrics.rs             # Controlled guest metric API (counter, f64 gauge, duration in nanos)
 │   │       ├── panic.rs               # Custom std::panic hook forwarding to datalake_host_log
 │   │       ├── logger.rs              # Guest tracing/log forwarder using HostLogRecord
 │   │       └── testing.rs             # Mock batch generators & WasmHarness test runner
@@ -69,9 +75,9 @@ opentelemetry-datalake/
 │   ├── wasm-cli/                      # Developer CLI & validation tool
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       └── main.rs                # CLI commands: validate, test, bench
+│   │       └── main.rs                # CLI commands: validate, test (with value immutability check), bench
 │   │
-│   └── core/                          # Updated pipeline_core config with WasmTransformerConfig and DLQ validation
+│   └── core/                          # pipeline_core config with WasmTransformerConfig and DLQ validation
 ```
 
 ---
@@ -124,7 +130,7 @@ pub struct TransformResponseHeader {
     /// 0 = Success (emit batches downstream)
     /// 1 = Discard (noise drop / sampling, silently dropped, never rerouted)
     /// 2 = Reject (business validation drop, routed to _reroute_rejected if on_reject = "reroute")
-    /// 3 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if on_error = "reroute")
+    /// 3 = Error (execution failure, panic, unhandled error, routed to _reroute_errored if on_error = "reroute")
     pub status: u32,
 
     /// Number of emitted Arrow IPC batches (0..N)
@@ -167,8 +173,14 @@ void datalake_host_log(uint32_t record_ptr);
 
 // Emits a controlled custom metric counter, gauge, or duration (histogram).
 // metric_type: 0 = Counter, 1 = Gauge, 2 = Duration
-// For metric_type = 2 (Duration), value is strictly in NANOSECONDS (u64).
-// Host automatically converts nanoseconds to seconds (value / 1e9) and records into Prometheus Histogram.
+//
+// Value interpretation by metric_type:
+// - Counter (0): u64 integer count to increment by.
+// - Gauge (1): IEEE 754 64-bit float bitcast (f64::to_bits() in guest, f64::from_bits() on host).
+//              Allows full negative, fractional, and positive float representation.
+// - Duration (2): u64 integer duration in NANOSECONDS.
+//                 Host automatically converts to seconds (value / 1e9) and records into Prometheus Histogram.
+//
 // name_ptr / name_len: relative metric name (e.g. "pii_redacted")
 void datalake_host_metric_emit(uint32_t metric_type, uint32_t name_ptr, uint32_t name_len, uint64_t value);
 
@@ -191,7 +203,7 @@ uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_l
 
 Designed for publishability on `crates.io`, this crate provides idiomatic, safe abstractions for writing transforms.
 
-### 4.1 Trait Definition & Output Semantics
+### 4.1 Trait Definition & Semantic Error Guidance
 
 ```rust
 use arrow::record_batch::RecordBatch;
@@ -205,11 +217,13 @@ pub enum SignalType {
 
 pub enum TransformResult {
     /// Emit 0..N transformed RecordBatches downstream to primary sinks.
-    /// Note: Emitting vec![] is a valid success outcome: marks batch consumed, 
+    /// Note: Emitting vec![] (via ok_empty()) is a valid success outcome: marks batch consumed, 
     /// emits 0 rows, bypasses schema guard, and does not trigger error/reject handling.
     Success(Vec<RecordBatch>),
+
     /// Intentional noise filtering / sampling. Silently discarded from memory, counted in metrics, NEVER rerouted.
     Discard,
+
     /// Business-logic rejection (e.g. validation failure, security policy).
     /// Routed to <component_id>._reroute_rejected if on_reject = "reroute".
     Reject { reason: String },
@@ -244,6 +258,12 @@ pub trait BatchTransformer: Default + Send + Sync + 'static {
     }
 
     /// Core transform entrypoint.
+    ///
+    /// ## Guidance on Error vs Reject:
+    /// - Use `Ok(TransformResult::Reject { reason })` for expected data validation failures,
+    ///   malformed payload data, or business rule rejections (routed to `_reroute_rejected`).
+    /// - Only return `Err(...)` for unrecoverable, catastrophic code failures or internal
+    ///   inconsistencies (routed to `_reroute_errored` as status = 3).
     fn transform(
         &mut self,
         signal: SignalType,
@@ -290,7 +310,7 @@ pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u3
 }
 ```
 
-### 4.4 Guest Custom Metrics & Client-Side Immutability Guards
+### 4.4 Guest Custom Metrics & Call-Site Immutability Guards
 
 The SDK provides safe wrappers for metrics, logging, environment access, and helpers that **fail fast at the call site** if an immutable field is targeted:
 
@@ -305,7 +325,10 @@ sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")?;
 
 // Custom metrics (automatically namespaced to datalake_transformers_<component_id>_*)
 sdk::metrics::counter("pii_redacted", 1);
-sdk::metrics::gauge("cache_size", 1024);
+
+// Gauge takes f64 (supports negative, fractional, and positive values via IEEE 754 bitcast)
+sdk::metrics::gauge("cpu_usage_ratio", 0.742);
+sdk::metrics::gauge("ambient_temp_celsius", -4.5);
 
 // Duration helper: extracts nanoseconds (u64) from std::time::Duration
 sdk::metrics::duration("lookup_duration", elapsed_duration);
@@ -329,6 +352,7 @@ type = "wasm"
 module_path = "transforms/enrichment.wasm"
 sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Optional integrity verification
 max_execution_duration = "500ms"
+drain_timeout = "10s"                # Maximum time to drain in-flight batches during graceful shutdown
 max_batch_rows = 5000                # Invariant boundary limit; reject if exceeded
 concurrency = 4                      # Number of worker tasks / pooling slots
 max_memory = "64MiB"                 # Virtual memory slot size (recommended: 64MiB)
@@ -364,10 +388,41 @@ environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Failure Policies & Backpressure Semantics
+### 5.2 Trait Integration & Multi-Channel Routing
+
+`WasmTransformer` implements the existing `pipeline_core::pipeline::Transform` trait:
+```rust
+#[async_trait]
+impl Transform for WasmTransformer {
+    async fn transform(
+        &mut self,
+        input: PipelineReceiver,
+        output: PipelineSender,
+    ) -> Result<(), PipelineError> {
+        self.run_worker_pool(input, output).await
+    }
+}
+```
+
+**Secondary Reroute Channels as Internal Struct State**:
+Rather than modifying the `Transform` trait definition across the entire codebase, `WasmTransformer` stores optional secondary senders internally, provided at construction time by the topology builder:
+```rust
+pub struct WasmTransformer {
+    config: WasmTransformerConfig,
+    engine: Arc<EngineCache>,
+    reroute_errored_tx: Option<PipelineSender>,
+    reroute_rejected_tx: Option<PipelineSender>,
+}
+```
+- Primary transformed batches are sent directly to `output.send(batch).await`.
+- Failed batches (`on_error = "reroute"`) are sent to `self.reroute_errored_tx`.
+- Policy rejected batches (`on_reject = "reroute"`) are sent to `self.reroute_rejected_tx`.
+- When the worker pool completes, all senders (primary and internal reroutes) are dropped, naturally propagating EOF to downstream sinks.
+
+### 5.3 Failure Policies & Backpressure Semantics
 
 1. **`on_error = "reroute"` (Default Recommended)**:
-   - When a batch execution fails (timeout, panic, trap, IPC decode error), the pristine original batch is routed to the virtual stream `<component_id>._reroute_errored`.
+   - When a batch execution fails (timeout, panic, trap, IPC decode error, or unhandled guest `Err`), the pristine original batch is routed to `<component_id>._reroute_errored`.
    - The topology builder asserts at startup that a sink is subscribed to `inputs = ["<component_id>._reroute_errored"]`. If missing, startup fails immediately.
 2. **`on_error = "passthrough"` (Fail-Open)**:
    - Requires `allow_unmasked_passthrough = true` in configuration.
@@ -376,7 +431,7 @@ mask_credit_cards = true
 3. **`on_error = "drop"` (Fail-Closed)**:
    - Failed batches are discarded from memory, and `component_errors_total` is incremented.
 
-### 5.3 Audit Rejection vs. Noise Discard Semantics
+### 5.4 Audit Rejection vs. Noise Discard Semantics
 
 1. **`TransformResult::Discard` (Noise Filtering / Sampling)**:
    - Telemetry that the module intentionally filters out (e.g. noisy health checks).
@@ -389,23 +444,29 @@ mask_credit_cards = true
    - If `on_reject = "drop"`, the batch is discarded from memory.
    - Increments `component_discarded_rows_total{component_id="...", reason="reject"}`.
 
-### 5.4 Core Telemetry Immutability & O(1) Schema Guard
+### 5.5 Three-Tier Telemetry Immutability & O(1) Schema Guard
 
-#### 5.4.1 Mandatory Immutable Core Fields
 The OpenTelemetry data model relies on immutable trace and metric identities:
 * **Traces**: `trace_id`, `span_id`.
 * **Logs**: `timestamp` (or `observed_timestamp`).
 * **Metrics**: Metric `name`, metric `type`.
 
-**O(1) Hot-Path Immutability Check**:
-To verify an immutable column has not been stripped or completely nullified, the host avoids walking bitmaps and evaluates:
-```rust
-let is_all_null = col.null_count() == col.len() && col.len() > 0;
-```
-Because Arrow arrays store `null_count` as cached metadata in `ArrayData`, this operation is strictly **$O(1)$ arithmetic**. If an immutable column is missing or `is_all_null` is true while the input batch had valid non-null entries, the host immediately rejects the batch with `WasmTransformError::ImmutableFieldViolation { column }` and triggers `on_error` handling.
+To prevent silent corruption without incurring per-record byte comparison penalties in the hot path, immutability is guaranteed across three tiers:
 
-#### 5.4.2 Schema Guard (Defensive vs. Strict)
-For mutable fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`):
+1. **Host Hot-Path Structural Integrity Check ($O(1)$)**:
+   - Asserts mandatory columns exist in the Arrow schema.
+   - Evaluates:
+     ```rust
+     let is_all_null = col.null_count() == col.len() && col.len() > 0;
+     ```
+     Because `null_count` is cached metadata in Arrow's `ArrayData`, this is strictly **$O(1)$ integer arithmetic**. If an immutable column is omitted or `is_all_null` is true while the input had valid non-null entries, the batch is rejected with `WasmTransformError::ImmutableFieldViolation { column }` and routed to `on_error`.
+2. **Guest SDK Call-Site Fail-Fast**:
+   - `sdk::helpers::nullify_column` and `redact_column_regex` inspect the target column against static immutable lists, returning `Err(SdkError::ImmutableFieldViolation)` immediately in local guest unit tests.
+3. **Developer CLI Value Conformance (`datalake-wasm test`)**:
+   - The CLI test runner feeds synthetic batches with known IDs and explicitly checks byte-for-byte that the values of `trace_id` and `span_id` were not overwritten or scrambled by the module.
+
+#### Schema Guard for Mutable Fields (Defensive vs. Strict)
+For mutable auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`):
 * **`schema_guard = "defensive"` (Default)**:
   - If a guest omits a mutable canonical column, the host backfills it using `arrow::array::new_null_array(field.data_type(), num_rows)`.
   - Increments counter: `datalake_wasm_schema_columns_backfilled_total{component_id, signal, column}`.
@@ -413,7 +474,7 @@ For mutable fields (`attributes`, `scope_attributes`, `resource_attributes`, `bo
 * **`schema_guard = "strict"`**:
   - Missing mutable columns are treated as an error, rejecting the batch and triggering `on_error`.
 
-### 5.5 Resilient Rejuvenation & Lifecycle
+### 5.6 Resilient Rejuvenation & Lifecycle
 
 When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `rejuvenate_batches = 10000`):
 1. **Non-Destructive Instance Swap**:
@@ -423,7 +484,7 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
    - If `datalake_init` returns non-zero or times out (`init_timeout = 2s`), the worker logs an error and retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
    - If all retries fail, the worker keeps serving on the existing store (avoiding permanent worker slot death), logs a critical warning, and attempts rejuvenation again after 100 batches.
 
-### 5.6 Vector-Aligned Observability & Controlled Metrics
+### 5.7 Vector-Aligned Observability & Controlled Metrics
 
 1. **Uniform Component Identification**:
    - All host logs and metrics emitted by the transformer include the standardized Vector-style labels:
@@ -444,13 +505,13 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
      ```
    - Type mapping:
      - `metric_type = 0` (Counter): Prometheus counter.
-     - `metric_type = 1` (Gauge): Prometheus gauge.
+     - `metric_type = 1` (Gauge): IEEE 754 64-bit float bitcast (`f64::from_bits(value)`), recorded into Prometheus Gauge.
      - `metric_type = 2` (Duration): Value in nanoseconds (`u64`), converted to seconds (`f64 / 1e9`) and recorded into a Prometheus Histogram (`..._duration_seconds`).
    - Hard limits:
      - Metric names: ASCII alphanumeric + `_`, max 64 characters.
      - Cardinality ceiling: Maximum 50 distinct custom metric names per `component_id`.
 
-### 5.7 Environment Variable Sandboxing & Zero-Trust WASI
+### 5.8 Environment Variable Sandboxing & Zero-Trust WASI
 
 1. **Default Deny**: By default, `wasmtime_wasi::WasiCtxBuilder` does not inherit host environment variables.
 2. **Precedence Rule**:
@@ -458,15 +519,23 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
    - If a key exists in both, the static value is used and an informational notice is logged.
 3. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
 
-### 5.8 Kubernetes Sizing & Memory Guidance
+### 5.9 Graceful Shutdown & Pipeline Drain
 
-$$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$$
+During rolling deployments or process termination (`SIGTERM` / `SIGINT`):
+1. The upstream OTLP receiver shuts down its listening port and ceases accepting new traffic.
+2. The receiver completes in-flight requests and drops its channel senders (`input` on `WasmTransformer` observes EOF `None`).
+3. **Worker Drain Loop**:
+   - Workers finish their current in-flight batch (bounded by `max_execution_duration`).
+   - Workers drain all remaining batches buffered in the `input` channel, executing transforms and forwarding outputs downstream.
+4. **Drain Timeout Guard**:
+   - The shutdown process enforces `drain_timeout` (default: 10s). If draining exceeds this threshold, worker tasks are aborted, logging:
+     ```text
+     WARN wasm_host: Shutdown drain timeout reached (10s), aborting remaining workers [component_id="..."]
+     ```
+5. **Clean Downstream Cascade**:
+   - Once workers terminate, all output channels (`output`, `_reroute_errored`, `_reroute_rejected`) drop, allowing downstream sinks to finish commits and flush Parquet files cleanly without truncated writes.
 
-* **Recommended Edge Configuration**: `concurrency = 4`, `max_memory = "64MiB"`, `rejuvenate_threshold = "16MiB"`. Requires $256\text{MiB}$ of virtual address space.
-* **Host Physical RAM**: Actual physical RSS stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
-* **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient.
-
-### 5.9 Deterministic Hot-Reloading & Generation Fencing
+### 5.10 Deterministic Hot-Reloading & Generation Fencing
 
 1. **Single-Read In-Memory Compilation**:
    ```rust
@@ -505,7 +574,7 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
 | `datalake_wasm_rejuvenations_total` | Counter | `component_id`, `instance_id`, `reason` | Total instance pool resets. |
 | `datalake_wasm_module_info` | Gauge | `component_id`, `sha256`, `generation`, `abi_version` | Active module audit information. |
 | `datalake_wasm_schema_columns_backfilled_total` | Counter | `component_id`, `signal`, `column` | Missing mutable columns backfilled with nulls. |
-| `datalake_transformers_<component_id>_<name>` | Counter / Gauge | `component_id`, `signal` | Guest custom counter or gauge. |
+| `datalake_transformers_<component_id>_<name>` | Counter / Gauge | `component_id`, `signal` | Guest custom counter or gauge (f64). |
 | `datalake_transformers_<component_id>_<name>_duration_seconds` | Histogram | `component_id`, `signal` | Guest custom duration histogram (fed by nanoseconds). |
 
 ### Logging Standards
@@ -528,7 +597,7 @@ Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
    - Validates memory limits and initialization behavior.
 2. **`datalake-wasm test <path.wasm> [--signal logs|metrics|traces] [--input sample.ipc] [--env KEY=VAL]`**:
    - Executes module against synthetic or user-provided Arrow IPC streams.
-   - **Immutability Conformance Suite**: Verifies that known non-null immutable columns (`trace_id`, `timestamp`, metric `name`) remain intact and unmuted. Emits explicit failure if illegal mutation occurred.
+   - **Value Immutability Conformance Suite**: Feeds synthetic batches with known IDs and verifies that the output batch's `trace_id` / `span_id` bytes match the input byte-for-byte. Emits explicit failure if illegal mutation occurred.
    - Injects test environment variables into guest WASI context.
    - Enables DWARF debug info for full guest stack traces on panics.
    - Verifies handling of 0-row batches, Discard, Reject, and canonical schema invariance.
