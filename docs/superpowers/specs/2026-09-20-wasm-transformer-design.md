@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Full Architecture & Operational Reviews)  
+**Status**: Final Approved Spec (Incorporating Full Architecture, Operational, and Security Whitelist Reviews)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,6 +15,7 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
+* **Environment Variable Sandboxing & Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest, preventing accidental leakage of host secrets (e.g., AWS/GCP credentials, database passwords).
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
 * **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
@@ -34,10 +35,11 @@ opentelemetry-datalake/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
-│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256)
+│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
 │   │       ├── guard.rs               # Invariant validation (max_batch_rows) & schema defense
+│   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader
 │   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
@@ -207,7 +209,7 @@ impl TransformResult {
 }
 
 pub trait BatchTransformer: Default + Send + Sync + 'static {
-    /// One-time initialization hook. Query host capabilities and parse config here.
+    /// One-time initialization hook. Query host capabilities, read whitelisted env vars, and parse config here.
     fn init(&mut self, _config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
@@ -259,12 +261,13 @@ pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u3
 }
 ```
 
-### 4.4 Canonical Schema Helpers
+### 4.4 Canonical Schema Helpers & Environment Access
 
 The SDK provides zero-copy helpers for stripping data while maintaining canonical schema invariance:
 - `sdk::helpers::nullify_column(&batch, "scope_attributes")`
 - `sdk::helpers::filter_batch(&batch, &boolean_mask)`
 - `sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")`
+- `std::env::var("APP_ENV")` directly reads variables permitted through the host whitelist.
 
 ---
 
@@ -288,13 +291,34 @@ init_timeout = "2s"                  # Maximum duration for datalake_init
 on_error = "drop"                    # "drop", "quarantine", or "passthrough"
 allow_unmasked_passthrough = false   # Required if on_error = "passthrough"
 
+# Whitelisted host environment variables passed to the WASM sandbox
+env_whitelist = [
+    "APP_ENV",
+    "CLUSTER_ID",
+    "REGION"
+]
+
+# Explicit static environment variables injected into the WASM sandbox
+[pipeline.transform.wasm.env]
+LOG_LEVEL = "info"
+TRANSFORM_VERSION = "1.2.0"
+
 # Optional config block passed to datalake_init
 [pipeline.transform.wasm.config]
 environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Kubernetes Sizing & Memory Guidance
+### 5.2 Environment Variable Sandboxing & Zero-Trust WASI
+
+1. **Default Deny**: By default, `wasmtime_wasi::WasiCtxBuilder` does not inherit host environment variables.
+2. **Whitelist Resolution**:
+   - For each key in `env_whitelist`, the host checks `std::env::var(key)`. If present, it injects `(key, value)` into the guest's WASI context.
+   - Host secrets (e.g., `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, `TOKEN`) that are not explicitly whitelisted remain completely invisible to the guest.
+3. **Explicit Injections**: All key-values in `[pipeline.transform.wasm.env]` are added to the guest's WASI environment.
+4. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
+
+### 5.3 Kubernetes Sizing & Memory Guidance
 
 When running in containerized environments (Kubernetes pods), operators must account for Wasmtime's virtual memory pooling allocator:
 
@@ -304,12 +328,12 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
 * **Host Physical RAM**: Thanks to `madvise(MADV_DONTNEED)`, actual physical resident set size (RSS) stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
 * **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient (Linux default of 65,530 is plenty for standard pools).
 
-### 5.3 Concurrency & Boundary Guards
+### 5.4 Concurrency & Boundary Guards
 
 * **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender`. No inter-batch reorder buffer, no head-of-line blocking.
 * **Batch Size Invariant Check**: If an incoming batch exceeds `max_batch_rows`, the transformer rejects it with a fatal pipeline error directing operators to configure an upstream `AccumulatorTransformer`.
 
-### 5.4 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
+### 5.5 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
 
 * **Pooling Instance Allocator**: Pre-allocates $N$ memory slots in virtual memory at startup (`PoolingAllocationConfig`).
 * **Microsecond Resets (`MADV_DONTNEED`)**: When an instance is refreshed, Wasmtime issues `MADV_DONTNEED` to reclaim physical RAM pages and zero the memory in $\approx 5\text{--}10\,\mu\text{s}$.
@@ -319,7 +343,7 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
   3. *Trap Recovery*: If an instance traps, the contaminated `Store` is immediately discarded and replaced.
 * **Init Deadline**: Re-initializing an instance via `datalake_init` is bounded by `init_timeout` (default: 2s) to prevent stalled module initialization.
 
-### 5.5 Canonical OTel Schema Invariance & Typed Null Backfill
+### 5.6 Canonical OTel Schema Invariance & Typed Null Backfill
 
 * Telemetry entering and exiting the WASM boundary must conform to the canonical OpenTelemetry Arrow schema for that `SignalType`.
 * **Type-Aware Defensive Backfill**: If a guest module omits a canonical column (e.g. user completely dropped `scope_attributes` or `attributes`), the host automatically backfills it using Arrow's type-aware constructor:
@@ -328,13 +352,13 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
   ```
   This creates a structurally valid null array matching complex nested types (`MapArray`, `ListArray`, `StructArray`). Downstream Parquet writes and Iceberg commits are 100% protected against physical schema divergence.
 
-### 5.6 Failure Policies & Security Safeguard
+### 5.7 Failure Policies & Security Safeguard
 
 * **`on_error = "drop"` (Default / Fail-Closed)**: Discards failed batches, incrementing `datalake_wasm_errors_total`.
 * **`on_error = "quarantine"`**: Routes failed batches to dead-letter storage.
 * **`on_error = "passthrough"` (Fail-Open)**: Forwards un-transformed raw batches. Requires `allow_unmasked_passthrough = true` in config; otherwise startup halts with a fatal security error.
 
-### 5.7 In-Memory Single-Read & Zero-Downtime Hot-Reloading
+### 5.8 In-Memory Single-Read & Zero-Downtime Hot-Reloading
 
 To eliminate TOCTOU filesystem races and enable zero-downtime updates:
 1. **Atomic Read & Hash**:
@@ -388,8 +412,9 @@ Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
    - Checks exports (`datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`).
    - Rejects forbidden WASI syscalls (raw sockets/files).
    - Validates memory limits and initialization behavior.
-2. **`datalake-wasm test <path.wasm> [--signal logs|metrics|traces] [--input sample.ipc]`**:
+2. **`datalake-wasm test <path.wasm> [--signal logs|metrics|traces] [--input sample.ipc] [--env KEY=VAL]`**:
    - Executes module against synthetic or user-provided Arrow IPC streams.
+   - Injects test environment variables into guest WASI context.
    - Enables DWARF debug info for full guest stack traces on panics.
    - Verifies handling of 0-row batches, drops, and canonical schema invariance.
 3. **`datalake-wasm bench <path.wasm> [--rows 10000] [--concurrency 4]`**:

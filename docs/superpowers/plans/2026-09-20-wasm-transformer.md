@@ -4,9 +4,9 @@
 
 **Goal:** Implement a high-performance WebAssembly (WASM) transformer for `opentelemetry-datalake` allowing users to manipulate, enrich, filter, or drop whole Arrow `RecordBatch`es, with a publishable guest SDK and testing/validation CLI.
 
-**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, panic hooks, init-time capability caching, and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with pooling instance allocation, typed null schema guards, in-memory single-read SHA-256 verification, and atomic zero-downtime hot-reloading; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
+**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, panic hooks, init-time capability caching, and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with pooling instance allocation, zero-trust environment variable whitelisting, typed null schema guards, in-memory single-read SHA-256 verification, and atomic zero-downtime hot-reloading; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
 
-**Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`, `sha2`, `hex`.
+**Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `wasmtime-wasi`, `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`, `sha2`, `hex`.
 
 **Spec:** [`docs/superpowers/specs/2026-09-20-wasm-transformer-design.md`](file:///home/jalamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/superpowers/specs/2026-09-20-wasm-transformer-design.md)
 
@@ -15,6 +15,7 @@
 - All FFI exchanges across WASM linear memory use versioned C-ABI v1 (`datalake_abi_version() == 1`) with standard Apache Arrow IPC streaming format.
 - Output batches must preserve canonical OpenTelemetry Arrow schemas; missing fields are backfilled using `arrow::array::new_null_array`.
 - Batches exceeding `max_batch_rows` are rejected at the transformer boundary (delegating coalescing/splitting to upcoming `AccumulatorTransformer`).
+- WASI environment isolation enforces zero-trust: no ambient host environment variables leak into the guest. Only keys in `env_whitelist` or explicit values in `env` are exposed.
 - Memory management uses `wasmtime::PoolingAllocationConfig` with `madvise(MADV_DONTNEED)` resets and dual-trigger rejuvenation.
 - Single-read in-memory compilation prevents TOCTOU vulnerabilities when verifying SHA-256 hashes.
 - `on_error = "passthrough"` must be rejected at configuration time unless `allow_unmasked_passthrough = true` is explicitly enabled.
@@ -39,10 +40,10 @@
 
 - [ ] **Step 1: Write Cargo.toml files for crates**
 
-Add `wasmtime = { version = "31", default-features = false, features = ["cranelift", "async", "pooling-allocator"] }`, `sha2 = "0.10"`, and `hex = "0.4"` to root `[workspace.dependencies]`.
+Add `wasmtime = { version = "31", default-features = false, features = ["cranelift", "async", "pooling-allocator"] }`, `wasmtime-wasi = "31"`, `sha2 = "0.10"`, and `hex = "0.4"` to root `[workspace.dependencies]`.
 Create:
 - `crates/wasm-sdk/Cargo.toml` with package name `opentelemetry-datalake-wasm-sdk`.
-- `crates/wasm-transformer/Cargo.toml` with `wasmtime`, `pipeline-core`, `arrow`, `arrow-ipc`, `sha2`, `hex`.
+- `crates/wasm-transformer/Cargo.toml` with `wasmtime`, `wasmtime-wasi`, `pipeline-core`, `arrow`, `arrow-ipc`, `sha2`, `hex`.
 - `crates/wasm-cli/Cargo.toml` with `clap`, `wasmtime`, `arrow`, `arrow-ipc`.
 
 - [ ] **Step 2: Add placeholder lib.rs and main.rs files**
@@ -152,50 +153,53 @@ git commit -m "feat(wasm-sdk): add mock telemetry batch generators and testing u
 
 ---
 
-### Task 4: Wasmtime Engine, Pooling Allocator & Soft Rejuvenation (`crates/wasm-transformer`)
+### Task 4: Wasmtime Engine, Pooling Allocator & Zero-Trust WASI Env (`crates/wasm-transformer`)
 
 **Files:**
 - Create: `crates/wasm-transformer/src/error.rs`
 - Create: `crates/wasm-transformer/src/config.rs`
 - Create: `crates/wasm-transformer/src/engine.rs`
 - Create: `crates/wasm-transformer/src/pool.rs`
+- Create: `crates/wasm-transformer/src/wasi_env.rs`
 - Test: `crates/wasm-transformer/tests/engine_tests.rs`
+- Test: `crates/wasm-transformer/tests/env_whitelist_tests.rs`
 
 **Interfaces:**
-- Consumes: `WasmTransformerConfig` (max_memory, rejuvenate_threshold, rejuvenate_batches, sha256, init_timeout).
-- Produces: `WasmEngine`, `InstancePool`, `HostState`, `WasmTransformError`.
+- Consumes: `WasmTransformerConfig` (max_memory, rejuvenate_threshold, rejuvenate_batches, sha256, init_timeout, env_whitelist, env).
+- Produces: `WasmEngine`, `InstancePool`, `WasiEnvBuilder`, `HostState`, `WasmTransformError`.
 
-- [ ] **Step 1: Write failing test for pooling allocator, epoch timeout, and soft rejuvenation**
+- [ ] **Step 1: Write failing test for pooling allocator, epoch timeout, and environment variable whitelisting**
 
-Write `tests/engine_tests.rs` verifying:
+Write `tests/engine_tests.rs` and `tests/env_whitelist_tests.rs` verifying:
 - Wasmtime pooling allocator initialization.
-- Instance reset on soft memory threshold / batch count ceiling.
-- Epoch interruption triggers timeout when execution loop exceeds deadline.
+- Ambient host environment variables (e.g. `SECRET_HOST_KEY`) are NOT visible to the guest.
+- Explicitly whitelisted keys in `env_whitelist` and injected keys in `env` ARE visible to the guest.
 - Single-read in-memory SHA-256 verification.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p wasm-transformer --test engine_tests`  
+Run: `cargo test -p wasm-transformer --test engine_tests --test env_whitelist_tests`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `error.rs`, `config.rs`, `engine.rs`, and `pool.rs`**
+- [ ] **Step 3: Implement `error.rs`, `config.rs`, `engine.rs`, `pool.rs`, and `wasi_env.rs`**
 
 Implement:
 - `WasmTransformError` with `thiserror`.
 - `WasmEngine` configuring `PoolingAllocationConfig` and epoch ticker thread (10ms).
 - `InstancePool` managing stores and triggering `madvise(MADV_DONTNEED)` resets on threshold.
+- `WasiEnvBuilder` constructing isolated WASI contexts passing only whitelisted and injected variables.
 - In-memory single-read SHA-256 verification on module loading.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p wasm-transformer --test engine_tests`  
+Run: `cargo test -p wasm-transformer --test engine_tests --test env_whitelist_tests`  
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement wasmtime pooling allocator, epoch ticker, and soft rejuvenation"
+git commit -m "feat(wasm-transformer): implement wasmtime pooling allocator, epoch ticker, and zero-trust env whitelist"
 ```
 
 ---
@@ -310,7 +314,7 @@ Expected: FAIL.
 
 Implement:
 - `validate`: verifies ABI v1, exports, and memory boundaries.
-- `test`: executes synthetic batches with DWARF debug info enabled for full stack traces.
+- `test`: executes synthetic batches with DWARF debug info enabled for full stack traces; supports `--env KEY=VAL`.
 - `bench`: measures p50/p95/p99 latency distribution.
 
 - [ ] **Step 4: Run test to verify it passes**
@@ -379,7 +383,7 @@ git commit -m "feat: integrate wasm transformer into datalake configuration and 
 
 - [ ] **Step 1: Create example PII scrubber module**
 
-Implement a `BatchTransformer` that detects credit cards in log messages, redacts them to `[REDACTED]`, and nullifies specified attributes.
+Implement a `BatchTransformer` that detects credit cards in log messages, redacts them to `[REDACTED]`, and reads whitelisted environment variables.
 
 - [ ] **Step 2: Run native tests for example module**
 
