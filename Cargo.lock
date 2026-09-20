@@ -3439,6 +3439,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-datalake-wasm-sdk"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "thiserror",
+]
+
+[[package]]
 name = "opentelemetry-otlp"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
