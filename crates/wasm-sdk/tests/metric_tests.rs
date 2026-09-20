@@ -5,12 +5,14 @@ use opentelemetry_datalake_wasm_sdk::panic::init_panic_hook;
 use std::time::Duration;
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_gauge_f64_bitcast_preserves_negative_and_fractions() {
     let original = -12.375_f64;
     assert_eq!(f64::from_bits(gauge_to_bits(original)), original);
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_gauge_f64_special_values() {
     // Zero and negative zero
     assert_eq!(f64::from_bits(gauge_to_bits(0.0)), 0.0);
@@ -67,10 +69,12 @@ fn test_metric_emission_helpers_callable_native() {
 
 #[test]
 fn test_init_panic_hook_handles_panics() {
+    let prev_hook = std::panic::take_hook();
     init_panic_hook();
 
     let caught = std::panic::catch_unwind(|| {
         panic!("simulated test panic to verify hook integration");
     });
+    std::panic::set_hook(prev_hook);
     assert!(caught.is_err());
 }

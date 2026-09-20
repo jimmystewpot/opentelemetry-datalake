@@ -1,7 +1,17 @@
 use opentelemetry_datalake_wasm_sdk::abi::{
-    ABI_VERSION, BatchDescriptor, HostLogRecord, TransformResponseHeader, datalake_abi_version,
-    datalake_alloc, datalake_dealloc,
+    ABI_VERSION, BatchDescriptor, HostLogRecord, LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO,
+    LOG_LEVEL_TRACE, LOG_LEVEL_WARN, TransformResponseHeader, datalake_abi_version, datalake_alloc,
+    datalake_dealloc,
 };
+
+#[test]
+fn test_log_level_constants() {
+    assert_eq!(LOG_LEVEL_ERROR, 1u32);
+    assert_eq!(LOG_LEVEL_WARN, 2u32);
+    assert_eq!(LOG_LEVEL_INFO, 3u32);
+    assert_eq!(LOG_LEVEL_DEBUG, 4u32);
+    assert_eq!(LOG_LEVEL_TRACE, 5u32);
+}
 
 #[test]
 fn test_abi_v1_header_memory_layout() {
