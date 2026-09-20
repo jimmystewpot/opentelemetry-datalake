@@ -75,6 +75,21 @@ pub struct WasmWorker {
     memory: Memory,
     batches_processed: u64,
     local_generation: u64,
+    rejuvenate_threshold_bytes: usize,
+}
+
+impl std::fmt::Debug for WasmWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WasmWorker")
+            .field("id", &self.id)
+            .field("batches_processed", &self.batches_processed)
+            .field("local_generation", &self.local_generation)
+            .field(
+                "rejuvenate_threshold_bytes",
+                &self.rejuvenate_threshold_bytes,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl WasmWorker {
@@ -82,15 +97,27 @@ impl WasmWorker {
     ///
     /// # Errors
     ///
-    /// Returns [`WasmTransformError`] if instance creation fails or required
+    /// Returns [`WasmTransformError`] if instance creation fails, required
     /// C-ABI v1 exports (`datalake_alloc`, `datalake_dealloc`, `datalake_transform`,
-    /// `memory`) are missing.
+    /// `memory`) are missing, or `rejuvenate_threshold` is invalid.
     pub fn new(
         id: usize,
         engine: Arc<EngineCache>,
         module: Arc<Module>,
         config: WasmTransformerConfig,
     ) -> Result<Self, WasmTransformError> {
+        let trimmed_threshold = config.rejuvenate_threshold.trim();
+        let rejuvenate_threshold_bytes = if trimmed_threshold.is_empty() {
+            0
+        } else {
+            parse_byte_size(trimmed_threshold).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!(
+                    "Invalid memory threshold: {}",
+                    config.rejuvenate_threshold
+                ))
+            })?
+        };
+
         let guest = Self::instantiate_guest(engine.engine(), &module)?;
         let local_generation = engine.module_generation();
 
@@ -107,6 +134,7 @@ impl WasmWorker {
             memory: guest.memory,
             batches_processed: 0,
             local_generation,
+            rejuvenate_threshold_bytes,
         })
     }
 
@@ -193,6 +221,12 @@ impl WasmWorker {
         self.local_generation
     }
 
+    /// Returns the parsed memory rejuvenation threshold in bytes.
+    #[must_use]
+    pub fn rejuvenate_threshold_bytes(&self) -> usize {
+        self.rejuvenate_threshold_bytes
+    }
+
     /// Returns a reference to the active Wasmtime [`Instance`].
     #[must_use]
     pub fn instance(&self) -> &Instance {
@@ -272,10 +306,8 @@ impl WasmWorker {
 
     /// Rejuvenates the guest instance if batch count or memory limits are exceeded.
     fn check_rejuvenation(&mut self) -> Result<(), WasmTransformError> {
-        let memory_exceeded =
-            parse_byte_size(&self.config.rejuvenate_threshold).is_some_and(|threshold| {
-                threshold > 0 && self.memory.data_size(&self.store) >= threshold
-            });
+        let memory_exceeded = self.rejuvenate_threshold_bytes > 0
+            && self.memory.data_size(&self.store) >= self.rejuvenate_threshold_bytes;
 
         if (self.config.rejuvenate_batches > 0
             && self.batches_processed >= self.config.rejuvenate_batches)
@@ -402,6 +434,8 @@ fn read_guest_message(
     }
 }
 
+const MAX_GUEST_BATCH_COUNT: u32 = 1024;
+
 /// Extracts transformed output batches from guest memory via a `BatchDescriptor` array.
 fn extract_output_batches(
     memory: &Memory,
@@ -410,6 +444,12 @@ fn extract_output_batches(
     batch_count: u32,
     input_batch: &SignalBatch,
 ) -> Result<Vec<SignalBatch>, WasmTransformError> {
+    if batch_count > MAX_GUEST_BATCH_COUNT {
+        return Err(WasmTransformError::Pipeline(format!(
+            "Guest batch count {batch_count} exceeds maximum allowed limit of {MAX_GUEST_BATCH_COUNT}"
+        )));
+    }
+
     let descriptor_size = 8usize;
     let mem_size = memory.data_size(store);
 
@@ -485,5 +525,22 @@ fn parse_byte_size(s: &str) -> Option<usize> {
         num.trim().parse::<usize>().ok()
     } else {
         trimmed.parse::<usize>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_byte_size() {
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("   "), None);
+        assert_eq!(parse_byte_size("100XYZ"), None);
+        assert_eq!(parse_byte_size("1024B"), Some(1024));
+        assert_eq!(parse_byte_size("16KiB"), Some(16 * 1024));
+        assert_eq!(parse_byte_size("128MiB"), Some(128 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1GiB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("500"), Some(500));
     }
 }

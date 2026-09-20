@@ -486,3 +486,76 @@ async fn test_worker_guards_out_of_bounds_batch_buffer() {
         "Unexpected error: {err}"
     );
 }
+
+// Excessive batch count WAT module
+fn excessive_batch_count_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            ;; Return status 0 with batch_count = 1025 (> MAX_GUEST_BATCH_COUNT of 1024)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1025))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[test]
+fn test_worker_invalid_rejuvenate_threshold_fails() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_threshold = "100XYZ".into();
+
+    let err = WasmWorker::new(10, Arc::clone(&cache), module, cfg).unwrap_err();
+    assert!(
+        err.to_string().contains("Invalid memory threshold: 100XYZ"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_rejuvenate_threshold_caching() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_threshold = "128MiB".into();
+
+    let worker = WasmWorker::new(11, Arc::clone(&cache), module, cfg).unwrap();
+    assert_eq!(worker.rejuvenate_threshold_bytes(), 128 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn test_worker_guards_excessive_batch_count() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(excessive_batch_count_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(12, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Guest batch count 1025 exceeds maximum allowed limit of 1024"),
+        "Unexpected error: {err}"
+    );
+}
