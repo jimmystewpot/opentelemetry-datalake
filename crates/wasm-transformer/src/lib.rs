@@ -3,6 +3,7 @@
 //! Provides an ultra-high-performance, sandboxed WASM transformation engine executing
 //! whole-batch Apache Arrow transformations using Wasmtime's pooling allocator.
 
+pub mod dispatcher;
 pub mod engine;
 pub mod error;
 pub mod guard;

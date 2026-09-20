@@ -1,0 +1,309 @@
+//! Least-loaded batch dispatcher distributing telemetry across sandboxed WASM workers.
+//!
+//! Manages a pool of isolated [`WasmWorker`] instances running on independent tokio
+//! tasks, distributing incoming Arrow batches using non-blocking `try_send` with
+//! round-robin fallback backpressure, and draining gracefully on input channel closure.
+
+use crate::engine::EngineCache;
+use crate::error::WasmTransformError;
+use crate::worker::{WasmWorker, WorkerOutcome};
+use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, WasmTransformerConfig};
+use pipeline_core::pipeline::{PipelineReceiver, PipelineSender, SignalBatch};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+use wasmtime::Module;
+
+/// Configuration for the WASM batch dispatcher and worker pool.
+#[derive(Debug, Clone)]
+pub struct DispatcherConfig {
+    /// Number of concurrent worker instances to run.
+    pub concurrency: usize,
+    /// Channel capacity for each individual worker task.
+    pub worker_channel_capacity: usize,
+}
+
+/// Dispatcher distributing incoming telemetry batches across isolated WASM workers.
+///
+/// Dispatches batches using a least-loaded non-blocking `try_send` strategy across
+/// `concurrency` worker tasks, with round-robin fallback `send` providing backpressure.
+/// Results from worker executions are routed to primary output or DLQ channels according
+/// to configured error and rejection policies.
+pub struct WasmDispatcher {
+    config: DispatcherConfig,
+    engine: Arc<EngineCache>,
+    module: Arc<Module>,
+    transformer_config: WasmTransformerConfig,
+    output: PipelineSender,
+    reroute_error: Option<PipelineSender>,
+    reroute_reject: Option<PipelineSender>,
+}
+
+impl WasmDispatcher {
+    /// Creates a new `WasmDispatcher`.
+    #[must_use]
+    pub fn new(
+        config: DispatcherConfig,
+        engine: Arc<EngineCache>,
+        module: Arc<Module>,
+        transformer_config: WasmTransformerConfig,
+        output: PipelineSender,
+        reroute_error: Option<PipelineSender>,
+        reroute_reject: Option<PipelineSender>,
+    ) -> Self {
+        Self {
+            config,
+            engine,
+            module,
+            transformer_config,
+            output,
+            reroute_error,
+            reroute_reject,
+        }
+    }
+
+    /// Runs the dispatcher loop until the `input` channel is closed, then drains workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if dispatcher processing encounters an unrecoverable failure.
+    pub async fn run(self, mut input: PipelineReceiver) -> Result<(), WasmTransformError> {
+        let concurrency = self.config.concurrency.max(1);
+        let cap = self.config.worker_channel_capacity.max(1);
+        let (worker_txs, worker_handles) = self.spawn_workers(concurrency, cap);
+
+        let mut next_worker = 0usize;
+        while let Some(batch) = input.recv().await {
+            if !Self::dispatch_batch(batch, &worker_txs, &mut next_worker, concurrency).await {
+                break;
+            }
+        }
+
+        drop(worker_txs);
+        Self::drain_workers(worker_handles, &self.transformer_config.drain_timeout).await;
+
+        Ok(())
+    }
+
+    /// Spawns worker tasks and returns their channel senders and task join handles.
+    fn spawn_workers(
+        &self,
+        concurrency: usize,
+        cap: usize,
+    ) -> (Vec<mpsc::Sender<SignalBatch>>, Vec<JoinHandle<()>>) {
+        let mut worker_txs = Vec::with_capacity(concurrency);
+        let mut worker_handles = Vec::with_capacity(concurrency);
+
+        for worker_id in 0..concurrency {
+            let (wtx, mut wrx) = mpsc::channel::<SignalBatch>(cap);
+            worker_txs.push(wtx);
+
+            let engine = Arc::clone(&self.engine);
+            let module = Arc::clone(&self.module);
+            let tf_cfg = self.transformer_config.clone();
+            let output = self.output.clone();
+            let err_tx = self.reroute_error.clone();
+            let rej_tx = self.reroute_reject.clone();
+
+            worker_handles.push(tokio::spawn(async move {
+                let mut worker = match WasmWorker::new(worker_id, engine, module, tf_cfg.clone()) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        warn!(worker_id, "Worker initialization failed: {e}");
+                        return;
+                    }
+                };
+
+                while let Some(batch) = wrx.recv().await {
+                    let outcome = worker.execute_batch(batch).await;
+                    Self::handle_worker_outcome(
+                        worker_id,
+                        outcome,
+                        &mut worker,
+                        &tf_cfg,
+                        &output,
+                        err_tx.as_ref(),
+                        rej_tx.as_ref(),
+                    )
+                    .await;
+                }
+                info!(worker_id, "Worker drain complete");
+            }));
+        }
+
+        (worker_txs, worker_handles)
+    }
+
+    /// Handles an individual execution outcome from a worker.
+    async fn handle_worker_outcome(
+        worker_id: usize,
+        outcome: Result<WorkerOutcome, WasmTransformError>,
+        worker: &mut WasmWorker,
+        tf_cfg: &WasmTransformerConfig,
+        output: &PipelineSender,
+        err_tx: Option<&PipelineSender>,
+        rej_tx: Option<&PipelineSender>,
+    ) {
+        match outcome {
+            Ok(WorkerOutcome::Emitted(batches)) => {
+                for b in batches {
+                    if let Err(e) = output.send(b).await {
+                        warn!(worker_id, "Failed to forward emitted batch to output: {e}");
+                        break;
+                    }
+                }
+            }
+            Ok(WorkerOutcome::Discarded) => {}
+            Ok(WorkerOutcome::Rejected { reason, original }) => {
+                Self::handle_rejected(worker_id, reason, original, tf_cfg.on_reject, rej_tx).await;
+            }
+            Ok(WorkerOutcome::Errored { reason, original }) => {
+                Self::handle_errored(worker_id, reason, original, tf_cfg.on_error, output, err_tx)
+                    .await;
+            }
+            Err(e) => {
+                warn!(worker_id, "Worker execution trap or error: {e}");
+                let _ = worker.rejuvenate();
+            }
+        }
+    }
+
+    /// Routes a rejected batch according to the rejection policy.
+    async fn handle_rejected(
+        worker_id: usize,
+        reason: String,
+        original: SignalBatch,
+        policy: OnRejectPolicy,
+        rej_tx: Option<&PipelineSender>,
+    ) {
+        if policy == OnRejectPolicy::Reroute {
+            if let Some(rtx) = rej_tx {
+                if let Err(e) = rtx.send(original).await {
+                    warn!(worker_id, "Failed to send rejected batch to DLQ: {e}");
+                }
+            } else {
+                warn!(
+                    worker_id,
+                    "Reject policy is Reroute, but no DLQ reject channel configured; dropping batch"
+                );
+            }
+        }
+        warn!(worker_id, %reason, "Batch rejected by guest");
+    }
+
+    /// Routes an errored batch according to the error policy.
+    async fn handle_errored(
+        worker_id: usize,
+        reason: String,
+        original: SignalBatch,
+        policy: OnErrorPolicy,
+        output: &PipelineSender,
+        err_tx: Option<&PipelineSender>,
+    ) {
+        match policy {
+            OnErrorPolicy::Reroute => {
+                if let Some(etx) = err_tx {
+                    if let Err(e) = etx.send(original).await {
+                        warn!(worker_id, "Failed to send errored batch to DLQ: {e}");
+                    }
+                } else {
+                    warn!(
+                        worker_id,
+                        "Error policy is Reroute, but no DLQ error channel configured; dropping batch"
+                    );
+                }
+            }
+            OnErrorPolicy::Passthrough => {
+                if let Err(e) = output.send(original).await {
+                    warn!(worker_id, "Failed to send passthrough batch to output: {e}");
+                }
+            }
+            OnErrorPolicy::Drop => {}
+        }
+        warn!(worker_id, %reason, "Batch error in guest execution");
+    }
+
+    /// Dispatches an incoming batch to the least-loaded worker with backpressure fallback.
+    async fn dispatch_batch(
+        batch: SignalBatch,
+        worker_txs: &[mpsc::Sender<SignalBatch>],
+        next_worker: &mut usize,
+        concurrency: usize,
+    ) -> bool {
+        let mut pending_batch = Some(batch);
+
+        for offset in 0..concurrency {
+            let idx = (next_worker.saturating_add(offset)) % concurrency;
+            if let Some(b) = pending_batch.take() {
+                match worker_txs[idx].try_send(b) {
+                    Ok(()) => {
+                        *next_worker = (idx.saturating_add(1)) % concurrency;
+                        break;
+                    }
+                    Err(
+                        mpsc::error::TrySendError::Full(returned)
+                        | mpsc::error::TrySendError::Closed(returned),
+                    ) => {
+                        pending_batch = Some(returned);
+                    }
+                }
+            }
+        }
+
+        if let Some(b) = pending_batch {
+            if worker_txs[*next_worker].send(b).await.is_err() {
+                warn!("Worker channel closed during backpressure send");
+                return false;
+            }
+            *next_worker = (next_worker.saturating_add(1)) % concurrency;
+        }
+
+        true
+    }
+
+    /// Drains worker tasks up to the configured drain timeout.
+    async fn drain_workers(handles: Vec<JoinHandle<()>>, drain_timeout_str: &str) {
+        let timeout_dur =
+            parse_duration(drain_timeout_str).unwrap_or_else(|| std::time::Duration::from_secs(10));
+
+        let drain_result = tokio::time::timeout(timeout_dur, async {
+            for handle in handles {
+                if let Err(e) = handle.await {
+                    warn!("Worker task panicked during drain: {e:?}");
+                }
+            }
+        })
+        .await;
+
+        if drain_result.is_err() {
+            warn!("Worker drain timed out after {timeout_dur:?}");
+        }
+    }
+}
+
+/// Parses a duration string (e.g. "500ms", "5s", "1m") into a [`std::time::Duration`].
+fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("ms") {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    } else if let Some(num) = trimmed.strip_suffix('m') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
+    } else {
+        trimmed
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    }
+}
