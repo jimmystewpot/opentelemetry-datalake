@@ -329,3 +329,158 @@ async fn test_worker_hot_reload_on_generation_advance() {
     // but worker.rejuvenate() can also be called explicitly or generation can be tested.
     assert_eq!(worker.local_generation(), 0);
 }
+
+// Echo WAT module with batch_count = 1: sets descriptor to input IPC buffer and emits it
+fn echo_single_batch_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            ;; TransformResponseHeader: status=0, batch_count=1, batches_ptr=24, message_ptr=0, message_len=0
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            ;; BatchDescriptor: ptr=$ptr, len=$len
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
+            (i32.const 0)
+        )
+    )"#
+}
+
+// Out-of-bounds descriptors WAT module
+fn oob_descriptors_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            ;; batches_ptr near end of 64KiB (65530) + 16 bytes = 65546 > 65536
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 2))
+            (i32.store (i32.const 8) (i32.const 65530))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+// Out-of-bounds batch buffer WAT module
+fn oob_batch_buffer_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            ;; BatchDescriptor with b_ptr=60000, b_len=10000 -> 70000 > 65536
+            (i32.store (i32.const 24) (i32.const 60000))
+            (i32.store (i32.const 28) (i32.const 10000))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_extracts_batch_count_greater_than_zero_with_rejuvenation() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    // Configure rejuvenation to trigger on every batch (rejuvenate_batches = 1)
+    // to rigorously test that batch extraction occurs BEFORE rejuvenation wipes guest memory.
+    cfg.rejuvenate_batches = 1;
+
+    let mut worker = WasmWorker::new(7, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+
+    match outcome {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 1);
+            match &batches[0] {
+                SignalBatch::Logs(rb) => {
+                    assert_eq!(rb.num_rows(), 1);
+                    assert_eq!(rb.schema(), batch.schema());
+                }
+                _ => panic!("Expected Logs signal"),
+            }
+        }
+        _ => panic!("Expected WorkerOutcome::Emitted"),
+    }
+
+    // Rejuvenation must have executed after successful batch extraction, resetting counter to 0
+    assert_eq!(worker.batches_processed(), 0);
+
+    // The rejuvenated instance can immediately process another batch cleanly
+    let outcome2 = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.batches_processed(), 0);
+}
+
+#[tokio::test]
+async fn test_worker_guards_out_of_bounds_batch_descriptors() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(oob_descriptors_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(8, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Batch descriptors array bounds exceed guest memory size"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_guards_out_of_bounds_batch_buffer() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(oob_batch_buffer_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(9, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Batch IPC buffer bounds exceed guest memory size"),
+        "Unexpected error: {err}"
+    );
+}

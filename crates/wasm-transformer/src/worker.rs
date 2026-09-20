@@ -157,11 +157,11 @@ impl WasmWorker {
             header.message_len,
         );
 
+        // 5. Dispatch outcome and extract transformed batches while guest memory is intact
+        let outcome = self.dispatch_outcome(&header, &message, batch)?;
         self.batches_processed = self.batches_processed.saturating_add(1);
         self.check_rejuvenation()?;
-
-        // 5. Dispatch based on response status
-        self.dispatch_outcome(&header, &message, batch)
+        Ok(outcome)
     }
 
     /// Rejuvenates the worker by discarding its store and creating a fresh instance.
@@ -376,6 +376,8 @@ fn serialize_batch_to_ipc(record_batch: &RecordBatch) -> Result<Vec<u8>, WasmTra
     Ok(ipc_buf)
 }
 
+const MAX_GUEST_MESSAGE_LEN: usize = 64 * 1024;
+
 /// Reads an optional UTF-8 message string from guest memory.
 fn read_guest_message(
     memory: &Memory,
@@ -383,12 +385,14 @@ fn read_guest_message(
     message_ptr: u32,
     message_len: u32,
 ) -> String {
-    if message_len > 0 && message_ptr > 0 {
-        let mut msg_bytes = vec![0u8; message_len as usize];
-        if memory
-            .read(store, message_ptr as usize, &mut msg_bytes)
-            .is_ok()
-        {
+    let m_ptr = message_ptr as usize;
+    let m_len = message_len as usize;
+    let mem_size = memory.data_size(store);
+
+    if message_len > 0 && message_ptr > 0 && m_ptr.saturating_add(m_len) <= mem_size {
+        let alloc_len = m_len.min(MAX_GUEST_MESSAGE_LEN);
+        let mut msg_bytes = vec![0u8; alloc_len];
+        if memory.read(store, m_ptr, &mut msg_bytes).is_ok() {
             String::from_utf8_lossy(&msg_bytes).into_owned()
         } else {
             String::new()
@@ -407,10 +411,21 @@ fn extract_output_batches(
     input_batch: &SignalBatch,
 ) -> Result<Vec<SignalBatch>, WasmTransformError> {
     let descriptor_size = 8usize;
-    let mut out_batches = Vec::with_capacity(batch_count as usize);
+    let mem_size = memory.data_size(store);
+
+    if (batches_ptr as usize).saturating_add((batch_count as usize).saturating_mul(descriptor_size))
+        > mem_size
+    {
+        return Err(WasmTransformError::Pipeline(format!(
+            "Batch descriptors array bounds exceed guest memory size {mem_size}"
+        )));
+    }
+
+    let mut out_batches = Vec::with_capacity((batch_count as usize).min(64));
 
     for i in 0..batch_count {
-        let offset = (batches_ptr as usize).saturating_add(i as usize * descriptor_size);
+        let offset =
+            (batches_ptr as usize).saturating_add((i as usize).saturating_mul(descriptor_size));
         let mut desc_bytes = [0u8; 8];
         memory
             .read(store, offset, &mut desc_bytes)
@@ -419,6 +434,12 @@ fn extract_output_batches(
             u32::from_le_bytes([desc_bytes[0], desc_bytes[1], desc_bytes[2], desc_bytes[3]]);
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
+
+        if (b_ptr as usize).saturating_add(b_len as usize) > mem_size {
+            return Err(WasmTransformError::Pipeline(format!(
+                "Batch IPC buffer bounds exceed guest memory size {mem_size}"
+            )));
+        }
 
         let mut out_ipc_bytes = vec![0u8; b_len as usize];
         memory
