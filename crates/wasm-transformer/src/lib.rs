@@ -9,6 +9,7 @@ pub mod error;
 pub mod guard;
 pub mod host_calls;
 pub mod pool;
+pub mod reload;
 pub mod wasi_env;
 pub mod worker;
 

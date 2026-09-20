@@ -56,6 +56,38 @@ impl EngineCache {
         Ok(module)
     }
 
+    /// Recompiles a WebAssembly module from bytes, verifies its SHA-256 hash if specified,
+    /// atomically swaps the active module in the cache, and advances the generation counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError::Sha256Mismatch`] if `expected_sha` is provided and does
+    /// not match the SHA-256 checksum of `new_bytes` (comparison is case-insensitive).
+    /// Returns [`WasmTransformError::Wasmtime`] if the WebAssembly module fails compilation.
+    pub fn reload_from_bytes(
+        &self,
+        new_bytes: &[u8],
+        expected_sha: Option<&str>,
+    ) -> Result<u64, WasmTransformError> {
+        if let Some(expected) = expected_sha {
+            let actual = crate::reload::compute_sha256(new_bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(WasmTransformError::Sha256Mismatch {
+                    expected: expected.to_string(),
+                    actual,
+                });
+            }
+        }
+
+        let new_module = Arc::new(Module::new(&self.engine, new_bytes)?);
+        let mut guard = self
+            .module
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(Arc::clone(&new_module));
+        Ok(self.advance_generation())
+    }
+
     /// Retrieves the currently compiled module from the cache, if available.
     #[must_use]
     pub fn module(&self) -> Option<Arc<Module>> {
