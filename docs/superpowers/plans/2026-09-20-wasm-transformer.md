@@ -4,7 +4,7 @@
 
 **Goal:** Implement a high-performance WebAssembly (WASM) transformer for `opentelemetry-datalake` allowing users to manipulate, enrich, filter, or drop whole Arrow `RecordBatch`es, with a publishable guest SDK and testing/validation CLI.
 
-**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with epoch-based timeouts and instance pooling; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification and testing tooling.
+**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, Arrow IPC bindings, and manual FFI escape hatch; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with epoch-based timeouts, instance pooling, and a bounded FIFO re-sequencing buffer; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
 
 **Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`.
 
@@ -12,10 +12,12 @@
 
 ## Global Constraints
 - Strictly adhere to the zero-panic policy in production code (`src/`): no `unwrap()`, `expect()`, or `panic!()`.
-- All FFI exchanges across WASM linear memory use standard Apache Arrow IPC streaming format.
+- All FFI exchanges across WASM linear memory use versioned C-ABI v1 with standard Apache Arrow IPC streaming format.
 - CPU timeouts must be enforced via wall-clock duration using Wasmtime epoch interruption (`max_execution_duration`).
 - Linear memory caps must be enforced per instance via `wasmtime::ResourceLimiter` (`max_memory`).
-- Host logger imports must enrich guest log events with `instance_id`, `signal_type`, and guest source location (`file`, `line`, `target`).
+- Host logger imports (`datalake_host_v1`) pass a structured `HostLogRecord` and enrich log events with `instance_id`, `signal_type`, and guest source location (`file`, `line`, `target`).
+- Batch ordering must be preserved via a bounded FIFO re-sequencer when `ordered = true` (default).
+- `on_error = "passthrough"` must be rejected at configuration time unless `allow_unmasked_passthrough = true` is explicitly enabled.
 - Code must pass `cargo fmt` and `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`.
 
 ---
@@ -73,11 +75,11 @@ git commit -m "chore: scaffold wasm-sdk, wasm-transformer, and wasm-cli crates"
 
 **Interfaces:**
 - Consumes: `arrow` RecordBatch & Array types.
-- Produces: `BatchTransformer` trait, `TransformResult`, `SignalType`, `export_transformer!` macro, `helpers` module.
+- Produces: `BatchTransformer` trait, `TransformResult`, `SignalType`, `export_transformer!` macro, `abi::raw_alloc`, `abi::dispatch_transform` (manual escape hatch), `helpers` module.
 
-- [ ] **Step 1: Write the failing test for SDK Arrow IPC serialization and helper methods**
+- [ ] **Step 1: Write the failing test for SDK Arrow IPC serialization, ABI versioning, and manual escape hatch**
 
-Write unit test in `crates/wasm-sdk/tests/sdk_abi_tests.rs` creating a `RecordBatch`, writing to IPC stream using `crates/wasm-sdk/src/ipc.rs`, and verifying roundtrip reading.
+Write unit test in `crates/wasm-sdk/tests/sdk_abi_tests.rs` testing IPC stream roundtripping, verifying `datalake_abi_version() == 1`, and testing `dispatch_transform` without macros.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -87,11 +89,12 @@ Expected: FAIL with unresolved modules.
 - [ ] **Step 3: Implement `ipc.rs`, `abi.rs`, `helpers.rs`, and `lib.rs`**
 
 Implement:
+- `abi::raw_alloc`, `abi::raw_dealloc`, `abi::dispatch_transform`
 - `ipc::read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>, ArrowError>`
 - `ipc::write_ipc_stream(batches: &[RecordBatch]) -> Result<Vec<u8>, ArrowError>`
 - `helpers::drop_columns(batch: &RecordBatch, names: &[&str]) -> Result<RecordBatch, ArrowError>`
 - `helpers::filter_batch(batch: &RecordBatch, predicate: &arrow::array::BooleanArray) -> Result<RecordBatch, ArrowError>`
-- `export_transformer!` macro generating `datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`.
+- `export_transformer!` macro generating `datalake_abi_version`, `datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -102,7 +105,7 @@ Expected: PASS.
 
 ```bash
 git add -f crates/wasm-sdk
-git commit -m "feat(wasm-sdk): implement BatchTransformer trait, Arrow IPC codec, and export macro"
+git commit -m "feat(wasm-sdk): implement BatchTransformer trait, Arrow IPC codec, export macro, and manual FFI escape hatch"
 ```
 
 ---
@@ -157,13 +160,14 @@ git commit -m "feat(wasm-sdk): add mock telemetry batch generators and testing u
 - Test: `crates/wasm-transformer/tests/engine_tests.rs`
 
 **Interfaces:**
-- Consumes: `WasmTransformerConfig` (module path, max_execution_duration, max_memory).
+- Consumes: `WasmTransformerConfig` (module path, max_execution_duration, max_memory, on_error, allow_unmasked_passthrough).
 - Produces: `WasmEngine`, `WasmInstance`, `HostState`, `WasmTransformError`.
 
 - [ ] **Step 1: Write failing test for engine compilation, epoch ticking, and memory limit**
 
 Write `tests/engine_tests.rs` verifying:
 - Compilation of a minimal WebAssembly module.
+- Validation that `on_error = "passthrough"` without `allow_unmasked_passthrough = true` returns a configuration error.
 - Memory limiter rejects allocations exceeding `max_memory`.
 - Epoch interruption triggers timeout when execution loop exceeds deadline.
 
@@ -175,7 +179,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement `error.rs`, `config.rs`, `engine.rs`, and `instance.rs`**
 
 Implement:
-- `WasmTransformError` with `thiserror` (Timeout, OutOfMemory, Trap, IpcError, InitializationFailed).
+- `WasmTransformError` with `thiserror` (Timeout, OutOfMemory, Trap, IpcError, InitializationFailed, AbiVersionMismatch, SecurityConfigurationError).
 - `WasmEngine::new(config: &WasmTransformerConfig)` initializing `wasmtime::Engine` with `epoch_interruption(true)`.
 - Background ticker thread calling `engine.increment_epoch()` every 10ms.
 - `ResourceLimiter` implementation in `instance.rs` enforcing `max_memory` bytes.
@@ -189,12 +193,12 @@ Expected: PASS.
 
 ```bash
 git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement wasmtime engine, epoch ticker, and memory limiter"
+git commit -m "feat(wasm-transformer): implement wasmtime engine, epoch ticker, and security config validation"
 ```
 
 ---
 
-### Task 5: Host Imports & Guest Log Forwarding (`crates/wasm-transformer`)
+### Task 5: Host Imports & Structured Guest Log Forwarding (`crates/wasm-transformer`)
 
 **Files:**
 - Create: `crates/wasm-transformer/src/host_calls.rs`
@@ -203,11 +207,11 @@ git commit -m "feat(wasm-transformer): implement wasmtime engine, epoch ticker, 
 
 **Interfaces:**
 - Consumes: Wasmtime `Linker<HostState>`.
-- Produces: Imported host functions (`datalake_host_log`, `datalake_host_metric_inc`, `datalake_host_has_capability`).
+- Produces: Imported host functions under `datalake_host_v1` (`datalake_host_log` with `HostLogRecord`, `datalake_host_metric_inc`, `datalake_host_has_capability`).
 
-- [ ] **Step 1: Write failing test for host log interception and capability probe**
+- [ ] **Step 1: Write failing test for structured host log interception and capability probe**
 
-Write `tests/host_calls_tests.rs` where a test WASM module invokes `datalake_host_log` and `datalake_host_has_capability`, asserting logs are emitted with instance ID and capability checks return 1.
+Write `tests/host_calls_tests.rs` where a test WASM module invokes `datalake_host_log` with a `HostLogRecord` pointer and `datalake_host_has_capability`, asserting logs are emitted with instance ID and capability checks return 1.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -216,8 +220,8 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement `host_calls.rs`**
 
-Register imported functions in `wasmtime::Linker<HostState>`:
-- `datalake_host_log`: reads guest string, emits `tracing::event!` with `instance_id`, `signal`, `file`, `line`.
+Register imported functions in `wasmtime::Linker<HostState>` under `datalake_host_v1`:
+- `datalake_host_log`: reads `HostLogRecord` struct, emits `tracing::event!` with `instance_id`, `signal`, `file`, `line`, `target`.
 - `datalake_host_metric_inc`: increments named metric counter.
 - `datalake_host_has_capability`: checks supported capability strings.
 
@@ -230,50 +234,53 @@ Expected: PASS.
 
 ```bash
 git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement host functions for logging, metrics, and capability probing"
+git commit -m "feat(wasm-transformer): implement versioned datalake_host_v1 imports with structured HostLogRecord"
 ```
 
 ---
 
-### Task 6: Host `WasmTransformer` & Worker Pool Implementation
+### Task 6: FIFO Re-Sequencing & Host `WasmTransformer` Implementation
 
 **Files:**
+- Create: `crates/wasm-transformer/src/reorder.rs`
 - Create: `crates/wasm-transformer/src/worker.rs`
 - Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/reorder_tests.rs`
 - Test: `crates/wasm-transformer/tests/transformer_pipeline_tests.rs`
 
 **Interfaces:**
 - Consumes: `pipeline_core::pipeline::Transform`, `PipelineReceiver`, `PipelineSender`.
-- Produces: `WasmTransformer` struct implementing `Transform`.
+- Produces: `ReorderBuffer`, `WasmTransformer` struct implementing `Transform`.
 
-- [ ] **Step 1: Write failing test for `Transform::transform` stream execution**
+- [ ] **Step 1: Write failing test for out-of-order completion re-sequencing and pipeline execution**
 
-Write `tests/transformer_pipeline_tests.rs` running `SignalBatch::Logs` through `WasmTransformer`, asserting output batches are correctly received on `PipelineSender`, and aborts drop batches with incremented metrics.
+Write `tests/reorder_tests.rs` verifying that out-of-order batches completed across workers are re-ordered into monotonic sequence order before emitting downstream.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p wasm-transformer --test transformer_pipeline_tests`  
+Run: `cargo test -p wasm-transformer --test reorder_tests`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `worker.rs` and `lib.rs`**
+- [ ] **Step 3: Implement `reorder.rs`, `worker.rs`, and `lib.rs`**
 
 Implement:
-- Batch serialization to Arrow IPC.
+- `ReorderBuffer`: bounded min-heap indexed by `seq_id: u64` with immediate contiguous drain.
+- Batch serialization to Arrow IPC and version verification (`datalake_abi_version() == 1`).
 - Calling `datalake_alloc`, writing buffer, invoking `datalake_transform`, parsing `TransformResponseHeader`.
 - Handling `status == 1` (Drop/Abort), `status == 2` (Error), and `status == 0` (Success).
-- Deallocating memory.
-- Worker task pool reading from `input: PipelineReceiver` and sending to `output: PipelineSender`.
+- Memory deallocation.
+- Worker task pool with dispatcher and re-sequencer.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p wasm-transformer --test transformer_pipeline_tests`  
+Run: `cargo test -p wasm-transformer --test reorder_tests --test transformer_pipeline_tests`  
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement Transform trait with worker pool and Arrow IPC batch exchange"
+git commit -m "feat(wasm-transformer): implement FIFO re-sequencing buffer and Transform pipeline engine"
 ```
 
 ---
@@ -290,9 +297,9 @@ git commit -m "feat(wasm-transformer): implement Transform trait with worker poo
 - Consumes: Compiled `.wasm` files.
 - Produces: CLI binary `datalake-wasm` with `validate`, `test`, `bench` subcommands.
 
-- [ ] **Step 1: Write failing test for CLI validation subcommand**
+- [ ] **Step 1: Write failing test for CLI validation subcommand checking ABI version and exports**
 
-Write `tests/cli_tests.rs` calling validator on a valid vs invalid WASM binary (missing `datalake_transform` export), asserting `validate` returns Ok or Err.
+Write `tests/cli_tests.rs` calling validator on a valid vs invalid WASM binary (missing `datalake_abi_version` export), asserting `validate` returns Ok or Err.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -302,9 +309,9 @@ Expected: FAIL.
 - [ ] **Step 3: Implement `validator.rs`, `runner.rs`, and `main.rs`**
 
 Implement:
-- `validate`: parses WASM exports, asserts presence of `datalake_alloc`, `datalake_dealloc`, `datalake_transform`, `datalake_init`.
+- `validate`: verifies `datalake_abi_version() == 1`, asserts presence of exports, checks memory boundaries.
 - `test`: runs synthetic Arrow batch through module, validates output schema, verifies memory cleanup.
-- `bench`: executes N batches and prints latency distribution.
+- `bench`: executes N batches and prints latency distribution (p50, p95, p99) and rows/sec.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -358,17 +365,17 @@ git commit -m "feat: integrate wasm transformer into datalake configuration and 
 
 ---
 
-### Task 9: End-to-End Example Module & Quality Gates
+### Task 9: End-to-End Example Module, Boundary Benchmarks & Quality Gates
 
 **Files:**
 - Create: `examples/wasm-pii-scrubber/Cargo.toml`
 - Create: `examples/wasm-pii-scrubber/src/lib.rs`
 - Create: `examples/wasm-pii-scrubber/tests/scrubber_test.rs`
-- Modify: `docs/superpowers/specs/2026-09-20-wasm-transformer-design.md`
+- Create: `benches/wasm_boundary_bench.rs`
 
 **Interfaces:**
-- Consumes: `opentelemetry-datalake-wasm-sdk`.
-- Produces: Working example WASM module demonstrating credit card masking and deliberate test batch dropping.
+- Consumes: `opentelemetry-datalake-wasm-sdk`, `wasm-transformer`.
+- Produces: Working example WASM module and latency budget verification benchmark.
 
 - [ ] **Step 1: Create example PII scrubber module**
 
@@ -379,7 +386,15 @@ Implement a `BatchTransformer` that detects credit cards in log messages, redact
 Run: `cargo test -p wasm-pii-scrubber`  
 Expected: PASS.
 
-- [ ] **Step 3: Run full workspace quality gates**
+- [ ] **Step 3: Add and run boundary latency benchmark**
+
+Write `benches/wasm_boundary_bench.rs` and run criterion benchmark:
+```bash
+cargo bench --bench wasm_boundary_bench
+```
+Verify round-trip overhead satisfies $p95 \le 1.5\text{ms}$.
+
+- [ ] **Step 4: Run full workspace quality gates**
 
 Run:
 ```bash
@@ -389,9 +404,9 @@ cargo test --workspace
 ```
 Expected: PASS with 0 warnings and 0 errors.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add -f examples/wasm-pii-scrubber
-git commit -m "docs(example): add wasm-pii-scrubber example module and verify quality gates"
+git add -f examples/wasm-pii-scrubber benches/wasm_boundary_bench.rs
+git commit -m "docs(example): add wasm-pii-scrubber example, latency benchmark, and verify quality gates"
 ```
