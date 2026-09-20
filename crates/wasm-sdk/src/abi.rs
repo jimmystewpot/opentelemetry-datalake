@@ -60,6 +60,21 @@ pub struct HostLogRecord {
     pub line: u32,
 }
 
+/// Tracing log level for error messages.
+pub const LOG_LEVEL_ERROR: u32 = 1;
+
+/// Tracing log level for warning messages.
+pub const LOG_LEVEL_WARN: u32 = 2;
+
+/// Tracing log level for informational messages.
+pub const LOG_LEVEL_INFO: u32 = 3;
+
+/// Tracing log level for debug messages.
+pub const LOG_LEVEL_DEBUG: u32 = 4;
+
+/// Tracing log level for trace messages.
+pub const LOG_LEVEL_TRACE: u32 = 5;
+
 /// Returns the C-ABI protocol version implemented by this guest module.
 #[must_use]
 // SAFETY: Exporting symbol with standard C linkage for the WASM C-ABI protocol.
