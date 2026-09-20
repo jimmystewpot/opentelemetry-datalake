@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Full Architecture, Observability, Topological DLQ, and Security Reviews)  
+**Status**: Final Approved Spec (Incorporating Full Architecture, Telemetry Immutability, Noise Discard vs Audit Reject, and DLQ Topology Reviews)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,16 +15,17 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge`, `Duration` automatically mapped to Histograms) with cardinality caps.
-* **Topological Reroute & Dead-Letter Sinks (`_reroute_errored` & `_reroute_aborted`)**: Failed or aborted batches are routed directly through the datalake pipeline topology to dedicated virtual sink inputs (`<transform_name>._reroute_errored` and `<transform_name>._reroute_aborted`). The topology builder strictly enforces at startup that matching sinks exist if rerouting is enabled.
+* **Core Telemetry Immutability**: Core OpenTelemetry identity fields (`trace_id`, `span_id` in traces; metric `name`, `type` in metrics; `timestamp` in logs) are strictly **immutable**. Dropping or nullifying immutable fields triggers a schema invariant violation. Only auxiliary fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`) can be nullified or redacted.
+* **Noise Discard vs. Audit Rejection**: Distinguishes intentional noise filtering/sampling (`TransformResult::Discard`, which drops silently without rerouting) from compliance/validation rejections (`TransformResult::Reject { reason }`, which routes to `<component_id>._reroute_aborted` if configured).
+* **Unified Error Policy & Topological DLQ (`on_error`)**: Configured via a single enum: `on_error = "drop" | "reroute" | "passthrough"`. If `"reroute"`, the topology builder strictly enforces at startup that a sink is subscribed to `<component_id>._reroute_errored`. If `"passthrough"`, the worker preserves the original batch and forwards it downstream under standard channel backpressure (requiring `allow_unmasked_passthrough = true`).
+* **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
+* **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
 * **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest. Static config values always override host environment values.
 * **Deterministic Hot-Reload Generation Fencing**: A monotonic `module_generation` counter is verified by workers at every batch boundary. When a hot-reload occurs, workers finish their active batch, detect the generation mismatch, and immediately drain and reload their instance in $\approx 10\,\mu\text{s}$, eliminating zombie worker drift.
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
 * **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
-* **Canonical OpenTelemetry Schema Invariance**: Telemetry entering and exiting the transformer always adheres to the canonical OpenTelemetry Arrow schema for that signal type. Stripped fields are represented as nulls or empty structures. The host automatically backfills any missing canonical columns with type-aware null arrays (`arrow::array::new_null_array`), guaranteeing downstream sinks (Iceberg, StarRocks, Elasticsearch) never experience schema failure.
 * **Init-Time Capability Negotiation**: Capabilities (e.g. GeoIP, cache, secrets) are queried exclusively during `datalake_init` and cached in guest memory. The host uses explicit return codes (`0 = unavailable`, `1 = available`) and logs diagnostic warnings for unrecognized capability names to prevent silent typos.
-* **Actionable Panic Diagnostics**: The SDK installs a standard WASM panic hook capturing source file, line, and message, emitted directly into host structured logs with component contextual tags.
 * **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
 
 ---
@@ -38,10 +39,10 @@ opentelemetry-datalake/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
-│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, reroutes)
+│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
-│   │       ├── guard.rs               # Invariant validation (max_batch_rows) & schema defense
+│   │       ├── guard.rs               # Invariant validation, immutability checks & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
@@ -55,7 +56,7 @@ opentelemetry-datalake/
 │   │       ├── abi.rs                 # Low-level FFI exports & memory protocol (with manual escape hatch)
 │   │       ├── ipc.rs                 # Arrow IPC stream reading & writing in guest
 │   │       ├── helpers.rs             # Column nullification, projection, filtering utilities
-│   │       ├── metrics.rs             # Controlled guest metric API (counter, gauge, duration)
+│   │       ├── metrics.rs             # Controlled guest metric API (counter, gauge, duration in nanos)
 │   │       ├── panic.rs               # Custom std::panic hook forwarding to datalake_host_log
 │   │       ├── logger.rs              # Guest tracing/log forwarder using HostLogRecord
 │   │       └── testing.rs             # Mock batch generators & WasmHarness test runner
@@ -116,8 +117,9 @@ pub struct TransformResponseHeader {
     pub abi_version: u32,
 
     /// 0 = Success (emit batches downstream)
-    /// 1 = Abort/Drop (deliberately drop payload, routed to _reroute_aborted if enabled)
-    /// 2 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if enabled)
+    /// 1 = Discard (noise drop / sampling, silently dropped, never rerouted)
+    /// 2 = Reject (business validation drop, routed to _reroute_aborted if enabled)
+    /// 3 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if enabled)
     pub status: u32,
 
     /// Number of emitted Arrow IPC batches (0..N)
@@ -126,7 +128,7 @@ pub struct TransformResponseHeader {
     /// Pointer to array of `BatchDescriptor { ptr: u32, len: u32 }`
     pub batches_ptr: u32,
 
-    /// Pointer to optional UTF-8 string (abort reason or error message)
+    /// Pointer to optional UTF-8 string (reject reason or error message)
     pub message_ptr: u32,
     pub message_len: u32,
 }
@@ -159,9 +161,10 @@ pub struct HostLogRecord {
 void datalake_host_log(uint32_t record_ptr);
 
 // Emits a controlled custom metric counter, gauge, or duration (histogram).
-// metric_type: 0 = Counter, 1 = Gauge, 2 = Duration (microseconds, automatically exposed as Histogram)
+// metric_type: 0 = Counter, 1 = Gauge, 2 = Duration
+// For metric_type = 2 (Duration), value is strictly in NANOSECONDS (u64).
+// Host automatically converts nanoseconds to seconds and records into Prometheus Histogram.
 // name_ptr / name_len: relative metric name (e.g. "pii_redacted")
-// value: u64
 void datalake_host_metric_emit(uint32_t metric_type, uint32_t name_ptr, uint32_t name_len, uint64_t value);
 
 // Dynamic capability query for optional host features (cache, geoip, secrets).
@@ -196,10 +199,13 @@ pub enum SignalType {
 }
 
 pub enum TransformResult {
-    /// Emit 0..N transformed RecordBatches downstream.
+    /// Emit 0..N transformed RecordBatches downstream to primary sinks.
     Success(Vec<RecordBatch>),
-    /// Deliberately drop/abort the payload with a reason (routed to _reroute_aborted if enabled).
-    Drop { reason: Option<String> },
+    /// Intentional noise filtering / sampling. Silently discarded from memory, counted in metrics, NEVER rerouted.
+    Discard,
+    /// Business-logic rejection (e.g. validation failure, security policy).
+    /// Routed to <component_id>._reroute_aborted if reroute_on_reject = true.
+    Reject { reason: String },
 }
 
 impl TransformResult {
@@ -211,8 +217,12 @@ impl TransformResult {
         Self::Success(batches)
     }
 
-    pub fn drop_payload(reason: impl Into<String>) -> Self {
-        Self::Drop { reason: Some(reason.into()) }
+    pub fn discard() -> Self {
+        Self::Discard
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Reject { reason: reason.into() }
     }
 }
 
@@ -237,7 +247,7 @@ The `export_transformer!(MyType)` macro generates the FFI exports and automatica
 
 ```rust
 // Automatically sets std::panic::set_hook to capture panic location & message,
-// routing it through datalake_host_log before returning status = 2.
+// routing it through datalake_host_log before returning status = 3 (Error).
 export_transformer!(MyCustomTransformer);
 ```
 
@@ -276,9 +286,12 @@ The SDK provides safe wrappers for metrics, logging, and environment access:
 // Custom metrics (automatically namespaced to datalake_transformers_<component_id>_*)
 sdk::metrics::counter("pii_redacted", 1);
 sdk::metrics::gauge("cache_size", 1024);
-sdk::metrics::duration("lookup_duration", elapsed_duration); // Recorded into Prometheus Histogram
 
-// Canonical schema helpers
+// Duration helper: takes std::time::Duration, automatically extracts nanoseconds (u64)
+// and host converts to seconds in Prometheus Histogram
+sdk::metrics::duration("lookup_duration", elapsed_duration);
+
+// Canonical schema helpers (only valid for mutable fields)
 sdk::helpers::nullify_column(&batch, "scope_attributes")?;
 sdk::helpers::filter_batch(&batch, &boolean_mask)?;
 sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")?;
@@ -308,12 +321,16 @@ max_memory = "64MiB"                 # Virtual memory slot size (recommended: 64
 rejuvenate_threshold = "16MiB"       # Soft memory limit for instant page reclamation
 rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
 init_timeout = "2s"                  # Maximum duration for datalake_init
-on_error = "drop"                    # "drop" or "passthrough"
-allow_unmasked_passthrough = false   # Required if on_error = "passthrough"
 
-# Topological Reroute (Dead-Letter Queue & Abort Sinks)
-reroute_on_error = true              # Routes failed/panicked batches to <id>._reroute_errored
-reroute_on_abort = true              # Routes intentionally dropped batches to <id>._reroute_aborted
+# Failure Policy (Unified Enum: "drop" | "reroute" | "passthrough")
+on_error = "reroute"                 # "reroute" requires a sink subscribed to <id>._reroute_errored
+allow_unmasked_passthrough = false   # Required only if on_error = "passthrough"
+
+# Audit Rejection Routing (TransformResult::Reject)
+reroute_on_reject = true             # Routes TransformResult::Reject to <id>._reroute_aborted
+
+# Schema Guard Mode: "defensive" (backfill typed nulls) or "strict" (fail on missing columns)
+schema_guard = "defensive"
 
 # Whitelisted host environment variables passed to the WASM sandbox
 env_whitelist = [
@@ -333,32 +350,60 @@ environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Topological Dead-Letter Routing (`_reroute_errored` & `_reroute_aborted`)
+### 5.2 Failure Policies & Backpressure Semantics
 
-Instead of writing unmanaged files to arbitrary local directories, error handling is integrated directly into the pipeline topology:
+1. **`on_error = "reroute"` (Default Recommended)**:
+   - When a batch execution fails (timeout, panic, trap, IPC decode error), the pristine original batch is routed to the virtual stream `<component_id>._reroute_errored`.
+   - The topology builder asserts at startup that a sink is subscribed to `inputs = ["<component_id>._reroute_errored"]`. If missing, startup fails immediately.
+2. **`on_error = "passthrough"` (Fail-Open)**:
+   - Requires `allow_unmasked_passthrough = true` in configuration.
+   - When a transform fails, the worker **preserves the original batch in memory** and forwards it to the primary `output.send(batch).await`.
+   - The worker **blocks under backpressure** until downstream sinks accept the batch. If downstream is stalled, backpressure propagates upstream to the OTLP receiver, which returns `503 Service Unavailable` to the caller. No data is dropped.
+3. **`on_error = "drop"` (Fail-Closed)**:
+   - Failed batches are discarded from memory, and `component_errors_total` is incremented.
 
-1. **Virtual Source Outputs**:
-   - Every `WasmTransformer` exposes three logical output streams:
-     - `primary`: Standard successfully transformed batches (subscribed via `inputs = ["<component_id>"]`).
-     - `_reroute_errored`: Original, pristine incoming batches that failed execution (panic, timeout, trap, IPC decode failure).
-     - `_reroute_aborted`: Original, pristine incoming batches that were explicitly dropped via `TransformResult::Drop`.
-2. **Topology Builder Startup Enforcement**:
-   - If `reroute_on_error = true`, the topology validator asserts that at least one sink lists `"<component_id>._reroute_errored"` in its `inputs`.
-   - If `reroute_on_abort = true`, the topology validator asserts that at least one sink lists `"<component_id>._reroute_aborted"` in its `inputs`.
-   - If the sink mapping is missing, the datalake **refuses to boot** with an actionable configuration error.
-   - Example sink configuration:
-     ```toml
-     [[pipeline.sinks]]
-     id = "quarantine_sink"
-     inputs = ["pii_scrubber._reroute_errored"]
-     type = "iceberg"
-     table = "telemetry_quarantine"
-     ```
-3. **Fallback When Rerouting Disabled**:
-   - If `reroute_on_error = false`, failures follow the `on_error` policy (`drop` or `passthrough`).
-   - If `reroute_on_abort = false`, aborted batches are dropped silently with a metric increment.
+### 5.3 Audit Rejection vs. Noise Discard Semantics
 
-### 5.3 Vector-Aligned Observability & Controlled Metrics
+1. **`TransformResult::Discard` (Noise Filtering / Sampling)**:
+   - Telemetry that the module intentionally filters out (e.g. noisy health checks).
+   - Dropped directly from memory. Never sent to any sink.
+   - Increments `component_discarded_rows_total{component_id="...", reason="discard"}`.
+2. **`TransformResult::Reject { reason }` (Audit Policy Drop)**:
+   - Telemetry dropped due to business validation failure or security rule.
+   - If `reroute_on_reject = true`, the original batch is routed to `<component_id>._reroute_aborted`.
+   - The topology builder requires a sink subscribed to `inputs = ["<component_id>._reroute_aborted"]`.
+   - Increments `component_discarded_rows_total{component_id="...", reason="reject"}`.
+
+### 5.4 Core Telemetry Immutability & Schema Guard
+
+#### 5.4.1 Mandatory Immutable Core Fields
+The OpenTelemetry data model relies on immutable trace and metric identities. The host enforces that these fields cannot be dropped or nullified:
+* **Traces**: `trace_id`, `span_id`.
+* **Logs**: `timestamp` (or `observed_timestamp`).
+* **Metrics**: Metric `name`, metric `type`.
+
+If an outgoing batch drops an immutable column or contains all-null values for an immutable column where the input had valid IDs, the host rejects the batch with `WasmTransformError::ImmutableFieldViolation { column }` and triggers the configured `on_error` policy.
+
+#### 5.4.2 Schema Guard (Defensive vs. Strict)
+For mutable fields (`attributes`, `scope_attributes`, `resource_attributes`, `body`, `exemplars`):
+* **`schema_guard = "defensive"` (Default)**:
+  - If a guest omits a mutable canonical column, the host backfills it using `arrow::array::new_null_array(field.data_type(), num_rows)`.
+  - Increments counter: `datalake_wasm_schema_columns_backfilled_total{component_id, signal, column}`.
+  - Logs a rate-limited `WARN` (at most once every 60s per column) to ensure visibility of guest bugs.
+* **`schema_guard = "strict"`**:
+  - Missing mutable columns are treated as an error, rejecting the batch and triggering `on_error`.
+
+### 5.5 Resilient Rejuvenation & Lifecycle
+
+When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `rejuvenate_batches = 10000`):
+1. **Non-Destructive Instance Swap**:
+   - The worker initializes a candidate `Store` from the active `Arc<Module>` and invokes `datalake_init`.
+   - The old instance is **not discarded** until `datalake_init` succeeds.
+2. **Retry with Exponential Backoff**:
+   - If `datalake_init` returns non-zero or times out (`init_timeout = 2s`), the worker logs an error and retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+   - If all retries fail, the worker keeps serving on the existing store (avoiding permanent worker slot death), logs a critical warning, and attempts rejuvenation again after 100 batches.
+
+### 5.6 Vector-Aligned Observability & Controlled Metrics
 
 1. **Uniform Component Identification**:
    - All host logs and metrics emitted by the transformer include the standardized Vector-style labels:
@@ -369,7 +414,7 @@ Instead of writing unmanaged files to arbitrary local directories, error handlin
 2. **Standard Pipeline Metrics**:
    - `component_received_rows_total`
    - `component_sent_rows_total`
-   - `component_discarded_rows_total`
+   - `component_discarded_rows_total{reason="discard|reject"}`
    - `component_errors_total`
    - `component_execution_duration_seconds` (Histogram)
 3. **Controlled Custom Metric Injection**:
@@ -380,12 +425,12 @@ Instead of writing unmanaged files to arbitrary local directories, error handlin
    - Type mapping:
      - `metric_type = 0` (Counter): Prometheus counter.
      - `metric_type = 1` (Gauge): Prometheus gauge.
-     - `metric_type = 2` (Duration): Emitted value is converted to seconds and recorded into a Prometheus Histogram (`..._duration_seconds`).
+     - `metric_type = 2` (Duration): Value in nanoseconds (`u64`), converted to seconds (`f64 / 1e9`) and recorded into a Prometheus Histogram (`..._duration_seconds`).
    - Hard limits:
      - Metric names: ASCII alphanumeric + `_`, max 64 characters.
      - Cardinality ceiling: Maximum 50 distinct custom metric names per `component_id`.
 
-### 5.4 Environment Variable Sandboxing & Zero-Trust WASI
+### 5.7 Environment Variable Sandboxing & Zero-Trust WASI
 
 1. **Default Deny**: By default, `wasmtime_wasi::WasiCtxBuilder` does not inherit host environment variables.
 2. **Precedence Rule**:
@@ -393,43 +438,16 @@ Instead of writing unmanaged files to arbitrary local directories, error handlin
    - If a key exists in both, the static value is used and an informational notice is logged.
 3. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
 
-### 5.5 Kubernetes Sizing & Memory Guidance
-
-When running in containerized environments (Kubernetes pods), operators must account for Wasmtime's virtual memory pooling allocator:
+### 5.8 Kubernetes Sizing & Memory Guidance
 
 $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$$
 
-* **Recommended Edge Configuration**: `concurrency = 4`, `max_memory = "64MiB"`, `rejuvenate_threshold = "16MiB"`. This requires $256\text{MiB}$ of virtual address space.
-* **Host Physical RAM**: Thanks to `madvise(MADV_DONTNEED)`, actual physical resident set size (RSS) stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
-* **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient (Linux default of 65,530 is plenty for standard pools).
-
-### 5.6 Concurrency & Boundary Guards
-
-* **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender` (or reroute channels). No inter-batch reorder buffer, no head-of-line blocking.
-* **Batch Size Invariant Check**: If an incoming batch exceeds `max_batch_rows`, the transformer rejects it with a fatal pipeline error directing operators to configure an upstream `AccumulatorTransformer`.
-
-### 5.7 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
-
-* **Pooling Instance Allocator**: Pre-allocates $N$ memory slots in virtual memory at startup (`PoolingAllocationConfig`).
-* **Microsecond Resets (`MADV_DONTNEED`)**: When an instance is refreshed, Wasmtime issues `MADV_DONTNEED` to reclaim physical RAM pages and zero the memory in $\approx 5\text{--}10\,\mu\text{s}$.
-* **Rejuvenation Triggers**:
-  1. *Soft Memory Cap*: If linear memory $> \text{rejuvenate\_threshold}$ after a batch, the `Store` is reset.
-  2. *Hygiene Trigger*: Every $10,000$ batches, the `Store` is reset.
-  3. *Trap Recovery*: If an instance traps, the contaminated `Store` is immediately discarded and replaced.
-* **Init Deadline**: Re-initializing an instance via `datalake_init` is bounded by `init_timeout` (default: 2s) to prevent stalled module initialization.
-
-### 5.8 Canonical OTel Schema Invariance & Typed Null Backfill
-
-* Telemetry entering and exiting the WASM boundary must conform to the canonical OpenTelemetry Arrow schema for that `SignalType`.
-* **Type-Aware Defensive Backfill**: If a guest module omits a canonical column (e.g. user completely dropped `scope_attributes` or `attributes`), the host automatically backfills it using Arrow's type-aware constructor:
-  ```rust
-  arrow::array::new_null_array(canonical_field.data_type(), batch.num_rows())
-  ```
-  This creates a structurally valid null array matching complex nested types (`MapArray`, `ListArray`, `StructArray`). Downstream Parquet writes and Iceberg commits are 100% protected against physical schema divergence.
+* **Recommended Edge Configuration**: `concurrency = 4`, `max_memory = "64MiB"`, `rejuvenate_threshold = "16MiB"`. Requires $256\text{MiB}$ of virtual address space.
+* **Host Physical RAM**: Actual physical RSS stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
+* **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient.
 
 ### 5.9 Deterministic Hot-Reloading & Generation Fencing
 
-To eliminate TOCTOU filesystem races and zombie worker drift:
 1. **Single-Read In-Memory Compilation**:
    ```rust
    let wasm_bytes = tokio::fs::read(&module_path).await?;
@@ -447,7 +465,7 @@ To eliminate TOCTOU filesystem races and zombie worker drift:
    - At the beginning of processing each batch, workers check:
      ```rust
      if self.local_generation != global_engine.module_generation() {
-         self.reload_instance(&global_engine)?; // Discards old store, rebuilds from new module
+         self.reload_instance(&global_engine)?; // Non-destructive reload from new module
      }
      ```
    - Maximum lag before running new code is exactly 1 batch per worker. Zero zombie drift.
@@ -460,14 +478,15 @@ To eliminate TOCTOU filesystem races and zombie worker drift:
 |---|---|---|---|
 | `component_received_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal` | Incoming rows. |
 | `component_sent_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal` | Outgoing rows after mutations. |
-| `component_discarded_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `reason` | Deliberately dropped/aborted rows. |
-| `component_errors_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `error_type` | Total execution failures (timeout, oom, trap, etc.). |
+| `component_discarded_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `reason` (`discard`, `reject`) | Dropped rows by discard category. |
+| `component_errors_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `error_type` | Total execution failures. |
 | `component_execution_duration_seconds` | Histogram | `component_id`, `component_type`, `component_kind`, `signal` | Boundary latency per batch. |
 | `datalake_wasm_memory_bytes` | Gauge | `component_id`, `instance_id` | Current linear memory consumption per instance. |
 | `datalake_wasm_rejuvenations_total` | Counter | `component_id`, `instance_id`, `reason` | Total instance pool resets. |
 | `datalake_wasm_module_info` | Gauge | `component_id`, `sha256`, `generation`, `abi_version` | Active module audit information. |
+| `datalake_wasm_schema_columns_backfilled_total` | Counter | `component_id`, `signal`, `column` | Missing mutable columns backfilled with nulls. |
 | `datalake_transformers_<component_id>_<name>` | Counter / Gauge | `component_id`, `signal` | Guest custom counter or gauge. |
-| `datalake_transformers_<component_id>_<name>_duration_seconds` | Histogram | `component_id`, `signal` | Guest custom duration histogram. |
+| `datalake_transformers_<component_id>_<name>_duration_seconds` | Histogram | `component_id`, `signal` | Guest custom duration histogram (fed by nanoseconds). |
 
 ### Logging Standards
 
@@ -491,7 +510,7 @@ Dedicated CLI utility (`datalake-wasm`) verifies compiled `.wasm` modules:
    - Executes module against synthetic or user-provided Arrow IPC streams.
    - Injects test environment variables into guest WASI context.
    - Enables DWARF debug info for full guest stack traces on panics.
-   - Verifies handling of 0-row batches, drops, and canonical schema invariance.
+   - Verifies handling of 0-row batches, Discard, Reject, and canonical schema invariance.
 3. **`datalake-wasm bench <path.wasm> [--rows 10000] [--concurrency 4]`**:
    - Measures batch transformation latency distribution (p50, p95, p99), throughput (rows/sec), and peak memory.
 
