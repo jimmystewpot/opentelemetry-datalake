@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Full Architecture, Operational, and Security Whitelist Reviews)  
+**Status**: Final Approved Spec (Incorporating Full Architecture, Observability, Topological DLQ, and Security Reviews)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,13 +15,16 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Environment Variable Sandboxing & Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest, preventing accidental leakage of host secrets (e.g., AWS/GCP credentials, database passwords).
+* **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge`, `Duration` automatically mapped to Histograms) with cardinality caps.
+* **Topological Reroute & Dead-Letter Sinks (`_reroute_errored` & `_reroute_aborted`)**: Failed or aborted batches are routed directly through the datalake pipeline topology to dedicated virtual sink inputs (`<transform_name>._reroute_errored` and `<transform_name>._reroute_aborted`). The topology builder strictly enforces at startup that matching sinks exist if rerouting is enabled.
+* **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest. Static config values always override host environment values.
+* **Deterministic Hot-Reload Generation Fencing**: A monotonic `module_generation` counter is verified by workers at every batch boundary. When a hot-reload occurs, workers finish their active batch, detect the generation mismatch, and immediately drain and reload their instance in $\approx 10\,\mu\text{s}$, eliminating zombie worker drift.
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
 * **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
 * **Canonical OpenTelemetry Schema Invariance**: Telemetry entering and exiting the transformer always adheres to the canonical OpenTelemetry Arrow schema for that signal type. Stripped fields are represented as nulls or empty structures. The host automatically backfills any missing canonical columns with type-aware null arrays (`arrow::array::new_null_array`), guaranteeing downstream sinks (Iceberg, StarRocks, Elasticsearch) never experience schema failure.
-* **Init-Time Capability Negotiation**: Capabilities (e.g. GeoIP, cache, secrets) are queried exclusively during `datalake_init` and cached in guest memory, preventing FFI overhead in the hot loop.
-* **Actionable Panic Diagnostics**: The SDK installs a standard WASM panic hook capturing source file, line, and message, emitted directly into host structured logs.
+* **Init-Time Capability Negotiation**: Capabilities (e.g. GeoIP, cache, secrets) are queried exclusively during `datalake_init` and cached in guest memory. The host uses explicit return codes (`0 = unavailable`, `1 = available`) and logs diagnostic warnings for unrecognized capability names to prevent silent typos.
+* **Actionable Panic Diagnostics**: The SDK installs a standard WASM panic hook capturing source file, line, and message, emitted directly into host structured logs with component contextual tags.
 * **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
 
 ---
@@ -35,13 +38,13 @@ opentelemetry-datalake/
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs                 # WasmTransformer implementing pipeline_core::Transform
-│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env)
-│   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>)
+│   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, reroutes)
+│   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
 │   │       ├── guard.rs               # Invariant validation (max_batch_rows) & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
-│   │       ├── reload.rs              # Atomic zero-downtime hot-reloader
+│   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
 │   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
 │   │
 │   ├── wasm-sdk/                      # Standalone, publishable guest SDK
@@ -52,6 +55,7 @@ opentelemetry-datalake/
 │   │       ├── abi.rs                 # Low-level FFI exports & memory protocol (with manual escape hatch)
 │   │       ├── ipc.rs                 # Arrow IPC stream reading & writing in guest
 │   │       ├── helpers.rs             # Column nullification, projection, filtering utilities
+│   │       ├── metrics.rs             # Controlled guest metric API (counter, gauge, duration)
 │   │       ├── panic.rs               # Custom std::panic hook forwarding to datalake_host_log
 │   │       ├── logger.rs              # Guest tracing/log forwarder using HostLogRecord
 │   │       └── testing.rs             # Mock batch generators & WasmHarness test runner
@@ -61,7 +65,7 @@ opentelemetry-datalake/
 │   │   └── src/
 │   │       └── main.rs                # CLI commands: validate, test, bench
 │   │
-│   └── core/                          # Updated pipeline_core config with WasmTransformerConfig
+│   └── core/                          # Updated pipeline_core config with WasmTransformerConfig and DLQ validation
 ```
 
 ---
@@ -111,9 +115,9 @@ pub struct TransformResponseHeader {
     /// ABI version (must be 1)
     pub abi_version: u32,
 
-    /// 0 = Success (emit batches)
-    /// 1 = Abort/Drop (deliberately drop payload)
-    /// 2 = Error (execution failure, panic, or unhandled error)
+    /// 0 = Success (emit batches downstream)
+    /// 1 = Abort/Drop (deliberately drop payload, routed to _reroute_aborted if enabled)
+    /// 2 = Error (execution failure, panic, or unhandled error, routed to _reroute_errored if enabled)
     pub status: u32,
 
     /// Number of emitted Arrow IPC batches (0..N)
@@ -151,14 +155,18 @@ pub struct HostLogRecord {
 ```
 
 ```c
-// Emits structured log event. Host enriches with instance_id and signal_type.
+// Emits structured log event. Host enriches with component_id, component_type, component_kind, signal, and instance_id.
 void datalake_host_log(uint32_t record_ptr);
 
-// Increments a telemetry metric counter on the host.
-void datalake_host_metric_inc(uint32_t name_ptr, uint32_t name_len, uint64_t value);
+// Emits a controlled custom metric counter, gauge, or duration (histogram).
+// metric_type: 0 = Counter, 1 = Gauge, 2 = Duration (microseconds, automatically exposed as Histogram)
+// name_ptr / name_len: relative metric name (e.g. "pii_redacted")
+// value: u64
+void datalake_host_metric_emit(uint32_t metric_type, uint32_t name_ptr, uint32_t name_len, uint64_t value);
 
 // Dynamic capability query for optional host features (cache, geoip, secrets).
 // CONTRACT: Must be queried during `datalake_init` and cached. Querying in `transform` is prohibited.
+// Returns: 1 = Available, 0 = Unavailable. Unrecognized capability names log a diagnostic warning.
 uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_len);
 ```
 
@@ -190,7 +198,7 @@ pub enum SignalType {
 pub enum TransformResult {
     /// Emit 0..N transformed RecordBatches downstream.
     Success(Vec<RecordBatch>),
-    /// Deliberately drop/abort the payload with a reason.
+    /// Deliberately drop/abort the payload with a reason (routed to _reroute_aborted if enabled).
     Drop { reason: Option<String> },
 }
 
@@ -261,13 +269,23 @@ pub extern "C" fn datalake_transform(signal_type: u32, ipc_ptr: u32, ipc_len: u3
 }
 ```
 
-### 4.4 Canonical Schema Helpers & Environment Access
+### 4.4 Guest Custom Metrics & Environment Helpers
 
-The SDK provides zero-copy helpers for stripping data while maintaining canonical schema invariance:
-- `sdk::helpers::nullify_column(&batch, "scope_attributes")`
-- `sdk::helpers::filter_batch(&batch, &boolean_mask)`
-- `sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")`
-- `std::env::var("APP_ENV")` directly reads variables permitted through the host whitelist.
+The SDK provides safe wrappers for metrics, logging, and environment access:
+```rust
+// Custom metrics (automatically namespaced to datalake_transformers_<component_id>_*)
+sdk::metrics::counter("pii_redacted", 1);
+sdk::metrics::gauge("cache_size", 1024);
+sdk::metrics::duration("lookup_duration", elapsed_duration); // Recorded into Prometheus Histogram
+
+// Canonical schema helpers
+sdk::helpers::nullify_column(&batch, "scope_attributes")?;
+sdk::helpers::filter_batch(&batch, &boolean_mask)?;
+sdk::helpers::redact_column_regex(&batch, "body", &regex, "[REDACTED]")?;
+
+// Environment access
+let env = std::env::var("APP_ENV").unwrap_or_else(|_| "unknown".to_string());
+```
 
 ---
 
@@ -278,7 +296,9 @@ The host transformer integrates into the pipeline via `pipeline_core::pipeline::
 ### 5.1 Configuration (`pipeline.toml`)
 
 ```toml
-[pipeline.transform.wasm]
+[[pipeline.transforms]]
+id = "pii_scrubber"
+type = "wasm"
 module_path = "transforms/enrichment.wasm"
 sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Optional integrity verification
 max_execution_duration = "500ms"
@@ -288,8 +308,12 @@ max_memory = "64MiB"                 # Virtual memory slot size (recommended: 64
 rejuvenate_threshold = "16MiB"       # Soft memory limit for instant page reclamation
 rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
 init_timeout = "2s"                  # Maximum duration for datalake_init
-on_error = "drop"                    # "drop", "quarantine", or "passthrough"
+on_error = "drop"                    # "drop" or "passthrough"
 allow_unmasked_passthrough = false   # Required if on_error = "passthrough"
+
+# Topological Reroute (Dead-Letter Queue & Abort Sinks)
+reroute_on_error = true              # Routes failed/panicked batches to <id>._reroute_errored
+reroute_on_abort = true              # Routes intentionally dropped batches to <id>._reroute_aborted
 
 # Whitelisted host environment variables passed to the WASM sandbox
 env_whitelist = [
@@ -298,7 +322,7 @@ env_whitelist = [
     "REGION"
 ]
 
-# Explicit static environment variables injected into the WASM sandbox
+# Explicit static environment variables injected into the WASM sandbox (overrides host env)
 [pipeline.transform.wasm.env]
 LOG_LEVEL = "info"
 TRANSFORM_VERSION = "1.2.0"
@@ -309,16 +333,67 @@ environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Environment Variable Sandboxing & Zero-Trust WASI
+### 5.2 Topological Dead-Letter Routing (`_reroute_errored` & `_reroute_aborted`)
+
+Instead of writing unmanaged files to arbitrary local directories, error handling is integrated directly into the pipeline topology:
+
+1. **Virtual Source Outputs**:
+   - Every `WasmTransformer` exposes three logical output streams:
+     - `primary`: Standard successfully transformed batches (subscribed via `inputs = ["<component_id>"]`).
+     - `_reroute_errored`: Original, pristine incoming batches that failed execution (panic, timeout, trap, IPC decode failure).
+     - `_reroute_aborted`: Original, pristine incoming batches that were explicitly dropped via `TransformResult::Drop`.
+2. **Topology Builder Startup Enforcement**:
+   - If `reroute_on_error = true`, the topology validator asserts that at least one sink lists `"<component_id>._reroute_errored"` in its `inputs`.
+   - If `reroute_on_abort = true`, the topology validator asserts that at least one sink lists `"<component_id>._reroute_aborted"` in its `inputs`.
+   - If the sink mapping is missing, the datalake **refuses to boot** with an actionable configuration error.
+   - Example sink configuration:
+     ```toml
+     [[pipeline.sinks]]
+     id = "quarantine_sink"
+     inputs = ["pii_scrubber._reroute_errored"]
+     type = "iceberg"
+     table = "telemetry_quarantine"
+     ```
+3. **Fallback When Rerouting Disabled**:
+   - If `reroute_on_error = false`, failures follow the `on_error` policy (`drop` or `passthrough`).
+   - If `reroute_on_abort = false`, aborted batches are dropped silently with a metric increment.
+
+### 5.3 Vector-Aligned Observability & Controlled Metrics
+
+1. **Uniform Component Identification**:
+   - All host logs and metrics emitted by the transformer include the standardized Vector-style labels:
+     - `component_id = "<id>"`
+     - `component_type = "wasm"`
+     - `component_kind = "transform"`
+     - `signal = "logs|metrics|traces"`
+2. **Standard Pipeline Metrics**:
+   - `component_received_rows_total`
+   - `component_sent_rows_total`
+   - `component_discarded_rows_total`
+   - `component_errors_total`
+   - `component_execution_duration_seconds` (Histogram)
+3. **Controlled Custom Metric Injection**:
+   - Custom guest metrics are restricted to:
+     ```text
+     datalake_transformers_<component_id>_<metric_name>{component_id="...", signal="..."}
+     ```
+   - Type mapping:
+     - `metric_type = 0` (Counter): Prometheus counter.
+     - `metric_type = 1` (Gauge): Prometheus gauge.
+     - `metric_type = 2` (Duration): Emitted value is converted to seconds and recorded into a Prometheus Histogram (`..._duration_seconds`).
+   - Hard limits:
+     - Metric names: ASCII alphanumeric + `_`, max 64 characters.
+     - Cardinality ceiling: Maximum 50 distinct custom metric names per `component_id`.
+
+### 5.4 Environment Variable Sandboxing & Zero-Trust WASI
 
 1. **Default Deny**: By default, `wasmtime_wasi::WasiCtxBuilder` does not inherit host environment variables.
-2. **Whitelist Resolution**:
-   - For each key in `env_whitelist`, the host checks `std::env::var(key)`. If present, it injects `(key, value)` into the guest's WASI context.
-   - Host secrets (e.g., `AWS_SECRET_ACCESS_KEY`, `DATABASE_URL`, `TOKEN`) that are not explicitly whitelisted remain completely invisible to the guest.
-3. **Explicit Injections**: All key-values in `[pipeline.transform.wasm.env]` are added to the guest's WASI environment.
-4. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
+2. **Precedence Rule**:
+   - `[pipeline.transform.wasm.env]` (static explicit injection) **strictly overrides** variables resolved from `env_whitelist`.
+   - If a key exists in both, the static value is used and an informational notice is logged.
+3. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
 
-### 5.3 Kubernetes Sizing & Memory Guidance
+### 5.5 Kubernetes Sizing & Memory Guidance
 
 When running in containerized environments (Kubernetes pods), operators must account for Wasmtime's virtual memory pooling allocator:
 
@@ -328,12 +403,12 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
 * **Host Physical RAM**: Thanks to `madvise(MADV_DONTNEED)`, actual physical resident set size (RSS) stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
 * **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient (Linux default of 65,530 is plenty for standard pools).
 
-### 5.4 Concurrency & Boundary Guards
+### 5.6 Concurrency & Boundary Guards
 
-* **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender`. No inter-batch reorder buffer, no head-of-line blocking.
+* **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender` (or reroute channels). No inter-batch reorder buffer, no head-of-line blocking.
 * **Batch Size Invariant Check**: If an incoming batch exceeds `max_batch_rows`, the transformer rejects it with a fatal pipeline error directing operators to configure an upstream `AccumulatorTransformer`.
 
-### 5.5 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
+### 5.7 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
 
 * **Pooling Instance Allocator**: Pre-allocates $N$ memory slots in virtual memory at startup (`PoolingAllocationConfig`).
 * **Microsecond Resets (`MADV_DONTNEED`)**: When an instance is refreshed, Wasmtime issues `MADV_DONTNEED` to reclaim physical RAM pages and zero the memory in $\approx 5\text{--}10\,\mu\text{s}$.
@@ -343,7 +418,7 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
   3. *Trap Recovery*: If an instance traps, the contaminated `Store` is immediately discarded and replaced.
 * **Init Deadline**: Re-initializing an instance via `datalake_init` is bounded by `init_timeout` (default: 2s) to prevent stalled module initialization.
 
-### 5.6 Canonical OTel Schema Invariance & Typed Null Backfill
+### 5.8 Canonical OTel Schema Invariance & Typed Null Backfill
 
 * Telemetry entering and exiting the WASM boundary must conform to the canonical OpenTelemetry Arrow schema for that `SignalType`.
 * **Type-Aware Defensive Backfill**: If a guest module omits a canonical column (e.g. user completely dropped `scope_attributes` or `attributes`), the host automatically backfills it using Arrow's type-aware constructor:
@@ -352,16 +427,10 @@ $$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$
   ```
   This creates a structurally valid null array matching complex nested types (`MapArray`, `ListArray`, `StructArray`). Downstream Parquet writes and Iceberg commits are 100% protected against physical schema divergence.
 
-### 5.7 Failure Policies & Security Safeguard
+### 5.9 Deterministic Hot-Reloading & Generation Fencing
 
-* **`on_error = "drop"` (Default / Fail-Closed)**: Discards failed batches, incrementing `datalake_wasm_errors_total`.
-* **`on_error = "quarantine"`**: Routes failed batches to dead-letter storage.
-* **`on_error = "passthrough"` (Fail-Open)**: Forwards un-transformed raw batches. Requires `allow_unmasked_passthrough = true` in config; otherwise startup halts with a fatal security error.
-
-### 5.8 In-Memory Single-Read & Zero-Downtime Hot-Reloading
-
-To eliminate TOCTOU filesystem races and enable zero-downtime updates:
-1. **Atomic Read & Hash**:
+To eliminate TOCTOU filesystem races and zombie worker drift:
+1. **Single-Read In-Memory Compilation**:
    ```rust
    let wasm_bytes = tokio::fs::read(&module_path).await?;
    if let Some(expected_sha) = &config.sha256 {
@@ -372,33 +441,39 @@ To eliminate TOCTOU filesystem races and enable zero-downtime updates:
    }
    let new_module = wasmtime::Module::from_binary(&engine, &wasm_bytes)?;
    ```
-2. **Atomic Swap**: The host atomically swaps `Arc<Module>`.
-3. In-flight worker batches finish on the old module. Fresh instances are instantiated from the new module via the pooling allocator. Zero gRPC/HTTP connection drops.
+2. **Atomic Swap & Generation Increment**:
+   - The host swaps `Arc<Module>` and increments an atomic `module_generation: AtomicU64`.
+3. **Generation Fencing at Worker Boundary**:
+   - At the beginning of processing each batch, workers check:
+     ```rust
+     if self.local_generation != global_engine.module_generation() {
+         self.reload_instance(&global_engine)?; // Discards old store, rebuilds from new module
+     }
+     ```
+   - Maximum lag before running new code is exactly 1 batch per worker. Zero zombie drift.
 
 ---
 
-## 6. Observability & Metrics
-
-All metrics strictly adhere to `docs/instrumentation.md` naming conventions:
+## 6. Observability & Metrics Specification
 
 | Metric Name | Type | Labels | Description |
 |---|---|---|---|
-| `datalake_wasm_batches_processed_total` | Counter | `signal`, `status` (`success`, `dropped`, `error`) | Total batches evaluated. |
-| `datalake_wasm_batches_dropped_total` | Counter | `signal`, `reason` | Deliberately aborted/dropped batches. |
-| `datalake_wasm_batches_emitted_total` | Counter | `signal` | Emitted batches downstream. |
-| `datalake_wasm_rows_in_total` | Counter | `signal` | Incoming rows. |
-| `datalake_wasm_rows_out_total` | Counter | `signal` | Outgoing rows after mutations. |
-| `datalake_wasm_errors_total` | Counter | `signal`, `error_type` (`timeout`, `oom`, `trap`, `ipc_decode`, `batch_limit`) | Total execution failures. |
-| `datalake_wasm_duration_seconds` | Histogram | `signal` | Execution latency per batch. |
-| `datalake_wasm_memory_bytes` | Gauge | `instance_id` | Current linear memory consumption per instance. |
-| `datalake_wasm_rejuvenations_total` | Counter | `instance_id`, `reason` (`memory_threshold`, `batch_count`, `trap`) | Total instance pool resets. |
-| `datalake_wasm_module_info` | Gauge | `sha256`, `abi_version` | Active module audit information. |
+| `component_received_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal` | Incoming rows. |
+| `component_sent_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal` | Outgoing rows after mutations. |
+| `component_discarded_rows_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `reason` | Deliberately dropped/aborted rows. |
+| `component_errors_total` | Counter | `component_id`, `component_type`, `component_kind`, `signal`, `error_type` | Total execution failures (timeout, oom, trap, etc.). |
+| `component_execution_duration_seconds` | Histogram | `component_id`, `component_type`, `component_kind`, `signal` | Boundary latency per batch. |
+| `datalake_wasm_memory_bytes` | Gauge | `component_id`, `instance_id` | Current linear memory consumption per instance. |
+| `datalake_wasm_rejuvenations_total` | Counter | `component_id`, `instance_id`, `reason` | Total instance pool resets. |
+| `datalake_wasm_module_info` | Gauge | `component_id`, `sha256`, `generation`, `abi_version` | Active module audit information. |
+| `datalake_transformers_<component_id>_<name>` | Counter / Gauge | `component_id`, `signal` | Guest custom counter or gauge. |
+| `datalake_transformers_<component_id>_<name>_duration_seconds` | Histogram | `component_id`, `signal` | Guest custom duration histogram. |
 
-### Logging
+### Logging Standards
 
 * **Panic & Guest Log Forwarding**: Host intercepts `datalake_host_log` (`HostLogRecord`) and emits structured logs:
   ```text
-  ERROR wasm_guest: Guest panic in transforms/pii.rs:42: called `Option::unwrap()` on a `None` value [instance_id=2, signal=Logs]
+  ERROR wasm_guest: Guest panic in transforms/pii.rs:42: called `Option::unwrap()` on a `None` value [component_id="pii_scrubber", component_type="wasm", component_kind="transform", signal="logs", instance_id=2]
   ```
 
 ---
