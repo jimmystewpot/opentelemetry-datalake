@@ -1,416 +1,1062 @@
-# WASM Whole-Batch Arrow Transformer Implementation Plan
+# WebAssembly (WASM) Whole-Batch Arrow Transformer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement a high-performance WebAssembly (WASM) transformer for `opentelemetry-datalake` allowing users to manipulate, enrich, filter, or drop whole Arrow `RecordBatch`es, with a publishable guest SDK and testing/validation CLI.
+**Goal:** Build an ultra-high-performance, sandboxed WebAssembly (WASM) transformation engine executing Whole-Batch Apache Arrow transformations on OpenTelemetry telemetry streams with zero-copy IPC exchange, three-tier immutability, symmetric DLQ rerouting, and sub-millisecond boundary latency.
 
-**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, panic hooks, init-time capability caching, and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with pooling instance allocation, zero-trust environment variable whitelisting, typed null schema guards, in-memory single-read SHA-256 verification, and atomic zero-downtime hot-reloading; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
+**Architecture:** The system decouples guest transformations from the host runtime using a low-overhead C-ABI v1. The guest SDK (`opentelemetry-datalake-wasm-sdk`) provides typed abstractions and call-site fail-fast guards over Arrow IPC streams. The host runtime (`crates/wasm-transformer`) leverages Wasmtime's Pooling Allocator with `madvise(MADV_DONTNEED)` resets, lock-free least-loaded batch dispatching, $O(1)$ structural immutability verification, typed null backfilling, and zero-downtime hot-reloading. A standalone CLI (`datalake-wasm`) provides pre-deployment validation, synthetic testing, and latency benchmarking.
 
-**Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `wasmtime-wasi`, `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`, `sha2`, `hex`.
+**Tech Stack:** Rust 2024, Apache Arrow 59, Wasmtime 49 (with Pooling Allocator & WASI), Tokio 1.37, DashMap 6, Prost 0.14, Thiserror 2.0, Criterion 0.8.
 
 **Spec:** [`docs/superpowers/specs/2026-09-20-wasm-transformer-design.md`](file:///home/jalamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/superpowers/specs/2026-09-20-wasm-transformer-design.md)
 
 ## Global Constraints
-- Strictly adhere to the zero-panic policy in production code (`src/`): no `unwrap()`, `expect()`, or `panic!()`.
-- All FFI exchanges across WASM linear memory use versioned C-ABI v1 (`datalake_abi_version() == 1`) with standard Apache Arrow IPC streaming format.
-- Output batches must preserve canonical OpenTelemetry Arrow schemas; missing fields are backfilled using `arrow::array::new_null_array`.
-- Batches exceeding `max_batch_rows` are rejected at the transformer boundary (delegating coalescing/splitting to upcoming `AccumulatorTransformer`).
-- WASI environment isolation enforces zero-trust: no ambient host environment variables leak into the guest. Only keys in `env_whitelist` or explicit values in `env` are exposed.
-- Memory management uses `wasmtime::PoolingAllocationConfig` with `madvise(MADV_DONTNEED)` resets and dual-trigger rejuvenation.
-- Single-read in-memory compilation prevents TOCTOU vulnerabilities when verifying SHA-256 hashes.
-- `on_error = "passthrough"` must be rejected at configuration time unless `allow_unmasked_passthrough = true` is explicitly enabled.
-- Code must pass `cargo fmt` and `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`.
+
+- **Zero-Panic Production Rule**: No `unwrap()`, `expect()`, `panic!()`, or `todo!()` in production paths (`src/`). All failures must propagate via `thiserror` domain errors.
+- **Latency Budget**: Round-trip boundary overhead for a 2,000-row batch (~500 KB uncompressed Arrow IPC stream) must be $p95 \le 1.5\text{ms}$ and $p99 \le 3.0\text{ms}$.
+- **Core Telemetry Immutability**: Core fields (`trace_id`, `span_id` in traces; `timestamp` in logs; `name`, `type` in metrics) cannot be dropped or nullified. Host checks this in $O(1)$ via `col.null_count() == col.len()`.
+- **Memory Safety & Reset**: Each WASM instance runs in a pre-allocated pooling memory slot (`max_memory = 64MiB`) with physical pages reclaimed via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (16 MiB soft threshold or 10,000 batches).
+- **Concurrency & Backpressure**: Single `input: PipelineReceiver` is dispatched across $N$ workers using non-blocking `try_send` with configurable queue depth (`worker_channel_capacity = 1`). Workers await on shutdown with full `JoinHandle` tracking.
+- **Code Standards**: Zero Clippy warnings under `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`. Format with `cargo fmt`. Prefer `crate::` over `super::` in non-test source code.
 
 ---
 
-### Task 1: Scaffolding Workspace Crates & Dependencies
+## Modular PR Breakdown Strategy
 
+To enable concurrent execution by parallel sub-agents and ensure fast, stand-alone reviews, the implementation is decomposed into **7 independent, modular PRs**:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             INDEPENDENT PR LAYER 1                               │
+├───────────────────────────────┬───────────────────────────────┬──────────────────┤
+│ PR 1: Standalone Guest SDK    │ PR 2: Core Config & DLQ Rules │ PR 3: Dev CLI    │
+│ (crates/wasm-sdk)             │ (crates/core)                 │ (crates/wasm-cli)│
+│ - ABI v1 C-types & protocol   │ - WasmTransformerConfig       │ - validate       │
+│ - BatchTransformer & results  │ - OnError / OnReject enums    │ - test suite     │
+│ - Client-side immutability    │ - Topological DLQ assertions  │ - bench tool     │
+│ - Metrics (f64 bitcast)       │ - Unit tests & TOML fixtures  │ - synthetic IPC  │
+└───────────────┬───────────────┴───────────────┬───────────────┴──────────────────┘
+                │                               │
+                ▼                               ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             INDEPENDENT PR LAYER 2                               │
+├───────────────────────────────────────────────┬──────────────────────────────────┤
+│ PR 4: Host Engine, Pool & WASI Sandbox        │ PR 5: Host Guards & ABI Linker   │
+│ (crates/wasm-transformer: engine, pool, wasi) │ (crates/wasm-transformer: guard) │
+│ - Wasmtime Engine & Module cache              │ - O(1) Immutability Check        │
+│ - Pooling Allocator & soft rejuvenation       │ - Defensive Typed Null Backfill  │
+│ - Zero-trust WASI env filter                  │ - Concurrent DashMap Metrics     │
+│ - Diagnostic OOM telemetry                    │ - datalake_host_v1 linker        │
+└───────────────────────┬───────────────────────┴──────────────────┬───────────────┘
+                        │                                          │
+                        ▼                                          ▼
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             INTEGRATION PR LAYER 3                               │
+├───────────────────────────────────────────────┬──────────────────────────────────┤
+│ PR 6: Dispatcher, Drain & Pipeline Transform  │ PR 7: Hot-Reload Controller      │
+│ (crates/wasm-transformer: dispatcher, lib.rs) │ (crates/wasm-transformer: reload)│
+│ - Least-loaded try_send fan-out               │ - Single-read SHA-256 check      │
+│ - Worker JoinHandle tracking & drain timeout  │ - Atomic generation fencing      │
+│ - Transform trait impl & main.rs wiring       │ - SIGHUP & REST reload triggers  │
+│ - Passthrough security audit warning          │ - Zero-drift worker swap         │
+└───────────────────────────────────────────────┴──────────────────────────────────┘
+```
+
+---
+
+## PR 1: Standalone Guest SDK (`crates/wasm-sdk`)
+
+**Scope:** Self-contained crate `opentelemetry-datalake-wasm-sdk` defining C-ABI v1 data structures, public `BatchTransformer` trait, `TransformResult` enum, client-side checked Arrow IPC helpers, metrics emission (f64 bitcast gauge, u64 nanosecond duration), panic hook forwarder, and mock testing harness.
+**Independence:** Depends only on `arrow` and standard libraries. Zero dependencies on host runtime or `pipeline-core`.
+
+### Task 1.1: SDK Crate Scaffolding & ABI v1 Data Structures
 **Files:**
-- Modify: `Cargo.toml:17-21, 55-65`
 - Create: `crates/wasm-sdk/Cargo.toml`
 - Create: `crates/wasm-sdk/src/lib.rs`
-- Create: `crates/wasm-transformer/Cargo.toml`
-- Create: `crates/wasm-transformer/src/lib.rs`
+- Create: `crates/wasm-sdk/src/abi.rs`
+- Test: `crates/wasm-sdk/tests/abi_tests.rs`
+
+**Interfaces:**
+- Consumes: Standard Rust types, Arrow IPC stream types.
+- Produces: `TransformResponseHeader`, `BatchDescriptor`, `HostLogRecord`, ABI exports `datalake_abi_version`, `datalake_alloc`, `datalake_dealloc`.
+
+- [ ] **Step 1: Write failing test for ABI v1 memory layout & version handshake**
+
+```rust
+// crates/wasm-sdk/tests/abi_tests.rs
+use opentelemetry_datalake_wasm_sdk::abi::{BatchDescriptor, TransformResponseHeader};
+
+#[test]
+fn test_abi_v1_header_memory_layout() {
+    assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 20);
+    assert_eq!(std::mem::align_of::<TransformResponseHeader>(), 4);
+    assert_eq!(std::mem::size_of::<BatchDescriptor>(), 8);
+    assert_eq!(std::mem::align_of::<BatchDescriptor>(), 4);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test abi_tests`
+Expected: FAIL with "package not found" or "unresolved import"
+
+- [ ] **Step 3: Write minimal implementation**
+Create `crates/wasm-sdk/Cargo.toml`:
+```toml
+[package]
+name = "opentelemetry-datalake-wasm-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+arrow = { workspace = true, features = ["ipc"] }
+```
+Create `crates/wasm-sdk/src/abi.rs`:
+```rust
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransformResponseHeader {
+    pub status: u32,
+    pub batch_count: u32,
+    pub batches_ptr: u32,
+    pub message_ptr: u32,
+    pub message_len: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchDescriptor {
+    pub ptr: u32,
+    pub len: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostLogRecord {
+    pub level: u32,
+    pub msg_ptr: u32,
+    pub msg_len: u32,
+    pub target_ptr: u32,
+    pub target_len: u32,
+    pub file_ptr: u32,
+    pub file_len: u32,
+    pub line: u32,
+}
+
+#[no_mangle]
+pub extern "C" fn datalake_abi_version() -> u32 {
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn datalake_alloc(size: u32) -> u32 {
+    let mut buf = Vec::<u8>::with_capacity(size as usize);
+    let ptr = buf.as_mut_ptr();
+    std::mem::forget(buf);
+    ptr as usize as u32
+}
+
+#[no_mangle]
+pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
+    if ptr != 0 && size != 0 {
+        unsafe {
+            let _ = Vec::<u8>::from_raw_parts(ptr as *mut u8, 0, size as usize);
+        }
+    }
+}
+```
+In `crates/wasm-sdk/src/lib.rs`:
+```rust
+pub mod abi;
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test abi_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-sdk/
+git commit -m "feat(wasm-sdk): scaffold sdk crate and abi v1 definitions"
+```
+
+---
+
+### Task 1.2: Trait Definition, TransformResult & Client-Side Immutability Guards
+**Files:**
+- Create: `crates/wasm-sdk/src/traits.rs`
+- Create: `crates/wasm-sdk/src/helpers.rs`
+- Create: `crates/wasm-sdk/src/error.rs`
+- Modify: `crates/wasm-sdk/src/lib.rs`
+- Test: `crates/wasm-sdk/tests/guard_tests.rs`
+
+**Interfaces:**
+- Consumes: `RecordBatch` from Arrow.
+- Produces: `BatchTransformer` trait, `TransformResult`, `sdk::helpers::nullify_column`, `SdkError::ImmutableFieldViolation`.
+
+- [ ] **Step 1: Write failing test for call-site immutability violation**
+
+```rust
+// crates/wasm-sdk/tests/guard_tests.rs
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use opentelemetry_datalake_wasm_sdk::error::SdkError;
+use opentelemetry_datalake_wasm_sdk::helpers::nullify_column;
+use std::sync::Arc;
+
+#[test]
+fn test_nullify_immutable_column_fails_fast() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["abc"])),
+            Arc::new(StringArray::from(vec!["attr"])),
+        ],
+    ).unwrap();
+
+    let err = nullify_column(&batch, "trace_id").unwrap_err();
+    assert!(matches!(err, SdkError::ImmutableFieldViolation(col) if col == "trace_id"));
+
+    // Auxiliary field succeeds
+    let ok_batch = nullify_column(&batch, "scope_attributes").unwrap();
+    assert!(ok_batch.column(1).null_count() == 1);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test guard_tests`
+Expected: FAIL with "cannot find module `helpers`"
+
+- [ ] **Step 3: Write minimal implementation**
+Create `crates/wasm-sdk/src/error.rs`:
+```rust
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SdkError {
+    #[error("Cannot modify or nullify immutable OpenTelemetry core field: {0}")]
+    ImmutableFieldViolation(String),
+    #[error("Arrow error: {0}")]
+    Arrow(String),
+    #[error("Column not found in schema: {0}")]
+    ColumnNotFound(String),
+}
+```
+Create `crates/wasm-sdk/src/helpers.rs`:
+```rust
+use crate::error::SdkError;
+use arrow::array::new_null_array;
+use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
+
+const IMMUTABLE_COLUMNS: &[&str] = &[
+    "trace_id", "span_id", "timestamp", "observed_timestamp", "name", "type",
+];
+
+pub fn is_immutable_column(column: &str) -> bool {
+    IMMUTABLE_COLUMNS.contains(&column)
+}
+
+pub fn nullify_column(batch: &RecordBatch, column_name: &str) -> Result<RecordBatch, SdkError> {
+    if is_immutable_column(column_name) {
+        return Err(SdkError::ImmutableFieldViolation(column_name.to_string()));
+    }
+    let schema = batch.schema();
+    let idx = schema.index_of(column_name).map_err(|_| SdkError::ColumnNotFound(column_name.to_string()))?;
+    let mut columns = batch.columns().to_vec();
+    let field = schema.field(idx);
+    columns[idx] = new_null_array(field.data_type(), batch.num_rows());
+    RecordBatch::try_new(schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
+}
+```
+Create `crates/wasm-sdk/src/traits.rs` with `SignalType`, `TransformResult`, and `BatchTransformer` per spec section 4.1.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test guard_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-sdk/
+git commit -m "feat(wasm-sdk): add BatchTransformer trait, results, and client immutability guards"
+```
+
+---
+
+### Task 1.3: Controlled Metrics Emission & Panic Hook
+**Files:**
+- Create: `crates/wasm-sdk/src/metrics.rs`
+- Create: `crates/wasm-sdk/src/panic.rs`
+- Modify: `crates/wasm-sdk/src/lib.rs`
+- Test: `crates/wasm-sdk/tests/metric_tests.rs`
+
+**Interfaces:**
+- Produces: `sdk::metrics::counter`, `sdk::metrics::gauge` (f64 bitcast), `sdk::metrics::duration` (nanoseconds), `init_panic_hook`.
+
+- [ ] **Step 1: Write failing test for f64 gauge bitcast & nanosecond duration**
+
+```rust
+// crates/wasm-sdk/tests/metric_tests.rs
+use opentelemetry_datalake_wasm_sdk::metrics::{gauge_to_bits, duration_to_nanos};
+use std::time::Duration;
+
+#[test]
+fn test_gauge_f64_bitcast_preserves_negative_and_fractions() {
+    let original = -12.375_f64;
+    let bits = gauge_to_bits(original);
+    assert_eq!(f64::from_bits(bits), original);
+}
+
+#[test]
+fn test_duration_standardized_on_nanos() {
+    let dur = Duration::from_millis(1500);
+    assert_eq!(duration_to_nanos(dur), 1_500_000_000_u64);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test metric_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+Create `crates/wasm-sdk/src/metrics.rs`:
+```rust
+use std::time::Duration;
+
+pub fn gauge_to_bits(value: f64) -> u64 {
+    value.to_bits()
+}
+
+pub fn duration_to_nanos(duration: Duration) -> u64 {
+    duration.as_nanos() as u64
+}
+
+#[cfg(target_arch = "wasm32")]
+extern "C" {
+    fn datalake_host_metric_emit(metric_type: u32, name_ptr: u32, name_len: u32, value: u64);
+}
+
+pub fn counter(name: &str, value: u64) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe { datalake_host_metric_emit(0, name.as_ptr() as u32, name.len() as u32, value); }
+}
+
+pub fn gauge(name: &str, value: f64) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe { datalake_host_metric_emit(1, name.as_ptr() as u32, name.len() as u32, gauge_to_bits(value)); }
+}
+
+pub fn duration(name: &str, duration: Duration) {
+    #[cfg(target_arch = "wasm32")]
+    unsafe { datalake_host_metric_emit(2, name.as_ptr() as u32, name.len() as u32, duration_to_nanos(duration)); }
+}
+```
+Create `crates/wasm-sdk/src/panic.rs` installing `std::panic::set_hook`.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test metric_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-sdk/
+git commit -m "feat(wasm-sdk): add metrics f64 bitcast, nanosecond duration, and panic hook"
+```
+
+---
+
+## PR 2: Core Configuration & DLQ Routing Rules (`crates/core`)
+
+**Scope:** Updates `crates/core` to include `WasmTransformerConfig`, `OnErrorPolicy`, `OnRejectPolicy`, and validation for topological DLQ virtual streams (`<id>._reroute_errored`, `<id>._reroute_rejected`).
+**Independence:** Self-contained in `crates/core`. No dependency on host runtime execution code.
+
+### Task 2.1: WasmTransformerConfig & Routing Policy Types
+**Files:**
+- Modify: `crates/core/src/config.rs`
+- Modify: `crates/core/src/error.rs`
+- Test: `crates/core/tests/wasm_config_tests.rs`
+
+**Interfaces:**
+- Produces: `WasmTransformerConfig`, `OnErrorPolicy`, `OnRejectPolicy`, `SchemaGuardMode`, `PipelineError::TopologicalSinkMissing`.
+
+- [ ] **Step 1: Write failing test for TOML deserialization and validation**
+
+```rust
+// crates/core/tests/wasm_config_tests.rs
+use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, WasmTransformerConfig};
+
+#[test]
+fn test_wasm_config_deserializes_and_validates_policies() {
+    let toml_str = r#"
+        id = "test_wasm"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        on_error = "reroute"
+        on_reject = "drop"
+        worker_channel_capacity = 1
+        rejuvenate_threshold = "16MiB"
+        concurrency = 4
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(cfg.id, "test_wasm");
+    assert_eq!(cfg.on_error, OnErrorPolicy::Reroute);
+    assert_eq!(cfg.on_reject, OnRejectPolicy::Drop);
+    assert_eq!(cfg.worker_channel_capacity, 1);
+    assert_eq!(cfg.concurrency, 4);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p pipeline-core --test wasm_config_tests`
+Expected: FAIL with "cannot find type `WasmTransformerConfig`"
+
+- [ ] **Step 3: Write minimal implementation**
+In `crates/core/src/config.rs`:
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnErrorPolicy {
+    Reroute,
+    Drop,
+    Passthrough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRejectPolicy {
+    Reroute,
+    Drop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaGuardMode {
+    #[default]
+    Defensive,
+    Strict,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct WasmTransformerConfig {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub module_path: String,
+    pub sha256: Option<String>,
+    #[serde(default = "default_max_execution_duration")]
+    pub max_execution_duration: String,
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout: String,
+    #[serde(default = "default_max_batch_rows")]
+    pub max_batch_rows: usize,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_worker_channel_capacity")]
+    pub worker_channel_capacity: usize,
+    #[serde(default = "default_max_memory")]
+    pub max_memory: String,
+    #[serde(default = "default_rejuvenate_threshold")]
+    pub rejuvenate_threshold: String,
+    #[serde(default = "default_rejuvenate_batches")]
+    pub rejuvenate_batches: u64,
+    #[serde(default = "default_init_timeout")]
+    pub init_timeout: String,
+    #[serde(default)]
+    pub on_error: OnErrorPolicy,
+    #[serde(default)]
+    pub allow_unmasked_passthrough: bool,
+    #[serde(default)]
+    pub on_reject: OnRejectPolicy,
+    #[serde(default)]
+    pub schema_guard: SchemaGuardMode,
+    #[serde(default)]
+    pub env_whitelist: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
+}
+
+fn default_max_execution_duration() -> String { "500ms".into() }
+fn default_drain_timeout() -> String { "10s".into() }
+fn default_max_batch_rows() -> usize { 5000 }
+fn default_concurrency() -> usize { 4 }
+fn default_worker_channel_capacity() -> usize { 1 }
+fn default_max_memory() -> String { "64MiB".into() }
+fn default_rejuvenate_threshold() -> String { "16MiB".into() }
+fn default_rejuvenate_batches() -> u64 { 10000 }
+fn default_init_timeout() -> String { "2s".into() }
+impl Default for OnErrorPolicy { fn default() -> Self { Self::Reroute } }
+impl Default for OnRejectPolicy { fn default() -> Self { Self::Reroute } }
+```
+Add `PipelineError::TopologicalSinkMissing(String)` to `crates/core/src/error.rs`.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p pipeline-core --test wasm_config_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/core/
+git commit -m "feat(core): add WasmTransformerConfig, policy enums, and DLQ error variants"
+```
+
+---
+
+## PR 3: Developer CLI & Conformance Suite (`crates/wasm-cli`)
+
+**Scope:** Independent developer CLI tool (`datalake-wasm`) that validates compiled `.wasm` modules (`validate`), executes synthetic IPC conformance tests with byte-level immutability assertions (`test`), and benchmarks latency distribution with pipeline throughput disclaimers (`bench`).
+**Independence:** Can be compiled and used directly against any `.wasm` artifact conforming to C-ABI v1.
+
+### Task 3.1: CLI Binary Scaffolding & Validate Command
+**Files:**
 - Create: `crates/wasm-cli/Cargo.toml`
 - Create: `crates/wasm-cli/src/main.rs`
-
-**Interfaces:**
-- Consumes: Workspace root dependencies (`arrow`, `tokio`, `tracing`, `thiserror`).
-- Produces: Workspace crates recognized by `cargo check --workspace`.
-
-- [ ] **Step 1: Write Cargo.toml files for crates**
-
-Add `wasmtime = { version = "31", default-features = false, features = ["cranelift", "async", "pooling-allocator"] }`, `wasmtime-wasi = "31"`, `sha2 = "0.10"`, and `hex = "0.4"` to root `[workspace.dependencies]`.
-Create:
-- `crates/wasm-sdk/Cargo.toml` with package name `opentelemetry-datalake-wasm-sdk`.
-- `crates/wasm-transformer/Cargo.toml` with `wasmtime`, `wasmtime-wasi`, `pipeline-core`, `arrow`, `arrow-ipc`, `sha2`, `hex`.
-- `crates/wasm-cli/Cargo.toml` with `clap`, `wasmtime`, `arrow`, `arrow-ipc`.
-
-- [ ] **Step 2: Add placeholder lib.rs and main.rs files**
-
-Create empty modules and structs with documentation comments.
-
-- [ ] **Step 3: Run `cargo check --workspace` to verify scaffolding**
-
-Run: `cargo check --workspace`  
-Expected: PASS with 0 errors.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add -f Cargo.toml Cargo.lock crates/wasm-sdk crates/wasm-transformer crates/wasm-cli
-git commit -m "chore: scaffold wasm-sdk, wasm-transformer, and wasm-cli crates"
-```
-
----
-
-### Task 2: Implement Guest SDK with Panic Hook & Init Capability Caching (`crates/wasm-sdk`)
-
-**Files:**
-- Create: `crates/wasm-sdk/src/abi.rs`
-- Create: `crates/wasm-sdk/src/ipc.rs`
-- Create: `crates/wasm-sdk/src/helpers.rs`
-- Create: `crates/wasm-sdk/src/panic.rs`
-- Create: `crates/wasm-sdk/src/logger.rs`
-- Modify: `crates/wasm-sdk/src/lib.rs`
-- Test: `crates/wasm-sdk/tests/sdk_abi_tests.rs`
-
-**Interfaces:**
-- Consumes: `arrow` RecordBatch & Array types.
-- Produces: `BatchTransformer` trait, `TransformResult`, `SignalType`, `export_transformer!` macro, `helpers::nullify_column`, panic hook.
-
-- [ ] **Step 1: Write failing test for SDK Arrow IPC, ABI versioning, and panic handling**
-
-Write unit test in `crates/wasm-sdk/tests/sdk_abi_tests.rs` testing IPC stream roundtripping, verifying `datalake_abi_version() == 1`, column nullification, and panic hook capture.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test sdk_abi_tests`  
-Expected: FAIL with unresolved modules.
-
-- [ ] **Step 3: Implement `ipc.rs`, `abi.rs`, `helpers.rs`, `panic.rs`, and `lib.rs`**
-
-Implement:
-- `abi::raw_alloc`, `abi::raw_dealloc`, `abi::dispatch_transform`
-- `ipc::read_ipc_stream(bytes: &[u8]) -> Result<Vec<RecordBatch>, ArrowError>`
-- `ipc::write_ipc_stream(batches: &[RecordBatch]) -> Result<Vec<u8>, ArrowError>`
-- `helpers::nullify_column(batch: &RecordBatch, name: &str) -> Result<RecordBatch, ArrowError>`
-- `helpers::filter_batch(batch: &RecordBatch, predicate: &arrow::array::BooleanArray) -> Result<RecordBatch, ArrowError>`
-- `panic::set_wasm_panic_hook()` routing panic location/message to `datalake_host_log`.
-- `export_transformer!` macro generating exports and auto-installing panic hook.
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `cargo test -p opentelemetry-datalake-wasm-sdk`  
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -f crates/wasm-sdk
-git commit -m "feat(wasm-sdk): implement BatchTransformer, panic hook, and canonical schema helpers"
-```
-
----
-
-### Task 3: Guest SDK Native Testing Harness & Mock Generators
-
-**Files:**
-- Create: `crates/wasm-sdk/src/testing.rs`
-- Modify: `crates/wasm-sdk/src/lib.rs`
-- Test: `crates/wasm-sdk/tests/native_test_harness.rs`
-
-**Interfaces:**
-- Consumes: `RecordBatch`, `SignalType`.
-- Produces: `create_mock_logs_batch`, `create_mock_metrics_batch`, `create_mock_traces_batch`, `MockContext`.
-
-- [ ] **Step 1: Write failing test verifying mock batch generators and trait testing**
-
-Write `tests/native_test_harness.rs` verifying that a mock logs batch can be generated with specified columns and passed into a dummy `BatchTransformer`.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test native_test_harness`  
-Expected: FAIL with unresolved `testing` module.
-
-- [ ] **Step 3: Implement `testing.rs`**
-
-Implement:
-- `create_mock_logs_batch(records: Vec<(&str, &str)>) -> RecordBatch`
-- Helper utilities to inspect batches without boilerplate.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p opentelemetry-datalake-wasm-sdk --test native_test_harness`  
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -f crates/wasm-sdk
-git commit -m "feat(wasm-sdk): add mock telemetry batch generators and testing utilities"
-```
-
----
-
-### Task 4: Wasmtime Engine, Pooling Allocator & Zero-Trust WASI Env (`crates/wasm-transformer`)
-
-**Files:**
-- Create: `crates/wasm-transformer/src/error.rs`
-- Create: `crates/wasm-transformer/src/config.rs`
-- Create: `crates/wasm-transformer/src/engine.rs`
-- Create: `crates/wasm-transformer/src/pool.rs`
-- Create: `crates/wasm-transformer/src/wasi_env.rs`
-- Test: `crates/wasm-transformer/tests/engine_tests.rs`
-- Test: `crates/wasm-transformer/tests/env_whitelist_tests.rs`
-
-**Interfaces:**
-- Consumes: `WasmTransformerConfig` (max_memory, rejuvenate_threshold, rejuvenate_batches, sha256, init_timeout, env_whitelist, env).
-- Produces: `WasmEngine`, `InstancePool`, `WasiEnvBuilder`, `HostState`, `WasmTransformError`.
-
-- [ ] **Step 1: Write failing test for pooling allocator, epoch timeout, and environment variable whitelisting**
-
-Write `tests/engine_tests.rs` and `tests/env_whitelist_tests.rs` verifying:
-- Wasmtime pooling allocator initialization.
-- Ambient host environment variables (e.g. `SECRET_HOST_KEY`) are NOT visible to the guest.
-- Explicitly whitelisted keys in `env_whitelist` and injected keys in `env` ARE visible to the guest.
-- Single-read in-memory SHA-256 verification.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p wasm-transformer --test engine_tests --test env_whitelist_tests`  
-Expected: FAIL.
-
-- [ ] **Step 3: Implement `error.rs`, `config.rs`, `engine.rs`, `pool.rs`, and `wasi_env.rs`**
-
-Implement:
-- `WasmTransformError` with `thiserror`.
-- `WasmEngine` configuring `PoolingAllocationConfig` and epoch ticker thread (10ms).
-- `InstancePool` managing stores and triggering `madvise(MADV_DONTNEED)` resets on threshold.
-- `WasiEnvBuilder` constructing isolated WASI contexts passing only whitelisted and injected variables.
-- In-memory single-read SHA-256 verification on module loading.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p wasm-transformer --test engine_tests --test env_whitelist_tests`  
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement wasmtime pooling allocator, epoch ticker, and zero-trust env whitelist"
-```
-
----
-
-### Task 5: Invariant Batch Guard & Type-Aware Schema Backfill (`crates/wasm-transformer`)
-
-**Files:**
-- Create: `crates/wasm-transformer/src/guard.rs`
-- Test: `crates/wasm-transformer/tests/guard_tests.rs`
-
-**Interfaces:**
-- Consumes: `RecordBatch`, `SignalType`.
-- Produces: `BatchGuard` (`max_batch_rows` invariant validation, typed null backfilling via `arrow::array::new_null_array`).
-
-- [ ] **Step 1: Write failing test for max_batch_rows rejection and typed null backfilling**
-
-Write tests asserting:
-- Batches $> \text{max\_batch\_rows}$ return `WasmTransformError::BatchTooLarge`.
-- Batches missing complex canonical columns (e.g. `attributes: Map<Utf8, Utf8>`) are backfilled with a typed null MapArray.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p wasm-transformer --test guard_tests`  
-Expected: FAIL.
-
-- [ ] **Step 3: Implement `guard.rs`**
-
-Implement:
-- `BatchGuard::validate_batch_size(batch, max_rows) -> Result<(), WasmTransformError>`.
-- `BatchGuard::enforce_canonical_schema(signal, batch) -> Result<RecordBatch, WasmTransformError>` utilizing `arrow::array::new_null_array`.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p wasm-transformer --test guard_tests`  
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement invariant batch guard and typed null schema backfiller"
-```
-
----
-
-### Task 6: Host `WasmTransformer` Pipeline & Zero-Downtime Reloading (`crates/wasm-transformer`)
-
-**Files:**
-- Create: `crates/wasm-transformer/src/host_calls.rs`
-- Create: `crates/wasm-transformer/src/reload.rs`
-- Modify: `crates/wasm-transformer/src/lib.rs`
-- Test: `crates/wasm-transformer/tests/transformer_pipeline_tests.rs`
-- Test: `crates/wasm-transformer/tests/hot_reload_tests.rs`
-
-**Interfaces:**
-- Consumes: `pipeline_core::pipeline::Transform`, `PipelineReceiver`, `PipelineSender`.
-- Produces: `WasmTransformer` struct implementing `Transform`, `HotReloader`.
-
-- [ ] **Step 1: Write failing test for concurrent transform execution and atomic hot reload**
-
-Write tests running batches through `WasmTransformer` without ordering bottlenecks, asserting drops increment metrics and triggering hot reload swaps module without dropping batches.
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p wasm-transformer --test transformer_pipeline_tests --test hot_reload_tests`  
-Expected: FAIL.
-
-- [ ] **Step 3: Implement `host_calls.rs`, `reload.rs`, and `lib.rs`**
-
-Implement:
-- `datalake_host_log` parsing `HostLogRecord` and printing guest panics with line/file.
-- `datalake_host_has_capability` logging warnings if invoked outside `datalake_init`.
-- Worker pool reading from `input: PipelineReceiver` and sending directly to `output: PipelineSender`.
-- `HotReloader` swapping `Arc<Module>` on reload signal.
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p wasm-transformer --test transformer_pipeline_tests --test hot_reload_tests`  
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement Transform trait, worker pool, and zero-downtime hot reload"
-```
-
----
-
-### Task 7: Developer CLI & Validation Tool (`crates/wasm-cli`)
-
-**Files:**
 - Create: `crates/wasm-cli/src/validator.rs`
-- Create: `crates/wasm-cli/src/runner.rs`
-- Modify: `crates/wasm-cli/src/main.rs`
 - Test: `crates/wasm-cli/tests/cli_tests.rs`
 
 **Interfaces:**
-- Consumes: Compiled `.wasm` files.
-- Produces: CLI binary `datalake-wasm` with `validate`, `test`, `bench` subcommands.
+- Produces: `datalake-wasm validate <path.wasm>`, `datalake-wasm test`, `datalake-wasm bench`.
 
-- [ ] **Step 1: Write failing test for CLI validation subcommand**
+- [ ] **Step 1: Write failing test for validate checking ABI version and exports**
 
-Write `tests/cli_tests.rs` verifying `validate` checks `datalake_abi_version() == 1` and rejects invalid binaries.
+```rust
+// crates/wasm-cli/tests/cli_tests.rs
+use datalake_wasm_tool::validator::validate_wasm_bytes;
+
+#[test]
+fn test_validate_rejects_missing_abi_export() {
+    let invalid_wasm = wat::parse_str("(module)").unwrap();
+    let res = validate_wasm_bytes(&invalid_wasm);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Missing export 'datalake_abi_version'"));
+}
+```
 
 - [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p datalake-wasm-tool --test cli_tests`
+Expected: FAIL
 
-Run: `cargo test -p wasm-cli --test cli_tests`  
-Expected: FAIL.
+- [ ] **Step 3: Write minimal implementation**
+Create `crates/wasm-cli/Cargo.toml`:
+```toml
+[package]
+name = "datalake-wasm-tool"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
 
-- [ ] **Step 3: Implement `validator.rs`, `runner.rs`, and `main.rs`**
-
-Implement:
-- `validate`: verifies ABI v1, exports, and memory boundaries.
-- `test`: executes synthetic batches with DWARF debug info enabled for full stack traces; supports `--env KEY=VAL`.
-- `bench`: measures p50/p95/p99 latency distribution.
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+wasmtime = "29.0"
+arrow = { workspace = true, features = ["ipc"] }
+```
+Implement `validator.rs` checking required exports (`datalake_abi_version`, `datalake_alloc`, `datalake_dealloc`, `datalake_init`, `datalake_transform`) and ABI version == 1.
 
 - [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test -p wasm-cli --test cli_tests`  
-Expected: PASS.
+Run: `cargo test -p datalake-wasm-tool --test cli_tests`
+Expected: PASS
 
 - [ ] **Step 5: Commit**
-
 ```bash
-git add -f crates/wasm-cli
-git commit -m "feat(wasm-cli): implement datalake-wasm validate, test, and bench subcommands"
+git add crates/wasm-cli/
+git commit -m "feat(wasm-cli): add CLI validator checking ABI exports and version"
 ```
 
 ---
 
-### Task 8: Pipeline Core & `main.rs` Integration
-
+### Task 3.2: CLI Test Suite with Value Immutability Assertions & Bench
 **Files:**
-- Modify: `crates/core/src/config.rs`
-- Modify: `src/main.rs`
-- Test: `tests/wasm_integration_tests.rs`
+- Create: `crates/wasm-cli/src/tester.rs`
+- Create: `crates/wasm-cli/src/bench.rs`
+- Modify: `crates/wasm-cli/src/main.rs`
+- Test: `crates/wasm-cli/tests/immutability_conformance_tests.rs`
 
 **Interfaces:**
-- Consumes: TOML config file with `[pipeline.transforms.wasm]` options.
-- Produces: Runtime pipeline selecting `WasmTransformer` when configured.
+- Consumes: `.wasm` module.
+- Produces: `tester::run_immutability_suite`, `bench::run_benchmark_with_disclaimer`.
 
-- [ ] **Step 1: Write integration test with TOML config containing wasm transformer**
+- [ ] **Step 1: Write failing test for value immutability conformance checking**
 
-Write test verifying that configuring `[pipeline.transform.wasm]` constructs `WasmTransformer` and validates security configuration (`on_error = "passthrough"` requires `allow_unmasked_passthrough = true`).
+```rust
+// crates/wasm-cli/tests/immutability_conformance_tests.rs
+use datalake_wasm_tool::tester::verify_batch_immutability;
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
+
+#[test]
+fn test_verify_batch_immutability_detects_tampered_trace_id() {
+    let schema = Arc::new(Schema::new(vec![Field::new("trace_id", DataType::Utf8, false)]));
+    let input = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["trace_123"]))]).unwrap();
+    let output = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["trace_TAMPERED"]))]).unwrap();
+
+    let res = verify_batch_immutability(&input, &output);
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("Value mismatch in immutable column trace_id"));
+}
+```
 
 - [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p datalake-wasm-tool --test immutability_conformance_tests`
+Expected: FAIL
 
-Run: `cargo test --test wasm_integration_tests`  
-Expected: FAIL with unrecognized config field.
-
-- [ ] **Step 3: Implement config parsing in `crates/core/src/config.rs` and pipeline wiring in `src/main.rs`**
-
-Add `WasmTransformerConfig` to `PipelineConfig` and wire into `src/main.rs`.
+- [ ] **Step 3: Write minimal implementation**
+Implement `verify_batch_immutability` checking byte-for-byte matching of `trace_id`, `span_id`, `timestamp`, `name`, `type` between input and output batches. Implement `bench.rs` printing latency distribution and the required throughput disclaimer.
 
 - [ ] **Step 4: Run test to verify it passes**
-
-Run: `cargo test --test wasm_integration_tests`  
-Expected: PASS.
+Run: `cargo test -p datalake-wasm-tool --test immutability_conformance_tests`
+Expected: PASS
 
 - [ ] **Step 5: Commit**
-
 ```bash
-git add -f crates/core src/main.rs tests/wasm_integration_tests.rs
-git commit -m "feat: integrate wasm transformer into datalake configuration and main pipeline"
+git add crates/wasm-cli/
+git commit -m "feat(wasm-cli): implement immutability test suite and benchmark runner"
 ```
 
 ---
 
-### Task 9: End-to-End Example Module, Boundary Benchmarks & Quality Gates
+## PR 4: Host Engine, Pooling Allocator & Zero-Trust WASI (`crates/wasm-transformer`)
 
+**Scope:** Host runtime engine initialization, Wasmtime Pooling Allocator configuration, physical memory reclamation via `madvise(MADV_DONTNEED)`, soft memory rejuvenation lifecycle, zero-trust WASI environment whitelist builder, and OOM diagnostic telemetry.
+**Independence:** Implements the engine/pooling layer. Does not depend on the higher-level pipeline dispatcher.
+
+### Task 4.1: Wasmtime Engine & Pooling Allocator Cache
 **Files:**
-- Create: `examples/wasm-pii-scrubber/Cargo.toml`
-- Create: `examples/wasm-pii-scrubber/src/lib.rs`
-- Create: `examples/wasm-pii-scrubber/tests/scrubber_test.rs`
+- Create: `crates/wasm-transformer/Cargo.toml`
+- Create: `crates/wasm-transformer/src/lib.rs`
+- Create: `crates/wasm-transformer/src/engine.rs`
+- Create: `crates/wasm-transformer/src/pool.rs`
+- Create: `crates/wasm-transformer/src/error.rs`
+- Test: `crates/wasm-transformer/tests/engine_pool_tests.rs`
+
+**Interfaces:**
+- Produces: `EngineCache`, `InstancePool`, `WasmTransformError::Oom`.
+
+- [ ] **Step 1: Write failing test for pooling allocator instance initialization and memory reset**
+
+```rust
+// crates/wasm-transformer/tests/engine_pool_tests.rs
+use wasm_transformer::engine::EngineCache;
+use wasm_transformer::pool::InstancePool;
+
+#[test]
+fn test_pooling_allocator_instantiation_and_limit() {
+    let engine_cache = EngineCache::new_pooling(4, 64 * 1024 * 1024).unwrap();
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = engine_cache.compile_module(&wasm_bytes).unwrap();
+    let mut pool = InstancePool::new(engine_cache, module, 4);
+    assert_eq!(pool.available_slots(), 4);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test engine_pool_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+Create `crates/wasm-transformer/Cargo.toml`:
+```toml
+[package]
+name = "wasm-transformer"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+pipeline-core = { workspace = true }
+wasmtime = { version = "29.0", features = ["pooling-allocator"] }
+wasmtime-wasi = "29.0"
+tokio = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = "6.0"
+sha2 = "0.10"
+hex = "0.4"
+```
+Configure `PoolingAllocationConfig` with `max_memory_size = 64 * 1024 * 1024`, `max_instances = concurrency`, and implement non-destructive store rejuvenation with retry backoff.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test engine_pool_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): implement Wasmtime pooling allocator and engine cache"
+```
+
+---
+
+### Task 4.2: Zero-Trust WASI Context Builder & Precedence Rules
+**Files:**
+- Create: `crates/wasm-transformer/src/wasi_env.rs`
+- Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/wasi_env_tests.rs`
+
+**Interfaces:**
+- Produces: `build_wasi_ctx(whitelist: &[String], static_env: &HashMap<String, String>) -> Result<WasiCtx, WasmTransformError>`.
+
+- [ ] **Step 1: Write failing test verifying zero ambient env and static override precedence**
+
+```rust
+// crates/wasm-transformer/tests/wasi_env_tests.rs
+use std::collections::HashMap;
+use wasm_transformer::wasi_env::filter_environment_variables;
+
+#[test]
+fn test_wasi_env_filtering_and_precedence() {
+    unsafe { std::env::set_var("HOST_SECRET", "super_secret"); }
+    unsafe { std::env::set_var("APP_ENV", "host_dev"); }
+
+    let whitelist = vec!["APP_ENV".to_string()];
+    let mut static_env = HashMap::new();
+    static_env.insert("APP_ENV".to_string(), "static_override".to_string());
+    static_env.insert("EXTRA_KEY".to_string(), "val".to_string());
+
+    let filtered = filter_environment_variables(&whitelist, &static_env);
+    assert!(!filtered.contains_key("HOST_SECRET")); // Ambient denied
+    assert_eq!(filtered.get("APP_ENV").unwrap(), "static_override"); // Static override
+    assert_eq!(filtered.get("EXTRA_KEY").unwrap(), "val");
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test wasi_env_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+Implement `filter_environment_variables` in `src/wasi_env.rs` following spec section 5.9 with masked audit logging.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test wasi_env_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): add zero-trust wasi environment filter with static precedence"
+```
+
+---
+
+## PR 5: Host Guards, Concurrent Metrics & ABI Host Calls (`crates/wasm-transformer`)
+
+**Scope:** $O(1)$ structural immutability check, defensive vs strict schema guard with typed null backfill, concurrent `DashMap` metric registry with IEEE 754 f64 bitcast, `datalake_host_log`, and capability query phase enforcement.
+**Independence:** Self-contained logic verifying and guarding batches at the FFI boundary.
+
+### Task 5.1: O(1) Immutability Check & Defensive Schema Guard
+**Files:**
+- Create: `crates/wasm-transformer/src/guard.rs`
+- Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/guard_tests.rs`
+
+**Interfaces:**
+- Produces: `verify_structural_immutability(input: &RecordBatch, output: &RecordBatch) -> Result<(), WasmTransformError>`, `apply_schema_guard(...)`.
+
+- [ ] **Step 1: Write failing test for O(1) null_count immutability check and typed null backfill**
+
+```rust
+// crates/wasm-transformer/tests/guard_tests.rs
+use arrow::array::{new_null_array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
+use wasm_transformer::guard::{verify_structural_immutability, backfill_missing_columns};
+
+#[test]
+fn test_o1_immutability_check_detects_all_null_immutable_column() {
+    let schema = Arc::new(Schema::new(vec![Field::new("trace_id", DataType::Utf8, false)]));
+    let input = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["id_1"]))]).unwrap();
+    let null_col = new_null_array(&DataType::Utf8, 1);
+    let output = RecordBatch::try_new(schema, vec![null_col]).unwrap();
+
+    let res = verify_structural_immutability(&input, &output);
+    assert!(res.is_err());
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test guard_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+In `src/guard.rs`:
+Implement $O(1)$ check:
+```rust
+let is_all_null = col.null_count() == col.len() && col.len() > 0;
+```
+Implement defensive backfill using `arrow::array::new_null_array(field.data_type(), num_rows)` with rate-limited warning per spec 5.5.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test guard_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): implement O(1) structural immutability check and schema guard"
+```
+
+---
+
+### Task 5.2: Concurrent DashMap Metric Registry & Linker Phase Enforcement
+**Files:**
+- Create: `crates/wasm-transformer/src/host_calls.rs`
+- Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/host_calls_tests.rs`
+
+**Interfaces:**
+- Produces: `link_host_functions(linker: &mut Linker<HostState>) -> Result<(), WasmTransformError>`.
+
+- [ ] **Step 1: Write failing test verifying capability query rejection outside init and f64 bitcast gauge**
+
+```rust
+// crates/wasm-transformer/tests/host_calls_tests.rs
+use wasm_transformer::host_calls::{MetricRegistry, HostPhase};
+
+#[test]
+fn test_capability_query_fails_during_execution_phase() {
+    let registry = MetricRegistry::new("test_comp");
+    let mut phase = HostPhase::Execution;
+    assert_eq!(registry.query_capability(&mut phase, "geoip"), 0); // Must return 0
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test host_calls_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+In `src/host_calls.rs`:
+- Implement `MetricRegistry` using `DashMap<String, MetricHandle>` bounded by 50 custom metrics.
+- Read gauges via `f64::from_bits(value)` and durations via `value as f64 / 1e9`.
+- Link `datalake_host_v1` imports with phase check on `datalake_host_has_capability`.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test host_calls_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): add concurrent DashMap metric registry and init-phase enforcement"
+```
+
+---
+
+## PR 6: Least-Loaded Dispatcher, Lifecycle & Pipeline Integration (`crates/wasm-transformer` & `src/main.rs`)
+
+**Scope:** Wires the worker task pool, least-loaded `try_send` dispatcher, worker `JoinHandle` tracking, graceful shutdown drain with `shutdown_reroute_timeout` fallback, and implements `pipeline_core::pipeline::Transform`.
+**Independence:** Brings together PR 2, 4, 5 and exposes `WasmTransformer` to `src/main.rs`.
+
+### Task 6.1: Least-Loaded Dispatcher & Worker Task Pool
+**Files:**
+- Create: `crates/wasm-transformer/src/dispatcher.rs`
+- Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/dispatcher_tests.rs`
+
+**Interfaces:**
+- Produces: `WasmTransformer::transform(&mut self, input: PipelineReceiver, output: PipelineSender) -> Result<(), PipelineError>`.
+
+- [ ] **Step 1: Write failing test for dispatcher worker join tracking and try-send load balancing**
+
+```rust
+// crates/wasm-transformer/tests/dispatcher_tests.rs
+use pipeline_core::pipeline::{SignalBatch, Transform};
+use tokio::sync::mpsc;
+use wasm_transformer::WasmTransformer;
+
+#[tokio::test]
+async fn test_dispatcher_drains_and_joins_all_workers() {
+    // PipelineReceiver drain verification
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test dispatcher_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+Implement `transform` method per spec section 5.2:
+- Spawn $N$ workers with `worker_channel_capacity`.
+- Track `JoinHandle`s in `worker_handles`.
+- Run least-loaded `try_send` loop.
+- On EOF, drop `worker_txs` and `join` all `worker_handles`.
+- Implement shutdown reroute timeout of 2s in worker reroute senders.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test dispatcher_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): implement least-loaded dispatcher with worker join tracking"
+```
+
+---
+
+### Task 6.2: Pipeline Wiring in main.rs & Startup Security Audit
+**Files:**
+- Modify: `src/main.rs:200-240`
+- Modify: `Cargo.toml`
+- Test: `tests/integration_pipeline_tests.rs`
+
+**Interfaces:**
+- Produces: `main.rs` instantiation of `WasmTransformer` when configured, with startup security alert for `on_error = "passthrough"`.
+
+- [ ] **Step 1: Write failing integration test verifying WasmTransformer wired into signal pipeline**
+
+```rust
+// tests/integration_pipeline_tests.rs
+#[tokio::test]
+async fn test_wasm_transformer_runs_in_pipeline() {
+    // End-to-end SignalBatch::Logs through WasmTransformer to output channel
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test --test integration_pipeline_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+Update `src/main.rs` to instantiate `WasmTransformer` when configured in `AppConfig` and log startup security warning if `on_error = "passthrough"`.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test --test integration_pipeline_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add src/main.rs Cargo.toml
+git commit -m "feat: wire WasmTransformer into main pipeline orchestration with security auditing"
+```
+
+---
+
+## PR 7: Hot-Reload Controller & Generation Fencing (`crates/wasm-transformer`)
+
+**Scope:** Atomic zero-downtime hot-reloading with single-read in-memory SHA-256 validation, atomic generation counter (`module_generation: AtomicU64`), worker generation mismatch check, opt-in `enable_sighup` signal handler, and REST reload endpoint.
+**Independence:** Extends the engine cache and worker loop without changing the core transform ABI.
+
+### Task 7.1: Generation Fencing & Atomic Module Swap
+**Files:**
+- Create: `crates/wasm-transformer/src/reload.rs`
+- Modify: `crates/wasm-transformer/src/engine.rs`
+- Modify: `crates/wasm-transformer/src/lib.rs`
+- Test: `crates/wasm-transformer/tests/reload_tests.rs`
+
+**Interfaces:**
+- Produces: `EngineCache::reload_module(new_bytes: &[u8], expected_sha: Option<&str>) -> Result<u64, WasmTransformError>`, `module_generation() -> u64`.
+
+- [ ] **Step 1: Write failing test verifying generation increment and single-batch worker update**
+
+```rust
+// crates/wasm-transformer/tests/reload_tests.rs
+use wasm_transformer::engine::EngineCache;
+
+#[tokio::test]
+async fn test_reload_module_increments_generation_and_validates_sha256() {
+    let cache = EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap();
+    let initial_gen = cache.module_generation();
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+    )"#;
+    let bytes = wat::parse_str(wat).unwrap();
+    let new_gen = cache.reload_from_bytes(&bytes, None).unwrap();
+    assert_eq!(new_gen, initial_gen + 1);
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+Run: `cargo test -p wasm-transformer --test reload_tests`
+Expected: FAIL
+
+- [ ] **Step 3: Write minimal implementation**
+In `src/reload.rs`:
+- Verify SHA-256 on in-memory bytes before compilation.
+- Atomically swap `Arc<Module>` and increment `AtomicU64`.
+- Worker boundary checks `self.local_generation != global_engine.module_generation()`.
+- Implement opt-in `SIGHUP` listener and REST endpoint `POST /api/v1/transforms/wasm/reload`.
+
+- [ ] **Step 4: Run test to verify it passes**
+Run: `cargo test -p wasm-transformer --test reload_tests`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+```bash
+git add crates/wasm-transformer/
+git commit -m "feat(wasm-transformer): implement atomic hot-reload controller and generation fencing"
+```
+
+---
+
+## PR 8: End-to-End Boundary Benchmarks & Sample Transforms
+
+**Scope:** Automated CI boundary benchmark validating latency budget ($p95 \le 1.5\text{ms}$ on 2,000-row batch) and sample production PII scrubber module.
+**Independence:** Exercises the full stack end-to-end.
+
+### Task 8.1: CI Boundary Benchmark & Sample PII Scrubber
+**Files:**
 - Create: `benches/wasm_boundary_bench.rs`
+- Create: `examples/transforms/pii_scrubber/Cargo.toml`
+- Create: `examples/transforms/pii_scrubber/src/lib.rs`
+- Modify: `Cargo.toml`
 
 **Interfaces:**
-- Consumes: `opentelemetry-datalake-wasm-sdk`, `wasm-transformer`.
-- Produces: Working example WASM module and latency budget verification benchmark ($p95 \le 1.5\text{ms}$).
+- Produces: `cargo bench --bench wasm_boundary_bench` asserting $p95 \le 1.5\text{ms}$.
 
-- [ ] **Step 1: Create example PII scrubber module**
+- [ ] **Step 1: Write boundary benchmark measuring 2,000-row Arrow IPC roundtrip**
 
-Implement a `BatchTransformer` that detects credit cards in log messages, redacts them to `[REDACTED]`, and reads whitelisted environment variables.
+```rust
+// benches/wasm_boundary_bench.rs
+use criterion::{criterion_group, criterion_main, Criterion};
 
-- [ ] **Step 2: Run native tests for example module**
-
-Run: `cargo test -p wasm-pii-scrubber`  
-Expected: PASS.
-
-- [ ] **Step 3: Add and run boundary latency benchmark**
-
-Write `benches/wasm_boundary_bench.rs` and run criterion benchmark:
-```bash
-cargo bench --bench wasm_boundary_bench
+fn bench_wasm_boundary(c: &mut Criterion) {
+    // Benchmark 2,000-row batch through WasmTransformer asserting p95 <= 1.5ms
+}
+criterion_group!(benches, bench_wasm_boundary);
+criterion_main!(benches);
 ```
-Verify round-trip overhead satisfies $p95 \le 1.5\text{ms}$.
 
-- [ ] **Step 4: Run full workspace quality gates**
+- [ ] **Step 2: Run benchmark to establish baseline**
+Run: `cargo bench --bench wasm_boundary_bench`
 
-Run:
-```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc
-cargo test --workspace
-```
-Expected: PASS with 0 warnings and 0 errors.
+- [ ] **Step 3: Implement sample PII scrubber transform in `examples/transforms/`**
+Compile to `wasm32-unknown-unknown` and verify with `datalake-wasm test`.
+
+- [ ] **Step 4: Verify benchmark passes within latency budget**
+Run: `cargo bench --bench wasm_boundary_bench`
+Expected: PASS ($p95 \le 1.5\text{ms}$, $p99 \le 3.0\text{ms}$).
 
 - [ ] **Step 5: Commit**
-
 ```bash
-git add -f examples/wasm-pii-scrubber benches/wasm_boundary_bench.rs
-git commit -m "docs(example): add wasm-pii-scrubber example, latency benchmark, and verify quality gates"
+git add benches/ examples/
+git commit -m "test(bench): add automated CI wasm boundary benchmark and sample pii scrubber"
 ```
+
+---
+
+## Execution Handoff
+
+Plan complete and saved to `docs/superpowers/plans/2026-09-20-wasm-transformer.md`. Two execution options:
+
+**1. Subagent-Driven (recommended)** - I dispatch a fresh subagent per PR/task, review between tasks, fast iteration across parallel tracks (e.g. PR 1, PR 2, PR 3 can start concurrently).
+
+**2. Inline Execution** - Execute tasks in this session using `executing-plans`, batch execution with checkpoints.
+
+**Which approach?**
