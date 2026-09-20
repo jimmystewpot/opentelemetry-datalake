@@ -113,40 +113,11 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Request payload for the WASM hot-reload REST endpoint.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct WasmReloadRequest {
-    /// Filesystem path to the updated WebAssembly module.
-    pub module_path: String,
-}
-
-/// Handler for the WASM hot-reload REST endpoint.
-///
-/// Extracts the JSON payload containing `module_path`, emits a security audit warning,
-/// and returns an acceptance response.
-pub async fn wasm_reload_handler(
-    axum::Json(payload): axum::Json<WasmReloadRequest>,
-) -> axum::Json<serde_json::Value> {
-    tracing::warn!(
-        path = %payload.module_path,
-        "SECURITY AUDIT: REST hot-reload endpoint invoked"
-    );
-    axum::Json(serde_json::json!({
-        "status": "reload accepted",
-        "path": payload.module_path,
-    }))
-}
-
-/// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.
-pub fn build_admin_router() -> axum::Router {
-    axum::Router::new().route(
-        "/api/v1/transforms/wasm/reload",
-        axum::routing::post(wasm_reload_handler),
-    )
-}
+/// Re-exports the admin router builder registering the WASM hot-reload endpoint.
+pub use wasm_transformer::reload::build_admin_router;
 
 #[tokio::main]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
 async fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
 
@@ -234,7 +205,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
-    let _sighup_handle;
+    let mut _sighup_handles = Vec::new();
     let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
         Box<dyn Transform>,
         Box<dyn Transform>,
@@ -246,30 +217,34 @@ async fn main() -> anyhow::Result<()> {
             "Initializing 3x signal-isolated WasmTransformer instances"
         );
         let logs_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
-        _sighup_handle = if wasm_cfg.enable_sighup {
-            wasm_transformer::reload::spawn_sighup_listener(
+        let traces_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
+        let metrics_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
+
+        if wasm_cfg.enable_sighup {
+            let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
+            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(logs_wasm.engine()),
-                std::path::PathBuf::from(&wasm_cfg.module_path),
+                module_path.clone(),
                 true,
-            )
-        } else {
-            None
-        };
+            ));
+            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(traces_wasm.engine()),
+                module_path.clone(),
+                true,
+            ));
+            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(metrics_wasm.engine()),
+                module_path,
+                true,
+            ));
+        }
+
         (
             Box::new(logs_wasm),
-            Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
-                None,
-                None,
-            )?),
-            Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
-                None,
-                None,
-            )?),
+            Box::new(traces_wasm),
+            Box::new(metrics_wasm),
         )
     } else {
-        _sighup_handle = None;
         (
             Box::new(noop_transformer::NoopTransformer::new()),
             Box::new(noop_transformer::NoopTransformer::new()),
@@ -518,6 +493,10 @@ async fn main() -> anyhow::Result<()> {
         traces_sink_handle,
         metrics_sink_handle
     );
+
+    for h in _sighup_handles.into_iter().flatten() {
+        h.abort();
+    }
 
     tracing::info!("Shutdown complete.");
     Ok(())
@@ -838,6 +817,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_wasm_reload_handler_direct() {
+        use wasm_transformer::reload::{WasmReloadRequest, wasm_reload_handler};
+
         let request = WasmReloadRequest {
             module_path: "/opt/transforms/updated.wasm".to_string(),
         };
