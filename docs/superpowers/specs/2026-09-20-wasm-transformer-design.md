@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Trait Integration, Three-Tier Immutability, f64 Bitcast Gauge, and Graceful Shutdown)  
+**Status**: Final Approved Spec (Incorporating Trait Integration, Three-Tier Immutability, Dispatcher Fan-Out, and K8s Sizing)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -25,13 +25,15 @@ This specification defines the architecture, ABI, guest SDK, and verification to
   - `on_error = "reroute" | "drop" | "passthrough"` (routes failures to `<component_id>._reroute_errored`)
   - `on_reject = "reroute" | "drop"` (routes policy rejections to `<component_id>._reroute_rejected`)
   The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams.
+* **Lock-Free Dispatcher Multi-Worker Architecture**: A lightweight async dispatcher task reads from the single `input: PipelineReceiver` and distributes batches across $N$ worker channels, completely avoiding mutex contention on the input receiver while preserving natural backpressure.
 * **Seamless `Transform` Trait Integration**: `WasmTransformer` implements the standard `pipeline_core::pipeline::Transform` trait without modifying its single-output method signature. Secondary reroute channels (`_reroute_errored` and `_reroute_rejected`) are held as internal struct state injected at construction time.
-* **Full IEEE 754 `f64` Gauge Precision via Bitcast**: The controlled host metric ABI passes gauges as IEEE 754 64-bit float bit patterns (`f64::to_bits()` / `f64::from_bits()`), supporting fractional, positive, negative, and zero values with zero ABI overhead.
-* **Graceful Shutdown & Pipeline Drain**: On `SIGTERM` / `SIGINT`, upstream closes ingress, workers drain all queued batches in channel buffers, complete in-flight batches up to `max_execution_duration`, and exit cleanly, with a configurable `drain_timeout` ceiling to prevent hung processes during rolling deploys.
+* **Full IEEE 754 `f64` Gauge Precision via Bitcast**: The controlled host metric ABI passes gauges as IEEE 754 64-bit float bit patterns (`f64::to_bits()` / `f64::from_bits()`), supporting fractional, positive, negative, and zero values. The host uses a concurrent read-optimized registry (`DashMap`) to avoid hot-path lock contention.
+* **Graceful Shutdown with Drain Guards**: On `SIGTERM` / `SIGINT`, upstream closes ingress, workers drain all queued batches in channel buffers, complete in-flight batches up to `max_execution_duration`, and exit cleanly. Secondary reroute sends use a bounded timeout (`shutdown_reroute_timeout = 2s`) to prevent stalled dead-letter sinks from blocking process termination.
+* **Kubernetes Sizing Guidance**: Explicit sizing formulas for virtual memory pooling allocations and RSS footprint with `madvise(MADV_DONTNEED)` page resets.
 * **Defined 0-Batch Success Semantics**: Emitting `TransformResult::Success(vec![])` (via `TransformResult::ok_empty()`) is explicitly supported as a successful no-op/buffering outcome: incoming rows are recorded, 0 outgoing rows emitted, no dead-letter streams invoked, and schema guard is bypassed.
 * **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
 * **Vector-Aligned Component Observability**: Component logs and standard metrics are strictly labeled with `component_id`, `component_type = "wasm"`, and `component_kind = "transform"`. Custom guest metrics are restricted to a dedicated namespace (`datalake_transformers_<component_id>_*`) via a controlled host API (`Counter`, `Gauge` as `f64`, and `Duration` standardizing strictly on nanoseconds and automatically mapped to Prometheus Histograms).
-* **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transform.wasm.env]` are exposed to the guest. Static config values always override host environment values.
+* **Zero-Trust Environment Variable Whitelisting**: Strict zero-trust environment variable isolation. The WASI sandbox inherits zero ambient host environment variables by default. Only explicitly configured keys in `env_whitelist` or explicit values in `[pipeline.transforms.env]` are exposed to the guest. Static config values always override host environment values.
 * **Deterministic Hot-Reload Generation Fencing**: A monotonic `module_generation` counter is verified by workers at every batch boundary. When a hot-reload occurs, workers finish their active batch, detect the generation mismatch, and immediately drain and reload their instance in $\approx 10\,\mu\text{s}$, eliminating zombie worker drift.
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
@@ -53,9 +55,10 @@ opentelemetry-datalake/
 │   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error, on_reject)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
+│   │       ├── dispatcher.rs          # Lock-free single-receiver fan-out to N worker channels
 │   │       ├── guard.rs               # Invariant validation, O(1) structural integrity & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
-│   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
+│   │       ├── host_calls.rs          # Versioned host imports with concurrent DashMap metric registry
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
 │   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
 │   │
@@ -345,6 +348,8 @@ The host transformer integrates into the pipeline via `pipeline_core::pipeline::
 
 ### 5.1 Configuration (`pipeline.toml`)
 
+The configuration uses idiomatic TOML table nesting, scoping per-transform options directly under the specific array entry:
+
 ```toml
 [[pipeline.transforms]]
 id = "pii_scrubber"
@@ -377,35 +382,21 @@ env_whitelist = [
     "REGION"
 ]
 
-# Explicit static environment variables injected into the WASM sandbox (overrides host env)
-[pipeline.transform.wasm.env]
+# Explicit static environment variables injected into this WASM sandbox (overrides host env)
+[pipeline.transforms.env]
 LOG_LEVEL = "info"
 TRANSFORM_VERSION = "1.2.0"
 
 # Optional config block passed to datalake_init
-[pipeline.transform.wasm.config]
+[pipeline.transforms.config]
 environment = "production"
-mask_credit_cards = true
+redact_sensitive_fields = true
 ```
 
-### 5.2 Trait Integration & Multi-Channel Routing
+### 5.2 Lock-Free Dispatcher & Multi-Worker Concurrency
 
-`WasmTransformer` implements the existing `pipeline_core::pipeline::Transform` trait:
-```rust
-#[async_trait]
-impl Transform for WasmTransformer {
-    async fn transform(
-        &mut self,
-        input: PipelineReceiver,
-        output: PipelineSender,
-    ) -> Result<(), PipelineError> {
-        self.run_worker_pool(input, output).await
-    }
-}
-```
+Because `tokio::sync::mpsc::Receiver` is not `Clone`, sharing it across worker tasks with an `Arc<Mutex<Receiver>>` would create an unacceptable serialization bottleneck. Instead, `WasmTransformer` implements a **lock-free single-receiver fan-out pattern**:
 
-**Secondary Reroute Channels as Internal Struct State**:
-Rather than modifying the `Transform` trait definition across the entire codebase, `WasmTransformer` stores optional secondary senders internally, provided at construction time by the topology builder:
 ```rust
 pub struct WasmTransformer {
     config: WasmTransformerConfig,
@@ -413,11 +404,60 @@ pub struct WasmTransformer {
     reroute_errored_tx: Option<PipelineSender>,
     reroute_rejected_tx: Option<PipelineSender>,
 }
+
+#[async_trait]
+impl Transform for WasmTransformer {
+    async fn transform(
+        &mut self,
+        mut input: PipelineReceiver,
+        output: PipelineSender,
+    ) -> Result<(), PipelineError> {
+        let concurrency = self.config.concurrency;
+        let mut worker_txs = Vec::with_capacity(concurrency);
+
+        // 1. Spawn N independent worker tasks, each with its own instance and bounded channel
+        for worker_id in 0..concurrency {
+            let (worker_tx, mut worker_rx) = mpsc::channel::<SignalBatch>(2);
+            worker_txs.push(worker_tx);
+
+            let worker_output = output.clone();
+            let worker_error = self.reroute_errored_tx.clone();
+            let worker_reject = self.reroute_rejected_tx.clone();
+            let worker_engine = Arc::clone(&self.engine);
+            let worker_config = self.config.clone();
+
+            tokio::spawn(async move {
+                Self::run_worker(
+                    worker_id,
+                    worker_rx,
+                    worker_output,
+                    worker_error,
+                    worker_reject,
+                    worker_engine,
+                    worker_config,
+                ).await;
+            });
+        }
+
+        // 2. Dispatcher loop: read from input, distribute round-robin across worker channels
+        let mut next_worker = 0;
+        while let Some(batch) = input.recv().await {
+            worker_txs[next_worker]
+                .send(batch)
+                .await
+                .map_err(|_| PipelineError::DownstreamClosed)?;
+            next_worker = (next_worker + 1) % concurrency;
+        }
+
+        // 3. Upstream input closed; drop worker senders to signal drain
+        drop(worker_txs);
+        Ok(())
+    }
+}
 ```
-- Primary transformed batches are sent directly to `output.send(batch).await`.
-- Failed batches (`on_error = "reroute"`) are sent to `self.reroute_errored_tx`.
-- Policy rejected batches (`on_reject = "reroute"`) are sent to `self.reroute_rejected_tx`.
-- When the worker pool completes, all senders (primary and internal reroutes) are dropped, naturally propagating EOF to downstream sinks.
+
+- Each worker holds a clone of `output` (`mpsc::Sender` is `Clone`) and internal reroute senders (`_reroute_errored`, `_reroute_rejected`).
+- Backpressure propagates naturally: if workers are saturated, `worker_tx.send(batch).await` pauses the dispatcher, which pauses reading from `input`.
 
 ### 5.3 Failure Policies & Backpressure Semantics
 
@@ -484,7 +524,7 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
    - If `datalake_init` returns non-zero or times out (`init_timeout = 2s`), the worker logs an error and retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
    - If all retries fail, the worker keeps serving on the existing store (avoiding permanent worker slot death), logs a critical warning, and attempts rejuvenation again after 100 batches.
 
-### 5.7 Vector-Aligned Observability & Controlled Metrics
+### 5.7 Vector-Aligned Observability & Concurrent Metrics Registry
 
 1. **Uniform Component Identification**:
    - All host logs and metrics emitted by the transformer include the standardized Vector-style labels:
@@ -498,7 +538,7 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
    - `component_discarded_rows_total{reason="discard|reject"}`
    - `component_errors_total`
    - `component_execution_duration_seconds` (Histogram)
-3. **Controlled Custom Metric Injection**:
+3. **Controlled Custom Metric Injection with Lock-Free Registry**:
    - Custom guest metrics are restricted to:
      ```text
      datalake_transformers_<component_id>_<metric_name>{component_id="...", signal="..."}
@@ -507,35 +547,62 @@ When a worker instance rejuvenates (due to `rejuvenate_threshold = 16MiB` or `re
      - `metric_type = 0` (Counter): Prometheus counter.
      - `metric_type = 1` (Gauge): IEEE 754 64-bit float bitcast (`f64::from_bits(value)`), recorded into Prometheus Gauge.
      - `metric_type = 2` (Duration): Value in nanoseconds (`u64`), converted to seconds (`f64 / 1e9`) and recorded into a Prometheus Histogram (`..._duration_seconds`).
+   - **Concurrency Safety**:
+     - Metric handles are cached in a read-optimized concurrent map (`DashMap<String, MetricHandle>`).
+     - In steady-state execution, looking up handles is lock-free and $O(1)$.
+     - Insertions only take place on the first encounter of a metric name, strictly bounded by the 50-metric cardinality ceiling.
    - Hard limits:
      - Metric names: ASCII alphanumeric + `_`, max 64 characters.
      - Cardinality ceiling: Maximum 50 distinct custom metric names per `component_id`.
 
-### 5.8 Environment Variable Sandboxing & Zero-Trust WASI
+### 5.8 Kubernetes Sizing & Memory Guidance
+
+When running in containerized environments (Kubernetes pods), operators must account for Wasmtime's virtual memory pooling allocator:
+
+$$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$$
+
+* **Recommended Edge Configuration**: `concurrency = 4`, `max_memory = "64MiB"`, `rejuvenate_threshold = "16MiB"`. This requires $256\text{MiB}$ of virtual address space.
+* **Host Physical RAM (RSS)**: Thanks to `madvise(MADV_DONTNEED)`, actual physical resident set size (RSS) stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
+* **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient (Linux default of 65,530 is plenty for standard pools).
+
+### 5.9 Environment Variable Sandboxing & Zero-Trust WASI
 
 1. **Default Deny**: By default, `wasmtime_wasi::WasiCtxBuilder` does not inherit host environment variables.
 2. **Precedence Rule**:
-   - `[pipeline.transform.wasm.env]` (static explicit injection) **strictly overrides** variables resolved from `env_whitelist`.
+   - `[pipeline.transforms.env]` (static explicit injection) **strictly overrides** variables resolved from `env_whitelist`.
    - If a key exists in both, the static value is used and an informational notice is logged.
 3. **Audit Logging**: At startup and reload, the host logs the list of permitted variable names (values are masked) for compliance auditability.
 
-### 5.9 Graceful Shutdown & Pipeline Drain
+### 5.10 Graceful Shutdown & Pipeline Drain
 
 During rolling deployments or process termination (`SIGTERM` / `SIGINT`):
 1. The upstream OTLP receiver shuts down its listening port and ceases accepting new traffic.
 2. The receiver completes in-flight requests and drops its channel senders (`input` on `WasmTransformer` observes EOF `None`).
 3. **Worker Drain Loop**:
+   - The dispatcher loop exits, closing worker channels (`worker_txs`).
    - Workers finish their current in-flight batch (bounded by `max_execution_duration`).
-   - Workers drain all remaining batches buffered in the `input` channel, executing transforms and forwarding outputs downstream.
-4. **Drain Timeout Guard**:
-   - The shutdown process enforces `drain_timeout` (default: 10s). If draining exceeds this threshold, worker tasks are aborted, logging:
+   - Workers drain any remaining batches buffered in their `worker_rx` queues, executing transforms and forwarding outputs downstream.
+4. **Shutdown Reroute Timeout Guard**:
+   - During shutdown drain, secondary reroute channel sends use a bounded timeout (`shutdown_reroute_timeout = 2s`):
+     ```rust
+     tokio::select! {
+         res = reroute_tx.send(batch) => { ... },
+         _ = tokio::time::sleep(Duration::from_secs(2)) => {
+             tracing::warn!("Reroute channel full during shutdown; dropping batch to prevent hang");
+             metrics::counter!("component_errors_total", "error_type" => "shutdown_reroute_timeout");
+         }
+     }
+     ```
+   - This prevents stalled dead-letter sinks from holding the shutdown process hostage.
+5. **Drain Timeout Guard**:
+   - The overall shutdown process enforces `drain_timeout` (default: 10s). If draining exceeds this threshold, worker tasks are aborted, logging:
      ```text
      WARN wasm_host: Shutdown drain timeout reached (10s), aborting remaining workers [component_id="..."]
      ```
-5. **Clean Downstream Cascade**:
+6. **Clean Downstream Cascade**:
    - Once workers terminate, all output channels (`output`, `_reroute_errored`, `_reroute_rejected`) drop, allowing downstream sinks to finish commits and flush Parquet files cleanly without truncated writes.
 
-### 5.10 Deterministic Hot-Reloading & Generation Fencing
+### 5.11 Deterministic Hot-Reloading & Generation Fencing
 
 1. **Single-Read In-Memory Compilation**:
    ```rust
