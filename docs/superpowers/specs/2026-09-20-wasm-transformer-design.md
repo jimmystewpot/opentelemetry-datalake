@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Trait Integration, Three-Tier Immutability, Dispatcher Fan-Out, and K8s Sizing)  
+**Status**: Final Approved Spec (Incorporating Worker Join/Drain, Least-Loaded Dispatch, Init-Phase Enforcement, Clean Header, and Signal Architecture)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -25,10 +25,12 @@ This specification defines the architecture, ABI, guest SDK, and verification to
   - `on_error = "reroute" | "drop" | "passthrough"` (routes failures to `<component_id>._reroute_errored`)
   - `on_reject = "reroute" | "drop"` (routes policy rejections to `<component_id>._reroute_rejected`)
   The topology builder strictly enforces at startup that subscribed sinks exist for any enabled reroute streams.
-* **Lock-Free Dispatcher Multi-Worker Architecture**: A lightweight async dispatcher task reads from the single `input: PipelineReceiver` and distributes batches across $N$ worker channels, completely avoiding mutex contention on the input receiver while preserving natural backpressure.
-* **Seamless `Transform` Trait Integration**: `WasmTransformer` implements the standard `pipeline_core::pipeline::Transform` trait without modifying its single-output method signature. Secondary reroute channels (`_reroute_errored` and `_reroute_rejected`) are held as internal struct state injected at construction time.
+* **Least-Loaded Dispatcher with Full Worker Join Synchronization**: A lightweight async dispatcher task reads from the single `input: PipelineReceiver` and dispatches batches to workers using non-blocking `try_send` across idle channels before falling back to round-robin backpressure. On completion/shutdown, `transform()` awaits all worker `JoinHandle`s to guarantee complete drain and capture worker panics.
+* **Seamless `Transform` Trait Integration & Per-Signal Pipelines**: `WasmTransformer` implements the standard `pipeline_core::pipeline::Transform` trait for signal-isolated pipelines (`Logs`, `Metrics`, `Traces`). Secondary reroute channels (`_reroute_errored` and `_reroute_rejected`) are held as internal struct state injected at construction time.
 * **Full IEEE 754 `f64` Gauge Precision via Bitcast**: The controlled host metric ABI passes gauges as IEEE 754 64-bit float bit patterns (`f64::to_bits()` / `f64::from_bits()`), supporting fractional, positive, negative, and zero values. The host uses a concurrent read-optimized registry (`DashMap`) to avoid hot-path lock contention.
 * **Graceful Shutdown with Drain Guards**: On `SIGTERM` / `SIGINT`, upstream closes ingress, workers drain all queued batches in channel buffers, complete in-flight batches up to `max_execution_duration`, and exit cleanly. Secondary reroute sends use a bounded timeout (`shutdown_reroute_timeout = 2s`) to prevent stalled dead-letter sinks from blocking process termination.
+* **Streamlined ABI Response Header**: `TransformResponseHeader` contains only essential batch outcome fields, relying on the mandatory load-time `datalake_abi_version()` export for version verification.
+* **Runtime Phase Enforcement for Capability Queries**: Capability queries (`datalake_host_has_capability`) are strictly restricted to the `datalake_init` execution phase. Calls made during batch transformation return `0` (unavailable) and log diagnostic warnings.
 * **Kubernetes Sizing Guidance**: Explicit sizing formulas for virtual memory pooling allocations and RSS footprint with `madvise(MADV_DONTNEED)` page resets.
 * **Defined 0-Batch Success Semantics**: Emitting `TransformResult::Success(vec![])` (via `TransformResult::ok_empty()`) is explicitly supported as a successful no-op/buffering outcome: incoming rows are recorded, 0 outgoing rows emitted, no dead-letter streams invoked, and schema guard is bypassed.
 * **Resilient Instance Rejuvenation**: Fresh WASM instances are fully instantiated and initialized via `datalake_init` *before* retiring active stores. If `datalake_init` fails during periodic rejuvenation, the worker retries with exponential backoff and continues serving on its current instance, preventing worker death.
@@ -38,7 +40,6 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 * **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
 * **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
 * **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
-* **Init-Time Capability Negotiation**: Capabilities (e.g. GeoIP, cache, secrets) are queried exclusively during `datalake_init` and cached in guest memory. The host uses explicit return codes (`0 = unavailable`, `1 = available`) and logs diagnostic warnings for unrecognized capability names to prevent silent typos.
 * **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
 
 ---
@@ -51,14 +52,14 @@ opentelemetry-datalake/
 │   ├── wasm-transformer/             # Host runtime transformer implementing Transform
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs                 # WasmTransformer struct & Transform impl with internal reroute channels
+│   │       ├── lib.rs                 # WasmTransformer struct & Transform impl with worker join tracking
 │   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256, env, on_error, on_reject)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>, module_generation)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
-│   │       ├── dispatcher.rs          # Lock-free single-receiver fan-out to N worker channels
+│   │       ├── dispatcher.rs          # Least-loaded single-receiver fan-out to N worker channels
 │   │       ├── guard.rs               # Invariant validation, O(1) structural integrity & schema defense
 │   │       ├── wasi_env.rs            # Zero-trust WASI context builder & env whitelist filter
-│   │       ├── host_calls.rs          # Versioned host imports with concurrent DashMap metric registry
+│   │       ├── host_calls.rs          # Host imports with phase enforcement & DashMap metric registry
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader with generation fencing
 │   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
 │   │
@@ -127,9 +128,6 @@ uint64_t datalake_transform(uint32_t signal_type, uint32_t ipc_ptr, uint32_t ipc
 ```rust
 #[repr(C)]
 pub struct TransformResponseHeader {
-    /// ABI version (must be 1)
-    pub abi_version: u32,
-
     /// 0 = Success (emit batches downstream)
     /// 1 = Discard (noise drop / sampling, silently dropped, never rerouted)
     /// 2 = Reject (business validation drop, routed to _reroute_rejected if on_reject = "reroute")
@@ -189,7 +187,7 @@ void datalake_host_metric_emit(uint32_t metric_type, uint32_t name_ptr, uint32_t
 
 // Dynamic capability query for optional host features (cache, geoip, secrets).
 // CONTRACT: Must be queried during `datalake_init` and cached. Querying in `transform` is prohibited.
-// Returns: 1 = Available, 0 = Unavailable. Unrecognized capability names log a diagnostic warning.
+// Runtime Enforcement: Queries invoked during `datalake_transform` return 0 and log a warning.
 uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_len);
 ```
 
@@ -393,9 +391,9 @@ environment = "production"
 redact_sensitive_fields = true
 ```
 
-### 5.2 Lock-Free Dispatcher & Multi-Worker Concurrency
+### 5.2 Least-Loaded Dispatcher & Worker Join Synchronization
 
-Because `tokio::sync::mpsc::Receiver` is not `Clone`, sharing it across worker tasks with an `Arc<Mutex<Receiver>>` would create an unacceptable serialization bottleneck. Instead, `WasmTransformer` implements a **lock-free single-receiver fan-out pattern**:
+Because `tokio::sync::mpsc::Receiver` is not `Clone`, sharing it across worker tasks with an `Arc<Mutex<Receiver>>` would create an unacceptable serialization bottleneck. Instead, `WasmTransformer` implements a **least-loaded single-receiver fan-out pattern with worker join synchronization**:
 
 ```rust
 pub struct WasmTransformer {
@@ -414,10 +412,11 @@ impl Transform for WasmTransformer {
     ) -> Result<(), PipelineError> {
         let concurrency = self.config.concurrency;
         let mut worker_txs = Vec::with_capacity(concurrency);
+        let mut worker_handles = Vec::with_capacity(concurrency);
 
-        // 1. Spawn N independent worker tasks, each with its own instance and bounded channel
+        // 1. Spawn N independent worker tasks, tracking their JoinHandles
         for worker_id in 0..concurrency {
-            let (worker_tx, mut worker_rx) = mpsc::channel::<SignalBatch>(2);
+            let (worker_tx, worker_rx) = mpsc::channel::<SignalBatch>(2);
             worker_txs.push(worker_tx);
 
             let worker_output = output.clone();
@@ -426,7 +425,7 @@ impl Transform for WasmTransformer {
             let worker_engine = Arc::clone(&self.engine);
             let worker_config = self.config.clone();
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 Self::run_worker(
                     worker_id,
                     worker_rx,
@@ -437,27 +436,46 @@ impl Transform for WasmTransformer {
                     worker_config,
                 ).await;
             });
+            worker_handles.push(handle);
         }
 
-        // 2. Dispatcher loop: read from input, distribute round-robin across worker channels
+        // 2. Dispatcher loop: try-send to least-loaded worker, fallback to round-robin await
         let mut next_worker = 0;
         while let Some(batch) = input.recv().await {
-            worker_txs[next_worker]
-                .send(batch)
-                .await
-                .map_err(|_| PipelineError::DownstreamClosed)?;
-            next_worker = (next_worker + 1) % concurrency;
+            let mut dispatched = false;
+            // First pass: try non-blocking send to any idle worker
+            for offset in 0..concurrency {
+                let idx = (next_worker + offset) % concurrency;
+                if worker_txs[idx].try_send(batch.clone()).is_ok() {
+                    next_worker = (idx + 1) % concurrency;
+                    dispatched = true;
+                    break;
+                }
+            }
+            // Second pass: if all workers busy, await backpressure on round-robin worker
+            if !dispatched {
+                worker_txs[next_worker]
+                    .send(batch)
+                    .await
+                    .map_err(|_| PipelineError::DownstreamClosed)?;
+                next_worker = (next_worker + 1) % concurrency;
+            }
         }
 
         // 3. Upstream input closed; drop worker senders to signal drain
         drop(worker_txs);
+
+        // 4. Await all worker tasks to ensure complete drain and log any panics
+        for handle in worker_handles {
+            if let Err(e) = handle.await {
+                tracing::error!(component_id = %self.config.id, "WASM worker task panicked: {:?}", e);
+            }
+        }
+
         Ok(())
     }
 }
 ```
-
-- Each worker holds a clone of `output` (`mpsc::Sender` is `Clone`) and internal reroute senders (`_reroute_errored`, `_reroute_rejected`).
-- Backpressure propagates naturally: if workers are saturated, `worker_tx.send(batch).await` pauses the dispatcher, which pauses reading from `input`.
 
 ### 5.3 Failure Policies & Backpressure Semantics
 
@@ -600,7 +618,7 @@ During rolling deployments or process termination (`SIGTERM` / `SIGINT`):
      WARN wasm_host: Shutdown drain timeout reached (10s), aborting remaining workers [component_id="..."]
      ```
 6. **Clean Downstream Cascade**:
-   - Once workers terminate, all output channels (`output`, `_reroute_errored`, `_reroute_rejected`) drop, allowing downstream sinks to finish commits and flush Parquet files cleanly without truncated writes.
+   - Once worker handles are joined in step 4 of `transform()`, all output channels (`output`, `_reroute_errored`, `_reroute_rejected`) drop, allowing downstream sinks to finish commits and flush Parquet files cleanly without truncated writes.
 
 ### 5.11 Deterministic Hot-Reloading & Generation Fencing
 
