@@ -1,7 +1,7 @@
 # Design Specification: WebAssembly (WASM) Whole-Batch Arrow Transformer
 
 **Date**: 2026-09-20  
-**Status**: Final Approved Spec (Incorporating Architectural Review & Brainstorming Refinements)  
+**Status**: Final Approved Spec (Incorporating Full Architecture & Operational Reviews)  
 **Target Crates**:
 - `crates/wasm-transformer` (Host runtime implementing `pipeline_core::pipeline::Transform`)
 - `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`, standalone publishable SDK)
@@ -15,12 +15,13 @@ This specification defines the architecture, ABI, guest SDK, and verification to
 
 ### Key Architectural Decisions
 * **Whole-Batch Transformations**: Users can inspect, enrich, mask, filter rows, or drop/nullify fields inside a sandboxed WASM environment and emit `0..N` transformed `RecordBatch`es.
-* **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls.
+* **Pure Unordered Concurrency**: In alignment with distributed OpenTelemetry principles, batches are processed concurrently without artificial inter-batch FIFO sequencing, eliminating head-of-line blocking and reorder buffer stalls. In-batch record sorting is handled downstream by `crates/core/src/sort.rs` and sink partitioners.
+* **Bounded Invariant Guard & Upstream Accumulator**: The WASM transformer enforces a strict `max_batch_rows` ceiling (e.g. 5,000 rows). Batches exceeding this threshold are rejected at ingestion; batch coalescing, timeout flushing, and upstream splitting are delegated to a dedicated upstream `AccumulatorTransformer` (specified in a companion spec).
 * **Memory Safety via Wasmtime Pooling Allocator**: Uses pre-allocated virtual memory slots with microsecond physical page resets via `madvise(MADV_DONTNEED)`. Dual-trigger rejuvenation (soft memory threshold + batch count ceiling) guarantees zero memory leaks or fragmentation bloat.
-* **Pre-Transform Zero-Copy Batch Slicing**: Slices oversized batches natively using `RecordBatch::slice()` before entering the WASM sandbox, preserving dictionary arrays without copies and bounding memory usage.
-* **Canonical OpenTelemetry Schema Invariance**: Telemetry entering and exiting the transformer always adheres to the canonical OpenTelemetry Arrow schema for that signal type. Stripped fields are represented as nulls or empty structures. The host automatically backfills any missing canonical columns with typed null arrays, guaranteeing downstream sinks (Iceberg, StarRocks, Elasticsearch) never experience schema failure.
+* **Canonical OpenTelemetry Schema Invariance**: Telemetry entering and exiting the transformer always adheres to the canonical OpenTelemetry Arrow schema for that signal type. Stripped fields are represented as nulls or empty structures. The host automatically backfills any missing canonical columns with type-aware null arrays (`arrow::array::new_null_array`), guaranteeing downstream sinks (Iceberg, StarRocks, Elasticsearch) never experience schema failure.
+* **Init-Time Capability Negotiation**: Capabilities (e.g. GeoIP, cache, secrets) are queried exclusively during `datalake_init` and cached in guest memory, preventing FFI overhead in the hot loop.
 * **Actionable Panic Diagnostics**: The SDK installs a standard WASM panic hook capturing source file, line, and message, emitted directly into host structured logs.
-* **Enterprise Governance & Hot-Reloading**: Optional SHA-256 checksum verification and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
+* **Enterprise Governance & Atomic Hot-Reloading**: In-memory single-read SHA-256 verification (closing TOCTOU vulnerabilities) and atomic zero-downtime hot-reloading (`POST /api/v1/transforms/wasm/reload` or `SIGHUP`) without dropping active gRPC/HTTP ingestion streams.
 
 ---
 
@@ -36,8 +37,7 @@ opentelemetry-datalake/
 │   │       ├── config.rs              # TOML deserialization (paths, limits, concurrency, sha256)
 │   │       ├── engine.rs              # Wasmtime Engine & compiled Module cache (Arc<Module>)
 │   │       ├── pool.rs                # Pooling instance allocator & soft rejuvenation lifecycle
-│   │       ├── splitter.rs            # Zero-copy pre-transform batch slicer (RecordBatch::slice)
-│   │       ├── schema_guard.rs        # Canonical OTel schema validation & null backfiller
+│   │       ├── guard.rs               # Invariant validation (max_batch_rows) & schema defense
 │   │       ├── host_calls.rs          # Versioned host imports (datalake_host_v1)
 │   │       ├── reload.rs              # Atomic zero-downtime hot-reloader
 │   │       └── error.rs               # WasmTransformError (Timeout, Trap, OOM, IPC, ShaMismatch)
@@ -155,8 +155,8 @@ void datalake_host_log(uint32_t record_ptr);
 // Increments a telemetry metric counter on the host.
 void datalake_host_metric_inc(uint32_t name_ptr, uint32_t name_len, uint64_t value);
 
-// Dynamic capability query for future extensions (cache, geoip, secrets).
-// Returns 1 if supported, 0 otherwise.
+// Dynamic capability query for optional host features (cache, geoip, secrets).
+// CONTRACT: Must be queried during `datalake_init` and cached. Querying in `transform` is prohibited.
 uint32_t datalake_host_has_capability(uint32_t cap_name_ptr, uint32_t cap_name_len);
 ```
 
@@ -207,10 +207,12 @@ impl TransformResult {
 }
 
 pub trait BatchTransformer: Default + Send + Sync + 'static {
+    /// One-time initialization hook. Query host capabilities and parse config here.
     fn init(&mut self, _config: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
+    /// Core transform entrypoint.
     fn transform(
         &mut self,
         signal: SignalType,
@@ -277,11 +279,12 @@ The host transformer integrates into the pipeline via `pipeline_core::pipeline::
 module_path = "transforms/enrichment.wasm"
 sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Optional integrity verification
 max_execution_duration = "500ms"
-max_batch_rows = 5000                # Pre-transform batch slicer threshold
+max_batch_rows = 5000                # Invariant boundary limit; reject if exceeded
 concurrency = 4                      # Number of worker tasks / pooling slots
-max_memory = "128MiB"                # Hard virtual memory slot size
-rejuvenate_threshold = "32MiB"       # Soft memory limit for instant page reclamation
+max_memory = "64MiB"                 # Virtual memory slot size (recommended: 64MiB)
+rejuvenate_threshold = "16MiB"       # Soft memory limit for instant page reclamation
 rejuvenate_batches = 10000           # Maximum batches before hygiene refresh
+init_timeout = "2s"                  # Maximum duration for datalake_init
 on_error = "drop"                    # "drop", "quarantine", or "passthrough"
 allow_unmasked_passthrough = false   # Required if on_error = "passthrough"
 
@@ -291,38 +294,62 @@ environment = "production"
 mask_credit_cards = true
 ```
 
-### 5.2 Concurrency & Worker Model
+### 5.2 Kubernetes Sizing & Memory Guidance
+
+When running in containerized environments (Kubernetes pods), operators must account for Wasmtime's virtual memory pooling allocator:
+
+$$\text{Virtual Memory Reserved} = \text{concurrency} \times \text{max\_memory}$$
+
+* **Recommended Edge Configuration**: `concurrency = 4`, `max_memory = "64MiB"`, `rejuvenate_threshold = "16MiB"`. This requires $256\text{MiB}$ of virtual address space.
+* **Host Physical RAM**: Thanks to `madvise(MADV_DONTNEED)`, actual physical resident set size (RSS) stays around $\text{concurrency} \times \text{rejuvenate\_threshold}$ ($\approx 64\text{MiB}$).
+* **Container Limits**: Ensure pod `resources.limits.memory` is at least $2\times$ the expected RSS, and the host OS `vm.max_map_count` is sufficient (Linux default of 65,530 is plenty for standard pools).
+
+### 5.3 Concurrency & Boundary Guards
 
 * **Lock-Free Concurrency**: $N$ independent worker tasks pull directly from `input: PipelineReceiver` and emit directly to `output: PipelineSender`. No inter-batch reorder buffer, no head-of-line blocking.
-* **Pre-Transform Batch Slicer**: If an incoming batch exceeds `max_batch_rows`, the host splits it into zero-copy slices via `batch.slice(offset, len)` before dispatching to WASM. Dictionary arrays are shared via `Arc` without copying.
+* **Batch Size Invariant Check**: If an incoming batch exceeds `max_batch_rows`, the transformer rejects it with a fatal pipeline error directing operators to configure an upstream `AccumulatorTransformer`.
 
-### 5.3 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
+### 5.4 Memory Management: Wasmtime Pooling Allocator & Rejuvenation
 
 * **Pooling Instance Allocator**: Pre-allocates $N$ memory slots in virtual memory at startup (`PoolingAllocationConfig`).
 * **Microsecond Resets (`MADV_DONTNEED`)**: When an instance is refreshed, Wasmtime issues `MADV_DONTNEED` to reclaim physical RAM pages and zero the memory in $\approx 5\text{--}10\,\mu\text{s}$.
 * **Rejuvenation Triggers**:
-  1. *Soft Memory Cap*: If linear memory $> 32\text{MiB}$ after a batch, the `Store` is reset.
+  1. *Soft Memory Cap*: If linear memory $> \text{rejuvenate\_threshold}$ after a batch, the `Store` is reset.
   2. *Hygiene Trigger*: Every $10,000$ batches, the `Store` is reset.
   3. *Trap Recovery*: If an instance traps, the contaminated `Store` is immediately discarded and replaced.
+* **Init Deadline**: Re-initializing an instance via `datalake_init` is bounded by `init_timeout` (default: 2s) to prevent stalled module initialization.
 
-### 5.4 Canonical OTel Schema Invariance & Defense Guard
+### 5.5 Canonical OTel Schema Invariance & Typed Null Backfill
 
 * Telemetry entering and exiting the WASM boundary must conform to the canonical OpenTelemetry Arrow schema for that `SignalType`.
-* **Defensive Backfill**: If a guest module emits a batch omitting a canonical column (e.g. user completely dropped `scope_attributes`), `schema_guard` automatically backfills the missing column with a typed `NullArray` of length `num_rows()`. Downstream sinks (Iceberg, StarRocks, Elasticsearch) are 100% immune to schema corruption.
+* **Type-Aware Defensive Backfill**: If a guest module omits a canonical column (e.g. user completely dropped `scope_attributes` or `attributes`), the host automatically backfills it using Arrow's type-aware constructor:
+  ```rust
+  arrow::array::new_null_array(canonical_field.data_type(), batch.num_rows())
+  ```
+  This creates a structurally valid null array matching complex nested types (`MapArray`, `ListArray`, `StructArray`). Downstream Parquet writes and Iceberg commits are 100% protected against physical schema divergence.
 
-### 5.5 Failure Policies & Security Safeguard
+### 5.6 Failure Policies & Security Safeguard
 
 * **`on_error = "drop"` (Default / Fail-Closed)**: Discards failed batches, incrementing `datalake_wasm_errors_total`.
 * **`on_error = "quarantine"`**: Routes failed batches to dead-letter storage.
 * **`on_error = "passthrough"` (Fail-Open)**: Forwards un-transformed raw batches. Requires `allow_unmasked_passthrough = true` in config; otherwise startup halts with a fatal security error.
 
-### 5.6 Zero-Downtime Hot-Reloading
+### 5.7 In-Memory Single-Read & Zero-Downtime Hot-Reloading
 
-1. Admin endpoint `POST /api/v1/transforms/wasm/reload` or `SIGHUP` triggers reload.
-2. Host reads file, verifies SHA-256 hash (if configured), and compiles the new `wasmtime::Module` in the background.
-3. Host atomically replaces `Arc<Module>`.
-4. In-flight worker batches finish on the old module. The next time a worker takes an instance from the pool, it instantiates from the new module.
-5. Ingestion gRPC/HTTP endpoints experience zero connection resets.
+To eliminate TOCTOU filesystem races and enable zero-downtime updates:
+1. **Atomic Read & Hash**:
+   ```rust
+   let wasm_bytes = tokio::fs::read(&module_path).await?;
+   if let Some(expected_sha) = &config.sha256 {
+       let actual_sha = hex::encode(Sha256::digest(&wasm_bytes));
+       if &actual_sha != expected_sha {
+           return Err(WasmTransformError::Sha256Mismatch { expected, actual });
+       }
+   }
+   let new_module = wasmtime::Module::from_binary(&engine, &wasm_bytes)?;
+   ```
+2. **Atomic Swap**: The host atomically swaps `Arc<Module>`.
+3. In-flight worker batches finish on the old module. Fresh instances are instantiated from the new module via the pooling allocator. Zero gRPC/HTTP connection drops.
 
 ---
 
@@ -337,7 +364,7 @@ All metrics strictly adhere to `docs/instrumentation.md` naming conventions:
 | `datalake_wasm_batches_emitted_total` | Counter | `signal` | Emitted batches downstream. |
 | `datalake_wasm_rows_in_total` | Counter | `signal` | Incoming rows. |
 | `datalake_wasm_rows_out_total` | Counter | `signal` | Outgoing rows after mutations. |
-| `datalake_wasm_errors_total` | Counter | `signal`, `error_type` (`timeout`, `oom`, `trap`, `ipc_decode`) | Total execution failures. |
+| `datalake_wasm_errors_total` | Counter | `signal`, `error_type` (`timeout`, `oom`, `trap`, `ipc_decode`, `batch_limit`) | Total execution failures. |
 | `datalake_wasm_duration_seconds` | Histogram | `signal` | Execution latency per batch. |
 | `datalake_wasm_memory_bytes` | Gauge | `instance_id` | Current linear memory consumption per instance. |
 | `datalake_wasm_rejuvenations_total` | Counter | `instance_id`, `reason` (`memory_threshold`, `batch_count`, `trap`) | Total instance pool resets. |

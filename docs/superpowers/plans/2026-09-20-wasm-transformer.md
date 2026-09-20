@@ -4,19 +4,19 @@
 
 **Goal:** Implement a high-performance WebAssembly (WASM) transformer for `opentelemetry-datalake` allowing users to manipulate, enrich, filter, or drop whole Arrow `RecordBatch`es, with a publishable guest SDK and testing/validation CLI.
 
-**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, panic hooks, and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with pooling instance allocation, zero-copy batch pre-slicing, canonical schema defense guards, and atomic zero-downtime hot-reloading; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
+**Architecture:** A three-crate workspace architecture: `crates/wasm-sdk` (`opentelemetry-datalake-wasm-sdk`) provides the guest development experience, panic hooks, init-time capability caching, and Arrow IPC bindings; `crates/wasm-transformer` provides the host-side `pipeline_core::pipeline::Transform` engine using `wasmtime` with pooling instance allocation, typed null schema guards, in-memory single-read SHA-256 verification, and atomic zero-downtime hot-reloading; `crates/wasm-cli` (`datalake-wasm`) provides CLI verification, latency benchmarking, and testing tooling.
 
-**Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`, `sha2`.
+**Tech Stack:** Rust 2024 edition, Apache Arrow (v59), `wasmtime` (v31+), `arrow-ipc`, `tokio`, `tracing`, `clap`, `thiserror`, `sha2`, `hex`.
 
 **Spec:** [`docs/superpowers/specs/2026-09-20-wasm-transformer-design.md`](file:///home/jalamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/superpowers/specs/2026-09-20-wasm-transformer-design.md)
 
 ## Global Constraints
 - Strictly adhere to the zero-panic policy in production code (`src/`): no `unwrap()`, `expect()`, or `panic!()`.
 - All FFI exchanges across WASM linear memory use versioned C-ABI v1 (`datalake_abi_version() == 1`) with standard Apache Arrow IPC streaming format.
-- Output batches must preserve canonical OpenTelemetry Arrow schemas; stripped fields are nullified.
-- Pre-transform batch slicer slices batches larger than `max_batch_rows` via `RecordBatch::slice()` without copying.
+- Output batches must preserve canonical OpenTelemetry Arrow schemas; missing fields are backfilled using `arrow::array::new_null_array`.
+- Batches exceeding `max_batch_rows` are rejected at the transformer boundary (delegating coalescing/splitting to upcoming `AccumulatorTransformer`).
 - Memory management uses `wasmtime::PoolingAllocationConfig` with `madvise(MADV_DONTNEED)` resets and dual-trigger rejuvenation.
-- Workers execute in pure unordered concurrency without head-of-line blocking.
+- Single-read in-memory compilation prevents TOCTOU vulnerabilities when verifying SHA-256 hashes.
 - `on_error = "passthrough"` must be rejected at configuration time unless `allow_unmasked_passthrough = true` is explicitly enabled.
 - Code must pass `cargo fmt` and `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`.
 
@@ -39,10 +39,10 @@
 
 - [ ] **Step 1: Write Cargo.toml files for crates**
 
-Add `wasmtime = { version = "31", default-features = false, features = ["cranelift", "async", "pooling-allocator"] }` and `sha2 = "0.10"` to root `[workspace.dependencies]`.
+Add `wasmtime = { version = "31", default-features = false, features = ["cranelift", "async", "pooling-allocator"] }`, `sha2 = "0.10"`, and `hex = "0.4"` to root `[workspace.dependencies]`.
 Create:
 - `crates/wasm-sdk/Cargo.toml` with package name `opentelemetry-datalake-wasm-sdk`.
-- `crates/wasm-transformer/Cargo.toml` with `wasmtime`, `pipeline-core`, `arrow`, `arrow-ipc`, `sha2`.
+- `crates/wasm-transformer/Cargo.toml` with `wasmtime`, `pipeline-core`, `arrow`, `arrow-ipc`, `sha2`, `hex`.
 - `crates/wasm-cli/Cargo.toml` with `clap`, `wasmtime`, `arrow`, `arrow-ipc`.
 
 - [ ] **Step 2: Add placeholder lib.rs and main.rs files**
@@ -63,7 +63,7 @@ git commit -m "chore: scaffold wasm-sdk, wasm-transformer, and wasm-cli crates"
 
 ---
 
-### Task 2: Implement Guest SDK with Panic Hook & Canonical Helpers (`crates/wasm-sdk`)
+### Task 2: Implement Guest SDK with Panic Hook & Init Capability Caching (`crates/wasm-sdk`)
 
 **Files:**
 - Create: `crates/wasm-sdk/src/abi.rs`
@@ -162,7 +162,7 @@ git commit -m "feat(wasm-sdk): add mock telemetry batch generators and testing u
 - Test: `crates/wasm-transformer/tests/engine_tests.rs`
 
 **Interfaces:**
-- Consumes: `WasmTransformerConfig` (max_memory, rejuvenate_threshold, rejuvenate_batches, sha256).
+- Consumes: `WasmTransformerConfig` (max_memory, rejuvenate_threshold, rejuvenate_batches, sha256, init_timeout).
 - Produces: `WasmEngine`, `InstancePool`, `HostState`, `WasmTransformError`.
 
 - [ ] **Step 1: Write failing test for pooling allocator, epoch timeout, and soft rejuvenation**
@@ -171,7 +171,7 @@ Write `tests/engine_tests.rs` verifying:
 - Wasmtime pooling allocator initialization.
 - Instance reset on soft memory threshold / batch count ceiling.
 - Epoch interruption triggers timeout when execution loop exceeds deadline.
-- SHA-256 integrity verification.
+- Single-read in-memory SHA-256 verification.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -184,7 +184,7 @@ Implement:
 - `WasmTransformError` with `thiserror`.
 - `WasmEngine` configuring `PoolingAllocationConfig` and epoch ticker thread (10ms).
 - `InstancePool` managing stores and triggering `madvise(MADV_DONTNEED)` resets on threshold.
-- SHA-256 verification on module loading.
+- In-memory single-read SHA-256 verification on module loading.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -200,45 +200,43 @@ git commit -m "feat(wasm-transformer): implement wasmtime pooling allocator, epo
 
 ---
 
-### Task 5: Pre-Transform Batch Slicer & Canonical Schema Guard (`crates/wasm-transformer`)
+### Task 5: Invariant Batch Guard & Type-Aware Schema Backfill (`crates/wasm-transformer`)
 
 **Files:**
-- Create: `crates/wasm-transformer/src/splitter.rs`
-- Create: `crates/wasm-transformer/src/schema_guard.rs`
-- Test: `crates/wasm-transformer/tests/splitter_tests.rs`
-- Test: `crates/wasm-transformer/tests/schema_guard_tests.rs`
+- Create: `crates/wasm-transformer/src/guard.rs`
+- Test: `crates/wasm-transformer/tests/guard_tests.rs`
 
 **Interfaces:**
 - Consumes: `RecordBatch`, `SignalType`.
-- Produces: `BatchSplitter` (zero-copy Arrow slicing), `SchemaGuard` (OTel schema verification & null backfilling).
+- Produces: `BatchGuard` (`max_batch_rows` invariant validation, typed null backfilling via `arrow::array::new_null_array`).
 
-- [ ] **Step 1: Write failing test for zero-copy slicing and schema null backfilling**
+- [ ] **Step 1: Write failing test for max_batch_rows rejection and typed null backfilling**
 
 Write tests asserting:
-- Oversized batches are sliced into zero-copy chunks preserving dictionaries.
-- Batches missing canonical columns are defensively backfilled with typed null arrays.
+- Batches $> \text{max\_batch\_rows}$ return `WasmTransformError::BatchTooLarge`.
+- Batches missing complex canonical columns (e.g. `attributes: Map<Utf8, Utf8>`) are backfilled with a typed null MapArray.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p wasm-transformer --test splitter_tests --test schema_guard_tests`  
+Run: `cargo test -p wasm-transformer --test guard_tests`  
 Expected: FAIL.
 
-- [ ] **Step 3: Implement `splitter.rs` and `schema_guard.rs`**
+- [ ] **Step 3: Implement `guard.rs`**
 
 Implement:
-- `BatchSplitter::split(batch, max_rows) -> Vec<RecordBatch>` using `batch.slice(offset, len)`.
-- `SchemaGuard::enforce_canonical_schema(signal, batch) -> Result<RecordBatch, WasmTransformError>`.
+- `BatchGuard::validate_batch_size(batch, max_rows) -> Result<(), WasmTransformError>`.
+- `BatchGuard::enforce_canonical_schema(signal, batch) -> Result<RecordBatch, WasmTransformError>` utilizing `arrow::array::new_null_array`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p wasm-transformer --test splitter_tests --test schema_guard_tests`  
+Run: `cargo test -p wasm-transformer --test guard_tests`  
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add -f crates/wasm-transformer
-git commit -m "feat(wasm-transformer): implement zero-copy batch slicer and canonical schema guard"
+git commit -m "feat(wasm-transformer): implement invariant batch guard and typed null schema backfiller"
 ```
 
 ---
@@ -269,6 +267,7 @@ Expected: FAIL.
 
 Implement:
 - `datalake_host_log` parsing `HostLogRecord` and printing guest panics with line/file.
+- `datalake_host_has_capability` logging warnings if invoked outside `datalake_init`.
 - Worker pool reading from `input: PipelineReceiver` and sending directly to `output: PipelineSender`.
 - `HotReloader` swapping `Arc<Module>` on reload signal.
 
