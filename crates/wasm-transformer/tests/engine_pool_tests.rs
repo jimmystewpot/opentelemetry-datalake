@@ -137,3 +137,15 @@ fn test_compile_module_with_sha256_match_and_mismatch() {
     assert!(cache.module().is_some());
     assert!(Arc::ptr_eq(&module_none, &cache.module().unwrap()));
 }
+
+#[test]
+fn test_pooling_allocator_zero_concurrency_clamps_to_one() {
+    let cache = Arc::new(EngineCache::new_pooling(0, 32 * 1024 * 1024).unwrap());
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let pool = InstancePool::new(Arc::clone(&cache), module, 1);
+    assert_eq!(pool.available_slots(), 1);
+    assert!(pool.engine().module().is_some());
+    let debug_str = format!("{pool:?}");
+    assert!(debug_str.contains("InstancePool"));
+}

@@ -15,6 +15,7 @@ fn compute_sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Engine cache maintaining a compiled WebAssembly module and generation counter.
+#[derive(Debug)]
 pub struct EngineCache {
     engine: Engine,
     module: RwLock<Option<Arc<Module>>>,
@@ -32,9 +33,10 @@ impl EngineCache {
         concurrency: usize,
         max_memory_bytes: usize,
     ) -> Result<Self, WasmTransformError> {
+        let pool_slots = u32::try_from(concurrency.max(1)).unwrap_or(4);
         let mut pool_cfg = PoolingAllocationConfig::default();
-        pool_cfg.total_memories(u32::try_from(concurrency).unwrap_or(4));
-        pool_cfg.total_tables(u32::try_from(concurrency).unwrap_or(4));
+        pool_cfg.total_memories(pool_slots);
+        pool_cfg.total_tables(pool_slots);
         pool_cfg.max_memory_size(max_memory_bytes);
 
         let mut config = Config::new();
