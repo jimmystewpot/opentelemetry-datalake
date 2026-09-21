@@ -50,10 +50,11 @@ fn test_abi_v1_header_memory_layout() {
         24
     );
 
-    assert_eq!(std::mem::size_of::<BatchDescriptor>(), 8);
+    assert_eq!(std::mem::size_of::<BatchDescriptor>(), 12);
     assert_eq!(std::mem::align_of::<BatchDescriptor>(), 4);
     assert_eq!(std::mem::offset_of!(BatchDescriptor, ptr), 0);
     assert_eq!(std::mem::offset_of!(BatchDescriptor, len), 4);
+    assert_eq!(std::mem::offset_of!(BatchDescriptor, cap), 8);
 
     assert_eq!(std::mem::size_of::<HostLogRecord>(), 32);
     assert_eq!(std::mem::align_of::<HostLogRecord>(), 4);
