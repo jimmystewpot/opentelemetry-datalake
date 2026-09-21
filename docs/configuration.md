@@ -193,7 +193,7 @@ Outbound HTTP sinks (`elasticsearch` and `starrocks`) share a standardized TLS c
 ```toml
 [elasticsearch.tls] # or [starrocks.tls]
 ca_cert_path = "/etc/ssl/certs/custom-ca.pem"
-verification = "full" # "full" (default) or "disabled"
+verification = "full" # "full" (default)
 ```
 
 | Field | Type | Default | Description |

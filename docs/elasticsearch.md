@@ -118,7 +118,7 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 # TLS configuration.
 [elasticsearch.tls]
 ca_cert_path = "/etc/ssl/certs/es-ca.crt"
-verification = "full" # "full" (default) or "disabled"
+verification = "full" # "full" (default)
 ```
 
 ---
@@ -505,7 +505,7 @@ Outbound HTTPS requests to Elasticsearch or OpenSearch use the standardized `Tls
 ```toml
 [elasticsearch.tls]
 ca_cert_path = "/etc/ssl/certs/corporate-root-ca.pem"
-verification = "full" # "full" (default) or "disabled"
+verification = "full" # "full" (default)
 ```
 
 - **Dual Root Certificate Stores**: By default, `elasticsearch-sink` enables both `tls-native-roots` (loads the host OS trust store) and `tls-webpki-roots` (loads Mozilla WebPKI root certificates).

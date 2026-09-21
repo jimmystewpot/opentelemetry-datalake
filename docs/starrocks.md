@@ -142,11 +142,11 @@ The StarRocks sink supports standard TLS configuration for secure HTTPS stream l
 ```toml
 [starrocks.tls]
 ca_cert_path = "/etc/ssl/certs/starrocks-ca.pem"
-verification = "full" # "full" (default) or "disabled"
+verification = "full" # "full" (default)
 ```
 
-- `ca_cert_path`: Optional path to custom CA certificate (validated at startup).
-- `verification`: `"full"` (default; validates certificate and hostname) or `"disabled"` (insecure; test/dev only).
+- `ca_cert_path`: Optional path to custom CA certificate (validated at startup). Note: when using `tls-native-tls`, custom CAs must be installed in the host OS trust store.
+- `verification`: `"full"` (default; validates certificate and hostname). Disabling verification is prohibited for security (CWE-295).
 
 ### Compile-time TLS Backends
 
