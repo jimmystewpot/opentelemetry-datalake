@@ -47,12 +47,12 @@ impl TlsConfig {
     /// # Errors
     /// Returns [`PipelineError::Configuration`] if `ca_cert_path` is specified but the file does not exist.
     pub fn validate(&self) -> Result<(), PipelineError> {
-        if let Some(ref path) = self.ca_cert_path {
-            if !std::path::Path::new(path).exists() {
-                return Err(PipelineError::Configuration(Box::new(
-                    figment::Error::from(format!("CA certificate file not found: '{path}'")),
-                )));
-            }
+        if let Some(ref path) = self.ca_cert_path
+            && !std::path::Path::new(path).exists()
+        {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from(format!("CA certificate file not found: '{path}'")),
+            )));
         }
         Ok(())
     }
