@@ -1441,4 +1441,19 @@ mod tests {
                 .contains("disabling TLS certificate verification is prohibited")
         );
     }
+
+    #[test]
+    fn test_starrocks_tls_custom_ca_path_warns_and_succeeds() {
+        let mut config = base_config();
+        config.tls.ca_cert_path = Some(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")));
+        let sink = StarRocksSink::try_new(config.clone()).unwrap();
+        assert_eq!(
+            sink.config.tls.ca_cert_path.as_deref(),
+            Some(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR")).as_str())
+        );
+
+        let manager = sink.manager();
+        let sink2 = StarRocksSink::with_manager(config, manager).unwrap();
+        assert!(sink2.config.tls.ca_cert_path.is_some());
+    }
 }
