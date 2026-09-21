@@ -665,3 +665,316 @@ fn test_worker_captures_zero_trust_filtered_env() {
         Some("static_val")
     );
 }
+
+#[test]
+fn test_worker_debug_formatting_and_getters() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let worker = WasmWorker::new(42, Arc::clone(&cache), Arc::clone(&module), cfg).unwrap();
+
+    let debug_str = format!("{worker:?}");
+    assert!(debug_str.contains("WasmWorker"));
+    assert!(debug_str.contains("id: 42"));
+    assert!(debug_str.contains("batches_processed: 0"));
+
+    assert_eq!(worker.id, 42);
+    assert!(Arc::ptr_eq(worker.module(), &module));
+    assert_eq!(worker.config().id, "worker_test");
+    let _instance = worker.instance();
+}
+
+#[tokio::test]
+async fn test_worker_extracts_metrics_and_traces_signals() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(43, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    // Test Metrics signal extraction
+    let outcome_metrics = worker
+        .execute_batch(SignalBatch::Metrics(batch.clone()))
+        .await
+        .unwrap();
+    match outcome_metrics {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 1);
+            assert!(matches!(&batches[0], SignalBatch::Metrics(_)));
+        }
+        _ => panic!("Expected WorkerOutcome::Emitted for Metrics"),
+    }
+
+    // Test Traces signal extraction
+    let outcome_traces = worker
+        .execute_batch(SignalBatch::Traces(batch))
+        .await
+        .unwrap();
+    match outcome_traces {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 1);
+            assert!(matches!(&batches[0], SignalBatch::Traces(_)));
+        }
+        _ => panic!("Expected WorkerOutcome::Emitted for Traces"),
+    }
+}
+
+fn reject_no_msg_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 2))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.store (i32.const 8) (i32.const 0))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_rejected_status_without_message() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(reject_no_msg_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(44, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    match outcome {
+        WorkerOutcome::Rejected { reason, .. } => {
+            assert_eq!(reason, "Guest rejected batch");
+        }
+        _ => panic!("Expected WorkerOutcome::Rejected"),
+    }
+}
+
+fn grow_memory_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (drop (memory.grow (i32.const 2)))
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenates_on_memory_threshold_exceeded() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(grow_memory_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    // 128 KiB threshold: initial memory is 64 KiB. After growing by 2 pages (128 KiB), total is 192 KiB >= 128 KiB.
+    cfg.rejuvenate_threshold = "128KiB".into();
+    cfg.rejuvenate_batches = 10_000; // Not triggering on batches count
+
+    let mut worker = WasmWorker::new(45, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    assert_eq!(worker.batches_processed(), 0);
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+
+    // After execution, memory growth exceeded 128 KiB, so rejuvenation was triggered and batches_processed reset to 0
+    assert_eq!(worker.batches_processed(), 0);
+}
+
+fn missing_dealloc_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+fn missing_transform_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+fn missing_memory_wat() -> &'static str {
+    r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[test]
+fn test_worker_fails_on_all_missing_required_exports() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let cfg = default_test_config();
+
+    let mod_dealloc = cache
+        .compile_module(&wat::parse_str(missing_dealloc_wat()).unwrap())
+        .unwrap();
+    let err = WasmWorker::new(46, Arc::clone(&cache), mod_dealloc, cfg.clone()).unwrap_err();
+    assert!(matches!(err, WasmTransformError::MissingExport(ref s) if s == "datalake_dealloc"));
+
+    let mod_transform = cache
+        .compile_module(&wat::parse_str(missing_transform_wat()).unwrap())
+        .unwrap();
+    let err = WasmWorker::new(47, Arc::clone(&cache), mod_transform, cfg.clone()).unwrap_err();
+    assert!(matches!(err, WasmTransformError::MissingExport(ref s) if s == "datalake_transform"));
+
+    let mod_mem = cache
+        .compile_module(&wat::parse_str(missing_memory_wat()).unwrap())
+        .unwrap();
+    let err = WasmWorker::new(48, Arc::clone(&cache), mod_mem, cfg).unwrap_err();
+    assert!(matches!(err, WasmTransformError::MissingExport(ref s) if s == "memory"));
+}
+
+fn oob_message_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 2))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.store (i32.const 8) (i32.const 0))
+            (i32.store (i32.const 12) (i32.const 65530))
+            (i32.store (i32.const 16) (i32.const 100))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_oob_message_gracefully() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(oob_message_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(49, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    match outcome {
+        WorkerOutcome::Rejected { reason, .. } => {
+            assert_eq!(reason, "Guest rejected batch");
+        }
+        _ => panic!("Expected WorkerOutcome::Rejected"),
+    }
+}
+
+#[test]
+fn test_worker_empty_threshold_defaults_to_zero() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_threshold = "   ".into();
+
+    let worker = WasmWorker::new(50, Arc::clone(&cache), module, cfg).unwrap();
+    assert_eq!(worker.rejuvenate_threshold_bytes(), 0);
+}
+
+fn trap_alloc_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (unreachable))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_alloc_trap() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(trap_alloc_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(51, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Wasmtime(_)));
+}
+
+fn oob_header_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            ;; Return pointer near end of 64KiB (65530) where 20-byte header exceeds memory size
+            (i32.const 65530)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_oob_response_header() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(oob_header_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(52, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Pipeline(_)));
+}
