@@ -1014,3 +1014,26 @@ async fn test_worker_handles_dealloc_trap_and_rejuvenates() {
     assert!(matches!(err, WasmTransformError::Wasmtime(_)));
     assert_eq!(worker.batches_processed(), 0);
 }
+
+fn unsupported_abi_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 99))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[test]
+fn test_worker_fails_on_unsupported_abi_version() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(unsupported_abi_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let err = WasmWorker::new(61, Arc::clone(&cache), module, cfg).unwrap_err();
+    assert!(matches!(err, WasmTransformError::AbiVersionMismatch(99)));
+}

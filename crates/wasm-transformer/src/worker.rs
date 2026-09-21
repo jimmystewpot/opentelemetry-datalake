@@ -417,6 +417,13 @@ impl WasmWorker {
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, module, &[])?;
 
+        if let Ok(abi_fn) = instance.get_typed_func::<(), u32>(&mut store, "datalake_abi_version") {
+            let version = abi_fn.call(&mut store, ())?;
+            if version != opentelemetry_datalake_wasm_sdk::abi::ABI_VERSION {
+                return Err(WasmTransformError::AbiVersionMismatch(version));
+            }
+        }
+
         let alloc_fn = instance
             .get_typed_func::<u32, u32>(&mut store, "datalake_alloc")
             .map_err(|_| WasmTransformError::MissingExport("datalake_alloc".into()))?;
