@@ -25,14 +25,14 @@ struct MetricsRecordBuilder {
     timestamp: TimestampNanosecondBuilder,
     value: Float64Builder,
     attributes: StringBuilder,
-    service_name: StringBuilder,
+    `service_name`: StringBuilder,
     resource_attributes: StringBuilder,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
 }
 
 struct MetricContext<'a> {
-    service_name: &'a str,
+    `service_name`: &'a str,
     resource_attributes: &'a str,
     scope_name: &'a str,
     scope_version: &'a str,
@@ -53,7 +53,7 @@ impl MetricsRecordBuilder {
             timestamp: TimestampNanosecondBuilder::with_capacity(capacity),
             value: Float64Builder::with_capacity(capacity),
             attributes: StringBuilder::new(),
-            service_name: StringBuilder::new(),
+            `service_name`: StringBuilder::new(),
             resource_attributes: StringBuilder::new(),
             scope_name: StringBuilder::new(),
             scope_version: StringBuilder::new(),
@@ -69,7 +69,7 @@ impl MetricsRecordBuilder {
         timestamp_unix_nano: u64,
         value: f64,
         attributes: &str,
-        service_name: &str,
+        `service_name`: &str,
         resource_attributes: &str,
         scope_name: &str,
         scope_version: &str,
@@ -81,7 +81,7 @@ impl MetricsRecordBuilder {
             .append_value(timestamp_to_i64(timestamp_unix_nano)?);
         self.value.append_value(value);
         self.attributes.append_value(attributes);
-        self.service_name.append_value(service_name);
+        self.`service_name`.append_value(`service_name`);
         self.resource_attributes.append_value(resource_attributes);
         self.scope_name.append_value(scope_name);
         self.scope_version.append_value(scope_version);
@@ -113,7 +113,7 @@ fn process_gauge(
             dp.time_unix_nano,
             val,
             &convert_attributes(&dp.attributes),
-            ctx.service_name,
+            ctx.`service_name`,
             ctx.resource_attributes,
             ctx.scope_name,
             ctx.scope_version,
@@ -146,7 +146,7 @@ fn process_sum(
             dp.time_unix_nano,
             val,
             &convert_attributes(&dp.attributes),
-            ctx.service_name,
+            ctx.`service_name`,
             ctx.resource_attributes,
             ctx.scope_name,
             ctx.scope_version,
@@ -171,7 +171,7 @@ fn process_histogram(
             dp.time_unix_nano,
             val,
             &convert_attributes(&dp.attributes),
-            ctx.service_name,
+            ctx.`service_name`,
             ctx.resource_attributes,
             ctx.scope_name,
             ctx.scope_version,
@@ -208,14 +208,14 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
     let mut builder = MetricsRecordBuilder::with_capacity(total_records);
 
     for r_metric in &req.resource_metrics {
-        let (resource_attrs_json, service_name) = if let Some(ref res) = r_metric.resource {
-            let service_name = res
+        let (resource_attrs_json, `service_name`) = if let Some(ref res) = r_metric.resource {
+            let `service_name` = res
                 .attributes
                 .iter()
                 .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
                 .and_then(|kv| kv.value.as_ref())
                 .map_or_else(|| "unknown".to_string(), any_value_to_string);
-            (convert_attributes(&res.attributes), service_name)
+            (convert_attributes(&res.attributes), `service_name`)
         } else {
             ("{}".to_string(), "unknown".to_string())
         };
@@ -228,7 +228,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
             };
 
             let ctx = MetricContext {
-                service_name: &service_name,
+                `service_name`: &`service_name`,
                 resource_attributes: &resource_attrs_json,
                 scope_name,
                 scope_version,
@@ -270,7 +270,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
         ),
         Field::new("value", DataType::Float64, false),
         Field::new("attributes", DataType::Utf8, false),
-        Field::new("service_name", DataType::Utf8, false),
+        Field::new("`service_name`", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
         Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
@@ -285,7 +285,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
             Arc::new(builder.timestamp.finish()),
             Arc::new(builder.value.finish()),
             Arc::new(builder.attributes.finish()),
-            Arc::new(builder.service_name.finish()),
+            Arc::new(builder.`service_name`.finish()),
             Arc::new(builder.resource_attributes.finish()),
             Arc::new(builder.scope_name.finish()),
             Arc::new(builder.scope_version.finish()),
@@ -296,6 +296,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
 #[cfg(test)]
 mod tests {
+    use arrow::array::AsArray;
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
@@ -416,7 +417,6 @@ mod tests {
         .unwrap();
         assert_eq!(batch.num_rows(), 1);
         // The value column must contain the sum (250.0)
-        use arrow::array::AsArray;
         let val = batch
             .column_by_name("value")
             .unwrap()
@@ -428,7 +428,6 @@ mod tests {
     /// A Gauge data point with an integer value must be stored as f64.
     #[test]
     fn test_decode_metrics_gauge_as_int_value() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -466,7 +465,6 @@ mod tests {
     /// A Gauge data point with no value set must default to 0.0.
     #[test]
     fn test_decode_metrics_gauge_none_value_defaults_to_zero() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -499,10 +497,9 @@ mod tests {
         );
     }
 
-    /// When no resource is set, service_name must default to "unknown".
+    /// When no resource is set, `service_name` must default to "unknown".
     #[test]
     fn test_decode_metrics_missing_resource_uses_unknown() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             resource: None,
             scope_metrics: vec![ScopeMetrics {
@@ -528,7 +525,7 @@ mod tests {
         })
         .unwrap();
         let svc = batch
-            .column_by_name("service_name")
+            .column_by_name("`service_name`")
             .unwrap()
             .as_string::<i32>()
             .value(0);

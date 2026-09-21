@@ -74,7 +74,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), PipelineError> {
 mod tests {
     use super::*;
 
-    /// Default TelemetryConfig must use the localhost OTLP endpoint and
+    /// Default `TelemetryConfig` must use the localhost OTLP endpoint and
     /// the canonical service name without requiring any environment variables.
     #[test]
     fn test_telemetry_config_default_values() {
@@ -91,10 +91,10 @@ mod tests {
         );
     }
 
-    /// When the REGION environment variable is set, TelemetryConfig::default()
+    /// When the REGION environment variable is set, `TelemetryConfig::default()`
     /// must capture it in the `region` field. Because Rust runs tests in parallel
     /// and env var mutation is a global side-effect, we instead verify the
-    /// same behavior by directly constructing a TelemetryConfig with a known
+    /// same behavior by directly constructing a `TelemetryConfig` with a known
     /// region value — testing that the field is correctly handled downstream.
     #[test]
     fn test_telemetry_config_region_field_roundtrips() {

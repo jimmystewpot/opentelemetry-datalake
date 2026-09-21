@@ -76,7 +76,9 @@ impl WasmDispatcher {
         let mut next_worker = 0usize;
         while let Some(batch) = input.recv().await {
             if !Self::dispatch_batch(batch, &worker_txs, &mut next_worker, concurrency).await {
-                break;
+                return Err(WasmTransformError::Pipeline(
+                    "Dispatcher worker channel closed".into(),
+                ));
             }
         }
 
@@ -254,8 +256,9 @@ impl WasmDispatcher {
         if let Some(b) = pending_batch {
             if worker_txs[*next_worker].send(b).await.is_err() {
                 warn!(
-                    "Worker channel closed during backpressure send. Dropping batch to maintain dispatcher liveness."
+                    "Worker channel closed during backpressure send. Aborting dispatch loop to propagate backpressure and prevent data loss."
                 );
+                return false;
             }
             *next_worker = (next_worker.saturating_add(1)) % concurrency;
         }
@@ -320,7 +323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_batch_drops_batch_on_worker_channel_closed_without_terminating() {
+    async fn test_dispatch_batch_aborts_on_worker_channel_closed() {
         let (tx0, _rx0) = mpsc::channel::<SignalBatch>(1);
         let (tx1, rx1) = mpsc::channel::<SignalBatch>(1);
 
@@ -333,15 +336,12 @@ mod tests {
         let worker_txs = vec![tx0, tx1];
         let mut next_worker = 1;
 
-        // In the unpatched code, fallback send to worker_txs[1] fails and returns false.
-        // In the patched code, it drops the batch, logs a warning, advances next_worker to 0, and returns true.
         let live =
             WasmDispatcher::dispatch_batch(empty_batch(), &worker_txs, &mut next_worker, 2).await;
         assert!(
-            live,
-            "dispatcher must remain live when worker channel is closed"
+            !live,
+            "dispatcher must abort when worker channel is closed during backpressure"
         );
-        assert_eq!(next_worker, 0, "next_worker must advance to next worker");
     }
 
     #[test]

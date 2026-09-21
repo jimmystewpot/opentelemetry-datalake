@@ -212,19 +212,30 @@ async fn main() -> anyhow::Result<()> {
             module_path = %wasm_cfg.module_path,
             "Initializing 3x signal-isolated WasmTransformer instances"
         );
+        let mut logs_cfg = wasm_cfg.clone();
+        logs_cfg
+            .env
+            .insert("signal".to_string(), "logs".to_string());
+
+        let mut traces_cfg = wasm_cfg.clone();
+        traces_cfg
+            .env
+            .insert("signal".to_string(), "traces".to_string());
+
+        let mut metrics_cfg = wasm_cfg.clone();
+        metrics_cfg
+            .env
+            .insert("signal".to_string(), "metrics".to_string());
+
         (
             Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
-                None,
-                None,
+                logs_cfg, None, None,
             )?),
             Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
-                None,
-                None,
+                traces_cfg, None, None,
             )?),
             Box::new(wasm_transformer::WasmTransformer::new(
-                wasm_cfg.clone(),
+                metrics_cfg,
                 None,
                 None,
             )?),
