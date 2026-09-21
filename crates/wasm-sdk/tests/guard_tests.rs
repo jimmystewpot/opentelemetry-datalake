@@ -307,3 +307,35 @@ fn test_batch_transformer_trait_mock() {
         _ => panic!("expected TransformResult::Continue"),
     }
 }
+
+#[test]
+fn test_panic_payload_extraction() {
+    use opentelemetry_datalake_wasm_sdk::panic::extract_panic_payload;
+
+    let str_payload: Box<dyn std::any::Any> = Box::new("static literal error");
+    assert_eq!(extract_panic_payload(&*str_payload), "static literal error");
+
+    let string_payload: Box<dyn std::any::Any> = Box::new("dynamic String error".to_string());
+    assert_eq!(
+        extract_panic_payload(&*string_payload),
+        "dynamic String error"
+    );
+
+    let non_str_payload: Box<dyn std::any::Any> = Box::new(42_i32);
+    assert_eq!(
+        extract_panic_payload(&*non_str_payload),
+        "Wasm Guest Panic (OOM or unformattable)"
+    );
+}
+
+#[test]
+fn test_wasm_panic_hook_does_not_crash_on_non_string_payload() {
+    let prev_hook = std::panic::take_hook();
+    opentelemetry_datalake_wasm_sdk::panic::init_panic_hook();
+
+    let caught = std::panic::catch_unwind(|| {
+        std::panic::panic_any(12345);
+    });
+    std::panic::set_hook(prev_hook);
+    assert!(caught.is_err());
+}
