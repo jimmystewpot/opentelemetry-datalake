@@ -100,7 +100,7 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if instance creation fails, required
     /// C-ABI v1 exports (`datalake_alloc`, `datalake_dealloc`, `datalake_transform`,
-    /// `memory`) are missing, or `rejuvenate_threshold` is invalid.
+    /// `memory`) are missing, guest initialization fails, or `rejuvenate_threshold` is invalid.
     pub fn new(
         id: usize,
         engine: Arc<EngineCache>,
@@ -121,7 +121,8 @@ impl WasmWorker {
 
         let filtered_env =
             crate::wasi_env::filter_environment_variables(&config.env_whitelist, &config.env);
-        let guest = Self::instantiate_guest(engine.engine(), &module)?;
+        let mut guest = Self::instantiate_guest(engine.engine(), &module)?;
+        Self::initialize_guest(&mut guest, &config)?;
         let local_generation = engine.module_generation();
 
         Ok(Self {
@@ -233,9 +234,11 @@ impl WasmWorker {
     ///
     /// # Errors
     ///
-    /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
+    /// Returns [`WasmTransformError`] if re-instantiation fails, required exports are missing,
+    /// or guest initialization fails.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let guest = Self::instantiate_guest(self.engine.engine(), &self.module)?;
+        let mut guest = Self::instantiate_guest(self.engine.engine(), &self.module)?;
+        Self::initialize_guest(&mut guest, &self.config)?;
         self.store = guest.store;
         self.instance = guest.instance;
         self.alloc_fn = guest.alloc_fn;
@@ -445,6 +448,61 @@ impl WasmWorker {
             transform_fn,
             memory,
         })
+    }
+
+    /// Invokes the optional `datalake_init` lifecycle hook exported by the guest.
+    fn initialize_guest(
+        guest: &mut GuestComponents,
+        config: &WasmTransformerConfig,
+    ) -> Result<(), WasmTransformError> {
+        if let Ok(init_fn) = guest
+            .instance
+            .get_typed_func::<(u32, u32), i32>(&mut guest.store, "datalake_init")
+        {
+            let (conf_ptr, conf_len) = if let Some(ref conf_val) = config.config {
+                let serialized_config = serde_json::to_string(conf_val).map_err(|e| {
+                    WasmTransformError::Pipeline(format!("Failed to serialize config JSON: {e}"))
+                })?;
+                let conf_bytes = serialized_config.as_bytes();
+                let conf_len = u32::try_from(conf_bytes.len()).map_err(|_| {
+                    WasmTransformError::Pipeline("Config JSON exceeds u32::MAX".to_string())
+                })?;
+                let conf_ptr = match guest.alloc_fn.call(&mut guest.store, conf_len) {
+                    Ok(ptr) => ptr,
+                    Err(e) => return Err(WasmTransformError::InitFailed(e.to_string())),
+                };
+                if let Err(e) = guest
+                    .memory
+                    .write(&mut guest.store, conf_ptr as usize, conf_bytes)
+                {
+                    let _ = guest
+                        .dealloc_fn
+                        .call(&mut guest.store, (conf_ptr, conf_len));
+                    return Err(WasmTransformError::InitFailed(e.to_string()));
+                }
+                (conf_ptr, conf_len)
+            } else {
+                (0, 0)
+            };
+
+            let init_res = init_fn.call(&mut guest.store, (conf_ptr, conf_len));
+            if conf_ptr > 0 && conf_len > 0 {
+                let _ = guest
+                    .dealloc_fn
+                    .call(&mut guest.store, (conf_ptr, conf_len));
+            }
+
+            match init_res {
+                Ok(0) => {}
+                Ok(code) => {
+                    return Err(WasmTransformError::InitFailed(format!(
+                        "Guest init returned error code {code}"
+                    )));
+                }
+                Err(e) => return Err(WasmTransformError::InitFailed(e.to_string())),
+            }
+        }
+        Ok(())
     }
 }
 

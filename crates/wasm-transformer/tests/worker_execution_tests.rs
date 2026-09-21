@@ -1037,3 +1037,59 @@ fn test_worker_fails_on_unsupported_abi_version() {
     let err = WasmWorker::new(61, Arc::clone(&cache), module, cfg).unwrap_err();
     assert!(matches!(err, WasmTransformError::AbiVersionMismatch(99)));
 }
+
+fn failing_init_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 1))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[test]
+fn test_worker_fails_when_guest_init_returns_error() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(failing_init_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let err = WasmWorker::new(62, Arc::clone(&cache), module, cfg).unwrap_err();
+    assert!(matches!(err, WasmTransformError::InitFailed(_)));
+}
+
+fn config_init_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            ;; Verify length > 0 and pointer != 0
+            (if (i32.eqz (local.get $ptr))
+                (then (return (i32.const 2)))
+            )
+            (if (i32.eqz (local.get $len))
+                (then (return (i32.const 3)))
+            )
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[test]
+fn test_worker_passes_config_to_guest_init() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(config_init_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.config = Some(serde_json::json!({"test_key": "test_value"}));
+    let worker = WasmWorker::new(63, Arc::clone(&cache), module, cfg).unwrap();
+    assert_eq!(worker.id, 63);
+}
