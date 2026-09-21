@@ -189,6 +189,13 @@ fn default_init_timeout() -> std::time::Duration {
 }
 
 /// Configuration for a WebAssembly (WASM) transformer runtime and isolation sandbox.
+///
+/// **Concurrency Behavior:**
+/// This configuration is instantiated once at startup and is typically cloned per-worker 
+/// during initialization. The `concurrency` setting directly determines the number of parallel 
+/// WebAssembly instances (and Tokio tasks) spawned for this transformation step. The 
+/// `worker_channel_capacity` sets the buffer size for the bounded MPSC channel feeding 
+/// each individual worker, allowing it to absorb backpressure asynchronously.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WasmTransformerConfig {
     /// Unique identifier for this transformer instance.
