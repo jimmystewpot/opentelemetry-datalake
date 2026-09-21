@@ -42,13 +42,22 @@ impl TlsConfig {
         }
     }
 
-    /// Validates CA certificate file accessibility at configuration load time.
+    /// Validates TLS configuration parameters and CA certificate file accessibility.
     ///
     /// # Errors
-    /// Returns [`PipelineError::Configuration`] if `ca_cert_path` is specified but the file does not exist.
+    /// Returns [`PipelineError::Configuration`] if:
+    /// - Certificate verification is disabled (prohibited for CWE-295 security compliance).
+    /// - `ca_cert_path` is specified but does not point to an existing regular file.
     pub fn validate(&self) -> Result<(), PipelineError> {
+        if self.is_insecure() {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from(
+                    "disabling TLS certificate verification is prohibited; configure 'ca_cert_path' with the trusted CA certificate instead",
+                ),
+            )));
+        }
         if let Some(ref path) = self.ca_cert_path
-            && !std::path::Path::new(path).exists()
+            && !std::path::Path::new(path).is_file()
         {
             return Err(PipelineError::Configuration(Box::new(
                 figment::Error::from(format!("CA certificate file not found: '{path}'")),
@@ -98,10 +107,50 @@ mod tests {
 
     #[test]
     fn test_tls_config_validate_ca_path() {
-        let mut tls = TlsConfig::default();
+        let tls = TlsConfig::default();
         assert!(tls.validate().is_ok());
 
-        tls.ca_cert_path = Some("/nonexistent/ca/path/cert.pem".to_string());
-        assert!(tls.validate().is_err());
+        let invalid_tls = TlsConfig {
+            ca_cert_path: Some("/nonexistent/ca/path/cert.pem".to_string()),
+            ..Default::default()
+        };
+        assert!(invalid_tls.validate().is_err());
+    }
+
+    #[test]
+    fn test_tls_config_validate_rejects_insecure() {
+        let tls = TlsConfig {
+            verification: TlsVerificationMode::Disabled,
+            ..Default::default()
+        };
+        let err = tls.validate().unwrap_err();
+        assert!(matches!(err, PipelineError::Configuration(_)));
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited")
+        );
+
+        let tls_legacy = TlsConfig {
+            insecure_skip_verify: Some(true),
+            ..Default::default()
+        };
+        let err2 = tls_legacy.validate().unwrap_err();
+        assert!(matches!(err2, PipelineError::Configuration(_)));
+        assert!(
+            err2.to_string()
+                .contains("disabling TLS certificate verification is prohibited")
+        );
+    }
+
+    #[test]
+    fn test_tls_config_validate_rejects_directory_ca_path() {
+        // Pass an existing directory instead of a file
+        let tls = TlsConfig {
+            ca_cert_path: Some(env!("CARGO_MANIFEST_DIR").to_string()),
+            ..Default::default()
+        };
+        let err = tls.validate().unwrap_err();
+        assert!(matches!(err, PipelineError::Configuration(_)));
+        assert!(err.to_string().contains("CA certificate file not found:"));
     }
 }
