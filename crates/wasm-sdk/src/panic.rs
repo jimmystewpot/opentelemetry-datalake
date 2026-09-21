@@ -15,7 +15,7 @@ unsafe extern "C" {
 /// Registers a global panic hook forwarding panics to the host logger.
 ///
 /// On WebAssembly targets, panics are formatted into a message string and forwarded
-/// to the host import `datalake_host_log` at error level ([`LOG_LEVEL_ERROR`] / level 1).
+/// to the host import `datalake_host_log` at error level (`LOG_LEVEL_ERROR` / level 1).
 /// On non-wasm32 targets (e.g. host unit tests), panics are printed to `eprintln!`.
 #[allow(clippy::print_stderr)]
 pub fn init_panic_hook() {
