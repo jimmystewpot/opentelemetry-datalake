@@ -3,8 +3,8 @@
 //! Validates that compiled WebAssembly binaries satisfy C-ABI v1 requirements,
 //! including required function and memory exports and matching ABI versions.
 
-use wasmtime::{Config, Engine, Instance, Module, Store};
 use thiserror::Error;
+use wasmtime::{Config, Engine, Instance, Module, Store};
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -46,17 +46,21 @@ const REQUIRED_EXPORTS: &[&str] = &[
 pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationError> {
     let mut config = Config::new();
     config.consume_fuel(true);
-    let engine = Engine::new(&config).map_err(|e| ValidationError::EngineInit(anyhow::anyhow!(e)))?;
-    
-    let module = Module::new(&engine, bytes).map_err(|e| ValidationError::InvalidWasm(anyhow::anyhow!(e)))?;
+    let engine =
+        Engine::new(&config).map_err(|e| ValidationError::EngineInit(anyhow::anyhow!(e)))?;
+
+    let module = Module::new(&engine, bytes)
+        .map_err(|e| ValidationError::InvalidWasm(anyhow::anyhow!(e)))?;
     for &required in REQUIRED_EXPORTS {
         if !module.exports().any(|e| e.name() == required) {
             return Err(ValidationError::MissingExport(required.to_string()));
         }
     }
     let mut store: Store<()> = Store::new(&engine, ());
-    store.set_fuel(100_000).map_err(|e| ValidationError::EngineInit(anyhow::anyhow!(e)))?;
-    
+    store
+        .set_fuel(100_000)
+        .map_err(|e| ValidationError::EngineInit(anyhow::anyhow!(e)))?;
+
     let instance = Instance::new(&mut store, &module, &[])
         .map_err(|e| ValidationError::InstantiationFailed(anyhow::anyhow!(e)))?;
     let abi_fn = instance

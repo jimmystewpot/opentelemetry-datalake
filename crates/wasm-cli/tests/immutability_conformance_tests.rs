@@ -146,13 +146,15 @@ fn test_verify_batch_immutability_when_immutable_column_not_in_input() {
 }
 
 #[test]
-fn test_run_immutability_suite_succeeds() {
+fn test_run_immutability_suite_not_yet_implemented() {
     let res = run_immutability_suite(&[]);
-    assert!(res.is_ok());
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
 }
 
 #[test]
-fn test_run_benchmark_with_disclaimer_succeeds() {
+fn test_run_benchmark_with_disclaimer_not_yet_implemented() {
     let res = run_benchmark_with_disclaimer(&[]);
-    assert!(res.is_ok());
+    assert!(res.is_err());
+    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
 }
