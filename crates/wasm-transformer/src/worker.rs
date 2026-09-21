@@ -187,8 +187,11 @@ impl WasmWorker {
 
         // 3. Invoke datalake_transform and free input buffer
         let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
-        if transform_res.is_ok() {
-            let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        if transform_res.is_ok()
+            && let Err(e) = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len))
+        {
+            let _ = self.rejuvenate();
+            return Err(WasmTransformError::Wasmtime(e));
         }
         let header_ptr = match transform_res {
             Ok(ptr) => ptr,

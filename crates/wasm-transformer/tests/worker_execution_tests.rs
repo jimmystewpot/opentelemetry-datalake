@@ -978,3 +978,39 @@ async fn test_worker_handles_oob_response_header() {
         .unwrap_err();
     assert!(matches!(err, WasmTransformError::Pipeline(_)));
 }
+
+fn trap_dealloc_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32)
+            (unreachable)
+        )
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_dealloc_trap_and_rejuvenates() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(trap_dealloc_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(60, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Wasmtime(_)));
+    assert_eq!(worker.batches_processed(), 0);
+}
