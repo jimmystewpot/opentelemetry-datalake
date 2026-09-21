@@ -184,6 +184,7 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     if buf.try_reserve_exact(size as usize).is_err() {
         return 0;
     }
+    buf.resize(size as usize, 0);
     let mut id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     while (id as u32) == 0 {
         id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -212,6 +213,124 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
             map.remove(&ptr);
         }
     }
+}
+
+/// Copies bytes into the guest linear memory buffer at `ptr`.
+pub fn write_guest_memory(ptr: u32, src: &[u8]) {
+    if ptr == 0 || src.is_empty() {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SAFETY: `ptr` was allocated by `datalake_alloc` in wasm32 linear memory
+        // with capacity >= `src.len()`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut lock = match NATIVE_ALLOCS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(buf) = lock.as_mut().and_then(|map| map.get_mut(&ptr)) {
+            if buf.len() < src.len() {
+                buf.resize(src.len(), 0);
+            }
+            buf[..src.len()].copy_from_slice(src);
+        }
+    }
+}
+
+/// Reads `len` bytes from the guest linear memory buffer at `ptr`.
+#[must_use]
+pub fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
+    if ptr == 0 {
+        return None;
+    }
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // SAFETY: `ptr` is a valid non-null address in wasm32 linear memory
+        // containing at least `len` initialized bytes.
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr as *const u8, len);
+            Some(slice.to_vec())
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let lock = match NATIVE_ALLOCS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let map = lock.as_ref()?;
+        let buf = map.get(&ptr)?;
+        if buf.len() >= len {
+            Some(buf[..len].to_vec())
+        } else {
+            None
+        }
+    }
+}
+
+/// Reads and parses a [`TransformResponseHeader`] from guest memory at `ptr`.
+#[must_use]
+pub fn read_response_header(ptr: u32) -> Option<TransformResponseHeader> {
+    let bytes = read_guest_memory(ptr, std::mem::size_of::<TransformResponseHeader>())?;
+    if bytes.len() != std::mem::size_of::<TransformResponseHeader>() {
+        return None;
+    }
+    let status = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let batch_count = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    let batches_ptr = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let message_ptr = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    let message_len = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    Some(TransformResponseHeader {
+        status,
+        batch_count,
+        batches_ptr,
+        message_ptr,
+        message_len,
+    })
+}
+
+/// Reads an array of [`BatchDescriptor`] structs from guest memory at `ptr`.
+#[must_use]
+pub fn read_batch_descriptors(ptr: u32, count: usize) -> Option<Vec<BatchDescriptor>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let byte_len = count.checked_mul(std::mem::size_of::<BatchDescriptor>())?;
+    let bytes = read_guest_memory(ptr, byte_len)?;
+    if bytes.len() != byte_len {
+        return None;
+    }
+    let mut descriptors = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = i * std::mem::size_of::<BatchDescriptor>();
+        let desc_bytes = &bytes[offset..offset + std::mem::size_of::<BatchDescriptor>()];
+        let d_ptr = u32::from_le_bytes(desc_bytes[0..4].try_into().ok()?);
+        let d_len = u32::from_le_bytes(desc_bytes[4..8].try_into().ok()?);
+        descriptors.push(BatchDescriptor {
+            ptr: d_ptr,
+            len: d_len,
+        });
+    }
+    Some(descriptors)
+}
+
+/// Reads a UTF-8 string from guest memory at `ptr` with length `len`.
+#[must_use]
+pub fn read_guest_string(ptr: u32, len: usize) -> Option<String> {
+    if len == 0 {
+        return Some(String::new());
+    }
+    let bytes = read_guest_memory(ptr, len)?;
+    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
