@@ -1,5 +1,6 @@
 use pipeline_core::config::{
-    OnErrorPolicy, OnRejectPolicy, SchemaGuardMode, WasmTransformerConfig,
+    ByteSizeParseError, OnErrorPolicy, OnRejectPolicy, SchemaGuardMode, WasmConfigValidationError,
+    WasmTransformerConfig, parse_byte_size,
 };
 use pipeline_core::error::PipelineError;
 use std::time::Duration;
@@ -108,6 +109,8 @@ fn test_wasm_config_rejects_zero_max_batch_rows() {
 #[test]
 fn test_wasm_config_memory_units_and_raw_bytes() {
     let cases = [
+        ("1TiB", 1024 * 1024 * 1024 * 1024),
+        ("2TB", 2 * 1024 * 1024 * 1024 * 1024),
         ("64MiB", 64 * 1024 * 1024),
         ("64MIB", 64 * 1024 * 1024),
         ("16MB", 16 * 1024 * 1024),
@@ -288,4 +291,163 @@ fn test_policy_serde_roundtrip() {
 fn test_pipeline_error_topological_sink_missing() {
     let err = PipelineError::TopologicalSinkMissing("dlq_sink".to_string());
     assert_eq!(err.to_string(), "Topological DLQ sink missing: dlq_sink");
+}
+
+#[test]
+fn test_parse_byte_size_direct_api_success() {
+    assert_eq!(parse_byte_size("1TiB"), Ok(1024 * 1024 * 1024 * 1024));
+    assert_eq!(parse_byte_size("2TB"), Ok(2 * 1024 * 1024 * 1024 * 1024));
+    assert_eq!(parse_byte_size("1tib"), Ok(1024 * 1024 * 1024 * 1024));
+    assert_eq!(parse_byte_size("2tb"), Ok(2 * 1024 * 1024 * 1024 * 1024));
+    assert_eq!(parse_byte_size("64 MiB"), Ok(64 * 1024 * 1024));
+    assert_eq!(parse_byte_size(" 16 MB "), Ok(16 * 1024 * 1024));
+    assert_eq!(parse_byte_size("100 bytes"), Ok(100));
+}
+
+#[test]
+fn test_parse_byte_size_direct_api_errors() {
+    assert_eq!(parse_byte_size(""), Err(ByteSizeParseError::Empty));
+    assert_eq!(parse_byte_size("   "), Err(ByteSizeParseError::Empty));
+    assert!(matches!(
+        parse_byte_size("invalid"),
+        Err(ByteSizeParseError::InvalidNumber(..))
+    ));
+    assert!(matches!(
+        parse_byte_size("64foo"),
+        Err(ByteSizeParseError::InvalidNumber(..))
+    ));
+    assert!(matches!(
+        parse_byte_size("18446744073709551615TiB"),
+        Err(ByteSizeParseError::Overflow(..))
+    ));
+    assert!(matches!(
+        parse_byte_size("9999999999999999999999999999999999999B"),
+        Err(ByteSizeParseError::InvalidNumber(..))
+    ));
+
+    // Test that ByteSizeParseError implements Clone and Eq
+    let err = ByteSizeParseError::Empty;
+    let cloned = err.clone();
+    assert_eq!(err, cloned);
+    assert_eq!(err, ByteSizeParseError::Empty);
+
+    fn assert_implements_clone_and_eq<T: Clone + Eq>() {}
+    assert_implements_clone_and_eq::<ByteSizeParseError>();
+}
+
+#[test]
+fn test_wasm_config_validate_success() {
+    let toml_str = r#"
+        id = "test_wasm"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert!(cfg.validate().is_ok());
+
+    // Boundary condition: rejuvenate_threshold == max_memory is valid
+    let toml_boundary = r#"
+        id = "boundary_wasm"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        max_memory = "64MiB"
+        rejuvenate_threshold = "64MiB"
+    "#;
+    let cfg_boundary: WasmTransformerConfig = toml::from_str(toml_boundary).unwrap();
+    assert!(cfg_boundary.validate().is_ok());
+}
+
+#[test]
+fn test_wasm_config_validate_empty_id() {
+    for empty_id in ["", "   "] {
+        let toml_str = format!(
+            r#"
+            id = "{empty_id}"
+            type = "wasm"
+            module_path = "transforms/test.wasm"
+            "#
+        );
+        let cfg: WasmTransformerConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.validate(), Err(WasmConfigValidationError::EmptyId));
+    }
+}
+
+#[test]
+fn test_wasm_config_validate_invalid_type() {
+    let toml_str = r#"
+        id = "test_wasm"
+        type = "javascript"
+        module_path = "transforms/test.wasm"
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert!(
+        matches!(cfg.validate(), Err(WasmConfigValidationError::InvalidType(t)) if t == "javascript")
+    );
+}
+
+#[test]
+fn test_wasm_config_validate_empty_module_path() {
+    for empty_path in ["", "   "] {
+        let toml_str = format!(
+            r#"
+            id = "test_wasm"
+            type = "wasm"
+            module_path = "{empty_path}"
+            "#
+        );
+        let cfg: WasmTransformerConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            cfg.validate(),
+            Err(WasmConfigValidationError::EmptyModulePath)
+        );
+    }
+}
+
+#[test]
+fn test_wasm_config_validate_rejuvenate_exceeds_max_memory() {
+    let toml_str = r#"
+        id = "test_wasm"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        max_memory = "64MiB"
+        rejuvenate_threshold = "128MiB"
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert!(matches!(
+        cfg.validate(),
+        Err(WasmConfigValidationError::RejuvenateExceedsMaxMemory {
+            rejuvenate_threshold,
+            max_memory,
+        }) if rejuvenate_threshold > max_memory
+    ));
+}
+
+#[test]
+fn test_wasm_config_validation_error_display_and_traits() {
+    let err_empty_id = WasmConfigValidationError::EmptyId;
+    assert_eq!(err_empty_id.to_string(), "transformer id cannot be empty");
+
+    let err_invalid_type = WasmConfigValidationError::InvalidType("javascript".to_string());
+    assert_eq!(
+        err_invalid_type.to_string(),
+        "component type must be 'wasm', got 'javascript'"
+    );
+
+    let err_empty_path = WasmConfigValidationError::EmptyModulePath;
+    assert_eq!(err_empty_path.to_string(), "module_path cannot be empty");
+
+    let err_rejuv = WasmConfigValidationError::RejuvenateExceedsMaxMemory {
+        rejuvenate_threshold: 134_217_728,
+        max_memory: 67_108_864,
+    };
+    assert_eq!(
+        err_rejuv.to_string(),
+        "rejuvenate_threshold (134217728 bytes) cannot exceed max_memory (67108864 bytes)"
+    );
+
+    let cloned = err_empty_id.clone();
+    assert_eq!(err_empty_id, cloned);
+
+    fn assert_implements_clone_and_eq<T: Clone + Eq>() {}
+    assert_implements_clone_and_eq::<WasmConfigValidationError>();
 }

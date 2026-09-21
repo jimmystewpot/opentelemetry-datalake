@@ -84,7 +84,7 @@ enum ByteSizeValue {
     String(String),
 }
 
-#[derive(Debug, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ByteSizeParseError {
     #[error("byte size string cannot be empty")]
     Empty,
@@ -108,7 +108,7 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ByteSizeParseError> {
     }
 
     let lower = s.to_ascii_lowercase();
-    let (num_len, multiplier) = if let Some(stripped) = lower
+    let (num_len, multiplier): (usize, u64) = if let Some(stripped) = lower
         .strip_suffix("tib")
         .or_else(|| lower.strip_suffix("tb"))
     {
@@ -138,14 +138,16 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ByteSizeParseError> {
     };
 
     let num_str = &s[..num_len];
-
-    let val: usize = num_str
+    let val: u64 = num_str
         .trim()
         .parse()
         .map_err(|e| ByteSizeParseError::InvalidNumber(s.to_string(), e))?;
 
-    val.checked_mul(multiplier)
-        .ok_or_else(|| ByteSizeParseError::Overflow(s.to_string()))
+    let total = val
+        .checked_mul(multiplier)
+        .ok_or_else(|| ByteSizeParseError::Overflow(s.to_string()))?;
+
+    usize::try_from(total).map_err(|_| ByteSizeParseError::Overflow(s.to_string()))
 }
 
 fn deserialize_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
@@ -166,25 +168,29 @@ fn default_drain_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(10)
 }
 
+const DEFAULT_MAX_BATCH_ROWS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(5000) {
+    Some(v) => v,
+    None => panic!("non-zero value"),
+};
 const fn default_max_batch_rows() -> std::num::NonZeroUsize {
-    match std::num::NonZeroUsize::new(5000) {
-        Some(v) => v,
-        None => unreachable!(),
-    }
+    DEFAULT_MAX_BATCH_ROWS
 }
 
+const DEFAULT_CONCURRENCY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(4) {
+    Some(v) => v,
+    None => panic!("non-zero value"),
+};
 const fn default_concurrency() -> std::num::NonZeroUsize {
-    match std::num::NonZeroUsize::new(4) {
-        Some(v) => v,
-        None => unreachable!(),
-    }
+    DEFAULT_CONCURRENCY
 }
 
+const DEFAULT_WORKER_CHANNEL_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(1)
+{
+    Some(v) => v,
+    None => panic!("non-zero value"),
+};
 const fn default_worker_channel_capacity() -> std::num::NonZeroUsize {
-    match std::num::NonZeroUsize::new(1) {
-        Some(v) => v,
-        None => unreachable!(),
-    }
+    DEFAULT_WORKER_CHANNEL_CAPACITY
 }
 
 const fn default_max_memory() -> usize {
@@ -278,6 +284,60 @@ pub struct WasmTransformerConfig {
     /// Whether to reload the WASM module on receiving a SIGHUP signal.
     #[serde(default)]
     pub enable_sighup: bool,
+}
+
+/// Validation error returned when a [`WasmTransformerConfig`] violates invariant constraints.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WasmConfigValidationError {
+    /// Instance identifier is empty.
+    #[error("transformer id cannot be empty")]
+    EmptyId,
+    /// Component type is not "wasm".
+    #[error("component type must be 'wasm', got '{0}'")]
+    InvalidType(String),
+    /// Path to the .wasm binary is empty.
+    #[error("module_path cannot be empty")]
+    EmptyModulePath,
+    /// Rejuvenation memory threshold exceeds maximum linear memory limit.
+    #[error(
+        "rejuvenate_threshold ({rejuvenate_threshold} bytes) cannot exceed max_memory ({max_memory} bytes)"
+    )]
+    RejuvenateExceedsMaxMemory {
+        /// Configured rejuvenation threshold in bytes.
+        rejuvenate_threshold: usize,
+        /// Configured maximum memory limit in bytes.
+        max_memory: usize,
+    },
+}
+
+impl WasmTransformerConfig {
+    /// Validates invariant configuration constraints.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`WasmConfigValidationError`] if:
+    /// - `id` is empty or only whitespace
+    /// - `type` is not "wasm"
+    /// - `module_path` is empty or only whitespace
+    /// - `rejuvenate_threshold` is strictly greater than `max_memory`
+    pub fn validate(&self) -> Result<(), WasmConfigValidationError> {
+        if self.id.trim().is_empty() {
+            return Err(WasmConfigValidationError::EmptyId);
+        }
+        if self.r#type != "wasm" {
+            return Err(WasmConfigValidationError::InvalidType(self.r#type.clone()));
+        }
+        if self.module_path.trim().is_empty() {
+            return Err(WasmConfigValidationError::EmptyModulePath);
+        }
+        if self.rejuvenate_threshold > self.max_memory {
+            return Err(WasmConfigValidationError::RejuvenateExceedsMaxMemory {
+                rejuvenate_threshold: self.rejuvenate_threshold,
+                max_memory: self.max_memory,
+            });
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
