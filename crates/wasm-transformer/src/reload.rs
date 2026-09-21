@@ -40,8 +40,7 @@ pub fn spawn_sighup_listener(
                     return;
                 }
             };
-            loop {
-                stream.recv().await;
+            while stream.recv().await.is_some() {
                 tracing::warn!(
                     path = %module_path.display(),
                     "SECURITY AUDIT: SIGHUP hot-reload triggered"

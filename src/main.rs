@@ -113,11 +113,8 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-exports the admin router builder registering the WASM hot-reload endpoint.
-pub use wasm_transformer::reload::build_admin_router;
-
 #[tokio::main]
-#[allow(clippy::too_many_lines, clippy::used_underscore_binding)]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
 
@@ -205,7 +202,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
-    let mut _sighup_handles = Vec::new();
+    let mut sighup_handles = Vec::new();
     let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
         Box<dyn Transform>,
         Box<dyn Transform>,
@@ -222,17 +219,17 @@ async fn main() -> anyhow::Result<()> {
 
         if wasm_cfg.enable_sighup {
             let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
-            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(logs_wasm.engine()),
                 module_path.clone(),
                 true,
             ));
-            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(traces_wasm.engine()),
                 module_path.clone(),
                 true,
             ));
-            _sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(metrics_wasm.engine()),
                 module_path,
                 true,
@@ -494,7 +491,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_sink_handle
     );
 
-    for h in _sighup_handles.into_iter().flatten() {
+    for h in sighup_handles.into_iter().flatten() {
         h.abort();
     }
 
@@ -824,6 +821,7 @@ mod tests {
         use std::sync::Arc;
         use tower::ServiceExt;
         use wasm_transformer::engine::EngineCache;
+        use wasm_transformer::reload::build_admin_router;
 
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
         let router = build_admin_router(engine);

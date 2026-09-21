@@ -3838,7 +3838,6 @@ dependencies = [
  "otlp-receiver",
  "pipeline-core",
  "serde",
- "serde_json",
  "sha2 0.10.9",
  "starrocks-sink",
  "storage",

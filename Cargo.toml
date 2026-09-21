@@ -44,8 +44,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 figment = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-axum = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 
@@ -59,6 +57,7 @@ wat = "1.220"
 sha2 = { workspace = true }
 hex = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
+axum = { workspace = true }
 
 [workspace.dependencies]
 # Internal Workspace Crates
