@@ -73,3 +73,41 @@ fn test_validate_accepts_conformant_module() {
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(validate_wasm_bytes(&wasm).is_ok());
 }
+
+#[test]
+fn test_cli_subcommand_test_returns_not_yet_implemented() {
+    let bin = env!("CARGO_BIN_EXE_datalake-wasm");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dummy_file = format!("{manifest_dir}/Cargo.toml");
+
+    let output = std::process::Command::new(bin)
+        .args(["test", &dummy_file])
+        .output()
+        .expect("Failed to execute datalake-wasm process");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Not yet implemented"),
+        "Expected stderr to contain 'Not yet implemented', got: {stderr}"
+    );
+}
+
+#[test]
+fn test_cli_subcommand_bench_returns_not_yet_implemented() {
+    let bin = env!("CARGO_BIN_EXE_datalake-wasm");
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let dummy_file = format!("{manifest_dir}/Cargo.toml");
+
+    let output = std::process::Command::new(bin)
+        .args(["bench", &dummy_file])
+        .output()
+        .expect("Failed to execute datalake-wasm process");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Not yet implemented"),
+        "Expected stderr to contain 'Not yet implemented', got: {stderr}"
+    );
+}
