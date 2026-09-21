@@ -84,6 +84,16 @@ enum ByteSizeValue {
     String(String),
 }
 
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub enum ByteSizeParseError {
+    #[error("byte size string cannot be empty")]
+    Empty,
+    #[error("invalid number in byte size '{0}': {1}")]
+    InvalidNumber(String, std::num::ParseIntError),
+    #[error("byte size '{0}' overflows usize")]
+    Overflow(String),
+}
+
 /// Parses human-readable byte sizes (e.g. "64MiB", "16MB", "1GiB", "1024B") or numeric byte strings into byte counts.
 ///
 /// Supported units (case-insensitive): `B`/`bytes`, `KiB`/`KB`, `MiB`/`MB`, `GiB`/`GB`, `TiB`/`TB`.
@@ -91,10 +101,10 @@ enum ByteSizeValue {
 /// # Errors
 ///
 /// Returns an error if the string is empty, contains an invalid number, or overflows `usize`.
-pub fn parse_byte_size(s: &str) -> Result<usize, String> {
+pub fn parse_byte_size(s: &str) -> Result<usize, ByteSizeParseError> {
     let s = s.trim();
     if s.is_empty() {
-        return Err("byte size string cannot be empty".to_string());
+        return Err(ByteSizeParseError::Empty);
     }
 
     let (num_str, multiplier) = if let Some(stripped) = s
@@ -139,10 +149,10 @@ pub fn parse_byte_size(s: &str) -> Result<usize, String> {
     let val: usize = num_str
         .trim()
         .parse()
-        .map_err(|e| format!("invalid number in byte size '{s}': {e}"))?;
+        .map_err(|e| ByteSizeParseError::InvalidNumber(s.to_string(), e))?;
 
     val.checked_mul(multiplier)
-        .ok_or_else(|| format!("byte size '{s}' overflows usize"))
+        .ok_or_else(|| ByteSizeParseError::Overflow(s.to_string()))
 }
 
 fn deserialize_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
