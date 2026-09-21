@@ -72,6 +72,7 @@ impl TransformResult {
     }
 
     /// Creates a [`TransformResult::Reject`] result with the specified reason.
+    #[must_use]
     pub fn reject(reason: impl Into<String>) -> Self {
         Self::Reject {
             reason: reason.into(),
@@ -79,6 +80,7 @@ impl TransformResult {
     }
 
     /// Creates a [`TransformResult::Error`] result with the specified reason.
+    #[must_use]
     pub fn error(reason: impl Into<String>) -> Self {
         Self::Error {
             reason: reason.into(),
