@@ -73,8 +73,12 @@ pub fn backfill_missing_columns(
     output: RecordBatch,
 ) -> Result<RecordBatch, WasmTransformError> {
     let output_schema = output.schema();
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(input_schema.fields().len());
-    let mut fields = Vec::with_capacity(input_schema.fields().len());
+    let capacity = input_schema
+        .fields()
+        .len()
+        .max(output_schema.fields().len());
+    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(capacity);
+    let mut fields = Vec::with_capacity(capacity);
     let num_rows = output.num_rows();
     let mut added = false;
 
@@ -87,7 +91,12 @@ pub fn backfill_missing_columns(
                 column = %field.name(),
                 "Schema guard: backfilling missing column with typed nulls"
             );
-            fields.push(Arc::clone(field));
+            let backfilled_field = if field.is_nullable() {
+                Arc::clone(field)
+            } else {
+                Arc::new(field.as_ref().clone().with_nullable(true))
+            };
+            fields.push(backfilled_field);
             columns.push(new_null_array(field.data_type(), num_rows));
             added = true;
         }

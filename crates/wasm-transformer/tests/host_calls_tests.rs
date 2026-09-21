@@ -6,6 +6,7 @@ use wasmtime::{Engine, Store};
 
 #[test]
 fn test_host_linker_defines_required_guest_imports() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("test_comp"));
     let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
@@ -366,4 +367,103 @@ fn test_edge_case_unknown_metric_type_and_empty_name() {
     // Unknown metric type should not be recorded as counter or gauge
     assert_eq!(registry.read_counter("valid_metric"), 0);
     assert_eq!(registry.read_gauge("valid_metric"), None);
+}
+
+#[test]
+fn test_edge_case_gauge_metric_emission_from_wasm() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("gauge_wasm"));
+    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+
+    let wat = r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "cpu_usage")
+        (func (export "emit_gauge")
+            ;; metric_type = 1 (GAUGE), name_ptr = 0, name_len = 9, value = 4607182418800017408 (1.0 f64 bits)
+            (call $metric (i32.const 1) (i32.const 0) (i32.const 9) (i64.const 4607182418800017408))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            phase: HostPhase::Execution,
+            registry: Arc::clone(&registry),
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, "emit_gauge")
+        .unwrap();
+
+    assert!(func.call(&mut store, ()).is_ok());
+    assert_eq!(registry.read_gauge("cpu_usage"), Some(4607182418800017408));
+}
+
+#[test]
+fn test_edge_case_memory_export_not_a_memory() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("not_mem"));
+    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+
+    // Module with export named "memory", but it is a global, not a linear memory
+    let wat = r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (import "env" "datalake_host_log" (func $log (param i32 i32 i32)))
+        (global (export "memory") i32 (i32.const 42))
+        (func (export "call_not_mem")
+            (call $metric (i32.const 0) (i32.const 0) (i32.const 5) (i64.const 10))
+            (call $log (i32.const 1) (i32.const 0) (i32.const 5))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            phase: HostPhase::Init,
+            registry: Arc::clone(&registry),
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, "call_not_mem")
+        .unwrap();
+
+    assert!(func.call(&mut store, ()).is_ok());
+    assert_eq!(registry.read_counter("test"), 0);
+}
+
+#[test]
+fn test_edge_case_log_message_allocation_capping() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("log_cap"));
+    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+
+    // Module with 2 memory pages (131,072 bytes) and 70,000-byte log message (exceeding MAX_LOG_MESSAGE_LEN)
+    let wat = r#"(module
+        (import "env" "datalake_host_log" (func $log (param i32 i32 i32)))
+        (memory (export "memory") 2)
+        (func (export "emit_long_log")
+            (call $log (i32.const 3) (i32.const 0) (i32.const 70000))
+        )
+    )"#;
+
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            phase: HostPhase::Execution,
+            registry: Arc::clone(&registry),
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, "emit_long_log")
+        .unwrap();
+
+    assert!(func.call(&mut store, ()).is_ok());
 }

@@ -159,6 +159,7 @@ fn test_o1_immutability_check_allows_all_null_mutable_column() {
 
 #[test]
 fn test_backfill_adds_missing_columns_as_typed_nulls() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let full_schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, true),
@@ -418,4 +419,33 @@ fn test_backfill_restores_column_ordering_when_guest_permutes_columns() {
         .downcast_ref::<Int64Array>()
         .unwrap();
     assert_eq!(col_b.value(0), 42);
+}
+
+#[test]
+fn test_backfill_non_nullable_missing_column_sets_nullable_true() {
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("non_nullable_counter", DataType::Int64, false),
+    ]));
+    let partial_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["id_1", "id_2"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    assert_eq!(backfilled.num_columns(), 2);
+    assert_eq!(backfilled.num_rows(), 2);
+    assert_eq!(backfilled.column(1).null_count(), 2);
+
+    // The backfilled column MUST have is_nullable == true, even though input was false
+    assert!(
+        backfilled.schema().field(1).is_nullable(),
+        "Backfilled null column must have is_nullable == true"
+    );
 }

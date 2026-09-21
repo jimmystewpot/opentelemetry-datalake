@@ -142,37 +142,26 @@ fn read_guest_string(
         return None;
     };
 
-    let Ok(offset) = usize::try_from(ptr) else {
-        tracing::warn!(ptr, "WASM guest memory pointer out of usize range");
-        return None;
-    };
-    let Ok(raw_len) = usize::try_from(len) else {
-        tracing::warn!(len, "WASM guest memory length out of usize range");
+    let Some(end_u32) = ptr.checked_add(len) else {
+        tracing::warn!(ptr, len, "WASM guest memory address addition overflow");
         return None;
     };
 
     let mem_data = memory.data(caller);
-
-    let Some(total_end) = offset.checked_add(raw_len) else {
-        tracing::warn!(
-            offset,
-            raw_len,
-            "WASM guest memory address addition overflow"
-        );
-        return None;
-    };
+    let offset = ptr as usize;
+    let total_end = end_u32 as usize;
 
     if total_end > mem_data.len() {
         tracing::warn!(
             offset,
-            raw_len,
+            raw_len = len as usize,
             memory_len = mem_data.len(),
             "WASM guest memory read out of bounds"
         );
         return None;
     }
 
-    let read_len = raw_len.min(max_len);
+    let read_len = (len as usize).min(max_len);
     let end = offset.saturating_add(read_len);
 
     Some(String::from_utf8_lossy(&mem_data[offset..end]).into_owned())

@@ -22,3 +22,4 @@ opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
 [dev-dependencies]
 wat = "1.220"
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing-subscriber = { workspace = true }
