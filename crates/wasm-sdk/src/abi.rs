@@ -83,18 +83,26 @@ pub extern "C" fn datalake_abi_version() -> u32 {
     ABI_VERSION
 }
 
-/// Allocates a linear memory buffer of `size` bytes in the WebAssembly instance.
+#[cfg(target_arch = "wasm32")]
+use std::alloc::Layout;
+
+/// Allocates an 8-byte aligned linear memory buffer of `size` bytes in the WebAssembly instance.
 ///
-/// Returns the 32-bit linear address of the allocated buffer.
+/// Returns the 32-bit linear address of the allocated buffer, or `0` if `size == 0` or allocation fails.
 #[cfg(target_arch = "wasm32")]
 #[must_use]
 // SAFETY: Exporting allocator entry point with C linkage for host buffer provisioning.
 #[unsafe(no_mangle)]
 #[allow(clippy::cast_possible_truncation)]
 pub extern "C" fn datalake_alloc(size: u32) -> u32 {
-    let mut buf = Vec::<u8>::with_capacity(size as usize);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
+    if size == 0 {
+        return 0;
+    }
+    let Ok(layout) = Layout::from_size_align(size as usize, 8) else {
+        return 0;
+    };
+    // SAFETY: Global allocator invocation with verified non-zero 8-byte aligned layout.
+    let ptr = unsafe { std::alloc::alloc(layout) };
     ptr as usize as u32
 }
 
@@ -103,37 +111,50 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
 // SAFETY: Exporting deallocator entry point with C linkage for host buffer reclamation.
 #[unsafe(no_mangle)]
 pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
-    if ptr != 0 && size != 0 {
-        // SAFETY: ptr was allocated with datalake_alloc on wasm32 (32-bit linear address space)
-        // with capacity equal to `size` and forgotten.
+    if ptr == 0 || size == 0 {
+        return;
+    }
+    if let Ok(layout) = Layout::from_size_align(size as usize, 8) {
+        // SAFETY: ptr was allocated with datalake_alloc with 8-byte alignment and identical size.
         unsafe {
-            drop(Vec::<u8>::from_raw_parts(ptr as *mut u8, 0, size as usize));
+            std::alloc::dealloc(ptr as *mut u8, layout);
         }
     }
 }
 
 // Safe fallback for native host test harness (prevents 64-bit pointer truncation and segfaults)
 #[cfg(not(target_arch = "wasm32"))]
+const MOCK_MAX_ALLOC: usize = 64 * 1024 * 1024; // 64 MB mock allocation ceiling for deterministic testing
+
+#[cfg(not(target_arch = "wasm32"))]
 static NATIVE_ALLOCS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec<u8>>>> =
     std::sync::Mutex::new(None);
 
+#[cfg(not(target_arch = "wasm32"))]
+static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 /// Allocates a mock buffer entry in the host test allocator map.
 ///
-/// Returns a unique non-zero 32-bit mock handle.
+/// Returns a unique non-zero 32-bit mock handle, or `0` if `size == 0` or size exceeds 64 MB limit.
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
 // SAFETY: Exporting test allocator symbol with C linkage.
 #[unsafe(no_mangle)]
 pub extern "C" fn datalake_alloc(size: u32) -> u32 {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if size == 0 || size as usize > MOCK_MAX_ALLOC {
+        return 0;
+    }
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(size as usize).is_err() {
+        return 0;
+    }
+    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut lock = match NATIVE_ALLOCS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     lock.get_or_insert_with(std::collections::HashMap::new)
-        .insert(id, Vec::with_capacity(size as usize));
+        .insert(id, buf);
     id
 }
 

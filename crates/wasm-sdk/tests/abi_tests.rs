@@ -47,3 +47,20 @@ fn test_alloc_and_dealloc_native_safety() {
     datalake_dealloc(0, 0);
     datalake_dealloc(ptr1, 1024);
 }
+
+#[test]
+fn test_alloc_oom_returns_null_pointer() {
+    // Attempting to allocate an impossible capacity must return 0 instead of panicking
+    let impossible_size = u32::MAX;
+    let ptr = datalake_alloc(impossible_size);
+    assert_eq!(ptr, 0);
+    // Deallocating 0 must be a safe no-op
+    datalake_dealloc(0, impossible_size);
+}
+
+#[test]
+fn test_alloc_zero_returns_null_pointer() {
+    let ptr = datalake_alloc(0);
+    assert_eq!(ptr, 0);
+    datalake_dealloc(0, 0);
+}
