@@ -23,31 +23,24 @@ pub fn is_immutable_column(column: &str) -> bool {
     IMMUTABLE_COLUMNS.contains(&column)
 }
 
-/// Nullifies a column in the given [`RecordBatch`] while preserving schema and metadata.
+/// Nullifies a column in the given [`RecordBatch`] using the provided pre-computed `target_schema`.
 ///
-/// Returns an error if the column is immutable or not found in the schema.
-pub fn nullify_column(batch: &RecordBatch, column_name: &str) -> Result<RecordBatch, SdkError> {
+/// Returns an error if the column is immutable or not found in the target schema.
+pub fn nullify_column(
+    batch: &RecordBatch,
+    target_schema: Arc<arrow::datatypes::Schema>,
+    column_name: &str,
+) -> Result<RecordBatch, SdkError> {
     if is_immutable_column(column_name) {
         return Err(SdkError::ImmutableFieldViolation(column_name.to_string()));
     }
-    let schema = batch.schema();
-    let idx = schema
+    let idx = target_schema
         .index_of(column_name)
         .map_err(|_| SdkError::ColumnNotFound(column_name.to_string()))?;
+
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
-    let field = schema.field(idx);
+    let field = target_schema.field(idx);
     columns[idx] = new_null_array(field.data_type(), batch.num_rows());
 
-    let final_schema = if field.is_nullable() {
-        schema.clone()
-    } else {
-        let mut fields = schema.fields().to_vec();
-        fields[idx] = Arc::new(field.as_ref().clone().with_nullable(true));
-        Arc::new(arrow::datatypes::Schema::new_with_metadata(
-            fields,
-            schema.metadata().clone(),
-        ))
-    };
-
-    RecordBatch::try_new(final_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
+    RecordBatch::try_new(target_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
 }
