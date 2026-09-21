@@ -118,7 +118,7 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 # TLS configuration.
 [elasticsearch.tls]
 ca_cert_path = "/etc/ssl/certs/es-ca.crt"
-insecure_skip_verify = false
+verification = "full" # "full" (default) or "disabled"
 ```
 
 ---
@@ -498,6 +498,20 @@ OpenSearch Security uses action groups instead of Elasticsearch privileges. The 
 | Bulk Data Ingestion | `write` | `write` (or `crud`) | Ingests micro-batches via `POST /{data_stream}/_bulk`. |
 | Dynamic Index Creation | `create_index`, `auto_configure` | `create_index` | Allows creation of backing indices when data streams rollover. |
 
+### TLS & Root Certificate Stores
+
+Outbound HTTPS requests to Elasticsearch or OpenSearch use the standardized `TlsConfig`:
+
+```toml
+[elasticsearch.tls]
+ca_cert_path = "/etc/ssl/certs/corporate-root-ca.pem"
+verification = "full" # "full" (default) or "disabled"
+```
+
+- **Dual Root Certificate Stores**: By default, `elasticsearch-sink` enables both `tls-native-roots` (loads the host OS trust store) and `tls-webpki-roots` (loads Mozilla WebPKI root certificates).
+- **Custom Certificate Authorities**: Specifying `ca_cert_path` loads a custom PEM certificate, validated at startup.
+- **Verification Modes**: `verification = "full"` validates the certificate chain and hostname. `verification = "disabled"` (or legacy `insecure_skip_verify = true`) turns off verification for test/local environments with an explicit warning log.
+
 ---
 
 ## Full Example Configuration
@@ -538,7 +552,7 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 
 [elasticsearch.tls]
 ca_cert_path = "/etc/ssl/certs/corporate-root-ca.pem"
-insecure_skip_verify = false
+verification = "full"
 
 [elasticsearch.batching]
 max_batch_size_bytes = 15728640 # 15 MiB

@@ -98,6 +98,7 @@ Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.m
 | `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
 | `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds. |
+| `tls` | Map | `{}` | Standard TLS configuration (`ca_cert_path`, `verification`). |
 
 ### StarRocks Table Mapping (`[starrocks.table_mapping]`)
 
@@ -135,7 +136,7 @@ Configures the Elasticsearch & OpenSearch data streams sink. See [`docs/elastics
 | `endpoints` | `[String]` | (Required) | One or more cluster node HTTP URLs. Atomic round-robin and endpoint cooldowns apply. |
 | `data_streams` | Map | (Required) | Data stream mapping for `logs`, `metrics`, and `traces`. |
 | `auth` | Map | `{ type = "none" }` | Authentication configuration (`none`, `basic`, `api_key`, `bearer`, `aws_sigv4`). |
-| `tls` | Map | `{}` | TLS configuration (`ca_cert_path`, `insecure_skip_verify`). |
+| `tls` | Map | `{}` | Standard TLS configuration (`ca_cert_path`, `verification`). |
 | `unpack_attributes` | Boolean | `true` | Unpack JSON-stringified map/struct attributes into native JSON objects. |
 | `gzip_compression` | Boolean | `true` | Compress bulk request payloads using gzip `Content-Encoding`. |
 | `max_concurrent_requests` | Integer | `8` | Maximum concurrent outbound bulk requests throttled by semaphore. |
@@ -184,6 +185,22 @@ metrics = ["timestamp ASC", "metric_name ASC"]
 traces  = ["timestamp ASC"]
 on_missing_column = "skip" # "skip" (default) or "error"
 ```
+
+### Standard TLS Configuration (`[<sink>.tls]`)
+
+Outbound HTTP sinks (`elasticsearch` and `starrocks`) share a standardized TLS configuration block:
+
+```toml
+[elasticsearch.tls] # or [starrocks.tls]
+ca_cert_path = "/etc/ssl/certs/custom-ca.pem"
+verification = "full" # "full" (default) or "disabled"
+```
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `ca_cert_path` | String | `null` | Optional path to a custom PEM-encoded Certificate Authority file. Validated at startup. |
+| `verification` | String | `"full"` | TLS verification mode: `"full"` (validates CA chain and hostname) or `"disabled"` (insecure; test/dev only). |
+| `insecure_skip_verify` | Boolean | `null` | Backward-compatibility alias for `verification = "disabled"`. When `true`, disables certificate validation. |
 
 ---
 
@@ -256,6 +273,10 @@ traces  = "traces-otel-default"
 [elasticsearch.auth]
 type = "api_key"
 api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
+
+[elasticsearch.tls]
+ca_cert_path = "/etc/ssl/certs/es-ca.crt"
+verification = "full"
 
 [elasticsearch.batching]
 max_batch_size_bytes = 10485760 # 10 MiB
