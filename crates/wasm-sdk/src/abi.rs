@@ -43,18 +43,20 @@ pub struct TransformResponseHeader {
 
 /// Descriptor for a single Arrow IPC stream payload in guest memory.
 ///
-/// Invariant: Memory at `ptr` must be allocated with 8-byte alignment and its
-/// allocated capacity must match `len` (e.g. using exact layout deallocation or `Box<[u8]>`)
-/// so that `datalake_dealloc(ptr, len)` frees the exact allocated layout without heap corruption.
-///
-/// Total size: 8 bytes, alignment: 4 bytes.
+/// Total size: 12 bytes, alignment: 4 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchDescriptor {
     /// Memory pointer to the raw Arrow IPC stream buffer.
     pub ptr: u32,
-    /// Byte length and allocated capacity of the Arrow IPC stream buffer.
+    /// Byte length of the populated Arrow IPC stream buffer.
     pub len: u32,
+    /// Total allocated capacity of the buffer in bytes.
+    ///
+    /// Invariant: Memory at `ptr` must be allocated with 8-byte alignment and its
+    /// allocated capacity must match `cap` (e.g. using exact layout deallocation or `Box<[u8]>`)
+    /// so that `datalake_dealloc(ptr, cap)` frees the exact allocated layout without heap corruption.
+    pub cap: u32,
 }
 
 /// Memory layout for structured log records.
@@ -194,6 +196,35 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
         };
         if let Some(map) = lock.as_mut() {
             map.remove(&ptr);
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_native_alloc_mutex_poisoning_recovery() {
+        // Intentionally poison the NATIVE_ALLOCS mutex
+        let _ = std::thread::spawn(|| {
+            let _lock = NATIVE_ALLOCS.lock().unwrap();
+            panic!("Intentional poison for coverage");
+        })
+        .join();
+
+        // Must recover gracefully from the poisoned mutex
+        let ptr = datalake_alloc(128);
+        assert_ne!(ptr, 0);
+        datalake_dealloc(ptr, 128);
+
+        // Clean up the lock state for other tests if possible by replacing the Some value
+        if let Ok(mut _lock) = NATIVE_ALLOCS.lock() {
+            // Already clean
+        } else if let Err(poisoned) = NATIVE_ALLOCS.lock() {
+            let mut guard = poisoned.into_inner();
+            guard.take(); // Clear it
         }
     }
 }
