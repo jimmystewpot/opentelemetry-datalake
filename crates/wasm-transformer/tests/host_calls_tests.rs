@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use wasm_transformer::host_calls::{
-    HostPhase, HostState, MAX_METRIC_NAME_LEN, MetricRegistry, build_host_linker,
+    HostPhase, HostState, MAX_METRIC_ENTRIES, MAX_METRIC_NAME_LEN, MetricRegistry,
+    build_host_linker,
 };
 use wasmtime::{Engine, Store};
 
@@ -466,4 +467,28 @@ fn test_edge_case_log_message_allocation_capping() {
         .unwrap();
 
     assert!(func.call(&mut store, ()).is_ok());
+}
+
+#[test]
+fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
+    let registry = MetricRegistry::new("cap_test");
+
+    // Populate up to capacity
+    for i in 0..MAX_METRIC_ENTRIES {
+        registry.record_counter(&format!("counter_{i}"), 1);
+    }
+    assert_eq!(registry.metrics().len(), MAX_METRIC_ENTRIES);
+
+    // Attempting to add a new distinct entry must be dropped
+    registry.record_counter("overflow_counter", 100);
+    assert_eq!(registry.read_counter("overflow_counter"), 0);
+    assert_eq!(registry.metrics().len(), MAX_METRIC_ENTRIES);
+
+    registry.record_gauge("overflow_gauge", 42);
+    assert_eq!(registry.read_gauge("overflow_gauge"), None);
+    assert_eq!(registry.metrics().len(), MAX_METRIC_ENTRIES);
+
+    // Updating existing entries still succeeds
+    registry.record_counter("counter_0", 5);
+    assert_eq!(registry.read_counter("counter_0"), 6);
 }

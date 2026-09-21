@@ -26,6 +26,50 @@ fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Fie
             ));
             new_f.with_nullable(true)
         }
+        arrow::datatypes::DataType::List(child) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::List(Arc::new(
+                make_field_nullable(child),
+            )));
+            new_f.with_nullable(true)
+        }
+        arrow::datatypes::DataType::LargeList(child) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::LargeList(Arc::new(
+                make_field_nullable(child),
+            )));
+            new_f.with_nullable(true)
+        }
+        arrow::datatypes::DataType::FixedSizeList(child, size) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::FixedSizeList(
+                Arc::new(make_field_nullable(child)),
+                *size,
+            ));
+            new_f.with_nullable(true)
+        }
+        arrow::datatypes::DataType::ListView(child) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::ListView(Arc::new(
+                make_field_nullable(child),
+            )));
+            new_f.with_nullable(true)
+        }
+        arrow::datatypes::DataType::LargeListView(child) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::LargeListView(Arc::new(
+                make_field_nullable(child),
+            )));
+            new_f.with_nullable(true)
+        }
+        arrow::datatypes::DataType::Map(child, sorted) => {
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::Map(
+                Arc::new(make_field_nullable(child)),
+                *sorted,
+            ));
+            new_f.with_nullable(true)
+        }
         _ => field.clone().with_nullable(true),
     }
 }
@@ -59,17 +103,17 @@ pub fn verify_structural_immutability(
 
         let input_was_null = input_col_info
             .as_ref()
-            .map_or(true, |(_, was_null)| *was_null);
+            .is_none_or(|(_, was_null)| *was_null);
 
         if let Ok(idx) = schema.index_of(col_name) {
             let col = output.column(idx);
-            if let Some((in_dtype, _)) = input_col_info {
-                if col.data_type() != &in_dtype {
-                    return Err(WasmTransformError::Pipeline(format!(
-                        "Immutability violation: core field '{col_name}' data type mutated from {in_dtype:?} to {:?}",
-                        col.data_type()
-                    )));
-                }
+            if let Some((in_dtype, _)) = input_col_info
+                && col.data_type() != &in_dtype
+            {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Immutability violation: core field '{col_name}' data type mutated from {in_dtype:?} to {:?}",
+                    col.data_type()
+                )));
             }
             if col.null_count() == col.len() && !col.is_empty() && !input_was_null {
                 return Err(WasmTransformError::Pipeline(format!(

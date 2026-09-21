@@ -21,6 +21,9 @@ pub const MAX_METRIC_NAME_LEN: usize = 256;
 /// Maximum allowed length in bytes for log messages read from guest memory (64 KiB).
 pub const MAX_LOG_MESSAGE_LEN: usize = 65_536;
 
+/// Maximum distinct metric entries permitted in a [`MetricRegistry`] to prevent unbounded memory growth.
+pub const MAX_METRIC_ENTRIES: usize = 2048;
+
 /// Lifecycle execution phase of the host worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostPhase {
@@ -45,6 +48,7 @@ pub enum MetricValue {
 #[derive(Debug)]
 pub struct MetricRegistry {
     component_id: String,
+    prefix: String,
     metrics: DashMap<String, MetricValue>,
 }
 
@@ -54,18 +58,30 @@ impl MetricRegistry {
     pub fn new(component_id: &str) -> Self {
         Self {
             component_id: component_id.to_string(),
+            prefix: format!("datalake_transformers_{component_id}_"),
             metrics: DashMap::new(),
         }
     }
 
-    /// Formats a metric name into its full scoped key.
+    /// Formats a metric name into its full scoped key with pre-allocated capacity.
     fn format_key(&self, name: &str) -> String {
-        format!("datalake_transformers_{}_{name}", self.component_id)
+        let mut key = String::with_capacity(self.prefix.len() + name.len());
+        key.push_str(&self.prefix);
+        key.push_str(name);
+        key
     }
 
-    /// Records a counter increment with saturating addition.
+    /// Records a counter increment with saturating addition and bounded entry capacity.
     pub fn record_counter(&self, name: &str, delta: u64) {
         let key = self.format_key(name);
+        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new counter metric registration"
+            );
+            return;
+        }
         self.metrics
             .entry(key)
             .and_modify(|val| {
@@ -78,9 +94,17 @@ impl MetricRegistry {
             .or_insert(MetricValue::Counter(delta));
     }
 
-    /// Records an instantaneous gauge bitcast value.
+    /// Records an instantaneous gauge bitcast value with bounded entry capacity.
     pub fn record_gauge(&self, name: &str, bits: u64) {
         let key = self.format_key(name);
+        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new gauge metric registration"
+            );
+            return;
+        }
         self.metrics.insert(key, MetricValue::Gauge(bits));
     }
 
