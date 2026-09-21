@@ -1149,7 +1149,7 @@ async fn test_worker_handles_execution_timeout() {
 
     let mut cfg = default_test_config();
     cfg.max_execution_duration = "50ms".into();
-    
+
     let mut worker = WasmWorker::new(60, Arc::clone(&cache), module, cfg).unwrap();
     let batch = create_test_record_batch();
 
@@ -1191,7 +1191,9 @@ async fn test_worker_guards_positive_batch_count_null_ptr() {
         .execute_batch(SignalBatch::Logs(batch))
         .await
         .unwrap_err();
-    assert!(matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Malformed response: positive batch_count with null descriptor pointer")));
+    assert!(
+        matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Malformed response: positive batch_count with null descriptor pointer"))
+    );
 }
 
 fn excessive_aggregate_wat() -> &'static str {
@@ -1227,5 +1229,7 @@ async fn test_worker_guards_excessive_aggregate_batch_size() {
         .execute_batch(SignalBatch::Logs(batch))
         .await
         .unwrap_err();
-    assert!(matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Cumulative batch output size exceeds maximum allowed 64MiB limit")));
+    assert!(
+        matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Cumulative batch output size exceeds maximum allowed 64MiB limit"))
+    );
 }

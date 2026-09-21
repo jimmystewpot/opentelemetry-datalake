@@ -128,7 +128,7 @@ impl WasmWorker {
         let mut guest = Self::instantiate_guest(engine.engine(), &module, init_deadline_ticks)?;
         Self::initialize_guest(&mut guest, &config)?;
         let local_generation = engine.module_generation();
-        
+
         let duration_ms = parse_duration_ms(&config.max_execution_duration).unwrap_or(500);
         let epoch_deadline_ticks = duration_ms.max(10) / 10;
 
@@ -254,7 +254,11 @@ impl WasmWorker {
     /// Returns [`WasmTransformError`] if re-instantiation fails, required exports are missing,
     /// or guest initialization fails.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let mut guest = Self::instantiate_guest(self.engine.engine(), &self.module, self.epoch_deadline_ticks)?;
+        let mut guest = Self::instantiate_guest(
+            self.engine.engine(),
+            &self.module,
+            self.epoch_deadline_ticks,
+        )?;
         Self::initialize_guest(&mut guest, &self.config)?;
         self.store = guest.store;
         self.instance = guest.instance;
@@ -394,7 +398,8 @@ impl WasmWorker {
                     Ok(WorkerOutcome::Emitted(vec![]))
                 } else if header.batches_ptr == 0 {
                     Err(WasmTransformError::Pipeline(
-                        "Malformed response: positive batch_count with null descriptor pointer".into(),
+                        "Malformed response: positive batch_count with null descriptor pointer"
+                            .into(),
                     ))
                 } else {
                     let out_batches = extract_output_batches(
@@ -446,7 +451,7 @@ impl WasmWorker {
         let abi_fn = instance
             .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
             .map_err(|_| WasmTransformError::MissingExport("datalake_abi_version".into()))?;
-        
+
         let version = abi_fn.call(&mut store, ())?;
         if version != opentelemetry_datalake_wasm_sdk::abi::ABI_VERSION {
             return Err(WasmTransformError::AbiVersionMismatch(version));
@@ -626,7 +631,7 @@ fn extract_output_batches(
         total_bytes = total_bytes.saturating_add(b_len_usize);
         if total_bytes > 64 * 1024 * 1024 {
             return Err(WasmTransformError::Pipeline(
-                "Cumulative batch output size exceeds maximum allowed 64MiB limit".into()
+                "Cumulative batch output size exceeds maximum allowed 64MiB limit".into(),
             ));
         }
 
