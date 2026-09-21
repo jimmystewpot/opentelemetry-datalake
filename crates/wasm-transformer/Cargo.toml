@@ -15,6 +15,7 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true }
+dashmap = { workspace = true }
 opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
 
 [dev-dependencies]

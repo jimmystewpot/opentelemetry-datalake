@@ -1233,3 +1233,90 @@ async fn test_worker_guards_excessive_aggregate_batch_size() {
         matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Cumulative batch output size exceeds maximum allowed 64MiB limit"))
     );
 }
+
+fn v1_abi_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        ;; C-ABI v1: (signal_type: i32, ipc_ptr: i32, ipc_len: i32) -> i64
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            ;; Write header at 256: status = 0, batch_count = 0
+            (i32.store (i32.const 256) (i32.const 0))
+            (i32.store (i32.const 260) (i32.const 0))
+            ;; Pack response_ptr (256) in upper 32 bits, len (20) in lower 32 bits
+            ;; 256 << 32 | 20 = 1099511627804
+            (i64.const 1099511627804)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_executes_c_abi_v1_three_arg_transform() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(v1_abi_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(63, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+
+    match outcome {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 0);
+        }
+        _ => panic!("Expected WorkerOutcome::Emitted"),
+    }
+}
+
+fn host_imports_wat() -> &'static str {
+    r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (import "env" "datalake_host_log" (func $log (param i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 500) "events_total")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            ;; Emit metric type 0 (counter), ptr 500, len 12, delta 42
+            (call $metric (i32.const 0) (i32.const 500) (i32.const 12) (i64.const 42))
+            ;; Emit log: level 3 (info), msg_ptr 500, msg_len 12
+            (call $log (i32.const 3) (i32.const 500) (i32.const 12))
+
+            ;; Write response header at 256: status=0, batch_count=0
+            (i32.store (i32.const 256) (i32.const 0))
+            (i32.store (i32.const 260) (i32.const 0))
+            (i64.const 1099511627804)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_links_host_functions_and_collects_metrics() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(host_imports_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(64, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.registry().read_counter("events_total"), 42);
+}

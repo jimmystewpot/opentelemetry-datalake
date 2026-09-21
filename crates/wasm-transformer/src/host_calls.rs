@@ -86,7 +86,7 @@ impl MetricRegistry {
             .entry(key)
             .and_modify(|val| {
                 if let MetricValue::Counter(c) = val {
-                    *c = c.saturating_add(delta);
+                    *c = (*c).saturating_add(delta);
                 } else {
                     *val = MetricValue::Counter(delta);
                 }
@@ -113,7 +113,7 @@ impl MetricRegistry {
     pub fn read_counter(&self, name: &str) -> u64 {
         let key = self.format_key(name);
         match self.metrics.get(&key).as_deref() {
-            Some(MetricValue::Counter(c)) => *c,
+            Some(&MetricValue::Counter(c)) => c,
             _ => 0,
         }
     }
@@ -123,7 +123,7 @@ impl MetricRegistry {
     pub fn read_gauge(&self, name: &str) -> Option<u64> {
         let key = self.format_key(name);
         match self.metrics.get(&key).as_deref() {
-            Some(MetricValue::Gauge(bits)) => Some(*bits),
+            Some(&MetricValue::Gauge(bits)) => Some(bits),
             _ => None,
         }
     }

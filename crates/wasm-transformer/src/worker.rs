@@ -6,6 +6,7 @@
 
 use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
+use crate::host_calls::{HostPhase, HostState, MetricRegistry, build_host_linker};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -37,13 +38,35 @@ pub enum WorkerOutcome {
     },
 }
 
+/// Typed handle to the guest's `datalake_transform` export.
+///
+/// Supports both the canonical C-ABI v1 3-argument signature
+/// `(signal_type: u32, ipc_ptr: u32, ipc_len: u32) -> u64`
+/// and the legacy 2-argument signature `(ipc_ptr: u32, ipc_len: u32) -> u32`.
+#[derive(Clone)]
+pub enum TransformFunc {
+    /// Canonical C-ABI v1: `datalake_transform(signal_type, ipc_ptr, ipc_len) -> u64`.
+    V1(TypedFunc<(u32, u32, u32), u64>),
+    /// 2-argument variant: `datalake_transform(ipc_ptr, ipc_len) -> u32`.
+    V0(TypedFunc<(u32, u32), u32>),
+}
+
+impl std::fmt::Debug for TransformFunc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1(_) => write!(f, "TransformFunc::V1"),
+            Self::V0(_) => write!(f, "TransformFunc::V0"),
+        }
+    }
+}
+
 /// Internal container for guest Wasmtime execution state and exported entry points.
 struct GuestComponents {
-    store: Store<()>,
+    store: Store<HostState>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
-    transform_fn: TypedFunc<(u32, u32), u32>,
+    transform_fn: TransformFunc,
     memory: Memory,
 }
 
@@ -68,11 +91,12 @@ pub struct WasmWorker {
     module: Arc<Module>,
     config: WasmTransformerConfig,
     filtered_env: std::collections::HashMap<String, String>,
-    store: Store<()>,
+    registry: Arc<MetricRegistry>,
+    store: Store<HostState>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
-    transform_fn: TypedFunc<(u32, u32), u32>,
+    transform_fn: TransformFunc,
     memory: Memory,
     batches_processed: u64,
     local_generation: u64,
@@ -125,7 +149,13 @@ impl WasmWorker {
 
         let filtered_env =
             crate::wasi_env::filter_environment_variables(&config.env_whitelist, &config.env);
-        let mut guest = Self::instantiate_guest(engine.engine(), &module, init_deadline_ticks)?;
+        let registry = Arc::new(MetricRegistry::new(&config.id));
+        let mut guest = Self::instantiate_guest(
+            engine.engine(),
+            &module,
+            init_deadline_ticks,
+            Arc::clone(&registry),
+        )?;
         Self::initialize_guest(&mut guest, &config)?;
         let local_generation = engine.module_generation();
 
@@ -138,6 +168,7 @@ impl WasmWorker {
             module,
             config,
             filtered_env,
+            registry,
             store: guest.store,
             instance: guest.instance,
             alloc_fn: guest.alloc_fn,
@@ -149,6 +180,12 @@ impl WasmWorker {
             rejuvenate_threshold_bytes,
             epoch_deadline_ticks,
         })
+    }
+
+    /// Returns a reference to the worker's metric registry.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<MetricRegistry> {
+        &self.registry
     }
 
     /// Executes a transformation over a [`SignalBatch`].
@@ -204,7 +241,22 @@ impl WasmWorker {
         }
 
         // 3. Invoke datalake_transform and free input buffer
-        let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        let transform_res = match &self.transform_fn {
+            TransformFunc::V1(func) => {
+                let signal_type = match &batch {
+                    SignalBatch::Logs(_) => 0u32,
+                    SignalBatch::Metrics(_) => 1u32,
+                    SignalBatch::Traces(_) => 2u32,
+                };
+                func.call(&mut self.store, (signal_type, ipc_ptr, ipc_len))
+                    .map(|packed| {
+                        let ptr = (packed >> 32) as u32;
+                        let len = (packed & 0xFFFF_FFFF) as u32;
+                        if ptr == 0 && len > 0 { len } else { ptr }
+                    })
+            }
+            TransformFunc::V0(func) => func.call(&mut self.store, (ipc_ptr, ipc_len)),
+        };
         if transform_res.is_ok()
             && let Err(e) = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len))
         {
@@ -258,6 +310,7 @@ impl WasmWorker {
             self.engine.engine(),
             &self.module,
             self.epoch_deadline_ticks,
+            Arc::clone(&self.registry),
         )?;
         Self::initialize_guest(&mut guest, &self.config)?;
         self.store = guest.store;
@@ -443,10 +496,18 @@ impl WasmWorker {
         engine: &wasmtime::Engine,
         module: &Module,
         init_deadline_ticks: u64,
+        registry: Arc<MetricRegistry>,
     ) -> Result<GuestComponents, WasmTransformError> {
-        let mut store = Store::new(engine, ());
+        let mut store = Store::new(
+            engine,
+            HostState {
+                phase: HostPhase::Init,
+                registry,
+            },
+        );
         store.set_epoch_deadline(init_deadline_ticks);
-        let instance = Instance::new(&mut store, module, &[])?;
+        let linker = build_host_linker(engine)?;
+        let instance = linker.instantiate(&mut store, module)?;
 
         let abi_fn = instance
             .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
@@ -463,9 +524,19 @@ impl WasmWorker {
         let dealloc_fn = instance
             .get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")
             .map_err(|_| WasmTransformError::MissingExport("datalake_dealloc".into()))?;
-        let transform_fn = instance
-            .get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
-            .map_err(|_| WasmTransformError::MissingExport("datalake_transform".into()))?;
+        let transform_fn = if let Ok(func) =
+            instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
+        {
+            TransformFunc::V1(func)
+        } else if let Ok(func) =
+            instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
+        {
+            TransformFunc::V0(func)
+        } else {
+            return Err(WasmTransformError::MissingExport(
+                "datalake_transform".into(),
+            ));
+        };
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmTransformError::MissingExport("memory".into()))?;
@@ -562,9 +633,9 @@ fn serialize_batch_to_ipc(record_batch: &RecordBatch) -> Result<Vec<u8>, WasmTra
 const MAX_GUEST_MESSAGE_LEN: usize = 64 * 1024;
 
 /// Reads an optional UTF-8 message string from guest memory.
-fn read_guest_message(
+fn read_guest_message<T>(
     memory: &Memory,
-    store: &Store<()>,
+    store: &Store<T>,
     message_ptr: u32,
     message_len: u32,
 ) -> String {
@@ -588,9 +659,9 @@ fn read_guest_message(
 const MAX_GUEST_BATCH_COUNT: u32 = 1024;
 
 /// Extracts transformed output batches from guest memory via a `BatchDescriptor` array.
-fn extract_output_batches(
+fn extract_output_batches<T>(
     memory: &Memory,
-    store: &Store<()>,
+    store: &Store<T>,
     batches_ptr: u32,
     batch_count: u32,
     input_batch: &SignalBatch,
