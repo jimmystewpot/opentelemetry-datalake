@@ -10,7 +10,3 @@ pub mod metrics;
 pub mod panic;
 pub mod traits;
 
-/// Logs an error message to the host logger or stderr.
-pub fn log_error(msg: &str) {
-    panic::log_error(msg);
-}

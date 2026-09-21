@@ -47,21 +47,26 @@ pub fn extract_panic_payload<'a>(payload: &'a (dyn std::any::Any + 'static)) -> 
     }
 }
 
-/// Formats a panic hook info into a concise log message without allocating the full debug backtrace.
-#[must_use]
-pub fn format_panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
-    let msg = extract_panic_payload(info.payload());
-    let location = info.location().map_or("unknown", |l| l.file());
-    format!("Panic at {location}: {msg}")
-}
-
 /// Panic hook callback forwarding formatted guest panic messages to the host logger.
 ///
 /// Avoids dynamic `info.to_string()` allocation which constructs the entire `PanicHookInfo`
 /// debug tree and backtrace, preventing secondary OOM crashes in memory-constrained guests.
 pub fn wasm_panic_hook(info: &std::panic::PanicHookInfo<'_>) {
-    let log_msg = format_panic_message(info);
-    log_error(&log_msg);
+    let msg = extract_panic_payload(info.payload());
+
+    let mut loc_buf = [0u8; 256];
+    let loc_str = if let Some(location) = info.location() {
+        use std::io::Write;
+        let mut slice: &mut [u8] = &mut loc_buf;
+        let _ = write!(slice, "Panic at {}:{}: ", location.file(), location.line());
+        let len = 256 - slice.len();
+        std::str::from_utf8(&loc_buf[..len]).unwrap_or("Panic at unknown location: ")
+    } else {
+        "Panic at unknown location: "
+    };
+
+    log_error(loc_str);
+    log_error(msg);
 }
 
 /// Registers a global panic hook forwarding panics to the host logger.
