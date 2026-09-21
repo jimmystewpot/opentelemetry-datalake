@@ -94,8 +94,19 @@ arrow = { version = "59", default-features = false, features = ["json", "ipc"] }
 parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2", "lz4"] }
 
 # WebAssembly Runtime (Wasmtime 48 — current stable, Rust 1.98+ required)
-wasmtime = { version = "48", default-features = false, features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "48", default-features = false }
+wasmtime = { version = "48", default-features = false, features = [
+    "async",             # Non-blocking async execution (call_async) avoiding Tokio thread starvation
+    "cranelift",         # Native JIT compiler backend
+    "pooling-allocator", # Pre-allocated memory pool avoiding per-instance mmap overhead
+    "runtime",           # Core execution engine types (Store, Instance, Linker)
+    "backtrace",         # Trap stack trace capture
+    "addr2line",         # Maps trap program counters to source code locations
+    "demangle",          # Demangles symbol names in error output
+] }
+wasmtime-wasi = { version = "48", default-features = false, features = [
+    "p1",                # WASI Preview 1 syscall shims (clocks, random, stdio)
+    "p2",                # WASI Preview 2 component-model async foundation
+] }
 
 # Concurrent Collections
 dashmap = { version = "6.0", default-features = false }
