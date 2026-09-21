@@ -188,9 +188,7 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     while (id as u32) == 0 {
         id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    // Safe to cast u64 ID to pointer representation on 64-bit OS for test harness handle generation.
-    let ptr = id as *mut u8;
-    let handle = ptr as usize as u32;
+    let handle = id as u32;
     let mut lock = match NATIVE_ALLOCS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -246,6 +244,9 @@ mod tests {
 
     #[test]
     fn test_test_allocator_u64_wrap_around_prevention() {
+        // Read original value to restore it later to maintain test isolation.
+        let original_id = NEXT_ID.load(std::sync::atomic::Ordering::SeqCst);
+
         // Test that NEXT_ID uses AtomicU64 and that when approaching/crossing the 32-bit boundary (u32::MAX),
         // datalake_alloc never returns 0 (null handle) and allocation succeeds.
         NEXT_ID.store(u64::from(u32::MAX), std::sync::atomic::Ordering::SeqCst);
@@ -261,5 +262,8 @@ mod tests {
 
         datalake_dealloc(ptr1, 64);
         datalake_dealloc(ptr2, 64);
+
+        // Restore original value
+        NEXT_ID.store(original_id, std::sync::atomic::Ordering::SeqCst);
     }
 }
