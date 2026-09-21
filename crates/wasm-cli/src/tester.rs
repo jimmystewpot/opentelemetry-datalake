@@ -23,7 +23,10 @@ pub enum TesterError {
 ///
 /// Returns an error string if an immutable column present in `input` is missing from `output`,
 /// or if the values in an immutable column have been altered.
-pub fn verify_batch_immutability(input: &RecordBatch, output: &RecordBatch) -> std::result::Result<(), TesterError> {
+pub fn verify_batch_immutability(
+    input: &RecordBatch,
+    output: &RecordBatch,
+) -> std::result::Result<(), TesterError> {
     let in_schema = input.schema();
     let out_schema = output.schema();
     for &col_name in IMMUTABLE_COLUMNS {

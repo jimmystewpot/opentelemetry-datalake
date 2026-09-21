@@ -33,7 +33,11 @@ fn test_validate_rejects_missing_alloc_export() {
     let wasm = wat::parse_str(wat_src).unwrap();
     let res = validate_wasm_bytes(&wasm);
     assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("Missing export 'datalake_alloc'"));
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Missing export 'datalake_alloc'")
+    );
 }
 
 #[test]
