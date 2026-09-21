@@ -1,11 +1,18 @@
 //! Wasmtime engine cache and pooling allocator configuration.
 
 use crate::error::WasmTransformError;
+use sha2::{Digest, Sha256};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, Module, PoolingAllocationConfig};
+
+fn compute_sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
 
 /// Engine cache maintaining a compiled WebAssembly module and generation counter.
 pub struct EngineCache {
@@ -54,6 +61,30 @@ impl EngineCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(Arc::clone(&module));
         Ok(module)
+    }
+
+    /// Compiles a WebAssembly binary into an `Arc<Module>` and stores it in the cache,
+    /// optionally verifying its SHA-256 hash if `expected_sha256` is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError::Sha256Mismatch`] if hash verification fails,
+    /// or [`WasmTransformError::Wasmtime`] if module compilation fails.
+    pub fn compile_module_with_sha256(
+        &self,
+        bytes: &[u8],
+        expected_sha256: Option<&str>,
+    ) -> Result<Arc<Module>, WasmTransformError> {
+        if let Some(expected) = expected_sha256 {
+            let actual = compute_sha256_hex(bytes);
+            if !actual.eq_ignore_ascii_case(expected.trim()) {
+                return Err(WasmTransformError::Sha256Mismatch {
+                    expected: expected.trim().to_string(),
+                    actual,
+                });
+            }
+        }
+        self.compile_module(bytes)
     }
 
     /// Retrieves the currently compiled module from the cache, if available.

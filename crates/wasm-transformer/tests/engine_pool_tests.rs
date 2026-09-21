@@ -92,3 +92,48 @@ fn test_error_variants() {
     ));
     assert_eq!(io_err.to_string(), "IO error: file not found");
 }
+
+#[test]
+fn test_compile_module_with_sha256_match_and_mismatch() {
+    use sha2::{Digest, Sha256};
+
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+
+    // Mismatched hash
+    let err = cache
+        .compile_module_with_sha256(
+            &wasm_bytes,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        WasmTransformError::Sha256Mismatch { ref expected, .. }
+            if expected == "0000000000000000000000000000000000000000000000000000000000000000"
+    ));
+
+    // Correct computed hash
+    let mut hasher = Sha256::new();
+    hasher.update(&wasm_bytes);
+    let expected = hex::encode(hasher.finalize());
+
+    let module = cache
+        .compile_module_with_sha256(&wasm_bytes, Some(&expected))
+        .unwrap();
+    assert_eq!(cache.module_generation(), 0);
+    assert!(cache.module().is_some());
+    assert!(Arc::ptr_eq(&module, &cache.module().unwrap()));
+
+    // Case-insensitive and trimmed hash
+    let expected_upper = format!("  {}  ", expected.to_uppercase());
+    let module_trimmed = cache
+        .compile_module_with_sha256(&wasm_bytes, Some(&expected_upper))
+        .unwrap();
+    assert!(Arc::ptr_eq(&module_trimmed, &cache.module().unwrap()));
+
+    // None hash (skip verification)
+    let module_none = cache.compile_module_with_sha256(&wasm_bytes, None).unwrap();
+    assert!(cache.module().is_some());
+    assert!(Arc::ptr_eq(&module_none, &cache.module().unwrap()));
+}
