@@ -55,9 +55,11 @@ impl EngineCache {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
         let engine_clone = engine.clone();
-        std::thread::spawn(move || {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             while is_running_clone.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                interval.tick().await;
                 engine_clone.increment_epoch();
             }
         });

@@ -14,8 +14,8 @@ fn valid_wat() -> &'static str {
     )"#
 }
 
-#[test]
-fn test_pooling_allocator_instantiation_and_available_slots() {
+#[tokio::test]
+async fn test_pooling_allocator_instantiation_and_available_slots() {
     let cache = Arc::new(EngineCache::new_pooling(4, 64 * 1024 * 1024).expect("engine init"));
     let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
     let module = cache.compile_module(&wasm_bytes).expect("module compile");
@@ -23,14 +23,14 @@ fn test_pooling_allocator_instantiation_and_available_slots() {
     assert_eq!(pool.available_slots(), 4);
 }
 
-#[test]
-fn test_module_generation_starts_at_zero() {
+#[tokio::test]
+async fn test_module_generation_starts_at_zero() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
     assert_eq!(cache.module_generation(), 0);
 }
 
-#[test]
-fn test_module_getter_before_and_after_compilation() {
+#[tokio::test]
+async fn test_module_getter_before_and_after_compilation() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).expect("engine init");
     assert!(cache.module().is_none());
 
@@ -40,22 +40,22 @@ fn test_module_getter_before_and_after_compilation() {
     assert!(Arc::ptr_eq(&compiled, &retrieved));
 }
 
-#[test]
-fn test_engine_reference() {
+#[tokio::test]
+async fn test_engine_reference() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).expect("engine init");
     let _engine = cache.engine();
 }
 
-#[test]
-fn test_compile_invalid_wasm_bytes() {
+#[tokio::test]
+async fn test_compile_invalid_wasm_bytes() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).expect("engine init");
     let invalid_bytes = b"not a wasm binary";
     let res = cache.compile_module(invalid_bytes);
     assert!(matches!(res, Err(WasmTransformError::Wasmtime(_))));
 }
 
-#[test]
-fn test_error_variants() {
+#[tokio::test]
+async fn test_error_variants() {
     let err = WasmTransformError::AbiVersionMismatch(99);
     assert_eq!(err.to_string(), "ABI version mismatch: expected 1, got 99");
 
@@ -93,8 +93,8 @@ fn test_error_variants() {
     assert_eq!(io_err.to_string(), "IO error: file not found");
 }
 
-#[test]
-fn test_compile_module_with_sha256_match_and_mismatch() {
+#[tokio::test]
+async fn test_compile_module_with_sha256_match_and_mismatch() {
     use sha2::{Digest, Sha256};
 
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
@@ -138,8 +138,8 @@ fn test_compile_module_with_sha256_match_and_mismatch() {
     assert!(Arc::ptr_eq(&module_none, &cache.module().unwrap()));
 }
 
-#[test]
-fn test_pooling_allocator_zero_concurrency_clamps_to_one() {
+#[tokio::test]
+async fn test_pooling_allocator_zero_concurrency_clamps_to_one() {
     let cache = Arc::new(EngineCache::new_pooling(0, 32 * 1024 * 1024).unwrap());
     let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
     let module = cache.compile_module(&wasm_bytes).unwrap();
@@ -150,8 +150,8 @@ fn test_pooling_allocator_zero_concurrency_clamps_to_one() {
     assert!(debug_str.contains("InstancePool"));
 }
 
-#[test]
-fn test_engine_cache_clean_drop() {
+#[tokio::test]
+async fn test_engine_cache_clean_drop() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
     // Drop cache and ensure thread exits without deadlock or panic
     drop(cache);

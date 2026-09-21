@@ -287,14 +287,31 @@ impl WasmWorker {
             header.message_len,
         );
 
+        let mut allocs_to_free = vec![(header_ptr, 20)];
+        if header.message_ptr > 0 && header.message_len > 0 {
+            allocs_to_free.push((header.message_ptr, header.message_len));
+        }
+        if header.batch_count > 0 && header.batches_ptr > 0 {
+            allocs_to_free.push((header.batches_ptr, header.batch_count.saturating_mul(8)));
+        }
+
         // 5. Dispatch outcome and extract transformed batches while guest memory is intact
-        let outcome = match self.dispatch_outcome(&header, &message, batch) {
+        let outcome = match self.dispatch_outcome(&header, &message, batch, &mut allocs_to_free) {
             Ok(o) => o,
             Err(e) => {
                 let _ = self.rejuvenate();
                 return Err(e);
             }
         };
+
+        // 6. Free guest allocations on the happy path to prevent memory growth
+        for (ptr, len) in allocs_to_free {
+            if let Err(_) = self.dealloc_fn.call(&mut self.store, (ptr, len)) {
+                let _ = self.rejuvenate();
+                break;
+            }
+        }
+
         self.batches_processed = self.batches_processed.saturating_add(1);
         self.check_rejuvenation()?;
         Ok(outcome)
@@ -445,6 +462,7 @@ impl WasmWorker {
         header: &ParsedHeader,
         message: &str,
         batch: SignalBatch,
+        allocs_to_free: &mut Vec<(u32, u32)>,
     ) -> Result<WorkerOutcome, WasmTransformError> {
         match header.status {
             0 => {
@@ -463,6 +481,7 @@ impl WasmWorker {
                         header.batch_count,
                         &batch,
                         self.config.schema_guard,
+                        allocs_to_free,
                     )?;
                     Ok(WorkerOutcome::Emitted(out_batches))
                 }
@@ -668,6 +687,7 @@ fn extract_output_batches<T>(
     batch_count: u32,
     input_batch: &SignalBatch,
     schema_guard: SchemaGuardMode,
+    allocs_to_free: &mut Vec<(u32, u32)>,
 ) -> Result<Vec<SignalBatch>, WasmTransformError> {
     if batch_count > MAX_GUEST_BATCH_COUNT {
         return Err(WasmTransformError::Pipeline(format!(
@@ -704,6 +724,10 @@ fn extract_output_batches<T>(
             u32::from_le_bytes([desc_bytes[0], desc_bytes[1], desc_bytes[2], desc_bytes[3]]);
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
+
+        if b_ptr > 0 && b_len > 0 {
+            allocs_to_free.push((b_ptr, b_len));
+        }
 
         let b_len_usize = b_len as usize;
         total_bytes = total_bytes.saturating_add(b_len_usize);
