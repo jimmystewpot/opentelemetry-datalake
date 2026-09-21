@@ -108,15 +108,30 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ByteSizeParseError> {
     }
 
     let lower = s.to_ascii_lowercase();
-    let (num_len, multiplier) = if let Some(stripped) = lower.strip_suffix("tib").or_else(|| lower.strip_suffix("tb")) {
+    let (num_len, multiplier) = if let Some(stripped) = lower
+        .strip_suffix("tib")
+        .or_else(|| lower.strip_suffix("tb"))
+    {
         (stripped.len(), 1024 * 1024 * 1024 * 1024)
-    } else if let Some(stripped) = lower.strip_suffix("gib").or_else(|| lower.strip_suffix("gb")) {
+    } else if let Some(stripped) = lower
+        .strip_suffix("gib")
+        .or_else(|| lower.strip_suffix("gb"))
+    {
         (stripped.len(), 1024 * 1024 * 1024)
-    } else if let Some(stripped) = lower.strip_suffix("mib").or_else(|| lower.strip_suffix("mb")) {
+    } else if let Some(stripped) = lower
+        .strip_suffix("mib")
+        .or_else(|| lower.strip_suffix("mb"))
+    {
         (stripped.len(), 1024 * 1024)
-    } else if let Some(stripped) = lower.strip_suffix("kib").or_else(|| lower.strip_suffix("kb")) {
+    } else if let Some(stripped) = lower
+        .strip_suffix("kib")
+        .or_else(|| lower.strip_suffix("kb"))
+    {
         (stripped.len(), 1024)
-    } else if let Some(stripped) = lower.strip_suffix("bytes").or_else(|| lower.strip_suffix("b")) {
+    } else if let Some(stripped) = lower
+        .strip_suffix("bytes")
+        .or_else(|| lower.strip_suffix("b"))
+    {
         (stripped.len(), 1)
     } else {
         (s.len(), 1)
@@ -191,10 +206,10 @@ fn default_init_timeout() -> std::time::Duration {
 /// Configuration for a WebAssembly (WASM) transformer runtime and isolation sandbox.
 ///
 /// **Concurrency Behavior:**
-/// This configuration is instantiated once at startup and is typically cloned per-worker 
-/// during initialization. The `concurrency` setting directly determines the number of parallel 
-/// WebAssembly instances (and Tokio tasks) spawned for this transformation step. The 
-/// `worker_channel_capacity` sets the buffer size for the bounded MPSC channel feeding 
+/// This configuration is instantiated once at startup and is typically cloned per-worker
+/// during initialization. The `concurrency` setting directly determines the number of parallel
+/// WebAssembly instances (and Tokio tasks) spawned for this transformation step. The
+/// `worker_channel_capacity` sets the buffer size for the bounded MPSC channel feeding
 /// each individual worker, allowing it to absorb backpressure asynchronously.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct WasmTransformerConfig {
