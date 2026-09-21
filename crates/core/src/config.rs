@@ -170,7 +170,7 @@ fn default_drain_timeout() -> std::time::Duration {
 
 const DEFAULT_MAX_BATCH_ROWS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(5000) {
     Some(v) => v,
-    None => panic!("non-zero value"),
+    None => std::num::NonZeroUsize::MIN,
 };
 const fn default_max_batch_rows() -> std::num::NonZeroUsize {
     DEFAULT_MAX_BATCH_ROWS
@@ -178,17 +178,13 @@ const fn default_max_batch_rows() -> std::num::NonZeroUsize {
 
 const DEFAULT_CONCURRENCY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(4) {
     Some(v) => v,
-    None => panic!("non-zero value"),
+    None => std::num::NonZeroUsize::MIN,
 };
 const fn default_concurrency() -> std::num::NonZeroUsize {
     DEFAULT_CONCURRENCY
 }
 
-const DEFAULT_WORKER_CHANNEL_CAPACITY: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(1)
-{
-    Some(v) => v,
-    None => panic!("non-zero value"),
-};
+const DEFAULT_WORKER_CHANNEL_CAPACITY: std::num::NonZeroUsize = std::num::NonZeroUsize::MIN;
 const fn default_worker_channel_capacity() -> std::num::NonZeroUsize {
     DEFAULT_WORKER_CHANNEL_CAPACITY
 }
@@ -308,6 +304,9 @@ pub enum WasmConfigValidationError {
         /// Configured maximum memory limit in bytes.
         max_memory: usize,
     },
+    /// Passthrough on error requested without explicit unmasked passthrough authorization.
+    #[error("on_error = 'passthrough' requires allow_unmasked_passthrough = true")]
+    UnauthorizedPassthrough,
 }
 
 impl WasmTransformerConfig {
@@ -320,6 +319,7 @@ impl WasmTransformerConfig {
     /// - `type` is not "wasm"
     /// - `module_path` is empty or only whitespace
     /// - `rejuvenate_threshold` is strictly greater than `max_memory`
+    /// - `on_error` is "passthrough" and `allow_unmasked_passthrough` is false
     pub fn validate(&self) -> Result<(), WasmConfigValidationError> {
         if self.id.trim().is_empty() {
             return Err(WasmConfigValidationError::EmptyId);
@@ -335,6 +335,9 @@ impl WasmTransformerConfig {
                 rejuvenate_threshold: self.rejuvenate_threshold,
                 max_memory: self.max_memory,
             });
+        }
+        if self.on_error == OnErrorPolicy::Passthrough && !self.allow_unmasked_passthrough {
+            return Err(WasmConfigValidationError::UnauthorizedPassthrough);
         }
         Ok(())
     }

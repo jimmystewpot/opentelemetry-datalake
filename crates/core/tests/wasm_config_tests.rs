@@ -5,6 +5,8 @@ use pipeline_core::config::{
 use pipeline_core::error::PipelineError;
 use std::time::Duration;
 
+fn assert_implements_clone_and_eq<T: Clone + Eq>() {}
+
 #[test]
 fn test_wasm_config_deserializes_explicit_fields() {
     let toml_str = r#"
@@ -331,7 +333,6 @@ fn test_parse_byte_size_direct_api_errors() {
     assert_eq!(err, cloned);
     assert_eq!(err, ByteSizeParseError::Empty);
 
-    fn assert_implements_clone_and_eq<T: Clone + Eq>() {}
     assert_implements_clone_and_eq::<ByteSizeParseError>();
 }
 
@@ -448,6 +449,56 @@ fn test_wasm_config_validation_error_display_and_traits() {
     let cloned = err_empty_id.clone();
     assert_eq!(err_empty_id, cloned);
 
-    fn assert_implements_clone_and_eq<T: Clone + Eq>() {}
     assert_implements_clone_and_eq::<WasmConfigValidationError>();
+}
+
+#[test]
+fn test_wasm_config_validate_unauthorized_passthrough_rejected() {
+    let toml_str = r#"
+        id = "test_passthrough"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        on_error = "passthrough"
+        allow_unmasked_passthrough = false
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(
+        cfg.validate(),
+        Err(WasmConfigValidationError::UnauthorizedPassthrough)
+    );
+
+    // Also verify when allow_unmasked_passthrough is defaulted (false)
+    let toml_default = r#"
+        id = "test_passthrough_default"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        on_error = "passthrough"
+    "#;
+    let cfg_default: WasmTransformerConfig = toml::from_str(toml_default).unwrap();
+    assert_eq!(
+        cfg_default.validate(),
+        Err(WasmConfigValidationError::UnauthorizedPassthrough)
+    );
+}
+
+#[test]
+fn test_wasm_config_validate_authorized_passthrough_accepted() {
+    let toml_str = r#"
+        id = "test_passthrough_allowed"
+        type = "wasm"
+        module_path = "transforms/test.wasm"
+        on_error = "passthrough"
+        allow_unmasked_passthrough = true
+    "#;
+    let cfg: WasmTransformerConfig = toml::from_str(toml_str).unwrap();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn test_wasm_config_validation_error_unauthorized_passthrough_display() {
+    let err = WasmConfigValidationError::UnauthorizedPassthrough;
+    assert!(
+        err.to_string()
+            .contains("on_error = 'passthrough' requires allow_unmasked_passthrough = true")
+    );
 }
