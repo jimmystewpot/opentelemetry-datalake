@@ -77,40 +77,127 @@ pub enum SchemaGuardMode {
     Strict,
 }
 
-fn default_max_execution_duration() -> String {
-    "500ms".into()
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ByteSizeValue {
+    Integer(usize),
+    String(String),
 }
 
-fn default_drain_timeout() -> String {
-    "10s".into()
+/// Parses human-readable byte sizes (e.g. "64MiB", "16MB", "1GiB", "1024B") or numeric byte strings into byte counts.
+///
+/// Supported units (case-insensitive): `B`/`bytes`, `KiB`/`KB`, `MiB`/`MB`, `GiB`/`GB`, `TiB`/`TB`.
+///
+/// # Errors
+///
+/// Returns an error if the string is empty, contains an invalid number, or overflows `usize`.
+pub fn parse_byte_size(s: &str) -> Result<usize, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("byte size string cannot be empty".to_string());
+    }
+
+    let (num_str, multiplier) = if let Some(stripped) = s
+        .strip_suffix("TiB")
+        .or_else(|| s.strip_suffix("tib"))
+        .or_else(|| s.strip_suffix("TB"))
+        .or_else(|| s.strip_suffix("tb"))
+    {
+        (stripped, 1024 * 1024 * 1024 * 1024)
+    } else if let Some(stripped) = s
+        .strip_suffix("GiB")
+        .or_else(|| s.strip_suffix("gib"))
+        .or_else(|| s.strip_suffix("GB"))
+        .or_else(|| s.strip_suffix("gb"))
+    {
+        (stripped, 1024 * 1024 * 1024)
+    } else if let Some(stripped) = s
+        .strip_suffix("MiB")
+        .or_else(|| s.strip_suffix("mib"))
+        .or_else(|| s.strip_suffix("MB"))
+        .or_else(|| s.strip_suffix("mb"))
+    {
+        (stripped, 1024 * 1024)
+    } else if let Some(stripped) = s
+        .strip_suffix("KiB")
+        .or_else(|| s.strip_suffix("kib"))
+        .or_else(|| s.strip_suffix("KB"))
+        .or_else(|| s.strip_suffix("kb"))
+    {
+        (stripped, 1024)
+    } else if let Some(stripped) = s
+        .strip_suffix("bytes")
+        .or_else(|| s.strip_suffix("BYTES"))
+        .or_else(|| s.strip_suffix('B'))
+        .or_else(|| s.strip_suffix('b'))
+    {
+        (stripped, 1)
+    } else {
+        (s, 1)
+    };
+
+    let val: usize = num_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid number in byte size '{s}': {e}"))?;
+
+    val.checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size '{s}' overflows usize"))
 }
 
-const fn default_max_batch_rows() -> usize {
-    5000
+fn deserialize_bytes<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match ByteSizeValue::deserialize(deserializer)? {
+        ByteSizeValue::Integer(bytes) => Ok(bytes),
+        ByteSizeValue::String(s) => parse_byte_size(&s).map_err(serde::de::Error::custom),
+    }
 }
 
-const fn default_concurrency() -> usize {
-    4
+fn default_max_execution_duration() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
 }
 
-const fn default_worker_channel_capacity() -> usize {
-    1
+fn default_drain_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(10)
 }
 
-fn default_max_memory() -> String {
-    "64MiB".into()
+const fn default_max_batch_rows() -> std::num::NonZeroUsize {
+    match std::num::NonZeroUsize::new(5000) {
+        Some(v) => v,
+        None => unreachable!(),
+    }
 }
 
-fn default_rejuvenate_threshold() -> String {
-    "16MiB".into()
+const fn default_concurrency() -> std::num::NonZeroUsize {
+    match std::num::NonZeroUsize::new(4) {
+        Some(v) => v,
+        None => unreachable!(),
+    }
+}
+
+const fn default_worker_channel_capacity() -> std::num::NonZeroUsize {
+    match std::num::NonZeroUsize::new(1) {
+        Some(v) => v,
+        None => unreachable!(),
+    }
+}
+
+const fn default_max_memory() -> usize {
+    64 * 1024 * 1024
+}
+
+const fn default_rejuvenate_threshold() -> usize {
+    16 * 1024 * 1024
 }
 
 const fn default_rejuvenate_batches() -> u64 {
     10_000
 }
 
-fn default_init_timeout() -> String {
-    "2s".into()
+fn default_init_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
 }
 
 /// Configuration for a WebAssembly (WASM) transformer runtime and isolation sandbox.
@@ -127,31 +214,36 @@ pub struct WasmTransformerConfig {
     pub sha256: Option<String>,
     /// Maximum execution duration per transform invocation before timing out.
     #[serde(default = "default_max_execution_duration")]
-    pub max_execution_duration: String,
+    #[serde(with = "humantime_serde")]
+    pub max_execution_duration: std::time::Duration,
     /// Maximum duration to allow in-flight batches to drain during graceful shutdown.
     #[serde(default = "default_drain_timeout")]
-    pub drain_timeout: String,
+    #[serde(with = "humantime_serde")]
+    pub drain_timeout: std::time::Duration,
     /// Maximum number of rows to process in a single batch.
     #[serde(default = "default_max_batch_rows")]
-    pub max_batch_rows: usize,
+    pub max_batch_rows: std::num::NonZeroUsize,
     /// Number of concurrent worker instances.
     #[serde(default = "default_concurrency")]
-    pub concurrency: usize,
+    pub concurrency: std::num::NonZeroUsize,
     /// Capacity of bounded worker input channels.
     #[serde(default = "default_worker_channel_capacity")]
-    pub worker_channel_capacity: usize,
+    pub worker_channel_capacity: std::num::NonZeroUsize,
     /// Maximum linear memory allocation allowed per worker instance.
     #[serde(default = "default_max_memory")]
-    pub max_memory: String,
+    #[serde(deserialize_with = "deserialize_bytes")]
+    pub max_memory: usize,
     /// Memory threshold triggering worker rejuvenation (clean restart).
     #[serde(default = "default_rejuvenate_threshold")]
-    pub rejuvenate_threshold: String,
+    #[serde(deserialize_with = "deserialize_bytes")]
+    pub rejuvenate_threshold: usize,
     /// Number of batches processed after which worker rejuvenation is triggered.
     #[serde(default = "default_rejuvenate_batches")]
     pub rejuvenate_batches: u64,
     /// Timeout duration for worker instance initialization and compilation.
     #[serde(default = "default_init_timeout")]
-    pub init_timeout: String,
+    #[serde(with = "humantime_serde")]
+    pub init_timeout: std::time::Duration,
     /// Policy governing behavior on execution failure or guest panic.
     #[serde(default)]
     pub on_error: OnErrorPolicy,
