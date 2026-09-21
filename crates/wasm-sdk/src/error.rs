@@ -16,4 +16,12 @@ pub enum SdkError {
     /// The specified column was not found in the record batch schema.
     #[error("Column not found in schema: {0}")]
     ColumnNotFound(String),
+
+    /// An IPC or serialization error occurred.
+    #[error("IPC error: {0}")]
+    Ipc(String),
+
+    /// An invalid signal type raw code was encountered.
+    #[error("Invalid signal type: {0}")]
+    InvalidSignalType(u32),
 }
