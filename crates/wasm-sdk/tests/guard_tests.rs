@@ -271,6 +271,11 @@ fn test_transform_result_variants_debug() {
         format!("{reject:?}"),
         "Reject { reason: \"corrupted data\" }"
     );
+
+    let error = TransformResult::Error {
+        reason: "fatal crash".to_string(),
+    };
+    assert_eq!(format!("{error:?}"), "Error { reason: \"fatal crash\" }");
 }
 
 struct DummyTransformer;
