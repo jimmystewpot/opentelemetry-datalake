@@ -15,7 +15,7 @@ fn test_log_level_constants() {
 
 #[test]
 fn test_abi_v1_header_memory_layout() {
-    assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 20);
+    assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 28);
     assert_eq!(std::mem::align_of::<TransformResponseHeader>(), 4);
     assert_eq!(std::mem::size_of::<BatchDescriptor>(), 8);
     assert_eq!(std::mem::align_of::<BatchDescriptor>(), 4);

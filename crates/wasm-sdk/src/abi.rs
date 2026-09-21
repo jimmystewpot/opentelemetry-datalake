@@ -8,7 +8,7 @@ pub const ABI_VERSION: u32 = 1;
 
 /// Response header returned by `datalake_transform` export.
 ///
-/// Total size: 20 bytes, alignment: 4 bytes.
+/// Total size: 28 bytes, alignment: 4 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformResponseHeader {
@@ -18,13 +18,21 @@ pub struct TransformResponseHeader {
     pub batch_count: u32,
     /// Memory pointer to an array of `BatchDescriptor` structs.
     pub batches_ptr: u32,
+    /// Total allocated capacity of the `BatchDescriptor` array buffer in bytes.
+    pub batches_cap_bytes: u32,
     /// Memory pointer to an optional UTF-8 error or rejection message.
     pub message_ptr: u32,
     /// Length of the message in bytes.
     pub message_len: u32,
+    /// Total allocated capacity of the message string buffer in bytes.
+    pub message_cap: u32,
 }
 
 /// Descriptor for a single Arrow IPC stream payload in guest memory.
+///
+/// Invariant: Memory at `ptr` must be allocated with 8-byte alignment and its
+/// allocated capacity must match `len` (e.g. using exact layout deallocation or `Box<[u8]>`)
+/// so that `datalake_dealloc(ptr, len)` frees the exact allocated layout without heap corruption.
 ///
 /// Total size: 8 bytes, alignment: 4 bytes.
 #[repr(C)]
@@ -32,7 +40,7 @@ pub struct TransformResponseHeader {
 pub struct BatchDescriptor {
     /// Memory pointer to the raw Arrow IPC stream buffer.
     pub ptr: u32,
-    /// Byte length of the Arrow IPC stream buffer.
+    /// Byte length and allocated capacity of the Arrow IPC stream buffer.
     pub len: u32,
 }
 
