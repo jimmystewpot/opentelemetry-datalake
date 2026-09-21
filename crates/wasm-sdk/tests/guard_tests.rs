@@ -16,7 +16,7 @@ fn test_nullify_immutable_column_fails_fast() {
         Field::new("scope_attributes", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(StringArray::from(vec!["abc"])),
             Arc::new(StringArray::from(vec!["attr"])),
@@ -24,7 +24,7 @@ fn test_nullify_immutable_column_fails_fast() {
     )
     .unwrap();
 
-    let err = nullify_column(&batch, "trace_id").unwrap_err();
+    let err = nullify_column(&batch, schema, "trace_id").unwrap_err();
     assert_eq!(
         err,
         SdkError::ImmutableFieldViolation("trace_id".to_string())
@@ -42,7 +42,7 @@ fn test_nullify_mutable_column_succeeds() {
         Field::new("scope_attributes", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(StringArray::from(vec!["abc", "def"])),
             Arc::new(StringArray::from(vec!["attr1", "attr2"])),
@@ -50,7 +50,7 @@ fn test_nullify_mutable_column_succeeds() {
     )
     .unwrap();
 
-    let ok_batch = nullify_column(&batch, "scope_attributes").unwrap();
+    let ok_batch = nullify_column(&batch, schema, "scope_attributes").unwrap();
     assert_eq!(ok_batch.column(1).null_count(), 2);
     assert_eq!(ok_batch.num_rows(), 2);
     // Trace ID remains unmodified
@@ -85,7 +85,14 @@ fn test_nullify_non_nullable_column_rewrites_schema_and_succeeds() {
     )
     .unwrap();
 
-    let result = nullify_column(&batch, "custom_field").unwrap();
+    let target_field =
+        Field::new("custom_field", DataType::Utf8, true).with_metadata(metadata.clone());
+    let target_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false), target_field],
+        metadata,
+    ));
+
+    let result = nullify_column(&batch, target_schema, "custom_field").unwrap();
     assert_eq!(result.num_rows(), 2);
     assert_eq!(result.column(1).null_count(), 2);
     // Verified that column is now nullable
@@ -138,7 +145,14 @@ fn test_nullify_dictionary_column_preserves_dictionary_type_and_metadata() {
     )
     .unwrap();
 
-    let result = nullify_column(&batch, "dict_column").unwrap();
+    let target_dict_field =
+        Field::new("dict_column", dict_type.clone(), true).with_metadata(field_metadata);
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        target_dict_field,
+    ]));
+
+    let result = nullify_column(&batch, target_schema, "dict_column").unwrap();
 
     assert_eq!(result.num_rows(), 3);
     assert_eq!(result.column(1).null_count(), 3);
@@ -190,15 +204,35 @@ fn test_nullify_empty_batch() {
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, true),
     ]));
-    let empty_batch = RecordBatch::new_empty(schema);
+    let empty_batch = RecordBatch::new_empty(schema.clone());
 
-    let ok_batch = nullify_column(&empty_batch, "body").unwrap();
+    let ok_batch = nullify_column(&empty_batch, schema, "body").unwrap();
     assert_eq!(ok_batch.num_rows(), 0);
     assert_eq!(ok_batch.column(1).null_count(), 0);
 }
 
 #[test]
 fn test_nullify_nonexistent_column_returns_column_not_found() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["abc"])),
+            Arc::new(StringArray::from(vec!["attr"])),
+        ],
+    )
+    .unwrap();
+
+    let err = nullify_column(&batch, schema, "nonexistent").unwrap_err();
+    assert_eq!(err, SdkError::ColumnNotFound("nonexistent".to_string()));
+    assert_eq!(err.to_string(), "Column not found in schema: nonexistent");
+}
+
+#[test]
+fn test_nullify_target_schema_mismatch_returns_arrow_error() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("scope_attributes", DataType::Utf8, true),
@@ -212,9 +246,19 @@ fn test_nullify_nonexistent_column_returns_column_not_found() {
     )
     .unwrap();
 
-    let err = nullify_column(&batch, "nonexistent").unwrap_err();
-    assert_eq!(err, SdkError::ColumnNotFound("nonexistent".to_string()));
-    assert_eq!(err.to_string(), "Column not found in schema: nonexistent");
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("extra_column", DataType::Utf8, true),
+    ]));
+
+    let err = nullify_column(&batch, target_schema, "scope_attributes").unwrap_err();
+    match err {
+        SdkError::Arrow(msg) => {
+            assert!(msg.contains("number of columns") || msg.contains("schema"));
+        }
+        other => panic!("expected SdkError::Arrow, got {other:?}"),
+    }
 }
 
 #[test]
