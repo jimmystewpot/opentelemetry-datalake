@@ -459,7 +459,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Builds the 3-signal transformers based on AppConfig, instantiating WasmTransformers and optionally SIGHUP listeners.
+/// Builds the 3-signal transformers based on `AppConfig`, instantiating `WasmTransformers` and optionally SIGHUP listeners.
+#[allow(clippy::type_complexity)]
 fn build_transformers(
     config: &AppConfig,
 ) -> anyhow::Result<(
@@ -890,7 +891,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_transformers_with_wasm() {
-        use std::io::Write;
         let valid_wat = r#"
         (module
           (func (export "transform") (param i32 i32) (result i32)
