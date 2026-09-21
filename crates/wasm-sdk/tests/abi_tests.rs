@@ -1,8 +1,15 @@
 use opentelemetry_datalake_wasm_sdk::abi::{
     ABI_VERSION, BatchDescriptor, HostLogRecord, LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO,
-    LOG_LEVEL_TRACE, LOG_LEVEL_WARN, TransformResponseHeader, datalake_abi_version, datalake_alloc,
-    datalake_dealloc,
+    LOG_LEVEL_TRACE, LOG_LEVEL_WARN, STATUS_ERROR, STATUS_REJECT, STATUS_SUCCESS,
+    TransformResponseHeader, datalake_abi_version, datalake_alloc, datalake_dealloc,
 };
+
+#[test]
+fn test_status_constants() {
+    assert_eq!(STATUS_SUCCESS, 0u32);
+    assert_eq!(STATUS_ERROR, 1u32);
+    assert_eq!(STATUS_REJECT, 2u32);
+}
 
 #[test]
 fn test_log_level_constants() {
@@ -50,6 +57,14 @@ fn test_abi_v1_header_memory_layout() {
 
     assert_eq!(std::mem::size_of::<HostLogRecord>(), 32);
     assert_eq!(std::mem::align_of::<HostLogRecord>(), 4);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, level), 0);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, msg_ptr), 4);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, msg_len), 8);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, target_ptr), 12);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, target_len), 16);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, file_ptr), 20);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, file_len), 24);
+    assert_eq!(std::mem::offset_of!(HostLogRecord, line), 28);
 }
 
 #[test]
