@@ -76,6 +76,16 @@ struct Cli {
 
 /// Validates that required sink configuration constraints are satisfied.
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
+    if config.kafka.is_none()
+        && config.iceberg.is_none()
+        && config.starrocks.is_none()
+        && config.elasticsearch.is_none()
+    {
+        anyhow::bail!(
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+        );
+    }
+
     if let Some(ref iceberg_cfg) = config.iceberg {
         let logs_table = iceberg_cfg
             .logs_table_identifier
@@ -98,14 +108,18 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
-    } else if let Some(ref es_cfg) = config.elasticsearch {
+    }
+
+    if let Some(ref es_cfg) = config.elasticsearch {
         es_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    } else if config.kafka.is_none() && config.starrocks.is_none() {
-        anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
-        );
+    }
+
+    if let Some(ref sr_cfg) = config.starrocks {
+        sr_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     }
 
     Ok(())
@@ -705,6 +719,71 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("at least one endpoint must be configured")
+        );
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_insecure_starrocks_tls() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks TLS verification is disabled");
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited"),
+            "Error message should indicate disabled verification prohibited: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_missing_starrocks_ca_cert() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        ca_cert_path = "/nonexistent/ca.pem"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks CA file is missing");
+        assert!(
+            err.to_string().contains("CA certificate file not found"),
+            "Error message should indicate missing CA file: {err}"
         );
     }
 }

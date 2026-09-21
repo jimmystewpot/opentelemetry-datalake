@@ -268,6 +268,40 @@ pub struct StarRocksSinkConfig {
     pub tls: pipeline_core::tls::TlsConfig,
 }
 
+impl StarRocksSinkConfig {
+    /// Validates StarRocks sink configuration parameters including TLS, URLs, and authentication.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError`] if:
+    /// - TLS validation fails (e.g. insecure mode or missing CA file).
+    /// - `frontend_urls` is empty.
+    /// - `username` or `database` is blank.
+    /// - `order_by` configuration fails to parse.
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        self.tls.validate()?;
+        if self.frontend_urls.is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `frontend_urls` must contain at least one FE URL"
+                    .to_string(),
+            ));
+        }
+        if self.username.trim().is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `username` must not be empty".to_string(),
+            ));
+        }
+        if self.database.trim().is_empty() {
+            return Err(PipelineError::Internal(
+                "StarRocks configuration error: `database` must not be empty".to_string(),
+            ));
+        }
+        if let Some(ref sort_cfg) = self.order_by {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)?;
+        }
+        Ok(())
+    }
+}
+
 // ─── Sink ────────────────────────────────────────────────────────────────────
 
 /// `StarRocks` stream-load sink.
@@ -307,7 +341,7 @@ impl StarRocksSink {
         config: StarRocksSinkConfig,
         manager: Arc<StreamLoadManager>,
     ) -> Result<Self, PipelineError> {
-        config.tls.validate()?;
+        config.validate()?;
         if config.tls.ca_cert_path.is_some() {
             tracing::warn!(
                 sink = "starrocks",
@@ -347,29 +381,13 @@ impl StarRocksSink {
     /// Returns [`PipelineError::Internal`] if configuration validation fails or
     /// if the [`StreamLoadManager`] cannot be initialised.
     pub fn try_new(config: StarRocksSinkConfig) -> Result<Self, PipelineError> {
-        config.tls.validate()?;
+        config.validate()?;
         if config.tls.ca_cert_path.is_some() {
             tracing::warn!(
                 sink = "starrocks",
                 ca_cert_path = ?config.tls.ca_cert_path,
                 "StarRocks Stream Load SDK resolves TLS roots via compile-time backend features (tls-rustls / tls-native-tls); ensure custom CA certificates are installed in the host trust store if using tls-native-tls"
             );
-        }
-        if config.frontend_urls.is_empty() {
-            return Err(PipelineError::Internal(
-                "StarRocks configuration error: `frontend_urls` must contain at least one FE URL"
-                    .to_string(),
-            ));
-        }
-        if config.username.trim().is_empty() {
-            return Err(PipelineError::Internal(
-                "StarRocks configuration error: `username` must not be empty".to_string(),
-            ));
-        }
-        if config.database.trim().is_empty() {
-            return Err(PipelineError::Internal(
-                "StarRocks configuration error: `database` must not be empty".to_string(),
-            ));
         }
 
         let sorter = if let Some(ref sort_cfg) = config.order_by {
