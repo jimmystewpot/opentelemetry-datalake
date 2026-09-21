@@ -6,13 +6,26 @@
 /// Current ABI version supported by this SDK.
 pub const ABI_VERSION: u32 = 1;
 
+/// Status code indicating successful batch transformation.
+pub const STATUS_SUCCESS: u32 = 0;
+/// Status code indicating an unrecoverable execution error.
+pub const STATUS_ERROR: u32 = 1;
+/// Status code indicating batch was rejected due to data validation failure.
+pub const STATUS_REJECT: u32 = 2;
+
 /// Response header returned by `datalake_transform` export.
 ///
 /// Total size: 28 bytes, alignment: 4 bytes.
+///
+/// # Alignment Invariants
+/// When memory buffers pointed to by `batches_ptr` (with capacity `batches_cap_bytes`) and
+/// `message_ptr` (with capacity `message_cap`) are reclaimed via `datalake_dealloc`, they must
+/// have been allocated with 8-byte alignment (e.g. via `datalake_alloc`) to satisfy the deallocation
+/// layout requirements without heap corruption.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformResponseHeader {
-    /// Status code of the transformation (e.g. Success = 0, Error = 1, Reject = 2).
+    /// Status code of the transformation (e.g. [`STATUS_SUCCESS`], [`STATUS_ERROR`], [`STATUS_REJECT`]).
     pub status: u32,
     /// Number of transformed record batches returned.
     pub batch_count: u32,
@@ -44,7 +57,10 @@ pub struct BatchDescriptor {
     pub len: u32,
 }
 
-/// Memory layout for structured log records forwarded to the host via `datalake_host_log`.
+/// Memory layout for structured log records.
+///
+/// Reserved for structured record logging rather than the flat 3-argument
+/// `datalake_host_log` scalar import used by panic hook.
 ///
 /// Total size: 32 bytes, alignment: 4 bytes.
 #[repr(C)]

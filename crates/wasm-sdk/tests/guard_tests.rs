@@ -109,6 +109,82 @@ fn test_nullify_non_nullable_column_rewrites_schema_and_succeeds() {
 }
 
 #[test]
+fn test_nullify_dictionary_column_preserves_dictionary_type_and_metadata() {
+    use arrow::array::{Array, DictionaryArray, Int32Array};
+    use arrow::datatypes::Int32Type;
+    use std::collections::HashMap;
+
+    let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+    let mut field_metadata = HashMap::new();
+    field_metadata.insert("semantic_role".to_string(), "dictionary_lookup".to_string());
+
+    let dict_field =
+        Field::new("dict_column", dict_type.clone(), false).with_metadata(field_metadata.clone());
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        dict_field,
+    ]));
+
+    let keys = Int32Array::from(vec![0, 1, 0]);
+    let values = Arc::new(StringArray::from(vec!["frontend", "backend"]));
+    let dict_array = Arc::new(DictionaryArray::<Int32Type>::new(keys, values));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace-1", "trace-2", "trace-3"])),
+            dict_array,
+        ],
+    )
+    .unwrap();
+
+    let result = nullify_column(&batch, "dict_column").unwrap();
+
+    assert_eq!(result.num_rows(), 3);
+    assert_eq!(result.column(1).null_count(), 3);
+
+    // Verify dictionary type is preserved
+    assert_eq!(result.schema().field(1).data_type(), &dict_type);
+    assert_eq!(result.column(1).data_type(), &dict_type);
+
+    // Verify dictionary structure is preserved via downcast
+    let nullified_dict = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .expect("column should downcast to DictionaryArray<Int32Type>");
+    assert_eq!(nullified_dict.len(), 3);
+    assert!(nullified_dict.is_null(0));
+    assert!(nullified_dict.is_null(1));
+    assert!(nullified_dict.is_null(2));
+
+    // Verify metadata is retained
+    assert_eq!(
+        result
+            .schema()
+            .field(1)
+            .metadata()
+            .get("semantic_role")
+            .map(String::as_str),
+        Some("dictionary_lookup")
+    );
+
+    // Verify nullability was updated to true if originally non-nullable
+    assert!(result.schema().field(1).is_nullable());
+
+    // Verify non-nullified column preserved
+    let trace_col = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(trace_col.value(0), "trace-1");
+    assert_eq!(trace_col.value(1), "trace-2");
+    assert_eq!(trace_col.value(2), "trace-3");
+    assert!(!result.schema().field(0).is_nullable());
+}
+
+#[test]
 fn test_nullify_empty_batch() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
