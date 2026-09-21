@@ -6,11 +6,12 @@
 
 use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
+use crate::guard::{backfill_missing_columns, verify_structural_immutability};
 use crate::host_calls::{HostPhase, HostState, MetricRegistry, build_host_linker};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use pipeline_core::config::WasmTransformerConfig;
+use pipeline_core::config::{SchemaGuardMode, WasmTransformerConfig};
 use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use wasmtime::{Instance, Memory, Module, Store, TypedFunc};
@@ -461,6 +462,7 @@ impl WasmWorker {
                         header.batches_ptr,
                         header.batch_count,
                         &batch,
+                        self.config.schema_guard,
                     )?;
                     Ok(WorkerOutcome::Emitted(out_batches))
                 }
@@ -665,6 +667,7 @@ fn extract_output_batches<T>(
     batches_ptr: u32,
     batch_count: u32,
     input_batch: &SignalBatch,
+    schema_guard: SchemaGuardMode,
 ) -> Result<Vec<SignalBatch>, WasmTransformError> {
     if batch_count > MAX_GUEST_BATCH_COUNT {
         return Err(WasmTransformError::Pipeline(format!(
@@ -682,6 +685,10 @@ fn extract_output_batches<T>(
             "Batch descriptors array bounds exceed guest memory size {mem_size}"
         )));
     }
+
+    let input_rb = match input_batch {
+        SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
+    };
 
     let mut out_batches = Vec::with_capacity((batch_count as usize).min(64));
     let mut total_bytes = 0usize;
@@ -721,7 +728,21 @@ fn extract_output_batches<T>(
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
         for maybe_rb in reader {
-            let rb = maybe_rb.map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+            let mut rb = maybe_rb.map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
+            verify_structural_immutability(input_rb, &rb)?;
+            match schema_guard {
+                SchemaGuardMode::Defensive => {
+                    rb = backfill_missing_columns(input_rb.schema().as_ref(), rb)?;
+                }
+                SchemaGuardMode::Strict => {
+                    if rb.schema() != input_rb.schema() {
+                        return Err(WasmTransformError::Pipeline(
+                            "Schema guard strict violation: guest output schema does not match input schema"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             let signal = match input_batch {
                 SignalBatch::Logs(_) => SignalBatch::Logs(rb),
                 SignalBatch::Metrics(_) => SignalBatch::Metrics(rb),

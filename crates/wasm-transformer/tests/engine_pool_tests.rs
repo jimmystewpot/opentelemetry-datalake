@@ -149,3 +149,11 @@ fn test_pooling_allocator_zero_concurrency_clamps_to_one() {
     let debug_str = format!("{pool:?}");
     assert!(debug_str.contains("InstancePool"));
 }
+
+#[test]
+fn test_engine_cache_clean_drop() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    // Drop cache and ensure thread exits without deadlock or panic
+    drop(cache);
+    std::thread::sleep(std::time::Duration::from_millis(25));
+}

@@ -1320,3 +1320,166 @@ async fn test_worker_links_host_functions_and_collects_metrics() {
     assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
     assert_eq!(worker.registry().read_counter("events_total"), 42);
 }
+
+fn custom_output_wat(ipc_bytes: &[u8]) -> String {
+    let mut escaped = String::new();
+    for &b in ipc_bytes {
+        use std::fmt::Write;
+        write!(&mut escaped, "\\{:02x}", b).unwrap();
+    }
+    format!(
+        r#"(module
+            (memory (export "memory") 2)
+            (data (i32.const 40960) "{escaped}")
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "datalake_transform") (param i32 i32) (result i32)
+                (i32.store (i32.const 0) (i32.const 0))
+                (i32.store (i32.const 4) (i32.const 1))
+                (i32.store (i32.const 8) (i32.const 24))
+                (i32.store (i32.const 12) (i32.const 0))
+                (i32.store (i32.const 16) (i32.const 0))
+                (i32.store (i32.const 24) (i32.const 40960))
+                (i32.store (i32.const 28) (i32.const {}))
+                (i32.const 0)
+            )
+        )"#,
+        ipc_bytes.len()
+    )
+}
+
+fn serialize_batch(batch: &RecordBatch) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+#[tokio::test]
+async fn test_worker_enforces_immutable_columns() {
+    let dropped_col_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let dropped_col_batch = RecordBatch::try_new(
+        dropped_col_schema,
+        vec![Arc::new(StringArray::from(vec!["hello"]))],
+    )
+    .unwrap();
+    let ipc_bytes = serialize_batch(&dropped_col_batch);
+    let wat = custom_output_wat(&ipc_bytes);
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(&wat).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(65, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Immutability violation: core field 'trace_id' was dropped by guest"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_defensive_schema_guard_backfills_missing_columns() {
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+        Field::new("severity", DataType::Utf8, true),
+    ]));
+    let full_input = RecordBatch::try_new(
+        full_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_1"])),
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(StringArray::from(vec!["WARN"])),
+        ],
+    )
+    .unwrap();
+
+    let guest_output = create_test_record_batch();
+    let ipc_bytes = serialize_batch(&guest_output);
+    let wat = custom_output_wat(&ipc_bytes);
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(&wat).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.schema_guard = pipeline_core::config::SchemaGuardMode::Defensive;
+    let mut worker = WasmWorker::new(66, Arc::clone(&cache), module, cfg).unwrap();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(full_input))
+        .await
+        .unwrap();
+    match outcome {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 1);
+            match &batches[0] {
+                SignalBatch::Logs(rb) => {
+                    assert_eq!(rb.num_rows(), 1);
+                    assert!(rb.schema().column_with_name("severity").is_some());
+                    let col = rb.column_by_name("severity").unwrap();
+                    assert_eq!(col.null_count(), 1);
+                }
+                _ => panic!("Expected Logs signal"),
+            }
+        }
+        _ => panic!("Expected Emitted outcome"),
+    }
+}
+
+#[tokio::test]
+async fn test_worker_strict_schema_guard_rejects_schema_drift() {
+    let extra_col_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+        Field::new("new_col", DataType::Utf8, true),
+    ]));
+    let extra_col_batch = RecordBatch::try_new(
+        extra_col_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_1"])),
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(StringArray::from(vec!["extra"])),
+        ],
+    )
+    .unwrap();
+    let ipc_bytes = serialize_batch(&extra_col_batch);
+    let wat = custom_output_wat(&ipc_bytes);
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(&wat).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.schema_guard = pipeline_core::config::SchemaGuardMode::Strict;
+    let mut worker = WasmWorker::new(67, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "Schema guard strict violation: guest output schema does not match input schema"
+        ),
+        "Unexpected error: {err}"
+    );
+}

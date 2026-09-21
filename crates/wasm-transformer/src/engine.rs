@@ -4,7 +4,7 @@ use crate::error::WasmTransformError;
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, Module, PoolingAllocationConfig};
 
@@ -20,6 +20,13 @@ pub struct EngineCache {
     engine: Engine,
     module: RwLock<Option<Arc<Module>>>,
     generation: AtomicU64,
+    is_running: Arc<AtomicBool>,
+}
+
+impl Drop for EngineCache {
+    fn drop(&mut self) {
+        self.is_running.store(false, Ordering::Relaxed);
+    }
 }
 
 impl EngineCache {
@@ -45,9 +52,11 @@ impl EngineCache {
 
         let engine = Engine::new(&config)?;
 
+        let is_running = Arc::new(AtomicBool::new(true));
+        let is_running_clone = Arc::clone(&is_running);
         let engine_clone = engine.clone();
         std::thread::spawn(move || {
-            loop {
+            while is_running_clone.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 engine_clone.increment_epoch();
             }
@@ -57,6 +66,7 @@ impl EngineCache {
             engine,
             module: RwLock::new(None),
             generation: AtomicU64::new(0),
+            is_running,
         })
     }
 
