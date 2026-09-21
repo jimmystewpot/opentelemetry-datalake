@@ -70,6 +70,9 @@ pub fn spawn_sighup_listener(
 pub struct WasmReloadRequest {
     /// Filesystem path to the new WebAssembly module.
     pub module_path: String,
+    /// Optional expected hex-encoded SHA-256 digest of the new WebAssembly module.
+    #[serde(default)]
+    pub expected_sha: Option<String>,
 }
 
 /// Handler for the WASM hot-reload REST endpoint.
@@ -90,10 +93,12 @@ pub async fn wasm_reload_handler(
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    engine.reload_from_bytes(&bytes, None).map_err(|e| {
-        tracing::warn!("Hot-reload REST: reload failed: {e}");
-        axum::http::StatusCode::BAD_REQUEST
-    })?;
+    engine
+        .reload_from_bytes(&bytes, payload.expected_sha.as_deref())
+        .map_err(|e| {
+            tracing::warn!("Hot-reload REST: reload failed: {e}");
+            axum::http::StatusCode::BAD_REQUEST
+        })?;
 
     Ok(axum::Json(serde_json::json!({
         "status": "reload successful",

@@ -283,12 +283,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
-    let (
-        mut logs_transformer,
-        mut traces_transformer,
-        mut metrics_transformer,
-        sighup_handles,
-    ) = initialize_transformers(&config)?;
+    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer, sighup_handles) =
+        initialize_transformers(&config)?;
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
@@ -943,7 +939,10 @@ mod tests {
         let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
 
         assert_eq!(handles.len(), 3);
-        assert_eq!(handles.into_iter().flatten().count(), if cfg!(unix) { 3 } else { 0 });
+        assert_eq!(
+            handles.into_iter().flatten().count(),
+            if cfg!(unix) { 3 } else { 0 }
+        );
         let _ = std::fs::remove_file(&path);
     }
 

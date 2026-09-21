@@ -150,3 +150,80 @@ async fn test_admin_router_reload_endpoint_invalid_wasm() {
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_matching_expected_sha() {
+    use wasm_transformer::reload::compute_sha256;
+
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "matching_sha_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let sha = compute_sha256(&wasm_bytes);
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    let router = build_admin_router(Arc::clone(&engine));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}", "expected_sha": "{}"}}"#,
+            module_path.to_str().unwrap(),
+            sha
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(engine.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_mismatching_expected_sha() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "mismatching_sha_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    let router = build_admin_router(Arc::clone(&engine));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}", "expected_sha": "0000000000000000000000000000000000000000000000000000000000000000"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // Expecting 400 Bad Request because the sha verification fails
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(engine.module_generation(), 0);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
