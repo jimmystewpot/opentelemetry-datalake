@@ -1,5 +1,6 @@
 use opentelemetry_datalake_wasm_sdk::metrics::{
-    counter, duration, duration_to_nanos, gauge, gauge_to_bits,
+    CounterHandle, DurationHandle, GaugeHandle, counter, duration, duration_to_nanos, gauge,
+    gauge_to_bits, register_counter, register_duration, register_gauge,
 };
 use opentelemetry_datalake_wasm_sdk::panic::init_panic_hook;
 use std::time::Duration;
@@ -58,13 +59,18 @@ fn test_duration_overflow_saturates_u64_max() {
 
 #[test]
 fn test_metric_emission_helpers_callable_native() {
-    // Emitting metrics on native host environment is a safe no-op
-    counter("guest_records_transformed_total", 42);
-    gauge("guest_memory_usage_ratio", 0.75);
-    duration(
-        "guest_batch_processing_duration_ns",
-        Duration::from_millis(15),
-    );
+    let c: CounterHandle = register_counter("guest_records_transformed_total");
+    let g: GaugeHandle = register_gauge("guest_memory_usage_ratio");
+    let d: DurationHandle = register_duration("guest_batch_processing_duration_ns");
+
+    // Verify distinct handles are generated on native targets
+    assert_ne!(c.0, g.0);
+    assert_ne!(g.0, d.0);
+
+    // Emitting metrics via registered typed handles on native host is a safe no-op
+    counter(c, 42);
+    gauge(g, 0.75);
+    duration(d, Duration::from_millis(15));
 }
 
 #[test]
