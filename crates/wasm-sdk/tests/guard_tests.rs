@@ -64,6 +64,51 @@ fn test_nullify_mutable_column_succeeds() {
 }
 
 #[test]
+fn test_nullify_non_nullable_column_rewrites_schema_and_succeeds() {
+    use std::collections::HashMap;
+
+    let mut metadata = HashMap::new();
+    metadata.insert("source".to_string(), "unit-test".to_string());
+
+    let field = Field::new("custom_field", DataType::Utf8, false).with_metadata(metadata.clone());
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false), field],
+        metadata.clone(),
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["abc", "def"])),
+            Arc::new(StringArray::from(vec!["val1", "val2"])),
+        ],
+    )
+    .unwrap();
+
+    let result = nullify_column(&batch, "custom_field").unwrap();
+    assert_eq!(result.num_rows(), 2);
+    assert_eq!(result.column(1).null_count(), 2);
+    // Verified that column is now nullable
+    assert!(result.schema().field(1).is_nullable());
+    // Metadata preserved
+    assert_eq!(
+        result
+            .schema()
+            .field(1)
+            .metadata()
+            .get("source")
+            .map(String::as_str),
+        Some("unit-test")
+    );
+    assert_eq!(
+        result.schema().metadata().get("source").map(String::as_str),
+        Some("unit-test")
+    );
+    // Non-nullified column preserved
+    assert!(!result.schema().field(0).is_nullable());
+}
+
+#[test]
 fn test_nullify_empty_batch() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
