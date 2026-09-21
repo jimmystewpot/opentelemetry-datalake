@@ -354,6 +354,86 @@ fn test_transform_result_variants_debug() {
     assert_eq!(format!("{error:?}"), "Error { reason: \"fatal crash\" }");
 }
 
+#[test]
+fn test_signal_type_from_u32() {
+    assert_eq!(SignalType::from_u32(0), Some(SignalType::Logs));
+    assert_eq!(SignalType::from_u32(1), Some(SignalType::Metrics));
+    assert_eq!(SignalType::from_u32(2), Some(SignalType::Traces));
+    assert_eq!(SignalType::from_u32(3), None);
+    assert_eq!(SignalType::from_u32(u32::MAX), None);
+
+    // Verify explicit repr(u32) values match C-ABI v1
+    assert_eq!(SignalType::Logs as u32, 0);
+    assert_eq!(SignalType::Metrics as u32, 1);
+    assert_eq!(SignalType::Traces as u32, 2);
+}
+
+#[test]
+fn test_transform_result_convenience_constructors() {
+    let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, true)]));
+    let batch = RecordBatch::new_empty(schema);
+
+    // ok
+    let res = TransformResult::ok(batch.clone());
+    match res {
+        TransformResult::Continue(batches) => {
+            assert_eq!(batches.len(), 1);
+        }
+        _ => panic!("expected Continue"),
+    }
+
+    // ok_multiple
+    let res = TransformResult::ok_multiple(vec![batch.clone(), batch]);
+    match res {
+        TransformResult::Continue(batches) => {
+            assert_eq!(batches.len(), 2);
+        }
+        _ => panic!("expected Continue"),
+    }
+
+    // ok_empty
+    let res = TransformResult::ok_empty();
+    match res {
+        TransformResult::Continue(batches) => {
+            assert!(batches.is_empty());
+        }
+        _ => panic!("expected Continue"),
+    }
+
+    // discard
+    let res = TransformResult::discard();
+    assert!(matches!(res, TransformResult::Discard));
+
+    // reject
+    let res = TransformResult::reject("bad batch");
+    match res {
+        TransformResult::Reject { reason } => {
+            assert_eq!(reason, "bad batch");
+        }
+        _ => panic!("expected Reject"),
+    }
+
+    // error
+    let res = TransformResult::error("internal error");
+    match res {
+        TransformResult::Error { reason } => {
+            assert_eq!(reason, "internal error");
+        }
+        _ => panic!("expected Error"),
+    }
+}
+
+#[test]
+fn test_sdk_error_ipc_and_invalid_signal_type_display() {
+    let err_ipc = SdkError::Ipc("deserialization failed".to_string());
+    assert_eq!(err_ipc.to_string(), "IPC error: deserialization failed");
+    assert_eq!(err_ipc, SdkError::Ipc("deserialization failed".to_string()));
+
+    let err_sig = SdkError::InvalidSignalType(42);
+    assert_eq!(err_sig.to_string(), "Invalid signal type: 42");
+    assert_eq!(err_sig, SdkError::InvalidSignalType(42));
+}
+
 struct DummyTransformer;
 
 impl BatchTransformer for DummyTransformer {
