@@ -107,44 +107,22 @@ pub fn parse_byte_size(s: &str) -> Result<usize, ByteSizeParseError> {
         return Err(ByteSizeParseError::Empty);
     }
 
-    let (num_str, multiplier) = if let Some(stripped) = s
-        .strip_suffix("TiB")
-        .or_else(|| s.strip_suffix("tib"))
-        .or_else(|| s.strip_suffix("TB"))
-        .or_else(|| s.strip_suffix("tb"))
-    {
-        (stripped, 1024 * 1024 * 1024 * 1024)
-    } else if let Some(stripped) = s
-        .strip_suffix("GiB")
-        .or_else(|| s.strip_suffix("gib"))
-        .or_else(|| s.strip_suffix("GB"))
-        .or_else(|| s.strip_suffix("gb"))
-    {
-        (stripped, 1024 * 1024 * 1024)
-    } else if let Some(stripped) = s
-        .strip_suffix("MiB")
-        .or_else(|| s.strip_suffix("mib"))
-        .or_else(|| s.strip_suffix("MB"))
-        .or_else(|| s.strip_suffix("mb"))
-    {
-        (stripped, 1024 * 1024)
-    } else if let Some(stripped) = s
-        .strip_suffix("KiB")
-        .or_else(|| s.strip_suffix("kib"))
-        .or_else(|| s.strip_suffix("KB"))
-        .or_else(|| s.strip_suffix("kb"))
-    {
-        (stripped, 1024)
-    } else if let Some(stripped) = s
-        .strip_suffix("bytes")
-        .or_else(|| s.strip_suffix("BYTES"))
-        .or_else(|| s.strip_suffix('B'))
-        .or_else(|| s.strip_suffix('b'))
-    {
-        (stripped, 1)
+    let lower = s.to_ascii_lowercase();
+    let (num_len, multiplier) = if let Some(stripped) = lower.strip_suffix("tib").or_else(|| lower.strip_suffix("tb")) {
+        (stripped.len(), 1024 * 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("gib").or_else(|| lower.strip_suffix("gb")) {
+        (stripped.len(), 1024 * 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("mib").or_else(|| lower.strip_suffix("mb")) {
+        (stripped.len(), 1024 * 1024)
+    } else if let Some(stripped) = lower.strip_suffix("kib").or_else(|| lower.strip_suffix("kb")) {
+        (stripped.len(), 1024)
+    } else if let Some(stripped) = lower.strip_suffix("bytes").or_else(|| lower.strip_suffix("b")) {
+        (stripped.len(), 1)
     } else {
-        (s, 1)
+        (s.len(), 1)
     };
+
+    let num_str = &s[..num_len];
 
     let val: usize = num_str
         .trim()
