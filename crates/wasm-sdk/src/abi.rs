@@ -8,42 +8,34 @@ pub const ABI_VERSION: u32 = 1;
 
 /// Status code indicating successful batch transformation.
 pub const STATUS_SUCCESS: u32 = 0;
-/// Status code indicating an unrecoverable execution error.
-pub const STATUS_ERROR: u32 = 1;
+/// Status code indicating that the batch was discarded.
+pub const STATUS_DISCARD: u32 = 1;
 /// Status code indicating batch was rejected due to data validation failure.
 pub const STATUS_REJECT: u32 = 2;
+/// Status code indicating an unrecoverable execution error.
+pub const STATUS_ERROR: u32 = 3;
 
 /// Response header returned by `datalake_transform` export.
 ///
-/// Total size: 28 bytes, alignment: 4 bytes.
-///
-/// # Alignment Invariants
-/// When memory buffers pointed to by `batches_ptr` (with capacity `batches_cap_bytes`) and
-/// `message_ptr` (with capacity `message_cap`) are reclaimed via `datalake_dealloc`, they must
-/// have been allocated with 8-byte alignment (e.g. via `datalake_alloc`) to satisfy the deallocation
-/// layout requirements without heap corruption.
+/// Total size: 20 bytes, alignment: 4 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformResponseHeader {
-    /// Status code of the transformation (e.g. [`STATUS_SUCCESS`], [`STATUS_ERROR`], [`STATUS_REJECT`]).
+    /// Status code of the transformation (e.g. [`STATUS_SUCCESS`], [`STATUS_DISCARD`], [`STATUS_REJECT`], [`STATUS_ERROR`]).
     pub status: u32,
     /// Number of transformed record batches returned.
     pub batch_count: u32,
     /// Memory pointer to an array of `BatchDescriptor` structs.
     pub batches_ptr: u32,
-    /// Total allocated capacity of the `BatchDescriptor` array buffer in bytes.
-    pub batches_cap_bytes: u32,
     /// Memory pointer to an optional UTF-8 error or rejection message.
     pub message_ptr: u32,
     /// Length of the message in bytes.
     pub message_len: u32,
-    /// Total allocated capacity of the message string buffer in bytes.
-    pub message_cap: u32,
 }
 
 /// Descriptor for a single Arrow IPC stream payload in guest memory.
 ///
-/// Total size: 12 bytes, alignment: 4 bytes.
+/// Total size: 8 bytes, alignment: 4 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchDescriptor {
@@ -51,12 +43,6 @@ pub struct BatchDescriptor {
     pub ptr: u32,
     /// Byte length of the populated Arrow IPC stream buffer.
     pub len: u32,
-    /// Total allocated capacity of the buffer in bytes.
-    ///
-    /// Invariant: Memory at `ptr` must be allocated with 8-byte alignment and its
-    /// allocated capacity must match `cap` (e.g. using exact layout deallocation or `Box<[u8]>`)
-    /// so that `datalake_dealloc(ptr, cap)` frees the exact allocated layout without heap corruption.
-    pub cap: u32,
 }
 
 /// Memory layout for structured log records.

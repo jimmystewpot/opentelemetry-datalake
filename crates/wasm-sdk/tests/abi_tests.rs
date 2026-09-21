@@ -1,14 +1,15 @@
 use opentelemetry_datalake_wasm_sdk::abi::{
     ABI_VERSION, BatchDescriptor, HostLogRecord, LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO,
-    LOG_LEVEL_TRACE, LOG_LEVEL_WARN, STATUS_ERROR, STATUS_REJECT, STATUS_SUCCESS,
+    LOG_LEVEL_TRACE, LOG_LEVEL_WARN, STATUS_DISCARD, STATUS_ERROR, STATUS_REJECT, STATUS_SUCCESS,
     TransformResponseHeader, datalake_abi_version, datalake_alloc, datalake_dealloc,
 };
 
 #[test]
 fn test_status_constants() {
     assert_eq!(STATUS_SUCCESS, 0u32);
-    assert_eq!(STATUS_ERROR, 1u32);
+    assert_eq!(STATUS_DISCARD, 1u32);
     assert_eq!(STATUS_REJECT, 2u32);
+    assert_eq!(STATUS_ERROR, 3u32);
 }
 
 #[test]
@@ -22,7 +23,7 @@ fn test_log_level_constants() {
 
 #[test]
 fn test_abi_v1_header_memory_layout() {
-    assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 28);
+    assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 20);
     assert_eq!(std::mem::align_of::<TransformResponseHeader>(), 4);
     assert_eq!(std::mem::offset_of!(TransformResponseHeader, status), 0);
     assert_eq!(
@@ -34,27 +35,18 @@ fn test_abi_v1_header_memory_layout() {
         8
     );
     assert_eq!(
-        std::mem::offset_of!(TransformResponseHeader, batches_cap_bytes),
+        std::mem::offset_of!(TransformResponseHeader, message_ptr),
         12
     );
     assert_eq!(
-        std::mem::offset_of!(TransformResponseHeader, message_ptr),
+        std::mem::offset_of!(TransformResponseHeader, message_len),
         16
     );
-    assert_eq!(
-        std::mem::offset_of!(TransformResponseHeader, message_len),
-        20
-    );
-    assert_eq!(
-        std::mem::offset_of!(TransformResponseHeader, message_cap),
-        24
-    );
 
-    assert_eq!(std::mem::size_of::<BatchDescriptor>(), 12);
+    assert_eq!(std::mem::size_of::<BatchDescriptor>(), 8);
     assert_eq!(std::mem::align_of::<BatchDescriptor>(), 4);
     assert_eq!(std::mem::offset_of!(BatchDescriptor, ptr), 0);
     assert_eq!(std::mem::offset_of!(BatchDescriptor, len), 4);
-    assert_eq!(std::mem::offset_of!(BatchDescriptor, cap), 8);
 
     assert_eq!(std::mem::size_of::<HostLogRecord>(), 32);
     assert_eq!(std::mem::align_of::<HostLogRecord>(), 4);

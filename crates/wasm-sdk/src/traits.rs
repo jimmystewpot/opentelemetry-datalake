@@ -25,6 +25,11 @@ pub enum TransformResult {
         /// Reason explaining why the batch was rejected.
         reason: String,
     },
+    /// Transformation encountered an execution error.
+    Error {
+        /// Reason explaining why the transformation failed.
+        reason: String,
+    },
 }
 
 /// Trait implemented by WASM guest transform plugins.

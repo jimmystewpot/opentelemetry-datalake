@@ -32,111 +32,71 @@ pub fn duration_to_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Strongly-typed handle for a pre-registered monotonic counter metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct CounterHandle(pub u32);
-
-/// Strongly-typed handle for a pre-registered instantaneous gauge metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct GaugeHandle(pub u32);
-
-/// Strongly-typed handle for a pre-registered duration metric.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub struct DurationHandle(pub u32);
-
 #[cfg(target_arch = "wasm32")]
 // SAFETY: Declaring host runtime imports provided by the wasm-transformer host environment.
 unsafe extern "C" {
-    fn datalake_host_metric_register(metric_type: u32, name_ptr: u32, name_len: u32) -> u32;
-    fn datalake_host_metric_emit(handle: u32, value: u64);
+    fn datalake_host_metric_emit(metric_type: u32, name_ptr: u32, name_len: u32, value: u64);
 }
 
-/// Registers a metric with the host runtime during module initialization and returns a handle integer.
-#[must_use]
-pub fn register_metric(metric_type: u32, name: &str) -> u32 {
+/// Emits a counter increment metric to the host runtime.
+pub fn counter(name: &str, value: u64) {
     #[cfg(target_arch = "wasm32")]
     {
         // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
             #[allow(clippy::cast_possible_truncation)]
-            datalake_host_metric_register(
-                metric_type,
+            datalake_host_metric_emit(
+                METRIC_TYPE_COUNTER,
                 name.as_ptr() as usize as u32,
                 name.len() as u32,
-            )
+                value,
+            );
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT_HANDLE: AtomicU32 = AtomicU32::new(1);
-        let _ = (metric_type, name);
-        NEXT_HANDLE.fetch_add(1, Ordering::Relaxed)
+        let _ = (name, value);
     }
 }
 
-/// Registers a monotonic counter metric and returns a strongly-typed [`CounterHandle`].
-#[must_use]
-pub fn register_counter(name: &str) -> CounterHandle {
-    CounterHandle(register_metric(METRIC_TYPE_COUNTER, name))
-}
-
-/// Registers an instantaneous gauge metric and returns a strongly-typed [`GaugeHandle`].
-#[must_use]
-pub fn register_gauge(name: &str) -> GaugeHandle {
-    GaugeHandle(register_metric(METRIC_TYPE_GAUGE, name))
-}
-
-/// Registers a duration nanosecond metric and returns a strongly-typed [`DurationHandle`].
-#[must_use]
-pub fn register_duration(name: &str) -> DurationHandle {
-    DurationHandle(register_metric(METRIC_TYPE_DURATION, name))
-}
-
-/// Emits a counter increment metric using a pre-registered [`CounterHandle`].
-pub fn counter(handle: CounterHandle, value: u64) {
+/// Emits an instantaneous gauge metric to the host runtime.
+pub fn gauge(name: &str, value: f64) {
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: Invoking host metric emit with a valid pre-registered handle.
+        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
-            datalake_host_metric_emit(handle.0, value);
+            #[allow(clippy::cast_possible_truncation)]
+            datalake_host_metric_emit(
+                METRIC_TYPE_GAUGE,
+                name.as_ptr() as usize as u32,
+                name.len() as u32,
+                gauge_to_bits(value),
+            );
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = (handle, value);
+        let _ = (name, value);
     }
 }
 
-/// Emits an instantaneous gauge metric using a pre-registered [`GaugeHandle`].
-pub fn gauge(handle: GaugeHandle, value: f64) {
+/// Emits a duration measurement metric in nanoseconds to the host runtime.
+pub fn duration(name: &str, dur: Duration) {
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: Invoking host metric emit with a valid pre-registered handle and bitcasted f64.
+        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
-            datalake_host_metric_emit(handle.0, gauge_to_bits(value));
+            #[allow(clippy::cast_possible_truncation)]
+            datalake_host_metric_emit(
+                METRIC_TYPE_DURATION,
+                name.as_ptr() as usize as u32,
+                name.len() as u32,
+                duration_to_nanos(dur),
+            );
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = (handle, value);
-    }
-}
-
-/// Emits a duration measurement metric using a pre-registered [`DurationHandle`].
-pub fn duration(handle: DurationHandle, dur: Duration) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        // SAFETY: Invoking host metric emit with a valid pre-registered handle and duration in nanos.
-        unsafe {
-            datalake_host_metric_emit(handle.0, duration_to_nanos(dur));
-        }
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (handle, dur);
+        let _ = (name, dur);
     }
 }
