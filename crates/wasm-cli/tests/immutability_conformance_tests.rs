@@ -146,17 +146,31 @@ fn test_verify_batch_immutability_when_immutable_column_not_in_input() {
 }
 
 #[test]
-fn test_run_immutability_suite_not_yet_implemented() {
-    let res = run_immutability_suite(&[]);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
+fn test_run_immutability_suite_conformant_module() {
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_immutability_suite(&wasm).is_ok());
 }
 
 #[test]
-fn test_run_benchmark_with_disclaimer_not_yet_implemented() {
-    let res = run_benchmark_with_disclaimer(&[]);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
+fn test_run_benchmark_with_disclaimer_conformant_module() {
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
 }
 
 #[test]
@@ -199,4 +213,51 @@ fn test_verify_batch_immutability_typed_variants() {
     .unwrap();
     let err = verify_batch_immutability(&input, &output_tampered).unwrap_err();
     assert_eq!(err, TesterError::ValueMismatch("trace_id"));
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_module_failing_validation() {
+    let res = run_immutability_suite(b"not a wasm module");
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Invalid WASM"));
+}
+
+#[test]
+fn test_run_immutability_suite_detects_guest_error_status() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\14\40\00\00\0c\00\00\00custom error")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 16384))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("Guest transform failed: custom error"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_succeeds_with_returned_batch() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\01\00\00\00\14\40\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            (i32.store (i32.const 16404) (local.get $ptr))
+            (i32.store (i32.const 16408) (local.get $len))
+            (i32.const 16384)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_immutability_suite(&wasm).is_ok());
 }

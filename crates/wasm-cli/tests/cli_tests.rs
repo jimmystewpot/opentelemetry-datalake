@@ -151,39 +151,63 @@ fn test_validate_accepts_conformant_module() {
 }
 
 #[test]
-fn test_cli_subcommand_test_returns_not_yet_implemented() {
+fn test_cli_subcommand_test_conformant_module() {
     let bin = env!("CARGO_BIN_EXE_datalake-wasm");
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dummy_file = format!("{manifest_dir}/Cargo.toml");
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let temp_path = std::env::temp_dir().join(format!(
+        "datalake_conformant_test_{}.wasm",
+        std::process::id()
+    ));
+    std::fs::write(&temp_path, &wasm).unwrap();
 
     let output = std::process::Command::new(bin)
-        .args(["test", &dummy_file])
+        .args(["test", temp_path.to_str().unwrap()])
         .output()
         .expect("Failed to execute datalake-wasm process");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_file(&temp_path);
     assert!(
-        stderr.contains("Not yet implemented"),
-        "Expected stderr to contain 'Not yet implemented', got: {stderr}"
+        output.status.success(),
+        "Expected datalake-wasm test to succeed, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
 #[test]
-fn test_cli_subcommand_bench_returns_not_yet_implemented() {
+fn test_cli_subcommand_bench_conformant_module() {
     let bin = env!("CARGO_BIN_EXE_datalake-wasm");
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let dummy_file = format!("{manifest_dir}/Cargo.toml");
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let temp_path = std::env::temp_dir().join(format!(
+        "datalake_conformant_bench_{}.wasm",
+        std::process::id()
+    ));
+    std::fs::write(&temp_path, &wasm).unwrap();
 
     let output = std::process::Command::new(bin)
-        .args(["bench", &dummy_file])
+        .args(["bench", temp_path.to_str().unwrap()])
         .output()
         .expect("Failed to execute datalake-wasm process");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_file(&temp_path);
     assert!(
-        stderr.contains("Not yet implemented"),
-        "Expected stderr to contain 'Not yet implemented', got: {stderr}"
+        output.status.success(),
+        "Expected datalake-wasm bench to succeed, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
