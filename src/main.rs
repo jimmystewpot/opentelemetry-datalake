@@ -815,12 +815,13 @@ mod tests {
 }
 
 #[cfg(test)]
-
-#[cfg(test)]
 mod additional_tests {
     use super::*;
     use crate::AppConfig;
-    use figment::{Figment, providers::{Format, Toml}};
+    use figment::{
+        Figment,
+        providers::{Format, Toml},
+    };
 
     #[test]
     fn test_initialize_transformers_noop() {
