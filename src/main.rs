@@ -108,17 +108,16 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
-    }
-
-    if let Some(ref es_cfg) = config.elasticsearch {
+    } else if let Some(ref es_cfg) = config.elasticsearch {
         es_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    }
-
-    if let Some(ref sr_cfg) = config.starrocks {
+    } else if let Some(ref sr_cfg) = config.starrocks {
         sr_cfg
             .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if let Some(sort_cfg) = config.kafka.as_ref().and_then(|k| k.order_by.as_ref()) {
+        pipeline_core::sort::BatchSorter::from_config(sort_cfg)
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     }
 
@@ -784,6 +783,49 @@ mod tests {
         assert!(
             err.to_string().contains("CA certificate file not found"),
             "Error message should indicate missing CA file: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_validates_only_selected_sink_in_priority_order() {
+        // Iceberg takes precedence over StarRocks and Elasticsearch.
+        // Even if an inactive StarRocks section has invalid TLS, validate_config should succeed
+        // because Iceberg is the selected sink.
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_name = "test_catalog"
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "db.telemetry"
+        logs_table_identifier = "db.logs"
+        traces_table_identifier = "db.traces"
+        metrics_table_identifier = "db.metrics"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        assert!(
+            validate_config(&config).is_ok(),
+            "validate_config should succeed because Iceberg is selected and valid, ignoring inactive StarRocks"
         );
     }
 }
