@@ -262,6 +262,10 @@ pub struct StarRocksSinkConfig {
     /// Optional batch buffering configuration for accumulating records.
     #[serde(default)]
     pub batching: Option<StarRocksBatchingConfig>,
+
+    /// Standardized TLS configuration for secure connections.
+    #[serde(default)]
+    pub tls: pipeline_core::tls::TlsConfig,
 }
 
 // ─── Sink ────────────────────────────────────────────────────────────────────
@@ -303,6 +307,7 @@ impl StarRocksSink {
         config: StarRocksSinkConfig,
         manager: Arc<StreamLoadManager>,
     ) -> Result<Self, PipelineError> {
+        config.tls.validate()?;
         let sorter = if let Some(ref sort_cfg) = config.order_by {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)?
         } else {
@@ -335,6 +340,7 @@ impl StarRocksSink {
     /// Returns [`PipelineError::Internal`] if configuration validation fails or
     /// if the [`StreamLoadManager`] cannot be initialised.
     pub fn try_new(config: StarRocksSinkConfig) -> Result<Self, PipelineError> {
+        config.tls.validate()?;
         if config.frontend_urls.is_empty() {
             return Err(PipelineError::Internal(
                 "StarRocks configuration error: `frontend_urls` must contain at least one FE URL"
@@ -777,6 +783,7 @@ mod tests {
             retry_interval_secs: default_retry_interval_secs(),
             order_by: None,
             batching: None,
+            tls: pipeline_core::tls::TlsConfig::default(),
         }
     }
 
@@ -1372,5 +1379,39 @@ mod tests {
             "Task should have failed on flush attempt, got: {:?}",
             result
         );
+    }
+
+    #[test]
+    fn test_starrocks_tls_config_default_and_deserialization() {
+        let toml_str = r#"
+            frontend_urls = ["http://fe-1:8030"]
+            database = "otel"
+            username = "root"
+            [table_mapping]
+            type = "unified"
+            table = "otel_events"
+            signal_type_column = "signal_type"
+            [tls]
+            ca_cert_path = "/path/to/custom-ca.pem"
+            verification = "disabled"
+        "#;
+        let config: StarRocksSinkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.tls.ca_cert_path.as_deref(),
+            Some("/path/to/custom-ca.pem")
+        );
+        assert!(config.tls.is_insecure());
+        assert_eq!(
+            config.tls.verification,
+            pipeline_core::tls::TlsVerificationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn test_starrocks_tls_validation_rejects_missing_ca_path() {
+        let mut config = base_config();
+        config.tls.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
+        let res = StarRocksSink::try_new(config);
+        assert!(matches!(res, Err(PipelineError::Configuration(_))));
     }
 }
