@@ -296,8 +296,8 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::AsArray;
     use super::*;
+    use arrow::array::AsArray;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::metrics::v1::{

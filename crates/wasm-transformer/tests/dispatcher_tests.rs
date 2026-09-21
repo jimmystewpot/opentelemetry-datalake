@@ -489,7 +489,6 @@ async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
     );
 }
 
-
 fn test_tf_cfg() -> WasmTransformerConfig {
     WasmTransformerConfig {
         id: "test".to_string(),
@@ -509,24 +508,29 @@ fn test_tf_cfg() -> WasmTransformerConfig {
         on_error: OnErrorPolicy::Passthrough,
         on_reject: OnRejectPolicy::Drop,
         schema_guard: SchemaGuardMode::Defensive,
-        env: std::collections::HashMap::new(), config: None, enable_sighup: false, env_whitelist: vec![],
+        env: std::collections::HashMap::new(),
+        config: None,
+        enable_sighup: false,
+        env_whitelist: vec![],
     }
 }
 
 #[tokio::test]
 async fn test_dispatcher_worker_init_failure() {
-    let engine = Arc::new(EngineCache::new_pooling(1, 1024*1024).unwrap());
-    
+    let engine = Arc::new(EngineCache::new_pooling(1, 1024 * 1024).unwrap());
+
     // Provide a valid module initially, but we'll mess up the config or module to cause WasmWorker::new to fail.
     // It calls `engine.instantiate(module)`. If the module needs imports that aren't provided by the linker.
     let bad_wat = r#"(module (import "env" "missing" (func)))"#;
-    let module = engine.compile_module(&wat::parse_str(bad_wat).unwrap()).unwrap();
+    let module = engine
+        .compile_module(&wat::parse_str(bad_wat).unwrap())
+        .unwrap();
 
     let cfg = DispatcherConfig {
         concurrency: 1,
         worker_channel_capacity: 1,
     };
-    
+
     let tf_cfg = test_tf_cfg();
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
@@ -534,8 +538,16 @@ async fn test_dispatcher_worker_init_failure() {
     let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
     let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
 
-    let dispatcher = WasmDispatcher::new(cfg, engine, module, tf_cfg, out_tx, Some(err_tx), Some(rej_tx));
-    
+    let dispatcher = WasmDispatcher::new(
+        cfg,
+        engine,
+        module,
+        tf_cfg,
+        out_tx,
+        Some(err_tx),
+        Some(rej_tx),
+    );
+
     // The worker spawn task will fail initializing WasmWorker, causing it to return early.
     // The worker channels are dropped, so sending to them will fail, causing run() to return Err.
     let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
@@ -545,23 +557,29 @@ async fn test_dispatcher_worker_init_failure() {
 
     // Send a batch.
     let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Utf8, false)]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
     let _ = in_tx.send(SignalBatch::Logs(batch)).await;
 
     let res = run_handle.await.unwrap();
-    assert!(res.is_err(), "Dispatcher should error because worker channel closed");
+    assert!(
+        res.is_err(),
+        "Dispatcher should error because worker channel closed"
+    );
 }
 
 #[tokio::test]
 async fn test_dispatcher_output_channel_closed() {
-    let engine = Arc::new(EngineCache::new_pooling(2, 1024*1024).unwrap());
-    let module = engine.compile_module(&wat::parse_str(passthrough_wat()).unwrap()).unwrap();
+    let engine = Arc::new(EngineCache::new_pooling(2, 1024 * 1024).unwrap());
+    let module = engine
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
 
     let cfg = DispatcherConfig {
         concurrency: 1,
         worker_channel_capacity: 1,
     };
-    
+
     let tf_cfg = test_tf_cfg();
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
@@ -569,14 +587,23 @@ async fn test_dispatcher_output_channel_closed() {
     let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
     let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
 
-    let dispatcher = WasmDispatcher::new(cfg, engine, module, tf_cfg, out_tx, Some(err_tx), Some(rej_tx));
+    let dispatcher = WasmDispatcher::new(
+        cfg,
+        engine,
+        module,
+        tf_cfg,
+        out_tx,
+        Some(err_tx),
+        Some(rej_tx),
+    );
     let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
 
     // Drop out_rx BEFORE sending the batch, so that output.send(b) inside the worker fails.
     drop(out_rx);
 
     let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Utf8, false)]));
-    let batch = RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
     let _ = in_tx.send(SignalBatch::Logs(batch)).await;
 
     // Send another to trigger the worker loop if first dropped silently
@@ -584,6 +611,8 @@ async fn test_dispatcher_output_channel_closed() {
     drop(in_tx);
 
     let res = run_handle.await.unwrap();
-    assert!(res.is_ok(), "Run should finish gracefully when input closes");
+    assert!(
+        res.is_ok(),
+        "Run should finish gracefully when input closes"
+    );
 }
-

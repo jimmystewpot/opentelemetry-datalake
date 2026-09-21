@@ -177,7 +177,6 @@ impl Transform for WasmTransformer {
 mod tests {
     use super::*;
     use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, SchemaGuardMode};
-    use std::io::Write;
 
     fn base_config(path: String) -> WasmTransformerConfig {
         WasmTransformerConfig {
@@ -225,27 +224,32 @@ mod tests {
     fn test_new_missing_module_path() {
         let config = base_config("/invalid/path/that/does/not/exist.wasm".to_string());
         let res = WasmTransformer::new(config, None, None);
-        assert!(matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("Failed to read WASM module")));
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("Failed to read WASM module"))
+        );
     }
 
     #[test]
     fn test_new_sha256_mismatch() {
         let path = std::env::temp_dir().join("test_new_sha256_mismatch.wasm");
         std::fs::write(&path, b"invalid wasm bytes").unwrap();
-        
+
         let mut config = base_config(path.to_str().unwrap().to_string());
-        config.sha256 = Some("0000000000000000000000000000000000000000000000000000000000000000".to_string());
-        
+        config.sha256 =
+            Some("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+
         let res = WasmTransformer::new(config, None, None);
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("SHA256 mismatch")));
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("SHA256 mismatch"))
+        );
     }
 
     #[test]
     fn test_new_invalid_wasm_compilation() {
         let path = std::env::temp_dir().join("test_new_invalid_wasm_compilation.wasm");
         std::fs::write(&path, b"invalid wasm bytes").unwrap();
-        
+
         let config = base_config(path.to_str().unwrap().to_string());
         let res = WasmTransformer::new(config, None, None);
         let _ = std::fs::remove_file(&path);

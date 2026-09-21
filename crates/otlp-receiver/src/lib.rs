@@ -334,8 +334,8 @@ impl Source for OtlpReceiverSource {
 
 #[cfg(test)]
 mod tests {
-    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use super::*;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use std::net::IpAddr;
 
     #[tokio::test]
@@ -587,7 +587,6 @@ mod tests {
     /// A non-empty gRPC logs request must push a `SignalBatch::Logs` onto the channel.
     #[tokio::test]
     async fn test_grpc_logs_non_empty_sends_to_channel() {
-
         let (tx, mut rx) = mpsc::channel(10);
         let svc = GrpcLogsService { tx };
 
