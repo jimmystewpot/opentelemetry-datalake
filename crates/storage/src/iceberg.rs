@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     /// `sort_logs` must return `PipelineError::Internal` when the batch lacks
-    /// the required ``service_name`` column.
+    /// the required `service_name` column.
     #[test]
     fn test_sort_logs_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1381,7 +1381,7 @@ mod tests {
         );
     }
 
-    /// ``sort_metrics`` must return `PipelineError::Internal` when the `name` column is absent.
+    /// `sort_metrics` must return `PipelineError::Internal` when the `name` column is absent.
     #[test]
     fn test_sort_metrics_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1411,14 +1411,14 @@ mod tests {
         assert_eq!(result.schema(), original_schema);
     }
 
-    /// ``get_partition_path`` must handle timestamp 0 (Unix epoch) correctly.
+    /// `get_partition_path` must handle timestamp 0 (Unix epoch) correctly.
     #[test]
     fn test_get_partition_path_zero_timestamp() {
         let path = get_partition_path(0, PartitionGranularity::Hourly).unwrap();
         assert_eq!(path, "year=1970/month=01/day=01/hour=00/");
     }
 
-    /// ``should_flush`` must trigger when `total_bytes` exceeds `max_batch_size_bytes`.
+    /// `should_flush` must trigger when `total_bytes` exceeds `max_batch_size_bytes`.
     #[test]
     fn test_should_flush_byte_threshold() {
         let mut config = make_dry_run_config(SchemaMode::Fixed);

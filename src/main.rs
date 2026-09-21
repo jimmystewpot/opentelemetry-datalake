@@ -113,18 +113,18 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Initializes the pipeline transformers based on the provided application configuration.
-/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
-/// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
-#[allow(clippy::type_complexity)]
-fn initialize_transformers(
-    config: &AppConfig,
-) -> anyhow::Result<(
+/// A tuple containing signal-isolated transformers for logs, traces, and metrics, along with SIGHUP listener handles.
+type SignalTransformers = (
     Box<dyn Transform>,
     Box<dyn Transform>,
     Box<dyn Transform>,
     Vec<Option<tokio::task::JoinHandle<()>>>,
-)> {
+);
+
+/// Initializes the pipeline transformers based on the provided application configuration.
+/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
+/// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
+fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransformers> {
     let mut sighup_handles = Vec::new();
     let (logs_transformer, traces_transformer, metrics_transformer): (
         Box<dyn Transform>,

@@ -271,6 +271,8 @@ impl WasmDispatcher {
         let timeout_dur =
             parse_duration(drain_timeout_str).unwrap_or_else(|| std::time::Duration::from_secs(10));
 
+        let abort_handles: Vec<_> = handles.iter().map(JoinHandle::abort_handle).collect();
+
         let drain_result = tokio::time::timeout(timeout_dur, async {
             for handle in handles {
                 if let Err(e) = handle.await {
@@ -281,7 +283,10 @@ impl WasmDispatcher {
         .await;
 
         if drain_result.is_err() {
-            warn!("Worker drain timed out after {timeout_dur:?}");
+            warn!("Worker drain timed out after {timeout_dur:?}; aborting lingering workers");
+            for abort_handle in abort_handles {
+                abort_handle.abort();
+            }
         }
     }
 }
@@ -361,6 +366,39 @@ mod tests {
         assert_eq!(
             parse_duration("10"),
             Some(std::time::Duration::from_secs(10))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_workers_aborts_lingering_tasks_on_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropDetector(Arc<AtomicBool>);
+        impl Drop for DropDetector {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_clone = Arc::clone(&dropped);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _detector = DropDetector(dropped_clone);
+            let _ = started_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let _ = started_rx.await;
+
+        WasmDispatcher::drain_workers(vec![handle], "10ms").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "Lingering worker task must be aborted and dropped on drain timeout"
         );
     }
 }
