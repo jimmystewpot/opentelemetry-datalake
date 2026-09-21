@@ -249,3 +249,133 @@ fn test_backfill_preserves_schema_metadata() {
     let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
     assert_eq!(backfilled.schema().metadata(), &metadata);
 }
+
+#[test]
+fn test_o1_immutability_check_detects_dropped_immutable_column() {
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let input = RecordBatch::try_new(
+        in_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_123"])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+    let output =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    let err = verify_structural_immutability(&input, &output).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Immutability violation: core field 'trace_id' was dropped by guest"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_o1_immutability_check_allows_dropped_immutable_column_if_input_was_null() {
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, true),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let input = RecordBatch::try_new(
+        in_schema,
+        vec![
+            new_null_array(&DataType::Utf8, 1),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+    let output =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    assert!(verify_structural_immutability(&input, &output).is_ok());
+}
+
+#[test]
+fn test_o1_immutability_check_allows_dropped_immutable_column_if_output_empty() {
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let input = RecordBatch::try_new(
+        in_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_123"])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+    let output = RecordBatch::new_empty(out_schema);
+
+    assert!(verify_structural_immutability(&input, &output).is_ok());
+}
+
+#[test]
+fn test_backfill_preserves_input_column_ordering_when_middle_column_dropped() {
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Int64, true),
+        Field::new("col_c", DataType::Utf8, true),
+    ]));
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_c", DataType::Utf8, true),
+    ]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a_val"])),
+            Arc::new(StringArray::from(vec!["c_val"])),
+        ],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+
+    assert_eq!(backfilled.num_columns(), 3);
+    assert_eq!(backfilled.schema().field(0).name(), "col_a");
+    assert_eq!(backfilled.schema().field(1).name(), "col_b");
+    assert_eq!(backfilled.schema().field(2).name(), "col_c");
+
+    assert_eq!(backfilled.column(0).null_count(), 0);
+    assert_eq!(backfilled.column(1).null_count(), 1);
+    assert_eq!(backfilled.column(2).null_count(), 0);
+}
+
+#[test]
+fn test_backfill_preserves_input_ordering_and_appends_guest_new_columns() {
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("col_b", DataType::Int64, true),
+    ]));
+    let partial_schema = Arc::new(Schema::new(vec![
+        Field::new("col_b", DataType::Int64, true),
+        Field::new("new_guest_col", DataType::Utf8, true),
+    ]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![42])),
+            Arc::new(StringArray::from(vec!["guest_val"])),
+        ],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+
+    assert_eq!(backfilled.num_columns(), 3);
+    assert_eq!(backfilled.schema().field(0).name(), "col_a");
+    assert_eq!(backfilled.schema().field(1).name(), "col_b");
+    assert_eq!(backfilled.schema().field(2).name(), "new_guest_col");
+
+    assert_eq!(backfilled.column(0).null_count(), 1);
+    assert_eq!(backfilled.column(1).null_count(), 0);
+    assert_eq!(backfilled.column(2).null_count(), 0);
+}
