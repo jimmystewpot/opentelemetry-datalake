@@ -216,6 +216,13 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
 }
 
 /// Copies bytes into the guest linear memory buffer at `ptr`.
+///
+/// # Safety
+///
+/// When targeting `wasm32`, `ptr` must refer to a valid, aligned linear memory buffer
+/// allocated with capacity at least `src.len()` (typically allocated via [`datalake_alloc`]).
+/// Calling this with an unallocated or out-of-bounds pointer leads to undefined behavior.
+/// On non-`wasm32` targets, memory safety is enforced via the thread-safe mock allocation map.
 pub fn write_guest_memory(ptr: u32, src: &[u8]) {
     if ptr == 0 || src.is_empty() {
         return;
@@ -244,6 +251,12 @@ pub fn write_guest_memory(ptr: u32, src: &[u8]) {
 }
 
 /// Reads `len` bytes from the guest linear memory buffer at `ptr`.
+///
+/// # Safety
+///
+/// When targeting `wasm32`, `ptr` must refer to a valid, initialized linear memory buffer
+/// of at least `len` bytes. Reading beyond allocated guest memory bounds leads to undefined behavior.
+/// On non-`wasm32` targets, memory bounds are checked against the mock allocation map.
 #[must_use]
 pub fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
     if ptr == 0 {

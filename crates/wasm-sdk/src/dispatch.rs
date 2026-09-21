@@ -7,7 +7,7 @@
 
 use crate::abi::{
     BatchDescriptor, STATUS_DISCARD, STATUS_ERROR, STATUS_REJECT, STATUS_SUCCESS,
-    TransformResponseHeader, datalake_alloc, write_guest_memory,
+    TransformResponseHeader, datalake_alloc, datalake_dealloc, write_guest_memory,
 };
 use crate::error::SdkError;
 use crate::traits::TransformResult;
@@ -71,11 +71,17 @@ pub fn encode_response(result: &TransformResult) -> u64 {
                     }
                 }
 
-                let mut descriptors = Vec::with_capacity(ipc_buffers.len());
+                let mut descriptors: Vec<BatchDescriptor> = Vec::with_capacity(ipc_buffers.len());
                 for buf in &ipc_buffers {
                     #[allow(clippy::cast_possible_truncation)]
                     let buf_len = buf.len() as u32;
                     let buf_ptr = datalake_alloc(buf_len);
+                    if buf_ptr == 0 && buf_len > 0 {
+                        for d in &descriptors {
+                            datalake_dealloc(d.ptr, d.len);
+                        }
+                        return create_error_response("Memory allocation failed for batch buffer");
+                    }
                     if buf_ptr != 0 {
                         write_guest_memory(buf_ptr, buf);
                     }
@@ -87,7 +93,14 @@ pub fn encode_response(result: &TransformResult) -> u64 {
 
                 let desc_byte_len = descriptors.len() * std::mem::size_of::<BatchDescriptor>();
                 #[allow(clippy::cast_possible_truncation)]
-                let desc_ptr = datalake_alloc(desc_byte_len as u32);
+                let desc_len_u32 = desc_byte_len as u32;
+                let desc_ptr = datalake_alloc(desc_len_u32);
+                if desc_ptr == 0 && !descriptors.is_empty() {
+                    for d in &descriptors {
+                        datalake_dealloc(d.ptr, d.len);
+                    }
+                    return create_error_response("Memory allocation failed for batch descriptors");
+                }
                 if desc_ptr != 0 {
                     let mut desc_bytes = Vec::with_capacity(desc_byte_len);
                     for d in &descriptors {
@@ -106,33 +119,22 @@ pub fn encode_response(result: &TransformResult) -> u64 {
         TransformResult::Reject { reason } => {
             let reason_bytes = reason.as_bytes();
             #[allow(clippy::cast_possible_truncation)]
-            let msg_len = reason_bytes.len() as u32;
+            let mut msg_len = reason_bytes.len() as u32;
             let msg_ptr = if msg_len == 0 {
                 0
             } else {
                 let ptr = datalake_alloc(msg_len);
-                if ptr != 0 {
+                if ptr == 0 {
+                    msg_len = 0;
+                    0
+                } else {
                     write_guest_memory(ptr, reason_bytes);
+                    ptr
                 }
-                ptr
             };
             write_and_pack_header(STATUS_REJECT, 0, 0, msg_ptr, msg_len)
         }
-        TransformResult::Error { reason } => {
-            let reason_bytes = reason.as_bytes();
-            #[allow(clippy::cast_possible_truncation)]
-            let msg_len = reason_bytes.len() as u32;
-            let msg_ptr = if msg_len == 0 {
-                0
-            } else {
-                let ptr = datalake_alloc(msg_len);
-                if ptr != 0 {
-                    write_guest_memory(ptr, reason_bytes);
-                }
-                ptr
-            };
-            write_and_pack_header(STATUS_ERROR, 0, 0, msg_ptr, msg_len)
-        }
+        TransformResult::Error { reason } => create_error_response(reason),
     }
 }
 
@@ -141,15 +143,18 @@ pub fn encode_response(result: &TransformResult) -> u64 {
 pub fn create_error_response(message: &str) -> u64 {
     let msg_bytes = message.as_bytes();
     #[allow(clippy::cast_possible_truncation)]
-    let msg_len = msg_bytes.len() as u32;
+    let mut msg_len = msg_bytes.len() as u32;
     let msg_ptr = if msg_len == 0 {
         0
     } else {
         let ptr = datalake_alloc(msg_len);
-        if ptr != 0 {
+        if ptr == 0 {
+            msg_len = 0;
+            0
+        } else {
             write_guest_memory(ptr, msg_bytes);
+            ptr
         }
-        ptr
     };
     write_and_pack_header(STATUS_ERROR, 0, 0, msg_ptr, msg_len)
 }
