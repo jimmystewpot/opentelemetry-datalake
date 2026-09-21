@@ -41,8 +41,16 @@ impl EngineCache {
 
         let mut config = Config::new();
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_cfg));
+        config.epoch_interruption(true);
 
         let engine = Engine::new(&config)?;
+        
+        let engine_clone = engine.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            engine_clone.increment_epoch();
+        });
+
         Ok(Self {
             engine,
             module: RwLock::new(None),

@@ -77,6 +77,7 @@ pub struct WasmWorker {
     batches_processed: u64,
     local_generation: u64,
     rejuvenate_threshold_bytes: usize,
+    epoch_deadline_ticks: u64,
 }
 
 impl std::fmt::Debug for WasmWorker {
@@ -119,11 +120,17 @@ impl WasmWorker {
             })?
         };
 
+        let init_duration_ms = parse_duration_ms(&config.init_timeout).unwrap_or(2000);
+        let init_deadline_ticks = init_duration_ms.max(10) / 10;
+
         let filtered_env =
             crate::wasi_env::filter_environment_variables(&config.env_whitelist, &config.env);
-        let mut guest = Self::instantiate_guest(engine.engine(), &module)?;
+        let mut guest = Self::instantiate_guest(engine.engine(), &module, init_deadline_ticks)?;
         Self::initialize_guest(&mut guest, &config)?;
         let local_generation = engine.module_generation();
+        
+        let duration_ms = parse_duration_ms(&config.max_execution_duration).unwrap_or(500);
+        let epoch_deadline_ticks = duration_ms.max(10) / 10;
 
         Ok(Self {
             id,
@@ -140,6 +147,7 @@ impl WasmWorker {
             batches_processed: 0,
             local_generation,
             rejuvenate_threshold_bytes,
+            epoch_deadline_ticks,
         })
     }
 
@@ -159,6 +167,8 @@ impl WasmWorker {
         batch: SignalBatch,
     ) -> Result<WorkerOutcome, WasmTransformError> {
         self.check_hot_reload()?;
+
+        self.store.set_epoch_deadline(self.epoch_deadline_ticks);
 
         let record_batch = match &batch {
             SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
@@ -244,7 +254,7 @@ impl WasmWorker {
     /// Returns [`WasmTransformError`] if re-instantiation fails, required exports are missing,
     /// or guest initialization fails.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let mut guest = Self::instantiate_guest(self.engine.engine(), &self.module)?;
+        let mut guest = Self::instantiate_guest(self.engine.engine(), &self.module, self.epoch_deadline_ticks)?;
         Self::initialize_guest(&mut guest, &self.config)?;
         self.store = guest.store;
         self.instance = guest.instance;
@@ -380,8 +390,12 @@ impl WasmWorker {
     ) -> Result<WorkerOutcome, WasmTransformError> {
         match header.status {
             0 => {
-                if header.batch_count == 0 || header.batches_ptr == 0 {
-                    Ok(WorkerOutcome::Emitted(vec![batch]))
+                if header.batch_count == 0 {
+                    Ok(WorkerOutcome::Emitted(vec![]))
+                } else if header.batches_ptr == 0 {
+                    Err(WasmTransformError::Pipeline(
+                        "Malformed response: positive batch_count with null descriptor pointer".into(),
+                    ))
                 } else {
                     let out_batches = extract_output_batches(
                         &self.memory,
@@ -423,15 +437,19 @@ impl WasmWorker {
     fn instantiate_guest(
         engine: &wasmtime::Engine,
         module: &Module,
+        init_deadline_ticks: u64,
     ) -> Result<GuestComponents, WasmTransformError> {
         let mut store = Store::new(engine, ());
+        store.set_epoch_deadline(init_deadline_ticks);
         let instance = Instance::new(&mut store, module, &[])?;
 
-        if let Ok(abi_fn) = instance.get_typed_func::<(), u32>(&mut store, "datalake_abi_version") {
-            let version = abi_fn.call(&mut store, ())?;
-            if version != opentelemetry_datalake_wasm_sdk::abi::ABI_VERSION {
-                return Err(WasmTransformError::AbiVersionMismatch(version));
-            }
+        let abi_fn = instance
+            .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
+            .map_err(|_| WasmTransformError::MissingExport("datalake_abi_version".into()))?;
+        
+        let version = abi_fn.call(&mut store, ())?;
+        if version != opentelemetry_datalake_wasm_sdk::abi::ABI_VERSION {
+            return Err(WasmTransformError::AbiVersionMismatch(version));
         }
 
         let alloc_fn = instance
@@ -496,6 +514,10 @@ impl WasmWorker {
             } else {
                 (0, 0)
             };
+
+            let init_duration_ms = parse_duration_ms(&config.init_timeout).unwrap_or(2000);
+            let init_deadline_ticks = init_duration_ms.max(10) / 10;
+            guest.store.set_epoch_deadline(init_deadline_ticks);
 
             let init_res = init_fn.call(&mut guest.store, (conf_ptr, conf_len));
             if conf_ptr > 0 && conf_len > 0 {
@@ -586,6 +608,7 @@ fn extract_output_batches(
     }
 
     let mut out_batches = Vec::with_capacity((batch_count as usize).min(64));
+    let mut total_bytes = 0usize;
 
     for i in 0..batch_count {
         let offset =
@@ -599,13 +622,21 @@ fn extract_output_batches(
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
 
-        if (b_ptr as usize).saturating_add(b_len as usize) > mem_size {
+        let b_len_usize = b_len as usize;
+        total_bytes = total_bytes.saturating_add(b_len_usize);
+        if total_bytes > 64 * 1024 * 1024 {
+            return Err(WasmTransformError::Pipeline(
+                "Cumulative batch output size exceeds maximum allowed 64MiB limit".into()
+            ));
+        }
+
+        if (b_ptr as usize).saturating_add(b_len_usize) > mem_size {
             return Err(WasmTransformError::Pipeline(format!(
                 "Batch IPC buffer bounds exceed guest memory size {mem_size}"
             )));
         }
 
-        let mut out_ipc_bytes = vec![0u8; b_len as usize];
+        let mut out_ipc_bytes = vec![0u8; b_len_usize];
         memory
             .read(store, b_ptr as usize, &mut out_ipc_bytes)
             .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
@@ -649,6 +680,18 @@ fn parse_byte_size(s: &str) -> Option<usize> {
         num.trim().parse::<usize>().ok()
     } else {
         trimmed.parse::<usize>().ok()
+    }
+}
+
+/// Parses a duration string (e.g., "500ms", "1s") into milliseconds.
+fn parse_duration_ms(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("ms") {
+        num.trim().parse::<u64>().ok()
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.trim().parse::<u64>().ok().map(|s| s * 1000)
+    } else {
+        trimmed.parse::<u64>().ok()
     }
 }
 

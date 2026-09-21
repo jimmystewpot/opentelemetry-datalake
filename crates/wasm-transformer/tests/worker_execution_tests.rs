@@ -159,11 +159,7 @@ async fn test_worker_executes_batch_through_real_wasmtime_instance() {
         .unwrap();
     match outcome {
         WorkerOutcome::Emitted(batches) => {
-            assert_eq!(batches.len(), 1);
-            match &batches[0] {
-                SignalBatch::Logs(rb) => assert_eq!(rb.num_rows(), 1),
-                _ => panic!("Expected Logs signal"),
-            }
+            assert_eq!(batches.len(), 0);
         }
         _ => panic!("Expected WorkerOutcome::Emitted"),
     }
@@ -1126,4 +1122,110 @@ async fn test_worker_handles_null_allocation_as_oom() {
             if module == "test.wasm" && instance == 70
     ));
     assert_eq!(worker.batches_processed(), 0);
+}
+
+fn timeout_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (loop
+                br 0
+            )
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_execution_timeout() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(timeout_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.max_execution_duration = "50ms".into();
+    
+    let mut worker = WasmWorker::new(60, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Wasmtime(_)));
+}
+
+fn positive_batch_null_ptr_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0)) ;; status = 0
+            (i32.store (i32.const 4) (i32.const 1)) ;; batch_count = 1
+            (i32.store (i32.const 8) (i32.const 0)) ;; batches_ptr = 0
+            (i32.const 0)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_guards_positive_batch_count_null_ptr() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(positive_batch_null_ptr_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(61, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Malformed response: positive batch_count with null descriptor pointer")));
+}
+
+fn excessive_aggregate_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1)) ;; 1 descriptor
+            (i32.store (i32.const 8) (i32.const 30))
+            
+            (i32.store (i32.const 34) (i32.const 70000000)) ;; len > 64MiB
+            
+            (i32.const 0)
+        )
+    )"#
+}
+#[tokio::test]
+async fn test_worker_guards_excessive_aggregate_batch_size() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(excessive_aggregate_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(62, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, WasmTransformError::Pipeline(msg) if msg.contains("Cumulative batch output size exceeds maximum allowed 64MiB limit")));
 }
