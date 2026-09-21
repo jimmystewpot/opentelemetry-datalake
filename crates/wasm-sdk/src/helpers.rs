@@ -37,5 +37,17 @@ pub fn nullify_column(batch: &RecordBatch, column_name: &str) -> Result<RecordBa
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
     let field = schema.field(idx);
     columns[idx] = new_null_array(field.data_type(), batch.num_rows());
-    RecordBatch::try_new(schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
+
+    let final_schema = if field.is_nullable() {
+        schema.clone()
+    } else {
+        let mut fields = schema.fields().to_vec();
+        fields[idx] = Arc::new(field.as_ref().clone().with_nullable(true));
+        Arc::new(arrow::datatypes::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    };
+
+    RecordBatch::try_new(final_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
 }
