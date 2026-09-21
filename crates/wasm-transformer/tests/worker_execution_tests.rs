@@ -1093,3 +1093,37 @@ fn test_worker_passes_config_to_guest_init() {
     let worker = WasmWorker::new(63, Arc::clone(&cache), module, cfg).unwrap();
     assert_eq!(worker.id, 63);
 }
+
+fn null_alloc_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_handles_null_allocation_as_oom() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(null_alloc_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(70, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        WasmTransformError::Oom { ref module, instance }
+            if module == "test.wasm" && instance == 70
+    ));
+    assert_eq!(worker.batches_processed(), 0);
+}

@@ -178,6 +178,13 @@ impl WasmWorker {
                 return Err(WasmTransformError::Wasmtime(e));
             }
         };
+        if ipc_ptr == 0 && ipc_len > 0 {
+            let _ = self.rejuvenate();
+            return Err(WasmTransformError::Oom {
+                module: self.config.module_path.clone(),
+                instance: self.id,
+            });
+        }
         if let Err(e) = self
             .memory
             .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
@@ -471,6 +478,11 @@ impl WasmWorker {
                     Ok(ptr) => ptr,
                     Err(e) => return Err(WasmTransformError::InitFailed(e.to_string())),
                 };
+                if conf_ptr == 0 && conf_len > 0 {
+                    return Err(WasmTransformError::InitFailed(
+                        "Guest allocation failed for config payload".to_string(),
+                    ));
+                }
                 if let Err(e) = guest
                     .memory
                     .write(&mut guest.store, conf_ptr as usize, conf_bytes)
