@@ -59,14 +59,14 @@ impl ComplianceEngine {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError::Internal` if the ``resource_attributes`` column
+    /// Returns `PipelineError::Internal` if the `resource_attributes` column
     /// is not a UTF-8 string array.
     pub fn check_batch_compliance(&self, batch: &RecordBatch) -> Result<bool, PipelineError> {
-        let Some(col) = batch.column_by_name("`resource_attributes`") else {
+        let Some(col) = batch.column_by_name("resource_attributes") else {
             return Ok(false);
         };
 
-        let arr = downcast_string_array(col.as_ref(), "`resource_attributes`")?;
+        let arr = downcast_string_array(col.as_ref(), "resource_attributes")?;
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 return Ok(false);
@@ -156,7 +156,7 @@ impl ComplianceEngine {
 
         for (i, field) in schema.fields().iter().enumerate() {
             let col = batch.column(i);
-            if field.name() == "attributes" || field.name() == "`resource_attributes`" {
+            if field.name() == "attributes" || field.name() == "resource_attributes" {
                 let arr = downcast_string_array(col.as_ref(), field.name())?;
                 let mut builder = arrow::array::StringBuilder::new();
                 for j in 0..arr.len() {
@@ -198,17 +198,17 @@ mod tests {
     fn make_test_batch(service_name: Option<&str>, legacy_key: Option<&str>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("attributes", DataType::Utf8, false),
-            Field::new("`resource_attributes`", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
         let resource_attrs = match service_name {
-            Some(name) => format!(r#"{{"service.name":"{}"}}"#, name),
-            None => r#"{}"#.to_string(),
+            Some(name) => format!(r#"{{"service.name":"{name}"}}"#),
+            None => r"{}".to_string(),
         };
 
         let attrs = match legacy_key {
             Some(key) => format!(r#"{{"{key}":"GET"}}"#),
-            None => r#"{}"#.to_string(),
+            None => r"{}".to_string(),
         };
 
         let attrs_array = Arc::new(StringArray::from(vec![attrs])) as ArrayRef;
@@ -274,10 +274,10 @@ mod tests {
     fn test_compliance_engine_malformed_json() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("attributes", DataType::Utf8, false),
-            Field::new("`resource_attributes`", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
-        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#])) as ArrayRef;
+        let attrs_array = Arc::new(StringArray::from(vec![r"{}"])) as ArrayRef;
         let res_array = Arc::new(StringArray::from(vec!["not valid json {{{"])) as ArrayRef;
 
         let batch = RecordBatch::try_new(schema, vec![attrs_array, res_array]).unwrap();
@@ -295,7 +295,7 @@ mod tests {
     fn test_compliance_engine_null_attributes() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("attributes", DataType::Utf8, true),
-            Field::new("`resource_attributes`", DataType::Utf8, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
         ]));
 
         let attrs_array = Arc::new(StringArray::from(vec![Some("{}")])) as ArrayRef;
@@ -307,7 +307,7 @@ mod tests {
         let result = engine.assess_and_remap(batch);
         assert!(
             result.is_err(),
-            "Null `resource_attributes` should fail strict compliance"
+            "Null resource_attributes should fail strict compliance"
         );
     }
 
@@ -317,10 +317,10 @@ mod tests {
     fn test_compliance_engine_multi_row_mixed() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("attributes", DataType::Utf8, false),
-            Field::new("`resource_attributes`", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
-        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#, r#"{}"#])) as ArrayRef;
+        let attrs_array = Arc::new(StringArray::from(vec![r"{}", r"{}"])) as ArrayRef;
         let res_array = Arc::new(StringArray::from(vec![
             r#"{"service.name":"svc-a"}"#,
             // Second row is missing service.name

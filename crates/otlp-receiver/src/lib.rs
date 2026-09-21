@@ -429,7 +429,6 @@ mod tests {
         // Drop the receiver to simulate a failed downstream.
         drop(rx);
 
-        // Build a non-empty request so the batch has > 0 rows
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
@@ -455,6 +454,7 @@ mod tests {
     /// must successfully parse the request.
     #[test]
     fn test_decode_http_body_json() {
+        #[allow(clippy::items_after_statements)]
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
@@ -497,7 +497,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        let body = Bytes::from(r#"{ not valid json }"#);
+        let body = Bytes::from(r"{ not valid json }");
         let result: Result<ExportLogsServiceRequest, _> = decode_http_body(&headers, body);
         assert!(result.is_err(), "Invalid JSON should fail decoding");
     }

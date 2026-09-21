@@ -15,8 +15,8 @@ use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64, t
 #[allow(clippy::too_many_lines)]
 pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, PipelineError> {
     let mut total_records = 0;
-    for r_log in &req.`resource_logs` {
-        for s_log in &r_log.`scope_logs` {
+    for r_log in &req.resource_logs {
+        for s_log in &r_log.scope_logs {
             total_records += s_log.log_records.len();
         }
     }
@@ -30,26 +30,26 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
     let mut span_id_builder = StringBuilder::new();
     let mut flags_builder = UInt32Builder::with_capacity(total_records);
     let mut attributes_builder = StringBuilder::new();
-    let mut `service_name`_builder = StringBuilder::new();
+    let mut service_name_builder = StringBuilder::new();
     let mut resource_attributes_builder = StringBuilder::new();
-    let mut `scope_name`_builder = StringBuilder::new();
+    let mut scope_name_builder = StringBuilder::new();
     let mut scope_version_builder = StringBuilder::new();
 
-    for r_log in &req.`resource_logs` {
-        let (resource_attrs_json, `service_name`) = if let Some(ref res) = r_log.resource {
-            let `service_name` = res
+    for r_log in &req.resource_logs {
+        let (resource_attrs_json, service_name) = if let Some(ref res) = r_log.resource {
+            let service_name = res
                 .attributes
                 .iter()
                 .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
                 .and_then(|kv| kv.value.as_ref())
                 .map_or_else(|| "unknown".to_string(), any_value_to_string);
-            (convert_attributes(&res.attributes), `service_name`)
+            (convert_attributes(&res.attributes), service_name)
         } else {
             ("{}".to_string(), "unknown".to_string())
         };
 
-        for s_log in &r_log.`scope_logs` {
-            let (`scope_name`, scope_version) = if let Some(ref scope) = s_log.scope {
+        for s_log in &r_log.scope_logs {
+            let (scope_name, scope_version) = if let Some(ref scope) = s_log.scope {
                 (scope.name.as_str(), scope.version.as_str())
             } else {
                 ("", "")
@@ -76,9 +76,9 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
                 let log_attrs_json = convert_attributes(&log.attributes);
                 attributes_builder.append_value(&log_attrs_json);
 
-                `service_name`_builder.append_value(&`service_name`);
+                service_name_builder.append_value(&service_name);
                 resource_attributes_builder.append_value(&resource_attrs_json);
-                `scope_name`_builder.append_value(`scope_name`);
+                scope_name_builder.append_value(scope_name);
                 scope_version_builder.append_value(scope_version);
             }
         }
@@ -102,9 +102,9 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
         Field::new("span_id", DataType::Utf8, false),
         Field::new("flags", DataType::UInt32, false),
         Field::new("attributes", DataType::Utf8, false),
-        Field::new("`service_name`", DataType::Utf8, false),
+        Field::new("service_name", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new("`scope_name`", DataType::Utf8, false),
+        Field::new("scope_name", DataType::Utf8, false),
         Field::new("scope_version", DataType::Utf8, false),
     ]));
 
@@ -120,9 +120,9 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
             Arc::new(span_id_builder.finish()),
             Arc::new(flags_builder.finish()),
             Arc::new(attributes_builder.finish()),
-            Arc::new(`service_name`_builder.finish()),
+            Arc::new(service_name_builder.finish()),
             Arc::new(resource_attributes_builder.finish()),
-            Arc::new(`scope_name`_builder.finish()),
+            Arc::new(scope_name_builder.finish()),
             Arc::new(scope_version_builder.finish()),
         ],
     )
@@ -158,7 +158,7 @@ mod tests {
                 dropped_attributes_count: 0,
                 ..Default::default()
             }),
-            `scope_logs`: vec![ScopeLogs {
+            scope_logs: vec![ScopeLogs {
                 log_records: vec![LogRecord {
                     time_unix_nano: 1_000_000_000,
                     severity_number: 9,
@@ -176,7 +176,7 @@ mod tests {
         };
 
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![r_log],
+            resource_logs: vec![r_log],
         };
 
         let batch = decode_logs(&req).unwrap();
@@ -188,7 +188,7 @@ mod tests {
 
     /// Two `resource_logs` groups each containing one log must yield 2 rows.
     #[test]
-    fn test_decode_logs_multiple_`resource_logs`() {
+    fn test_decode_logs_multiple_resource_logs() {
         let make_resource_log = |service: &str| ResourceLogs {
             resource: Some(Resource {
                 attributes: vec![KeyValue {
@@ -200,7 +200,7 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            `scope_logs`: vec![ScopeLogs {
+            scope_logs: vec![ScopeLogs {
                 log_records: vec![LogRecord {
                     time_unix_nano: 1_000_000_000,
                     severity_number: 9,
@@ -212,7 +212,7 @@ mod tests {
         };
 
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![make_resource_log("svc-a"), make_resource_log("svc-b")],
+            resource_logs: vec![make_resource_log("svc-a"), make_resource_log("svc-b")],
         };
         let batch = decode_logs(&req).unwrap();
         assert_eq!(batch.num_rows(), 2);
@@ -223,9 +223,9 @@ mod tests {
     fn test_decode_logs_missing_resource_uses_unknown() {
         use arrow::array::AsArray;
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![ResourceLogs {
+            resource_logs: vec![ResourceLogs {
                 resource: None,
-                `scope_logs`: vec![ScopeLogs {
+                scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord {
                         time_unix_nano: 1_000_000_000,
                         ..Default::default()
@@ -238,7 +238,7 @@ mod tests {
         let batch = decode_logs(&req).unwrap();
         assert_eq!(batch.num_rows(), 1);
         let svc = batch
-            .column_by_name("`service_name`")
+            .column_by_name("service_name")
             .unwrap()
             .as_string::<i32>()
             .value(0);
@@ -250,8 +250,8 @@ mod tests {
     fn test_decode_logs_missing_body_is_empty_string() {
         use arrow::array::AsArray;
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![ResourceLogs {
-                `scope_logs`: vec![ScopeLogs {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord {
                         time_unix_nano: 1_000_000_000,
                         body: None,
@@ -278,8 +278,8 @@ mod tests {
         use arrow::array::AsArray;
         use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![ResourceLogs {
-                `scope_logs`: vec![
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![
                     ScopeLogs {
                         scope: Some(InstrumentationScope {
                             name: "scope-a".to_string(),
@@ -309,7 +309,7 @@ mod tests {
         let batch = decode_logs(&req).unwrap();
         assert_eq!(batch.num_rows(), 2);
         let scope_col = batch
-            .column_by_name("`scope_name`")
+            .column_by_name("scope_name")
             .unwrap()
             .as_string::<i32>();
         let names: std::collections::HashSet<&str> = (0..arrow::array::Array::len(scope_col))
@@ -323,10 +323,10 @@ mod tests {
     #[test]
     fn test_decode_logs_timestamp_overflow_returns_error() {
         let req = ExportLogsServiceRequest {
-            `resource_logs`: vec![ResourceLogs {
-                `scope_logs`: vec![ScopeLogs {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
                     log_records: vec![LogRecord {
-                        // u64::MAX far exceeds `i64::MAX`
+                        // u64::MAX far exceeds i64::MAX
                         time_unix_nano: u64::MAX,
                         ..Default::default()
                     }],

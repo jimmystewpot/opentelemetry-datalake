@@ -30,28 +30,28 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
     let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut end_time_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut attributes_builder = StringBuilder::new();
-    let mut `service_name`_builder = StringBuilder::new();
+    let mut service_name_builder = StringBuilder::new();
     let mut resource_attributes_builder = StringBuilder::new();
-    let mut `scope_name`_builder = StringBuilder::new();
-    let mut `scope_version`_builder = StringBuilder::new();
+    let mut scope_name_builder = StringBuilder::new();
+    let mut scope_version_builder = StringBuilder::new();
     let mut status_code_builder = Int32Builder::with_capacity(total_records);
     let mut status_message_builder = StringBuilder::new();
 
     for r_span in &req.resource_spans {
-        let (resource_attrs_json, `service_name`) = if let Some(ref res) = r_span.resource {
-            let `service_name` = res
+        let (resource_attrs_json, service_name) = if let Some(ref res) = r_span.resource {
+            let service_name = res
                 .attributes
                 .iter()
                 .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
                 .and_then(|kv| kv.value.as_ref())
                 .map_or_else(|| "unknown".to_string(), crate::common::any_value_to_string);
-            (convert_attributes(&res.attributes), `service_name`)
+            (convert_attributes(&res.attributes), service_name)
         } else {
             ("{}".to_string(), "unknown".to_string())
         };
 
         for s_span in &r_span.scope_spans {
-            let (`scope_name`, `scope_version`) = if let Some(ref scope) = s_span.scope {
+            let (scope_name, scope_version) = if let Some(ref scope) = s_span.scope {
                 (scope.name.as_str(), scope.version.as_str())
             } else {
                 ("", "")
@@ -70,10 +70,10 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
                 let span_attrs_json = convert_attributes(&span.attributes);
                 attributes_builder.append_value(&span_attrs_json);
 
-                `service_name`_builder.append_value(&`service_name`);
+                service_name_builder.append_value(&service_name);
                 resource_attributes_builder.append_value(&resource_attrs_json);
-                `scope_name`_builder.append_value(`scope_name`);
-                `scope_version`_builder.append_value(`scope_version`);
+                scope_name_builder.append_value(scope_name);
+                scope_version_builder.append_value(scope_version);
 
                 if let Some(ref status) = span.status {
                     status_code_builder.append_value(status.code);
@@ -104,10 +104,10 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             false,
         ),
         Field::new("attributes", DataType::Utf8, false),
-        Field::new("`service_name`", DataType::Utf8, false),
+        Field::new("service_name", DataType::Utf8, false),
         Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new("`scope_name`", DataType::Utf8, false),
-        Field::new("`scope_version`", DataType::Utf8, false),
+        Field::new("scope_name", DataType::Utf8, false),
+        Field::new("scope_version", DataType::Utf8, false),
         Field::new("status_code", DataType::Int32, false),
         Field::new("status_message", DataType::Utf8, false),
     ]));
@@ -124,10 +124,10 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             Arc::new(timestamp_builder.finish()),
             Arc::new(end_time_builder.finish()),
             Arc::new(attributes_builder.finish()),
-            Arc::new(`service_name`_builder.finish()),
+            Arc::new(service_name_builder.finish()),
             Arc::new(resource_attributes_builder.finish()),
-            Arc::new(`scope_name`_builder.finish()),
-            Arc::new(`scope_version`_builder.finish()),
+            Arc::new(scope_name_builder.finish()),
+            Arc::new(scope_version_builder.finish()),
             Arc::new(status_code_builder.finish()),
             Arc::new(status_message_builder.finish()),
         ],
@@ -141,7 +141,7 @@ mod tests {
     use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::resource::v1::Resource;
-    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, `ScopeSpans`, Span};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
     #[test]
     fn test_decode_traces_empty() {
@@ -164,7 +164,7 @@ mod tests {
                 dropped_attributes_count: 0,
                 ..Default::default()
             }),
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     trace_id: vec![1; 16],
                     span_id: vec![2; 8],
@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_decode_traces_multiple_spans() {
         let r_span = ResourceSpans {
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 spans: vec![
                     Span {
                         trace_id: vec![1; 16],
@@ -228,7 +228,7 @@ mod tests {
         use arrow::array::AsArray;
         use opentelemetry_proto::tonic::trace::v1::Status;
         let r_span = ResourceSpans {
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     trace_id: vec![1; 16],
                     span_id: vec![1; 8],
@@ -269,7 +269,7 @@ mod tests {
         use arrow::array::AsArray;
         let r_span = ResourceSpans {
             resource: None,
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     start_time_unix_nano: 1_000_000_000,
                     end_time_unix_nano: 2_000_000_000,
@@ -284,7 +284,7 @@ mod tests {
         })
         .unwrap();
         let svc = batch
-            .column_by_name("`service_name`")
+            .column_by_name("service_name")
             .unwrap()
             .as_string::<i32>()
             .value(0);
@@ -297,7 +297,7 @@ mod tests {
     fn test_decode_traces_no_scope_produces_empty_strings() {
         use arrow::array::AsArray;
         let r_span = ResourceSpans {
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 scope: None,
                 spans: vec![Span {
                     start_time_unix_nano: 1_000_000_000,
@@ -312,19 +312,19 @@ mod tests {
             resource_spans: vec![r_span],
         })
         .unwrap();
-        let `scope_name` = batch
-            .column_by_name("`scope_name`")
+        let scope_name = batch
+            .column_by_name("scope_name")
             .unwrap()
             .as_string::<i32>()
             .value(0);
-        assert_eq!(`scope_name`, "");
+        assert_eq!(scope_name, "");
     }
 
     /// A span with `start_time_unix_nano` > `i64::MAX` must return an error.
     #[test]
     fn test_decode_traces_timestamp_overflow_returns_error() {
         let r_span = ResourceSpans {
-            scope_spans: vec![`ScopeSpans` {
+            scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
                     start_time_unix_nano: u64::MAX,
                     end_time_unix_nano: 0,

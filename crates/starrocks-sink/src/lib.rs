@@ -1369,7 +1369,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(PipelineError::DownstreamClosed)),
-            "Task should have failed on flush attempt, got: {result:?}",
+            "Task should have failed on flush attempt, got: {result:?}"
         );
     }
 }
