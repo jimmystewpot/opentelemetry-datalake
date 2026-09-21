@@ -262,6 +262,38 @@ fn test_nullify_target_schema_mismatch_returns_arrow_error() {
 }
 
 #[test]
+fn test_nullify_target_schema_out_of_bounds_index_returns_arrow_error() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["abc"])),
+            Arc::new(StringArray::from(vec!["attr"])),
+        ],
+    )
+    .unwrap();
+
+    let target_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("extra_column", DataType::Utf8, true),
+    ]));
+
+    let err = nullify_column(&batch, target_schema, "extra_column").unwrap_err();
+    match err {
+        SdkError::Arrow(msg) => {
+            assert!(
+                msg.contains("out of bounds") || msg.contains("schema") || msg.contains("column")
+            );
+        }
+        other => panic!("expected SdkError::Arrow, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_sdk_error_arrow_variant_display() {
     let err = SdkError::Arrow("schema mismatch".to_string());
     assert_eq!(err.to_string(), "Arrow error: schema mismatch");

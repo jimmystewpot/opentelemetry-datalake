@@ -38,6 +38,13 @@ pub fn nullify_column(
         .index_of(column_name)
         .map_err(|_| SdkError::ColumnNotFound(column_name.to_string()))?;
 
+    if idx >= batch.num_columns() {
+        return Err(SdkError::Arrow(format!(
+            "Column index {idx} out of bounds for batch with {} columns",
+            batch.num_columns()
+        )));
+    }
+
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
     let field = target_schema.field(idx);
     columns[idx] = new_null_array(field.data_type(), batch.num_rows());
