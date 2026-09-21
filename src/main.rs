@@ -113,6 +113,55 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Initializes the pipeline transformers based on the provided application configuration.
+/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances.
+/// Otherwise, it falls back to No-op transformers.
+fn initialize_transformers(
+    config: &AppConfig,
+) -> anyhow::Result<(Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>)> {
+    if let Some(ref wasm_cfg) = config.wasm_transformer {
+        tracing::info!(
+            transformer_id = %wasm_cfg.id,
+            module_path = %wasm_cfg.module_path,
+            "Initializing 3x signal-isolated WasmTransformer instances"
+        );
+        let mut logs_cfg = wasm_cfg.clone();
+        logs_cfg
+            .env
+            .insert("signal".to_string(), "logs".to_string());
+
+        let mut traces_cfg = wasm_cfg.clone();
+        traces_cfg
+            .env
+            .insert("signal".to_string(), "traces".to_string());
+
+        let mut metrics_cfg = wasm_cfg.clone();
+        metrics_cfg
+            .env
+            .insert("signal".to_string(), "metrics".to_string());
+
+        Ok((
+            Box::new(wasm_transformer::WasmTransformer::new(
+                logs_cfg, None, None,
+            )?),
+            Box::new(wasm_transformer::WasmTransformer::new(
+                traces_cfg, None, None,
+            )?),
+            Box::new(wasm_transformer::WasmTransformer::new(
+                metrics_cfg,
+                None,
+                None,
+            )?),
+        ))
+    } else {
+        Ok((
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+        ))
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -202,51 +251,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
-    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
-        tracing::info!(
-            transformer_id = %wasm_cfg.id,
-            module_path = %wasm_cfg.module_path,
-            "Initializing 3x signal-isolated WasmTransformer instances"
-        );
-        let mut logs_cfg = wasm_cfg.clone();
-        logs_cfg
-            .env
-            .insert("signal".to_string(), "logs".to_string());
-
-        let mut traces_cfg = wasm_cfg.clone();
-        traces_cfg
-            .env
-            .insert("signal".to_string(), "traces".to_string());
-
-        let mut metrics_cfg = wasm_cfg.clone();
-        metrics_cfg
-            .env
-            .insert("signal".to_string(), "metrics".to_string());
-
-        (
-            Box::new(wasm_transformer::WasmTransformer::new(
-                logs_cfg, None, None,
-            )?),
-            Box::new(wasm_transformer::WasmTransformer::new(
-                traces_cfg, None, None,
-            )?),
-            Box::new(wasm_transformer::WasmTransformer::new(
-                metrics_cfg,
-                None,
-                None,
-            )?),
-        )
-    } else {
-        (
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-        )
-    };
+    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer) =
+        initialize_transformers(&config)?;
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
@@ -805,5 +811,65 @@ mod tests {
         );
         assert_eq!(wasm.env_whitelist, vec!["REGION", "ENV"]);
         assert!(wasm.enable_sighup);
+    }
+}
+
+#[cfg(test)]
+
+#[cfg(test)]
+mod additional_tests {
+    use super::*;
+    use crate::AppConfig;
+    use figment::{Figment, providers::{Format, Toml}};
+
+    #[test]
+    fn test_initialize_transformers_noop() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = initialize_transformers(&config);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_transformers_wasm_error() {
+        // Just verify it attempts to construct WASM but fails properly
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        
+        [wasm_transformer]
+        id = "test_wasm"
+        type = "wasm"
+        module_path = "/nonexistent.wasm"
+        on_error = "drop"
+        on_reject = "drop"
+        concurrency = 1
+        worker_channel_capacity = 1
+        max_memory = "16MiB"
+        rejuvenate_threshold = "8MiB"
+        rejuvenate_batches = 1000
+        init_timeout = "1s"
+        allow_unmasked_passthrough = true
+        schema_guard = "defensive"
+        env_whitelist = []
+        enable_sighup = true
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = initialize_transformers(&config);
+        assert!(res.is_err());
     }
 }
