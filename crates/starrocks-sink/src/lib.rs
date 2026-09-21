@@ -308,6 +308,13 @@ impl StarRocksSink {
         manager: Arc<StreamLoadManager>,
     ) -> Result<Self, PipelineError> {
         config.tls.validate()?;
+        if config.tls.ca_cert_path.is_some() {
+            tracing::warn!(
+                sink = "starrocks",
+                ca_cert_path = ?config.tls.ca_cert_path,
+                "StarRocks Stream Load SDK resolves TLS roots via compile-time backend features (tls-rustls / tls-native-tls); ensure custom CA certificates are installed in the host trust store if using tls-native-tls"
+            );
+        }
         let sorter = if let Some(ref sort_cfg) = config.order_by {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)?
         } else {
@@ -341,6 +348,13 @@ impl StarRocksSink {
     /// if the [`StreamLoadManager`] cannot be initialised.
     pub fn try_new(config: StarRocksSinkConfig) -> Result<Self, PipelineError> {
         config.tls.validate()?;
+        if config.tls.ca_cert_path.is_some() {
+            tracing::warn!(
+                sink = "starrocks",
+                ca_cert_path = ?config.tls.ca_cert_path,
+                "StarRocks Stream Load SDK resolves TLS roots via compile-time backend features (tls-rustls / tls-native-tls); ensure custom CA certificates are installed in the host trust store if using tls-native-tls"
+            );
+        }
         if config.frontend_urls.is_empty() {
             return Err(PipelineError::Internal(
                 "StarRocks configuration error: `frontend_urls` must contain at least one FE URL"
@@ -1413,5 +1427,18 @@ mod tests {
         config.tls.ca_cert_path = Some("/nonexistent/ca.pem".to_string());
         let res = StarRocksSink::try_new(config);
         assert!(matches!(res, Err(PipelineError::Configuration(_))));
+    }
+
+    #[test]
+    fn test_starrocks_tls_validation_rejects_insecure_mode() {
+        let mut config = base_config();
+        config.tls.verification = pipeline_core::tls::TlsVerificationMode::Disabled;
+        let res = StarRocksSink::try_new(config);
+        assert!(matches!(res, Err(PipelineError::Configuration(_))));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("disabling TLS certificate verification is prohibited")
+        );
     }
 }
