@@ -3,6 +3,15 @@
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum TesterError {
+    #[error("Value mismatch in immutable column {0}")]
+    ValueMismatch(String),
+    #[error("Immutable column '{0}' present in input but missing from output")]
+    MissingColumn(String),
+}
 
 /// Verifies that immutable OpenTelemetry columns are preserved between input and output batches.
 ///
@@ -14,7 +23,7 @@ use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 ///
 /// Returns an error string if an immutable column present in `input` is missing from `output`,
 /// or if the values in an immutable column have been altered.
-pub fn verify_batch_immutability(input: &RecordBatch, output: &RecordBatch) -> Result<(), String> {
+pub fn verify_batch_immutability(input: &RecordBatch, output: &RecordBatch) -> std::result::Result<(), TesterError> {
     let in_schema = input.schema();
     let out_schema = output.schema();
     for &col_name in IMMUTABLE_COLUMNS {
@@ -23,15 +32,11 @@ pub fn verify_batch_immutability(input: &RecordBatch, output: &RecordBatch) -> R
         {
             let in_col = input.column(i_idx);
             let out_col = output.column(o_idx);
-            if format!("{in_col:?}") != format!("{out_col:?}") {
-                return Err(format!(
-                    "Value mismatch in immutable column {col_name}: input={in_col:?} output={out_col:?}"
-                ));
+            if in_col != out_col {
+                return Err(TesterError::ValueMismatch(col_name.to_string()));
             }
         } else if in_schema.index_of(col_name).is_ok() {
-            return Err(format!(
-                "Immutable column '{col_name}' present in input but missing from output"
-            ));
+            return Err(TesterError::MissingColumn(col_name.to_string()));
         }
     }
     Ok(())

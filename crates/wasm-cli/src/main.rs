@@ -38,7 +38,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Validate { path } => {
             let bytes = std::fs::read(&path)?;
-            validator::validate_wasm_bytes(&bytes).map_err(anyhow::Error::msg)?;
+            validator::validate_wasm_bytes(&bytes)?;
             println!("✓ {} is a valid ABI v1 module", path.display());
         }
         Commands::Test { path } => {

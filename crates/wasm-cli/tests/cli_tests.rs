@@ -9,6 +9,7 @@ fn test_validate_rejects_empty_module_missing_all_exports() {
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
+            .to_string()
             .contains("Missing export 'datalake_abi_version'")
     );
 }
@@ -17,7 +18,7 @@ fn test_validate_rejects_empty_module_missing_all_exports() {
 fn test_validate_rejects_invalid_wasm_bytes() {
     let res = validate_wasm_bytes(b"not a wasm binary");
     assert!(res.is_err());
-    assert!(res.unwrap_err().contains("Invalid WASM:"));
+    assert!(res.unwrap_err().to_string().contains("Invalid WASM:"));
 }
 
 #[test]
@@ -32,7 +33,7 @@ fn test_validate_rejects_missing_alloc_export() {
     let wasm = wat::parse_str(wat_src).unwrap();
     let res = validate_wasm_bytes(&wasm);
     assert!(res.is_err());
-    assert!(res.unwrap_err().contains("Missing export 'datalake_alloc'"));
+    assert!(res.unwrap_err().to_string().contains("Missing export 'datalake_alloc'"));
 }
 
 #[test]
@@ -50,6 +51,7 @@ fn test_validate_rejects_abi_version_mismatch() {
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
+            .to_string()
             .contains("ABI version mismatch: expected 1, got 2")
     );
 }
