@@ -166,18 +166,42 @@ impl WasmWorker {
         })?;
 
         // 2. Allocate buffer in guest linear memory and copy payload
-        let ipc_ptr = self.alloc_fn.call(&mut self.store, ipc_len)?;
-        self.memory
+        let ipc_ptr = match self.alloc_fn.call(&mut self.store, ipc_len) {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = self.rejuvenate();
+                return Err(WasmTransformError::Wasmtime(e));
+            }
+        };
+        if let Err(e) = self
+            .memory
             .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
-            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+        {
+            let _ = self.rejuvenate();
+            return Err(WasmTransformError::Pipeline(e.to_string()));
+        }
 
         // 3. Invoke datalake_transform and free input buffer
         let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
-        let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
-        let header_ptr = transform_res?;
+        if transform_res.is_ok() {
+            let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        }
+        let header_ptr = match transform_res {
+            Ok(ptr) => ptr,
+            Err(e) => {
+                let _ = self.rejuvenate();
+                return Err(WasmTransformError::Wasmtime(e));
+            }
+        };
 
         // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
-        let header = self.read_response_header(header_ptr)?;
+        let header = match self.read_response_header(header_ptr) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = self.rejuvenate();
+                return Err(e);
+            }
+        };
         let message = read_guest_message(
             &self.memory,
             &self.store,
@@ -186,7 +210,13 @@ impl WasmWorker {
         );
 
         // 5. Dispatch outcome and extract transformed batches while guest memory is intact
-        let outcome = self.dispatch_outcome(&header, &message, batch)?;
+        let outcome = match self.dispatch_outcome(&header, &message, batch) {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.rejuvenate();
+                return Err(e);
+            }
+        };
         self.batches_processed = self.batches_processed.saturating_add(1);
         self.check_rejuvenation()?;
         Ok(outcome)
@@ -374,11 +404,15 @@ impl WasmWorker {
         let mut store = Store::new(engine, ());
         let instance = Instance::new(&mut store, module, &[])?;
 
-        let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
-        let dealloc_fn =
-            instance.get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")?;
-        let transform_fn =
-            instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")?;
+        let alloc_fn = instance
+            .get_typed_func::<u32, u32>(&mut store, "datalake_alloc")
+            .map_err(|_| WasmTransformError::MissingExport("datalake_alloc".into()))?;
+        let dealloc_fn = instance
+            .get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")
+            .map_err(|_| WasmTransformError::MissingExport("datalake_dealloc".into()))?;
+        let transform_fn = instance
+            .get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
+            .map_err(|_| WasmTransformError::MissingExport("datalake_transform".into()))?;
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmTransformError::MissingExport("memory".into()))?;

@@ -7,6 +7,7 @@ use pipeline_core::config::WasmTransformerConfig;
 use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use wasm_transformer::engine::EngineCache;
+use wasm_transformer::error::WasmTransformError;
 use wasm_transformer::worker::{WasmWorker, WorkerOutcome};
 
 fn default_test_config() -> WasmTransformerConfig {
@@ -557,5 +558,79 @@ async fn test_worker_guards_excessive_batch_count() {
         err.to_string()
             .contains("Guest batch count 1025 exceeds maximum allowed limit of 1024"),
         "Unexpected error: {err}"
+    );
+}
+
+// Trap WAT module: executes unreachable instruction inside datalake_transform
+fn trap_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (unreachable)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenates_and_recovers_after_guest_trap() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let trap_module = cache
+        .compile_module(&wat::parse_str(trap_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(20, Arc::clone(&cache), trap_module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    // Batch 1: Traps inside datalake_transform
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::Wasmtime(_)),
+        "Expected WasmTransformError::Wasmtime, got: {err}"
+    );
+
+    // Now recompile with valid passthrough module into the cache and advance generation
+    let _pass_module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+    let _ = cache.advance_generation();
+
+    // Batch 2: Should reload and execute cleanly without failing from poisoned instance
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+}
+
+// Module missing datalake_alloc export
+fn missing_alloc_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
+#[test]
+fn test_worker_fails_on_missing_required_exports() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(missing_alloc_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let err = WasmWorker::new(21, Arc::clone(&cache), module, cfg).unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::MissingExport(ref s) if s == "datalake_alloc"),
+        "Expected MissingExport(\"datalake_alloc\"), got: {err}"
     );
 }
