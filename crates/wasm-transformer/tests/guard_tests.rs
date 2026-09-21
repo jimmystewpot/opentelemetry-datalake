@@ -379,3 +379,43 @@ fn test_backfill_preserves_input_ordering_and_appends_guest_new_columns() {
     assert_eq!(backfilled.column(1).null_count(), 0);
     assert_eq!(backfilled.column(2).null_count(), 0);
 }
+
+#[test]
+fn test_backfill_restores_column_ordering_when_guest_permutes_columns() {
+    let input_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Int64, false),
+    ]));
+    let output_schema = Arc::new(Schema::new(vec![
+        Field::new("col_b", DataType::Int64, false),
+        Field::new("col_a", DataType::Utf8, false),
+    ]));
+    let output = RecordBatch::try_new(
+        output_schema,
+        vec![
+            Arc::new(Int64Array::from(vec![42])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+
+    let restored = backfill_missing_columns(&input_schema, output).unwrap();
+
+    assert_eq!(restored.num_columns(), 2);
+    assert_eq!(restored.schema().field(0).name(), "col_a");
+    assert_eq!(restored.schema().field(1).name(), "col_b");
+
+    let col_a = restored
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(col_a.value(0), "hello");
+
+    let col_b = restored
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(col_b.value(0), 42);
+}

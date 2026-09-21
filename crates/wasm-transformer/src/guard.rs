@@ -101,7 +101,14 @@ pub fn backfill_missing_columns(
         }
     }
 
-    if !added && fields.len() == output_schema.fields().len() {
+    if !added
+        && output_schema.fields().len() == fields.len()
+        && output_schema
+            .fields()
+            .iter()
+            .zip(&fields)
+            .all(|(a, b)| a == b)
+    {
         return Ok(output);
     }
 
