@@ -39,14 +39,60 @@ async fn test_sighup_listener_returns_some_when_enabled() {
     }
 }
 
+fn valid_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#
+}
+
 #[tokio::test]
 async fn test_admin_router_reload_endpoint() {
-    let router = build_admin_router();
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
     let req = Request::builder()
         .method("POST")
         .uri("/api/v1/transforms/wasm/reload")
         .header("content-type", "application/json")
-        .body(Body::from(r#"{"module_path": "/path/to/module.wasm"}"#))
+        .body(Body::from(r#"{"module_path": "/tmp/non_existent.wasm"}"#))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // Expecting 500 because file doesn't exist
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_success() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "test_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    let router = build_admin_router(Arc::clone(&engine));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
         .unwrap();
 
     let response = router.oneshot(req).await.unwrap();
@@ -56,6 +102,51 @@ async fn test_admin_router_reload_endpoint() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(json["status"], "reload accepted");
-    assert_eq!(json["path"], "/path/to/module.wasm");
+    assert_eq!(json["status"], "reload successful");
+    assert_eq!(json["path"], module_path.to_str().unwrap());
+
+    // Verify module generation was incremented
+    assert_eq!(engine.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_invalid_wasm() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "invalid_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    tokio::fs::write(&module_path, b"not a valid wasm file")
+        .await
+        .unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    let router = build_admin_router(Arc::clone(&engine));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // Expecting 400 Bad Request because the wasm module compilation fails
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Verify module generation remained 0
+    assert_eq!(engine.module_generation(), 0);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
 }

@@ -816,45 +816,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wasm_reload_handler_direct() {
-        use wasm_transformer::reload::{WasmReloadRequest, wasm_reload_handler};
-
-        let request = WasmReloadRequest {
-            module_path: "/opt/transforms/updated.wasm".to_string(),
-        };
-        let response = wasm_reload_handler(axum::Json(request)).await;
-        assert_eq!(response.0["status"], "reload accepted");
-        assert_eq!(response.0["path"], "/opt/transforms/updated.wasm");
-    }
-
-    #[tokio::test]
     async fn test_build_admin_router_integration() {
         use axum::{
             body::Body,
             http::{Request, StatusCode},
         };
+        use std::sync::Arc;
         use tower::ServiceExt;
+        use wasm_transformer::engine::EngineCache;
 
-        let router = build_admin_router();
+        let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let router = build_admin_router(engine);
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/transforms/wasm/reload")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"module_path": "/tmp/custom.wasm"}"#))
+            .body(Body::from(r#"{"module_path": "/tmp/non_existent.wasm"}"#))
             .expect("Request should be created successfully");
 
         let response = router
             .oneshot(req)
             .await
             .expect("Router should handle request");
-        assert_eq!(response.status(), StatusCode::OK);
 
-        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("Body should be readable");
-        let json: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("Body should be valid JSON");
-        assert_eq!(json["status"], "reload accepted");
-        assert_eq!(json["path"], "/tmp/custom.wasm");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

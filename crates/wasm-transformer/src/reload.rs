@@ -46,7 +46,7 @@ pub fn spawn_sighup_listener(
                     path = %module_path.display(),
                     "SECURITY AUDIT: SIGHUP hot-reload triggered"
                 );
-                match std::fs::read(&module_path) {
+                match tokio::fs::read(&module_path).await {
                     Ok(bytes) => match engine.reload_from_bytes(&bytes, None) {
                         Ok(new_gen) => {
                             tracing::info!(generation = new_gen, "Hot-reload successful");
@@ -76,24 +76,38 @@ pub struct WasmReloadRequest {
 /// Handler for the WASM hot-reload REST endpoint.
 ///
 /// Extracts the JSON payload containing `module_path`, emits a security audit warning,
-/// and returns an acceptance response.
+/// attempts the reload, and returns an acceptance response.
 pub async fn wasm_reload_handler(
+    axum::extract::State(engine): axum::extract::State<Arc<EngineCache>>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
-) -> axum::Json<serde_json::Value> {
+) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
     tracing::warn!(
         path = %payload.module_path,
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
-    axum::Json(serde_json::json!({
-        "status": "reload accepted",
+
+    let bytes = tokio::fs::read(&payload.module_path).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to read module: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    engine.reload_from_bytes(&bytes, None).map_err(|e| {
+        tracing::warn!("Hot-reload REST: reload failed: {e}");
+        axum::http::StatusCode::BAD_REQUEST
+    })?;
+
+    Ok(axum::Json(serde_json::json!({
+        "status": "reload successful",
         "path": payload.module_path,
-    }))
+    })))
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.
-pub fn build_admin_router() -> axum::Router {
-    axum::Router::new().route(
-        "/api/v1/transforms/wasm/reload",
-        axum::routing::post(wasm_reload_handler),
-    )
+pub fn build_admin_router(engine: Arc<EngineCache>) -> axum::Router {
+    axum::Router::new()
+        .route(
+            "/api/v1/transforms/wasm/reload",
+            axum::routing::post(wasm_reload_handler),
+        )
+        .with_state(engine)
 }
