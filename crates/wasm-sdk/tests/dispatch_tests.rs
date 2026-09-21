@@ -235,3 +235,97 @@ fn test_encode_response_continue_empty() {
 
     datalake_dealloc(header_ptr, header_len);
 }
+
+#[test]
+fn test_encode_response_error_delegation() {
+    let reason = "error delegation test";
+    let packed = encode_response(&TransformResult::error(reason));
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
+
+    let header = read_response_header(header_ptr).expect("valid header");
+    assert_eq!(header.status, STATUS_ERROR);
+    assert_eq!(header.batch_count, 0);
+    assert_eq!(header.batches_ptr, 0);
+    assert_ne!(header.message_ptr, 0);
+    assert_eq!(header.message_len, reason.len() as u32);
+
+    let msg = read_guest_string(header.message_ptr, header.message_len as usize)
+        .expect("valid error string");
+    assert_eq!(msg, reason);
+
+    datalake_dealloc(header.message_ptr, header.message_len);
+    datalake_dealloc(header_ptr, header_len);
+}
+
+#[test]
+fn test_create_error_response_empty_message() {
+    let packed = create_error_response("");
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
+
+    let header = read_response_header(header_ptr).expect("valid header");
+    assert_eq!(header.status, STATUS_ERROR);
+    assert_eq!(header.batch_count, 0);
+    assert_eq!(header.batches_ptr, 0);
+    assert_eq!(header.message_ptr, 0);
+    assert_eq!(header.message_len, 0);
+
+    datalake_dealloc(header_ptr, header_len);
+}
+
+#[test]
+fn test_encode_response_reject_empty_reason() {
+    let packed = encode_response(&TransformResult::reject(""));
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
+
+    let header = read_response_header(header_ptr).expect("valid header");
+    assert_eq!(header.status, STATUS_REJECT);
+    assert_eq!(header.batch_count, 0);
+    assert_eq!(header.batches_ptr, 0);
+    assert_eq!(header.message_ptr, 0);
+    assert_eq!(header.message_len, 0);
+
+    datalake_dealloc(header_ptr, header_len);
+}
+
+#[test]
+fn test_create_error_response_allocation_failure_resets_len() {
+    static HUGE_MSG: [u8; 65 * 1024 * 1024] = [b'x'; 65 * 1024 * 1024];
+    // SAFETY: HUGE_MSG contains valid ASCII 'x' bytes.
+    let huge_str = unsafe { std::str::from_utf8_unchecked(&HUGE_MSG) };
+    let packed = create_error_response(huge_str);
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
+
+    let header = read_response_header(header_ptr).expect("valid header");
+    assert_eq!(header.status, STATUS_ERROR);
+    assert_eq!(header.message_ptr, 0);
+    assert_eq!(
+        header.message_len, 0,
+        "message_len must be 0 when datalake_alloc returns null"
+    );
+
+    datalake_dealloc(header_ptr, header_len);
+}
+
+#[test]
+fn test_encode_response_reject_allocation_failure_resets_len() {
+    static HUGE_MSG: [u8; 65 * 1024 * 1024] = [b'x'; 65 * 1024 * 1024];
+    // SAFETY: HUGE_MSG contains valid ASCII 'x' bytes.
+    let huge_str = unsafe { std::str::from_utf8_unchecked(&HUGE_MSG) };
+    let packed = encode_response(&TransformResult::reject(huge_str));
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
+
+    let header = read_response_header(header_ptr).expect("valid header");
+    assert_eq!(header.status, STATUS_REJECT);
+    assert_eq!(header.message_ptr, 0);
+    assert_eq!(
+        header.message_len, 0,
+        "message_len must be 0 when datalake_alloc returns null"
+    );
+
+    datalake_dealloc(header_ptr, header_len);
+}
