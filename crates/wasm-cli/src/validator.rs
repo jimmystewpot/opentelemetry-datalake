@@ -4,7 +4,7 @@
 //! including required function and memory exports and matching ABI versions.
 
 use thiserror::Error;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Caller, Config, Engine, ExternType, Linker, Module, Store, ValType};
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -12,6 +12,12 @@ pub enum ValidationError {
     InvalidWasm(#[source] wasmtime::Error),
     #[error("Missing export '{0}'")]
     MissingExport(String),
+    #[error("Export '{name}' has invalid type: expected {expected}, got {got}")]
+    InvalidExportType {
+        name: String,
+        expected: &'static str,
+        got: String,
+    },
     #[error("Instantiation failed: {0}")]
     InstantiationFailed(#[source] wasmtime::Error),
     #[error("Cannot call datalake_abi_version: {0}")]
@@ -24,14 +30,44 @@ pub enum ValidationError {
     EngineInit(#[source] wasmtime::Error),
 }
 
-/// The set of required symbol exports defined by the datalake WASM ABI v1.
-const REQUIRED_EXPORTS: &[&str] = &[
-    "datalake_abi_version",
-    "datalake_alloc",
-    "datalake_dealloc",
-    "datalake_init",
-    "datalake_transform",
-    "memory",
+struct FuncExportSpec {
+    name: &'static str,
+    expected: &'static str,
+    params: &'static [ValType],
+    results: &'static [ValType],
+}
+
+const REQUIRED_FUNCS: &[FuncExportSpec] = &[
+    FuncExportSpec {
+        name: "datalake_abi_version",
+        expected: "() -> (i32)",
+        params: &[],
+        results: &[ValType::I32],
+    },
+    FuncExportSpec {
+        name: "datalake_alloc",
+        expected: "(i32) -> (i32)",
+        params: &[ValType::I32],
+        results: &[ValType::I32],
+    },
+    FuncExportSpec {
+        name: "datalake_dealloc",
+        expected: "(i32, i32) -> ()",
+        params: &[ValType::I32, ValType::I32],
+        results: &[],
+    },
+    FuncExportSpec {
+        name: "datalake_init",
+        expected: "(i32, i32) -> (i32)",
+        params: &[ValType::I32, ValType::I32],
+        results: &[ValType::I32],
+    },
+    FuncExportSpec {
+        name: "datalake_transform",
+        expected: "(i32, i32) -> (i32)",
+        params: &[ValType::I32, ValType::I32],
+        results: &[ValType::I32],
+    },
 ];
 
 /// Validates raw WASM bytes against the C-ABI v1 specification.
@@ -41,6 +77,7 @@ const REQUIRED_EXPORTS: &[&str] = &[
 /// Returns [`ValidationError`] if:
 /// - The bytecode is invalid WebAssembly ([`ValidationError::InvalidWasm`]).
 /// - Any required export is missing from the module interface ([`ValidationError::MissingExport`]).
+/// - Any required export has an invalid type or signature ([`ValidationError::InvalidExportType`]).
 /// - The wasmtime engine fails to initialize or configure fuel ([`ValidationError::EngineInit`]).
 /// - The module cannot be instantiated ([`ValidationError::InstantiationFailed`]).
 /// - Calling `datalake_abi_version` fails ([`ValidationError::AbiFunctionMissing`] or [`ValidationError::AbiTrap`]).
@@ -51,18 +88,75 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
     let engine = Engine::new(&config).map_err(ValidationError::EngineInit)?;
 
     let module = Module::new(&engine, bytes).map_err(ValidationError::InvalidWasm)?;
-    for &required in REQUIRED_EXPORTS {
-        if !module.exports().any(|e| e.name() == required) {
-            return Err(ValidationError::MissingExport(required.to_string()));
+
+    for spec in REQUIRED_FUNCS {
+        match module.get_export(spec.name) {
+            None => return Err(ValidationError::MissingExport((*spec.name).to_string())),
+            Some(ExternType::Func(func_type)) => {
+                let params_match = func_type.params().len() == spec.params.len()
+                    && func_type
+                        .params()
+                        .zip(spec.params.iter())
+                        .all(|(a, b)| ValType::eq(&a, b));
+                let results_match = func_type.results().len() == spec.results.len()
+                    && func_type
+                        .results()
+                        .zip(spec.results.iter())
+                        .all(|(a, b)| ValType::eq(&a, b));
+                if !params_match || !results_match {
+                    return Err(ValidationError::InvalidExportType {
+                        name: (*spec.name).to_string(),
+                        expected: spec.expected,
+                        got: format!("{func_type:?}"),
+                    });
+                }
+            }
+            Some(other) => {
+                return Err(ValidationError::InvalidExportType {
+                    name: (*spec.name).to_string(),
+                    expected: spec.expected,
+                    got: format!("{other:?}"),
+                });
+            }
         }
     }
+
+    match module.get_export("memory") {
+        None => return Err(ValidationError::MissingExport("memory".to_string())),
+        Some(ExternType::Memory(_)) => {}
+        Some(other) => {
+            return Err(ValidationError::InvalidExportType {
+                name: "memory".to_string(),
+                expected: "memory",
+                got: format!("{other:?}"),
+            });
+        }
+    }
+
     let mut store: Store<()> = Store::new(&engine, ());
     store
         .set_fuel(100_000)
         .map_err(ValidationError::EngineInit)?;
 
-    let instance =
-        Instance::new(&mut store, &module, &[]).map_err(ValidationError::InstantiationFailed)?;
+    let mut linker: Linker<()> = Linker::new(&engine);
+    linker
+        .func_wrap(
+            "env",
+            "datalake_host_log",
+            |_caller: Caller<'_, ()>, _level: u32, _msg_ptr: u32, _msg_len: u32| {},
+        )
+        .map_err(ValidationError::EngineInit)?;
+    linker
+        .func_wrap(
+            "env",
+            "datalake_host_metric_emit",
+            |_caller: Caller<'_, ()>, _type: u32, _name_ptr: u32, _name_len: u32, _val: u64| {},
+        )
+        .map_err(ValidationError::EngineInit)?;
+
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(ValidationError::InstantiationFailed)?;
     let abi_fn = instance
         .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
         .map_err(ValidationError::AbiFunctionMissing)?;
