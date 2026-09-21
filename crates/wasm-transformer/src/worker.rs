@@ -67,6 +67,7 @@ pub struct WasmWorker {
     engine: Arc<EngineCache>,
     module: Arc<Module>,
     config: WasmTransformerConfig,
+    filtered_env: std::collections::HashMap<String, String>,
     store: Store<()>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
@@ -118,6 +119,8 @@ impl WasmWorker {
             })?
         };
 
+        let filtered_env =
+            crate::wasi_env::filter_environment_variables(&config.env_whitelist, &config.env);
         let guest = Self::instantiate_guest(engine.engine(), &module)?;
         let local_generation = engine.module_generation();
 
@@ -126,6 +129,7 @@ impl WasmWorker {
             engine,
             module,
             config,
+            filtered_env,
             store: guest.store,
             instance: guest.instance,
             alloc_fn: guest.alloc_fn,
@@ -273,6 +277,12 @@ impl WasmWorker {
     #[must_use]
     pub fn config(&self) -> &WasmTransformerConfig {
         &self.config
+    }
+
+    /// Returns a reference to the zero-trust filtered environment variables for this worker.
+    #[must_use]
+    pub fn filtered_env(&self) -> &std::collections::HashMap<String, String> {
+        &self.filtered_env
     }
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.

@@ -634,3 +634,34 @@ fn test_worker_fails_on_missing_required_exports() {
         "Expected MissingExport(\"datalake_alloc\"), got: {err}"
     );
 }
+
+#[test]
+fn test_worker_captures_zero_trust_filtered_env() {
+    unsafe {
+        std::env::set_var("HOST_API_KEY", "secret_ambient_key");
+        std::env::set_var("ALLOWED_OTEL_KEY", "otel_ambient_val");
+    }
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.env_whitelist = vec!["ALLOWED_OTEL_KEY".to_string()];
+    cfg.env
+        .insert("STATIC_OVERRIDE".to_string(), "static_val".to_string());
+
+    let worker = WasmWorker::new(30, Arc::clone(&cache), module, cfg).unwrap();
+    let env = worker.filtered_env();
+
+    assert!(!env.contains_key("HOST_API_KEY"));
+    assert_eq!(
+        env.get("ALLOWED_OTEL_KEY").map(String::as_str),
+        Some("otel_ambient_val")
+    );
+    assert_eq!(
+        env.get("STATIC_OVERRIDE").map(String::as_str),
+        Some("static_val")
+    );
+}
