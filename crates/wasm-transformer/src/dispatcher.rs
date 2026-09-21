@@ -253,8 +253,9 @@ impl WasmDispatcher {
 
         if let Some(b) = pending_batch {
             if worker_txs[*next_worker].send(b).await.is_err() {
-                warn!("Worker channel closed during backpressure send");
-                return false;
+                warn!(
+                    "Worker channel closed during backpressure send. Dropping batch to maintain dispatcher liveness."
+                );
             }
             *next_worker = (next_worker.saturating_add(1)) % concurrency;
         }
@@ -305,5 +306,61 @@ fn parse_duration(s: &str) -> Option<std::time::Duration> {
             .parse::<u64>()
             .ok()
             .map(std::time::Duration::from_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
+
+    fn empty_batch() -> SignalBatch {
+        SignalBatch::Logs(RecordBatch::new_empty(Arc::new(Schema::empty())))
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_batch_drops_batch_on_worker_channel_closed_without_terminating() {
+        let (tx0, _rx0) = mpsc::channel::<SignalBatch>(1);
+        let (tx1, rx1) = mpsc::channel::<SignalBatch>(1);
+
+        // Fill tx0 so try_send to tx0 will return Full
+        tx0.try_send(empty_batch()).expect("fill tx0");
+
+        // Close rx1 so tx1 is closed
+        drop(rx1);
+
+        let worker_txs = vec![tx0, tx1];
+        let mut next_worker = 1;
+
+        // In the unpatched code, fallback send to worker_txs[1] fails and returns false.
+        // In the patched code, it drops the batch, logs a warning, advances next_worker to 0, and returns true.
+        let live =
+            WasmDispatcher::dispatch_batch(empty_batch(), &worker_txs, &mut next_worker, 2).await;
+        assert!(
+            live,
+            "dispatcher must remain live when worker channel is closed"
+        );
+        assert_eq!(next_worker, 0, "next_worker must advance to next worker");
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(
+            parse_duration("500ms"),
+            Some(std::time::Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration("5s"),
+            Some(std::time::Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_duration("1m"),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_duration("10"),
+            Some(std::time::Duration::from_secs(10))
+        );
     }
 }
