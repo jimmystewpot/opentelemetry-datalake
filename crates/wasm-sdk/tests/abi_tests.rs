@@ -17,8 +17,37 @@ fn test_log_level_constants() {
 fn test_abi_v1_header_memory_layout() {
     assert_eq!(std::mem::size_of::<TransformResponseHeader>(), 28);
     assert_eq!(std::mem::align_of::<TransformResponseHeader>(), 4);
+    assert_eq!(std::mem::offset_of!(TransformResponseHeader, status), 0);
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, batch_count),
+        4
+    );
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, batches_ptr),
+        8
+    );
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, batches_cap_bytes),
+        12
+    );
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, message_ptr),
+        16
+    );
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, message_len),
+        20
+    );
+    assert_eq!(
+        std::mem::offset_of!(TransformResponseHeader, message_cap),
+        24
+    );
+
     assert_eq!(std::mem::size_of::<BatchDescriptor>(), 8);
     assert_eq!(std::mem::align_of::<BatchDescriptor>(), 4);
+    assert_eq!(std::mem::offset_of!(BatchDescriptor, ptr), 0);
+    assert_eq!(std::mem::offset_of!(BatchDescriptor, len), 4);
+
     assert_eq!(std::mem::size_of::<HostLogRecord>(), 32);
     assert_eq!(std::mem::align_of::<HostLogRecord>(), 4);
 }

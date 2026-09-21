@@ -170,8 +170,8 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
 #[cfg(not(target_arch = "wasm32"))]
 // SAFETY: Exporting test deallocator symbol with C linkage.
 #[unsafe(no_mangle)]
-pub extern "C" fn datalake_dealloc(ptr: u32, _size: u32) {
-    if ptr != 0 {
+pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
+    if ptr != 0 && size != 0 {
         let mut lock = match NATIVE_ALLOCS.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

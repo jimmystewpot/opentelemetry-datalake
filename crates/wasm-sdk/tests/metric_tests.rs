@@ -66,6 +66,7 @@ fn test_metric_emission_helpers_callable_native() {
     // Verify distinct handles are generated on native targets
     assert_ne!(c.0, g.0);
     assert_ne!(g.0, d.0);
+    assert_ne!(c.0, d.0);
 
     // Emitting metrics via registered typed handles on native host is a safe no-op
     counter(c, 42);
