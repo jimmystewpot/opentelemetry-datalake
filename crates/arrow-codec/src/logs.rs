@@ -186,7 +186,7 @@ mod tests {
         assert_eq!(schema.fields().len(), 13);
     }
 
-    /// Two resource_logs groups each containing one log must yield 2 rows.
+    /// Two `resource_logs` groups each containing one log must yield 2 rows.
     #[test]
     fn test_decode_logs_multiple_resource_logs() {
         let make_resource_log = |service: &str| ResourceLogs {
@@ -218,7 +218,7 @@ mod tests {
         assert_eq!(batch.num_rows(), 2);
     }
 
-    /// When resource is absent, service_name must fall back to "unknown".
+    /// When resource is absent, `service_name` must fall back to "unknown".
     #[test]
     fn test_decode_logs_missing_resource_uses_unknown() {
         use arrow::array::AsArray;
@@ -271,8 +271,8 @@ mod tests {
         assert_eq!(body, "", "Missing log body must produce an empty string");
     }
 
-    /// Two scope_logs under the same resource must both contribute rows,
-    /// and their scope_name values must be recorded correctly.
+    /// Two `scope_logs` under the same resource must both contribute rows,
+    /// and their `scope_name` values must be recorded correctly.
     #[test]
     fn test_decode_logs_multiple_scopes() {
         use arrow::array::AsArray;
@@ -319,7 +319,7 @@ mod tests {
         assert!(names.contains("scope-b"));
     }
 
-    /// A log record with a timestamp exceeding i64::MAX must propagate an error.
+    /// A log record with a timestamp exceeding `i64::MAX` must propagate an error.
     #[test]
     fn test_decode_logs_timestamp_overflow_returns_error() {
         let req = ExportLogsServiceRequest {

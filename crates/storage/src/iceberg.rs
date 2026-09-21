@@ -1109,7 +1109,7 @@ mod tests {
         );
     }
 
-    /// get_partition_path must produce correct hourly partition paths.
+    /// `get_partition_path` must produce correct hourly partition paths.
     #[test]
     fn test_partition_path_hourly() {
         // 2024-06-09T00:00:00Z in nanos
@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(path, "year=2024/month=06/day=09/hour=00/");
     }
 
-    /// get_partition_path must produce correct daily partition paths.
+    /// `get_partition_path` must produce correct daily partition paths.
     #[test]
     fn test_partition_path_daily() {
         let ts_nanos: i64 = 1_717_891_200_000_000_000;
@@ -1126,7 +1126,7 @@ mod tests {
         assert_eq!(path, "year=2024/month=06/day=09/");
     }
 
-    /// partition_batch with microsecond timestamps should correctly convert
+    /// `partition_batch` with microsecond timestamps should correctly convert
     /// and produce valid partitions.
     #[test]
     fn test_partition_batch_microsecond_timestamps() {
@@ -1156,7 +1156,7 @@ mod tests {
         );
     }
 
-    /// partition_batch must fail gracefully when the timestamp column
+    /// `partition_batch` must fail gracefully when the timestamp column
     /// uses an unsupported data type.
     #[test]
     fn test_partition_batch_unsupported_timestamp_type() {
@@ -1177,7 +1177,7 @@ mod tests {
         );
     }
 
-    /// partition_batch must fail when the timestamp column doesn't exist.
+    /// `partition_batch` must fail when the timestamp column doesn't exist.
     #[test]
     fn test_partition_batch_missing_timestamp_column() {
         let schema = Arc::new(Schema::new(vec![Field::new("data", DataType::Utf8, false)]));
@@ -1191,7 +1191,7 @@ mod tests {
         );
     }
 
-    /// Flushing an empty buffer in dry_run mode must succeed without
+    /// Flushing an empty buffer in `dry_run` mode must succeed without
     /// panicking or producing errors.
     #[tokio::test]
     async fn test_iceberg_sink_empty_flush() {
@@ -1201,7 +1201,7 @@ mod tests {
         assert!(result.is_ok(), "Empty flush should succeed gracefully");
     }
 
-    /// should_flush must return false when the buffer is empty,
+    /// `should_flush` must return false when the buffer is empty,
     /// even if other thresholds are exceeded.
     #[test]
     fn test_should_flush_empty_buffer() {
@@ -1212,8 +1212,8 @@ mod tests {
         );
     }
 
-    /// should_flush must trigger when the record count exceeds the
-    /// configured max_batch_records threshold.
+    /// `should_flush` must trigger when the record count exceeds the
+    /// configured `max_batch_records` threshold.
     #[test]
     fn test_should_flush_record_threshold() {
         let mut config = make_dry_run_config(SchemaMode::Fixed);
@@ -1242,7 +1242,7 @@ mod tests {
     }
 
     /// Multiple batches accumulating in the buffer must all be flushed
-    /// together and the buffer must be empty afterwards in dry_run mode.
+    /// together and the buffer must be empty afterwards in `dry_run` mode.
     #[tokio::test]
     async fn test_iceberg_sink_multi_batch_accumulation() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
@@ -1322,7 +1322,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![ts, svc, name]).unwrap()
     }
 
-    /// sort_metrics must order rows by (service_name, name, attributes, timestamp).
+    /// `sort_metrics` must order rows by (`service_name`, name, attributes, timestamp).
     #[test]
     fn test_sort_metrics_produces_correct_order() {
         use arrow::array::AsArray;
@@ -1340,7 +1340,7 @@ mod tests {
         assert_eq!(svc_col.value(1), "svc-b");
     }
 
-    /// sort_traces must order rows by (service_name, span_name, timestamp).
+    /// `sort_traces` must order rows by (`service_name`, `span_name`, timestamp).
     #[test]
     fn test_sort_traces_produces_correct_order() {
         use arrow::array::AsArray;
@@ -1355,8 +1355,8 @@ mod tests {
         assert_eq!(svc_col.value(0), "svc-a");
     }
 
-    /// sort_logs must return PipelineError::Internal when the batch lacks
-    /// the required `service_name` column.
+    /// `sort_logs` must return `PipelineError::Internal` when the batch lacks
+    /// the required ``service_name`` column.
     #[test]
     fn test_sort_logs_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1381,7 +1381,7 @@ mod tests {
         );
     }
 
-    /// sort_metrics must return PipelineError::Internal when the `name` column is absent.
+    /// ``sort_metrics`` must return `PipelineError::Internal` when the `name` column is absent.
     #[test]
     fn test_sort_metrics_missing_column_returns_error() {
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1401,7 +1401,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// apply_schema_mode with SchemaMode::Fixed must return the batch unchanged.
+    /// `apply_schema_mode` with `SchemaMode::Fixed` must return the batch unchanged.
     #[test]
     fn test_apply_schema_mode_fixed_is_passthrough() {
         let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
@@ -1411,14 +1411,14 @@ mod tests {
         assert_eq!(result.schema(), original_schema);
     }
 
-    /// get_partition_path must handle timestamp 0 (Unix epoch) correctly.
+    /// ``get_partition_path`` must handle timestamp 0 (Unix epoch) correctly.
     #[test]
     fn test_get_partition_path_zero_timestamp() {
         let path = get_partition_path(0, PartitionGranularity::Hourly).unwrap();
         assert_eq!(path, "year=1970/month=01/day=01/hour=00/");
     }
 
-    /// should_flush must trigger when total_bytes exceeds max_batch_size_bytes.
+    /// ``should_flush`` must trigger when `total_bytes` exceeds `max_batch_size_bytes`.
     #[test]
     fn test_should_flush_byte_threshold() {
         let mut config = make_dry_run_config(SchemaMode::Fixed);
@@ -1446,7 +1446,7 @@ mod tests {
         );
     }
 
-    /// dry_run mode with a Metrics signal must complete without error.
+    /// `dry_run` mode with a Metrics signal must complete without error.
     #[tokio::test]
     async fn test_iceberg_sink_run_with_metrics_batch() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
@@ -1462,7 +1462,7 @@ mod tests {
         );
     }
 
-    /// dry_run mode with a Traces signal must complete without error.
+    /// `dry_run` mode with a Traces signal must complete without error.
     #[tokio::test]
     async fn test_iceberg_sink_run_with_traces_batch() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));

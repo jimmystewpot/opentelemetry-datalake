@@ -83,7 +83,7 @@ impl KafkaSink {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError::Internal` if the producer creation fails.
+    /// Returns ``PipelineError::Internal`` if the producer creation fails.
     pub fn try_new(
         brokers: &str,
         topic: &str,
@@ -124,7 +124,7 @@ impl KafkaSink {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError::Internal` if serialization fails.
+    /// Returns ``PipelineError::Internal`` if serialization fails.
     pub fn serialize_batch(
         &self,
         batch: &arrow::record_batch::RecordBatch,
@@ -265,7 +265,7 @@ mod tests {
         ));
     }
 
-    /// An unrecognised format string must return a PipelineError::Internal error.
+    /// An unrecognised format string must return a `PipelineError::Internal` error.
     #[test]
     fn test_serialization_format_from_str_invalid() {
         use std::str::FromStr;
@@ -289,7 +289,7 @@ mod tests {
         assert!(SerializationFormat::from_str("Ipc").is_ok());
     }
 
-    /// IPC-serialized bytes must be readable back via Arrow's StreamReader,
+    /// IPC-serialized bytes must be readable back via Arrow's `StreamReader`,
     /// and the decoded schema and row count must match the original batch.
     #[test]
     fn test_kafka_sink_ipc_round_trip() {

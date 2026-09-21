@@ -335,6 +335,7 @@ impl Source for OtlpReceiverSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use std::net::IpAddr;
 
     #[tokio::test]
@@ -368,7 +369,7 @@ mod tests {
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
     }
 
-    /// Sending an empty ExportLogsServiceRequest must succeed with zero rows
+    /// Sending an empty `ExportLogsServiceRequest` must succeed with zero rows
     /// and NOT push anything to the channel.
     #[tokio::test]
     async fn test_grpc_logs_empty_request() {
@@ -386,7 +387,7 @@ mod tests {
         );
     }
 
-    /// Sending an empty ExportTraceServiceRequest must succeed with zero rows.
+    /// Sending an empty `ExportTraceServiceRequest` must succeed with zero rows.
     #[tokio::test]
     async fn test_grpc_traces_empty_request() {
         let (tx, mut rx) = mpsc::channel(10);
@@ -402,7 +403,7 @@ mod tests {
         );
     }
 
-    /// Sending an empty ExportMetricsServiceRequest must succeed with zero rows.
+    /// Sending an empty `ExportMetricsServiceRequest` must succeed with zero rows.
     #[tokio::test]
     async fn test_grpc_metrics_empty_request() {
         let (tx, mut rx) = mpsc::channel(10);
@@ -428,8 +429,6 @@ mod tests {
         // Drop the receiver to simulate a failed downstream.
         drop(rx);
 
-        // Build a non-empty request so the batch has > 0 rows
-        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 scope_logs: vec![ScopeLogs {
@@ -451,10 +450,11 @@ mod tests {
         );
     }
 
-    /// decode_http_body with application/json content-type and valid JSON
+    /// `decode_http_body` with application/json content-type and valid JSON
     /// must successfully parse the request.
     #[test]
     fn test_decode_http_body_json() {
+        #[allow(clippy::items_after_statements)]
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
@@ -463,7 +463,7 @@ mod tests {
         assert!(result.is_ok(), "Valid JSON should decode successfully");
     }
 
-    /// decode_http_body must default to JSON when no Content-Type header is set.
+    /// `decode_http_body` must default to JSON when no Content-Type header is set.
     #[test]
     fn test_decode_http_body_defaults_to_json() {
         let headers = HeaderMap::new();
@@ -475,7 +475,7 @@ mod tests {
         );
     }
 
-    /// decode_http_body with application/x-protobuf content-type and
+    /// `decode_http_body` with application/x-protobuf content-type and
     /// garbage bytes must return a decode error.
     #[test]
     fn test_decode_http_body_invalid_protobuf() {
@@ -490,14 +490,14 @@ mod tests {
         );
     }
 
-    /// decode_http_body with application/json content-type and
+    /// `decode_http_body` with application/json content-type and
     /// malformed JSON must return a decode error.
     #[test]
     fn test_decode_http_body_invalid_json() {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
 
-        let body = Bytes::from(r#"{ not valid json }"#);
+        let body = Bytes::from(r"{ not valid json }");
         let result: Result<ExportLogsServiceRequest, _> = decode_http_body(&headers, body);
         assert!(result.is_err(), "Invalid JSON should fail decoding");
     }
@@ -584,11 +584,9 @@ mod tests {
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unavailable);
     }
 
-    /// A non-empty gRPC logs request must push a SignalBatch::Logs onto the channel.
+    /// A non-empty gRPC logs request must push a `SignalBatch::Logs` onto the channel.
     #[tokio::test]
     async fn test_grpc_logs_non_empty_sends_to_channel() {
-        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-
         let (tx, mut rx) = mpsc::channel(10);
         let svc = GrpcLogsService { tx };
 
@@ -617,7 +615,7 @@ mod tests {
         );
     }
 
-    /// A non-empty gRPC traces request must push a SignalBatch::Traces onto the channel.
+    /// A non-empty gRPC traces request must push a `SignalBatch::Traces` onto the channel.
     #[tokio::test]
     async fn test_grpc_traces_non_empty_sends_to_channel() {
         use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};

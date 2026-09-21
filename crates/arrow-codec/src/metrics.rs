@@ -297,6 +297,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::AsArray;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
     use opentelemetry_proto::tonic::metrics::v1::{
@@ -416,7 +417,6 @@ mod tests {
         .unwrap();
         assert_eq!(batch.num_rows(), 1);
         // The value column must contain the sum (250.0)
-        use arrow::array::AsArray;
         let val = batch
             .column_by_name("value")
             .unwrap()
@@ -428,7 +428,6 @@ mod tests {
     /// A Gauge data point with an integer value must be stored as f64.
     #[test]
     fn test_decode_metrics_gauge_as_int_value() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -466,7 +465,6 @@ mod tests {
     /// A Gauge data point with no value set must default to 0.0.
     #[test]
     fn test_decode_metrics_gauge_none_value_defaults_to_zero() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             scope_metrics: vec![ScopeMetrics {
                 metrics: vec![Metric {
@@ -499,10 +497,9 @@ mod tests {
         );
     }
 
-    /// When no resource is set, service_name must default to "unknown".
+    /// When no resource is set, `service_name` must default to "unknown".
     #[test]
     fn test_decode_metrics_missing_resource_uses_unknown() {
-        use arrow::array::AsArray;
         let r_metric = ResourceMetrics {
             resource: None,
             scope_metrics: vec![ScopeMetrics {
