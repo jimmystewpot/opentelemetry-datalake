@@ -166,7 +166,7 @@ static NATIVE_ALLOCS: std::sync::Mutex<Option<std::collections::HashMap<u32, Vec
     std::sync::Mutex::new(None);
 
 #[cfg(not(target_arch = "wasm32"))]
-static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Allocates a mock buffer entry in the host test allocator map.
 ///
@@ -175,6 +175,7 @@ static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 #[must_use]
 // SAFETY: Exporting test allocator symbol with C linkage.
 #[unsafe(no_mangle)]
+#[allow(clippy::cast_possible_truncation)]
 pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     if size == 0 || size as usize > MOCK_MAX_ALLOC {
         return 0;
@@ -183,14 +184,20 @@ pub extern "C" fn datalake_alloc(size: u32) -> u32 {
     if buf.try_reserve_exact(size as usize).is_err() {
         return 0;
     }
-    let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    while (id as u32) == 0 {
+        id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Safe to cast u64 ID to pointer representation on 64-bit OS for test harness handle generation.
+    let ptr = id as *mut u8;
+    let handle = ptr as usize as u32;
     let mut lock = match NATIVE_ALLOCS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     lock.get_or_insert_with(std::collections::HashMap::new)
-        .insert(id, buf);
-    id
+        .insert(handle, buf);
+    handle
 }
 
 /// Deallocates a mock buffer entry previously allocated by `datalake_alloc`.
@@ -235,5 +242,24 @@ mod tests {
             let mut guard = poisoned.into_inner();
             guard.take(); // Clear it
         }
+    }
+
+    #[test]
+    fn test_test_allocator_u64_wrap_around_prevention() {
+        // Test that NEXT_ID uses AtomicU64 and that when approaching/crossing the 32-bit boundary (u32::MAX),
+        // datalake_alloc never returns 0 (null handle) and allocation succeeds.
+        NEXT_ID.store(u64::from(u32::MAX), std::sync::atomic::Ordering::SeqCst);
+
+        // First allocation at u32::MAX
+        let ptr1 = datalake_alloc(64);
+        assert_ne!(ptr1, 0, "handle must not be 0 at u32::MAX");
+
+        // Next allocation crosses 2^32 boundary; must not return 0 (null)
+        let ptr2 = datalake_alloc(64);
+        assert_ne!(ptr2, 0, "handle must not wrap to 0 (null)");
+        assert_ne!(ptr1, ptr2, "consecutive handles must be distinct");
+
+        datalake_dealloc(ptr1, 64);
+        datalake_dealloc(ptr2, 64);
     }
 }
