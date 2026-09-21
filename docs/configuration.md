@@ -199,8 +199,8 @@ verification = "full" # "full" (default) or "disabled"
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `ca_cert_path` | String | `null` | Optional path to a custom PEM-encoded Certificate Authority file. Validated at startup. |
-| `verification` | String | `"full"` | TLS verification mode: `"full"` (validates CA chain and hostname) or `"disabled"` (insecure; test/dev only). |
-| `insecure_skip_verify` | Boolean | `null` | Backward-compatibility alias for `verification = "disabled"`. When `true`, disables certificate validation. |
+| `verification` | String | `"full"` | TLS verification mode: `"full"` (validates CA chain and hostname; default). Disabling verification is rejected for security. |
+| `insecure_skip_verify` | Boolean | `null` | Backward-compatibility alias for `verification = "disabled"`. Disabling verification is rejected for security. |
 
 ---
 

@@ -510,7 +510,7 @@ verification = "full" # "full" (default) or "disabled"
 
 - **Dual Root Certificate Stores**: By default, `elasticsearch-sink` enables both `tls-native-roots` (loads the host OS trust store) and `tls-webpki-roots` (loads Mozilla WebPKI root certificates).
 - **Custom Certificate Authorities**: Specifying `ca_cert_path` loads a custom PEM certificate, validated at startup.
-- **Verification Modes**: `verification = "full"` validates the certificate chain and hostname. `verification = "disabled"` (or legacy `insecure_skip_verify = true`) turns off verification for test/local environments with an explicit warning log.
+- **Verification Modes**: `verification = "full"` validates the certificate chain and hostname. Disabling certificate verification (`verification = "disabled"` or legacy `insecure_skip_verify = true`) is prohibited for security (CWE-295); configure `ca_cert_path` with the trusted CA certificate instead.
 
 ---
 

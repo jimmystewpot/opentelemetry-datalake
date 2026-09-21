@@ -381,13 +381,10 @@ impl HttpClient {
             .tcp_nodelay(true)
             .gzip(true);
 
-        let is_insecure = config.tls.is_insecure();
-        builder = builder.danger_accept_invalid_certs(is_insecure);
-        if is_insecure {
-            tracing::warn!(
-                sink = "elasticsearch",
-                "TLS certificate validation is DISABLED; connections are vulnerable to man-in-the-middle attacks"
-            );
+        if config.tls.is_insecure() {
+            return Err(ElasticsearchError::StartupValidation(
+                "disabling TLS certificate verification is prohibited; configure 'tls.ca_cert_path' with the trusted CA certificate instead".to_string(),
+            ));
         }
 
         if let Some(ca_path) = &config.tls.ca_cert_path {
@@ -1885,16 +1882,24 @@ mod tests {
     fn test_tls_config_insecure_skip_verify() {
         let mut config = make_test_config(vec!["https://localhost:9200".to_string()]);
         config.tls.insecure_skip_verify = Some(true);
-        let client = HttpClient::try_new(&config);
-        assert!(client.is_ok());
+        let err = HttpClient::try_new(&config).unwrap_err();
+        assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited")
+        );
     }
 
     #[test]
     fn test_tls_config_verification_disabled() {
         let mut config = make_test_config(vec!["https://localhost:9200".to_string()]);
         config.tls.verification = crate::tls::TlsVerificationMode::Disabled;
-        let client = HttpClient::try_new(&config);
-        assert!(client.is_ok());
+        let err = HttpClient::try_new(&config).unwrap_err();
+        assert!(matches!(err, ElasticsearchError::StartupValidation(_)));
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited")
+        );
     }
 
     #[test]
