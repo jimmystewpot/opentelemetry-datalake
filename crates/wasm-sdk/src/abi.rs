@@ -2,6 +2,13 @@
 //!
 //! This module defines the memory layouts for communication between
 //! the host runtime (`wasm-transformer`) and guest WebAssembly transform modules.
+//!
+//! # Memory Ownership Model
+//!
+//! Memory allocated by the guest for payloads returned across the ABI boundary
+//! (such as [`TransformResponseHeader::batches_ptr`], [`BatchDescriptor::ptr`], and
+//! [`TransformResponseHeader::message_ptr`]) transfers ownership to the host runtime.
+//! The host is required to free these allocations by invoking `datalake_dealloc`.
 
 /// Current ABI version supported by this SDK.
 pub const ABI_VERSION: u32 = 1;
@@ -18,6 +25,15 @@ pub const STATUS_ERROR: u32 = 3;
 /// Response header returned by `datalake_transform` export.
 ///
 /// Total size: 20 bytes, alignment: 4 bytes.
+///
+/// # Memory Ownership Contract
+///
+/// Ownership of the descriptor array (`batches_ptr`) and all IPC buffers
+/// it points to is transferred across the ABI boundary to the host.
+/// The Host MUST call `datalake_dealloc` on the descriptor array pointer
+/// AND on each individual `BatchDescriptor.ptr` exactly once to prevent memory leaks.
+/// If `message_ptr` is non-zero, ownership of the error or rejection message buffer
+/// is also transferred to the host, and the Host MUST call `datalake_dealloc` on `message_ptr`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformResponseHeader {
@@ -36,6 +52,13 @@ pub struct TransformResponseHeader {
 /// Descriptor for a single Arrow IPC stream payload in guest memory.
 ///
 /// Total size: 8 bytes, alignment: 4 bytes.
+///
+/// # Memory Ownership Contract
+///
+/// Ownership of the memory buffer referenced by `ptr` (with byte length `len`) is
+/// transferred across the ABI boundary to the host runtime upon return of
+/// [`TransformResponseHeader`]. The Host MUST call `datalake_dealloc(ptr, len)`
+/// exactly once to reclaim the buffer after reading or copying the Arrow IPC stream payload.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchDescriptor {
