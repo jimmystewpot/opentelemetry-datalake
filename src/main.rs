@@ -113,12 +113,13 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A tuple containing signal-isolated transformers for logs, traces, and metrics.
+type SignalTransformers = (Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>);
+
 /// Initializes the pipeline transformers based on the provided application configuration.
 /// If `wasm_transformer` is configured, it instantiates three signal-isolated instances.
 /// Otherwise, it falls back to No-op transformers.
-fn initialize_transformers(
-    config: &AppConfig,
-) -> anyhow::Result<(Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>)> {
+fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransformers> {
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         tracing::info!(
             transformer_id = %wasm_cfg.id,
@@ -812,16 +813,6 @@ mod tests {
         assert_eq!(wasm.env_whitelist, vec!["REGION", "ENV"]);
         assert!(wasm.enable_sighup);
     }
-}
-
-#[cfg(test)]
-mod additional_tests {
-    use super::*;
-    use crate::AppConfig;
-    use figment::{
-        Figment,
-        providers::{Format, Toml},
-    };
 
     #[test]
     fn test_initialize_transformers_noop() {
@@ -841,7 +832,6 @@ mod additional_tests {
 
     #[test]
     fn test_initialize_transformers_wasm_error() {
-        // Just verify it attempts to construct WASM but fails properly
         let toml_str = r#"
         [server]
         grpc_addr = "127.0.0.1:4317"
