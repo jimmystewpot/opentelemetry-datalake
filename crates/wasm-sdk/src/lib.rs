@@ -4,6 +4,7 @@
 //! canonical immutability guards, and transformation abstractions for WASM guest transform modules.
 
 pub mod abi;
+pub mod dispatch;
 pub mod error;
 pub mod helpers;
 pub mod metrics;
