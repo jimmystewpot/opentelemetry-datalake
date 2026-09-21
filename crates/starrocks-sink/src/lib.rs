@@ -269,7 +269,7 @@ pub struct StarRocksSinkConfig {
 }
 
 impl StarRocksSinkConfig {
-    /// Validates StarRocks sink configuration parameters including TLS, URLs, and authentication.
+    /// Validates `StarRocks` sink configuration parameters including TLS, URLs, and authentication.
     ///
     /// # Errors
     /// Returns [`PipelineError`] if:
