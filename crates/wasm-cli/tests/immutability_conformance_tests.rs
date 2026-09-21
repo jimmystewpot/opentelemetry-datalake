@@ -158,3 +158,45 @@ fn test_run_benchmark_with_disclaimer_not_yet_implemented() {
     assert!(res.is_err());
     assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
 }
+
+#[test]
+fn test_verify_batch_immutability_typed_variants() {
+    use datalake_wasm_tool::tester::TesterError;
+
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("span_id", DataType::Utf8, false),
+    ]));
+    let out_schema_missing = Arc::new(Schema::new(vec![Field::new(
+        "span_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        in_schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["trace_123"])),
+            Arc::new(StringArray::from(vec!["span_456"])),
+        ],
+    )
+    .unwrap();
+    let output_missing = RecordBatch::try_new(
+        out_schema_missing,
+        vec![Arc::new(StringArray::from(vec!["span_456"]))],
+    )
+    .unwrap();
+
+    let err = verify_batch_immutability(&input, &output_missing).unwrap_err();
+    assert_eq!(err, TesterError::MissingColumn("trace_id"));
+
+    let output_tampered = RecordBatch::try_new(
+        in_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_TAMPERED"])),
+            Arc::new(StringArray::from(vec!["span_456"])),
+        ],
+    )
+    .unwrap();
+    let err = verify_batch_immutability(&input, &output_tampered).unwrap_err();
+    assert_eq!(err, TesterError::ValueMismatch("trace_id"));
+}
