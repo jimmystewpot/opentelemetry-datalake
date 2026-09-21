@@ -28,6 +28,7 @@ fn test_verify_batch_immutability_detects_tampered_trace_id() {
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
+            .to_string()
             .contains("Value mismatch in immutable column trace_id")
     );
 }
@@ -60,6 +61,7 @@ fn test_verify_batch_immutability_detects_missing_column() {
     assert!(res.is_err());
     assert!(
         res.unwrap_err()
+            .to_string()
             .contains("Immutable column 'trace_id' present in input but missing from output")
     );
 }
