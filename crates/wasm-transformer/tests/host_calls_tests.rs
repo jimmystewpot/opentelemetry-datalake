@@ -9,7 +9,7 @@ fn test_host_linker_defines_required_guest_imports() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("test_comp"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     let wat = r#"(module
         (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
@@ -68,7 +68,7 @@ fn test_metric_registry_counter_and_gauge_bitcast() {
 fn test_edge_case_missing_memory_export() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("missing_mem"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     // Module with NO exported "memory"
     let wat = r#"(module
@@ -103,7 +103,7 @@ fn test_edge_case_missing_memory_export() {
 fn test_edge_case_out_of_bounds_memory_reads() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("oob_comp"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     // 1 page = 65,536 bytes
     let wat = r#"(module
@@ -176,7 +176,7 @@ fn test_edge_case_gauge_negative_float_preservation() {
 fn test_edge_case_duration_nanos_counter_recording() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("duration_comp"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     let wat = r#"(module
         (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
@@ -211,7 +211,7 @@ fn test_edge_case_duration_nanos_counter_recording() {
 fn test_edge_case_log_levels_1_through_4_and_default_trace() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("log_comp"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     let wat = r#"(module
         (import "env" "datalake_host_log" (func $log (param i32 i32 i32)))
@@ -289,7 +289,7 @@ fn test_edge_case_counter_saturating_add_and_type_override() {
 fn test_edge_case_metric_name_allocation_capping() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("cap_comp"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     // Module with 300-byte string in memory.
     // Host should cap to MAX_METRIC_NAME_LEN (256 bytes) and record the clamped name.
@@ -334,7 +334,7 @@ fn test_edge_case_metric_name_allocation_capping() {
 fn test_edge_case_unknown_metric_type_and_empty_name() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("empty_unknown"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     let wat = r#"(module
         (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
@@ -373,7 +373,7 @@ fn test_edge_case_unknown_metric_type_and_empty_name() {
 fn test_edge_case_gauge_metric_emission_from_wasm() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("gauge_wasm"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     let wat = r#"(module
         (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
@@ -399,14 +399,14 @@ fn test_edge_case_gauge_metric_emission_from_wasm() {
         .unwrap();
 
     assert!(func.call(&mut store, ()).is_ok());
-    assert_eq!(registry.read_gauge("cpu_usage"), Some(4607182418800017408));
+    assert_eq!(registry.read_gauge("cpu_usage"), Some(1.0_f64.to_bits()));
 }
 
 #[test]
 fn test_edge_case_memory_export_not_a_memory() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("not_mem"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     // Module with export named "memory", but it is a global, not a linear memory
     let wat = r#"(module
@@ -440,7 +440,7 @@ fn test_edge_case_memory_export_not_a_memory() {
 fn test_edge_case_log_message_allocation_capping() {
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("log_cap"));
-    let linker = build_host_linker(&engine, Arc::clone(&registry)).unwrap();
+    let linker = build_host_linker(&engine).unwrap();
 
     // Module with 2 memory pages (131,072 bytes) and 70,000-byte log message (exceeding MAX_LOG_MESSAGE_LEN)
     let wat = r#"(module

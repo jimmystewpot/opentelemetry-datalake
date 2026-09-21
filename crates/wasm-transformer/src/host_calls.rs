@@ -176,10 +176,7 @@ fn read_guest_string(
 /// # Errors
 ///
 /// Returns [`WasmTransformError`] if function definition in the linker fails.
-pub fn build_host_linker(
-    engine: &Engine,
-    _registry: Arc<MetricRegistry>,
-) -> Result<Linker<HostState>, WasmTransformError> {
+pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTransformError> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap(
@@ -228,12 +225,21 @@ pub fn build_host_linker(
                 return;
             };
 
+            let comp_id = caller.data().registry.component_id();
             match level {
-                LOG_LEVEL_ERROR => tracing::error!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_WARN => tracing::warn!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_INFO => tracing::info!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_DEBUG => tracing::debug!(target: "wasm_guest", "{msg}"),
-                _ => tracing::trace!(target: "wasm_guest", "{msg}"),
+                LOG_LEVEL_ERROR => {
+                    tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_WARN => {
+                    tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_INFO => {
+                    tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_DEBUG => {
+                    tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
             }
         },
     )?;

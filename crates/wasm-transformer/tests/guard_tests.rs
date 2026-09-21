@@ -449,3 +449,118 @@ fn test_backfill_non_nullable_missing_column_sets_nullable_true() {
         "Backfilled null column must have is_nullable == true"
     );
 }
+
+#[test]
+fn test_immutability_check_detects_mutated_data_type() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new(
+        "timestamp",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        false,
+    )]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new(
+        "timestamp",
+        DataType::Int64,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        in_schema,
+        vec![Arc::new(TimestampNanosecondArray::from(vec![
+            1_700_000_000_000_000_000,
+        ]))],
+    )
+    .unwrap();
+    let output = RecordBatch::try_new(
+        out_schema,
+        vec![Arc::new(Int64Array::from(vec![1_700_000_000]))],
+    )
+    .unwrap();
+
+    let err = verify_structural_immutability(&input, &output).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("data type mutated"),
+        "Error message must indicate data type mutation: {msg}"
+    );
+}
+
+#[test]
+fn test_backfill_merges_input_and_output_schema_metadata() {
+    let mut in_meta = HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    in_meta.insert("source_system".to_string(), "collector".to_string());
+    let full_schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("dropped_col", DataType::Int32, true),
+        ],
+        in_meta,
+    ));
+
+    let mut out_meta = HashMap::new();
+    out_meta.insert("guest_version".to_string(), "v1.2".to_string());
+    let partial_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        out_meta,
+    ));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    let backfilled_schema = backfilled.schema();
+    let meta = backfilled_schema.metadata();
+    assert_eq!(
+        meta.get("otel::compliance::status").map(String::as_str),
+        Some("verified")
+    );
+    assert_eq!(
+        meta.get("source_system").map(String::as_str),
+        Some("collector")
+    );
+    assert_eq!(meta.get("guest_version").map(String::as_str), Some("v1.2"));
+}
+
+#[test]
+fn test_backfill_nested_struct_marks_child_fields_nullable() {
+    let child_field = Arc::new(Field::new("service_name", DataType::Utf8, false));
+    let struct_field = Field::new(
+        "resource",
+        DataType::Struct(vec![child_field].into()),
+        false,
+    );
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        struct_field,
+    ]));
+
+    let partial_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    assert_eq!(backfilled.num_columns(), 2);
+    let backfilled_schema = backfilled.schema();
+    let res_field = backfilled_schema.field(1);
+    assert!(res_field.is_nullable(), "Outer struct must be nullable");
+
+    if let DataType::Struct(children) = res_field.data_type() {
+        assert!(
+            children[0].is_nullable(),
+            "Nested child field inside backfilled null struct must be marked nullable"
+        );
+    } else {
+        panic!("Expected struct data type");
+    }
+}

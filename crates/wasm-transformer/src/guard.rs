@@ -12,17 +12,37 @@ use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 use std::sync::Arc;
 use tracing::warn;
 
-/// Verifies that canonical immutable columns have not been dropped or completely wiped to nulls.
+/// Recursively marks a field and any nested children as nullable.
+fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
+    match field.data_type() {
+        arrow::datatypes::DataType::Struct(subfields) => {
+            let nullable_subfields: Vec<Arc<arrow::datatypes::Field>> = subfields
+                .iter()
+                .map(|f| Arc::new(make_field_nullable(f)))
+                .collect();
+            let mut new_f = field.clone();
+            new_f = new_f.with_data_type(arrow::datatypes::DataType::Struct(
+                nullable_subfields.into(),
+            ));
+            new_f.with_nullable(true)
+        }
+        _ => field.clone().with_nullable(true),
+    }
+}
+
+/// Verifies that canonical immutable columns have not been dropped, completely wiped to nulls,
+/// or had their data types mutated.
 ///
 /// Executes an $O(1)$ metadata check on the output [`RecordBatch`] for each canonical
 /// OpenTelemetry field defined in [`IMMUTABLE_COLUMNS`]. If a column was not entirely null
 /// in the input batch, and is either completely nullified or dropped entirely in the output
-/// batch (when non-empty), an error is returned.
+/// batch (when non-empty), an error is returned. If an immutable column is present in both
+/// input and output, its [`arrow::datatypes::DataType`] must remain identical.
 ///
 /// # Errors
 ///
 /// Returns [`WasmTransformError::Pipeline`] if any immutable column present in `input` is
-/// dropped or entirely null in `output` with `!output.is_empty()`.
+/// dropped, entirely null in `output` with `!output.is_empty()`, or has its data type mutated.
 pub fn verify_structural_immutability(
     input: &RecordBatch,
     output: &RecordBatch,
@@ -30,14 +50,27 @@ pub fn verify_structural_immutability(
     let schema = output.schema();
     let input_schema = input.schema();
     for &col_name in IMMUTABLE_COLUMNS {
-        let input_was_null = if let Ok(idx) = input_schema.index_of(col_name) {
-            input.column(idx).null_count() == input.column(idx).len()
+        let input_col_info = if let Ok(idx) = input_schema.index_of(col_name) {
+            let col = input.column(idx);
+            Some((col.data_type().clone(), col.null_count() == col.len()))
         } else {
-            true
+            None
         };
+
+        let input_was_null = input_col_info
+            .as_ref()
+            .map_or(true, |(_, was_null)| *was_null);
 
         if let Ok(idx) = schema.index_of(col_name) {
             let col = output.column(idx);
+            if let Some((in_dtype, _)) = input_col_info {
+                if col.data_type() != &in_dtype {
+                    return Err(WasmTransformError::Pipeline(format!(
+                        "Immutability violation: core field '{col_name}' data type mutated from {in_dtype:?} to {:?}",
+                        col.data_type()
+                    )));
+                }
+            }
             if col.null_count() == col.len() && !col.is_empty() && !input_was_null {
                 return Err(WasmTransformError::Pipeline(format!(
                     "Immutability violation: core field '{col_name}' is entirely null in output"
@@ -53,17 +86,21 @@ pub fn verify_structural_immutability(
 }
 
 /// Backfills any missing columns from `input_schema` into `output` using typed null arrays,
-/// preserving input column ordering.
+/// preserving input column ordering and merging schema metadata.
 ///
 /// In defensive schema guard mode, if a guest transformation drops columns that existed
 /// in the upstream schema, this function re-inserts them as typed null arrays matching
 /// the input field data types and row count, preserving the input column ordering and
 /// ensuring downstream consumers and columnar writers (e.g. Parquet/Iceberg) do not
 /// encounter schema truncation or drift. Any new columns appended by the guest are
-/// preserved at the end.
+/// preserved at the end. Any nested structs in backfilled columns have their child fields
+/// recursively marked nullable to satisfy downstream format requirements.
 ///
-/// If no columns are missing and schema ordering is unchanged, returns `Ok(output)` without
-/// allocating a new [`RecordBatch`].
+/// Schema metadata from `input_schema` is preserved and merged with `output_schema` metadata,
+/// ensuring upstream compliance flags (e.g. `otel::compliance::status = "verified"`) remain intact.
+///
+/// If no columns are missing, schema ordering is unchanged, and metadata matches, returns
+/// `Ok(output)` without allocating a new [`RecordBatch`].
 ///
 /// # Errors
 ///
@@ -94,10 +131,10 @@ pub fn backfill_missing_columns(
             let backfilled_field = if field.is_nullable() {
                 Arc::clone(field)
             } else {
-                Arc::new(field.as_ref().clone().with_nullable(true))
+                Arc::new(make_field_nullable(field))
             };
+            columns.push(new_null_array(backfilled_field.data_type(), num_rows));
             fields.push(backfilled_field);
-            columns.push(new_null_array(field.data_type(), num_rows));
             added = true;
         }
     }
@@ -110,6 +147,9 @@ pub fn backfill_missing_columns(
         }
     }
 
+    let mut merged_metadata = input_schema.metadata().clone();
+    merged_metadata.extend(output_schema.metadata().clone());
+
     if !added
         && output_schema.fields().len() == fields.len()
         && output_schema
@@ -117,14 +157,12 @@ pub fn backfill_missing_columns(
             .iter()
             .zip(&fields)
             .all(|(a, b)| a == b)
+        && output_schema.metadata() == &merged_metadata
     {
         return Ok(output);
     }
 
-    let new_schema = Arc::new(Schema::new_with_metadata(
-        fields,
-        output_schema.metadata().clone(),
-    ));
+    let new_schema = Arc::new(Schema::new_with_metadata(fields, merged_metadata));
     RecordBatch::try_new(new_schema, columns)
         .map_err(|e| WasmTransformError::Pipeline(e.to_string()))
 }
