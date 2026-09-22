@@ -39,14 +39,10 @@ unsafe extern "C" {
 }
 
 /// Emits a counter increment metric to the host runtime.
-///
-/// On WebAssembly targets, this invokes the host import `datalake_host_metric_emit`.
-/// On non-wasm32 targets (e.g. host tests), this is a safe no-op.
 pub fn counter(name: &str, value: u64) {
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory
-        // to host runtime metric emission import.
+        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
             #[allow(clippy::cast_possible_truncation)]
             datalake_host_metric_emit(
@@ -64,16 +60,10 @@ pub fn counter(name: &str, value: u64) {
 }
 
 /// Emits an instantaneous gauge metric to the host runtime.
-///
-/// The `f64` value is bitcast to `u64` via [`gauge_to_bits`] to safely pass across
-/// the C-ABI boundary.
-/// On WebAssembly targets, this invokes the host import `datalake_host_metric_emit`.
-/// On non-wasm32 targets (e.g. host tests), this is a safe no-op.
 pub fn gauge(name: &str, value: f64) {
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory
-        // to host runtime metric emission import.
+        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
             #[allow(clippy::cast_possible_truncation)]
             datalake_host_metric_emit(
@@ -91,15 +81,10 @@ pub fn gauge(name: &str, value: f64) {
 }
 
 /// Emits a duration measurement metric in nanoseconds to the host runtime.
-///
-/// The duration is standardized to nanoseconds via [`duration_to_nanos`].
-/// On WebAssembly targets, this invokes the host import `datalake_host_metric_emit`.
-/// On non-wasm32 targets (e.g. host tests), this is a safe no-op.
 pub fn duration(name: &str, dur: Duration) {
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory
-        // to host runtime metric emission import.
+        // SAFETY: Passing valid UTF-8 string pointer and length within wasm32 linear memory.
         unsafe {
             #[allow(clippy::cast_possible_truncation)]
             datalake_host_metric_emit(

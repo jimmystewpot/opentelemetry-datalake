@@ -1,8 +1,16 @@
 use opentelemetry_datalake_wasm_sdk::metrics::{
-    counter, duration, duration_to_nanos, gauge, gauge_to_bits,
+    METRIC_TYPE_COUNTER, METRIC_TYPE_DURATION, METRIC_TYPE_GAUGE, counter, duration,
+    duration_to_nanos, gauge, gauge_to_bits,
 };
 use opentelemetry_datalake_wasm_sdk::panic::init_panic_hook;
 use std::time::Duration;
+
+#[test]
+fn test_metric_type_constants() {
+    assert_eq!(METRIC_TYPE_COUNTER, 0);
+    assert_eq!(METRIC_TYPE_GAUGE, 1);
+    assert_eq!(METRIC_TYPE_DURATION, 2);
+}
 
 #[test]
 #[allow(clippy::float_cmp)]
@@ -58,7 +66,6 @@ fn test_duration_overflow_saturates_u64_max() {
 
 #[test]
 fn test_metric_emission_helpers_callable_native() {
-    // Emitting metrics on native host environment is a safe no-op
     counter("guest_records_transformed_total", 42);
     gauge("guest_memory_usage_ratio", 0.75);
     duration(

@@ -172,11 +172,16 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn verify_transform_response(
+/// Reads and verifies the response status in the [`TransformResponseHeader`].
+///
+/// # Errors
+///
+/// Returns an error if the header pointer is out of memory bounds, or if the
+/// guest reported an error or rejection status.
+pub fn verify_transform_status(
     memory: &wasmtime::Memory,
     store: &Store<()>,
     header_ptr: u32,
-    input_batch: &RecordBatch,
 ) -> Result<()> {
     if header_ptr == 0 {
         return Ok(());
@@ -195,16 +200,6 @@ fn verify_transform_response(
         mem[h_start..h_start + 4]
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to read status: {e}"))?,
-    );
-    let batch_count = u32::from_le_bytes(
-        mem[h_start + 4..h_start + 8]
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Failed to read batch_count: {e}"))?,
-    );
-    let batches_ptr = u32::from_le_bytes(
-        mem[h_start + 8..h_start + 12]
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Failed to read batches_ptr: {e}"))?,
     );
     let message_ptr = u32::from_le_bytes(
         mem[h_start + 12..h_start + 16]
@@ -233,6 +228,34 @@ fn verify_transform_response(
         };
         anyhow::bail!("Guest transform failed: {msg}");
     }
+
+    Ok(())
+}
+
+fn verify_transform_response(
+    memory: &wasmtime::Memory,
+    store: &Store<()>,
+    header_ptr: u32,
+    input_batch: &RecordBatch,
+) -> Result<()> {
+    verify_transform_status(memory, store, header_ptr)?;
+    if header_ptr == 0 {
+        return Ok(());
+    }
+
+    let h_start = header_ptr as usize;
+    let mem = memory.data(store);
+
+    let batch_count = u32::from_le_bytes(
+        mem[h_start + 4..h_start + 8]
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to read batch_count: {e}"))?,
+    );
+    let batches_ptr = u32::from_le_bytes(
+        mem[h_start + 8..h_start + 12]
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to read batches_ptr: {e}"))?,
+    );
 
     for i in 0..batch_count {
         let desc_offset = (batches_ptr as usize)

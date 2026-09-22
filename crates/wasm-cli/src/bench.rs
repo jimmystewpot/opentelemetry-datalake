@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use wasmtime::{Config, Engine, Module, Store};
 
-use crate::tester::{build_canonical_test_batch, serialize_batch_to_ipc};
+use crate::tester::{build_canonical_test_batch, serialize_batch_to_ipc, verify_transform_status};
 use crate::validator::validate_wasm_bytes;
 
 fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
@@ -73,17 +73,19 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     memory.data_mut(&mut store)[start..end].copy_from_slice(&buffer);
 
     for _ in 0..5 {
-        let _ = transform_fn
+        let header_ptr = transform_fn
             .call(&mut store, (input_ptr, input_len))
             .map_err(wasm_err)?;
+        verify_transform_status(&memory, &store, header_ptr)?;
     }
 
     let iterations: u32 = 50;
     let start_time = Instant::now();
     for _ in 0..iterations {
-        let _ = transform_fn
+        let header_ptr = transform_fn
             .call(&mut store, (input_ptr, input_len))
             .map_err(wasm_err)?;
+        verify_transform_status(&memory, &store, header_ptr)?;
     }
     let total_elapsed = start_time.elapsed();
 
