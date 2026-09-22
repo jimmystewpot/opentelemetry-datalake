@@ -6,6 +6,7 @@
 
 use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
+use crate::host_calls::MetricRegistry;
 use crate::worker::{WasmWorker, WorkerOutcome};
 use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, WasmTransformerConfig};
 use pipeline_core::pipeline::{PipelineReceiver, PipelineSender, SignalBatch};
@@ -69,7 +70,7 @@ impl WasmDispatcher {
 
     /// Returns a reference to the shared [`MetricRegistry`].
     #[must_use]
-    pub fn registry(&self) -> &Arc<crate::host_calls::MetricRegistry> {
+    pub fn registry(&self) -> &Arc<MetricRegistry> {
         &self.registry
     }
 
