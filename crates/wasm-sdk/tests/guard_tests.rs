@@ -232,7 +232,7 @@ fn test_nullify_nonexistent_column_returns_column_not_found() {
 }
 
 #[test]
-fn test_nullify_target_schema_mismatch_returns_arrow_error() {
+fn test_nullify_target_schema_mismatch_returns_schema_mismatch_error() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("scope_attributes", DataType::Utf8, true),
@@ -254,15 +254,15 @@ fn test_nullify_target_schema_mismatch_returns_arrow_error() {
 
     let err = nullify_column(&batch, target_schema, "scope_attributes").unwrap_err();
     match err {
-        SdkError::Arrow(msg) => {
-            assert!(msg.contains("number of columns") || msg.contains("schema"));
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Column count mismatch"));
         }
-        other => panic!("expected SdkError::Arrow, got {other:?}"),
+        other => panic!("expected SdkError::SchemaMismatch, got {other:?}"),
     }
 }
 
 #[test]
-fn test_nullify_target_schema_out_of_bounds_index_returns_arrow_error() {
+fn test_nullify_target_schema_field_name_mismatch_returns_schema_mismatch_error() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("scope_attributes", DataType::Utf8, true),
@@ -278,18 +278,15 @@ fn test_nullify_target_schema_out_of_bounds_index_returns_arrow_error() {
 
     let target_schema = Arc::new(Schema::new(vec![
         Field::new("trace_id", DataType::Utf8, false),
-        Field::new("scope_attributes", DataType::Utf8, true),
-        Field::new("extra_column", DataType::Utf8, true),
+        Field::new("wrong_column", DataType::Utf8, true),
     ]));
 
-    let err = nullify_column(&batch, target_schema, "extra_column").unwrap_err();
+    let err = nullify_column(&batch, target_schema, "scope_attributes").unwrap_err();
     match err {
-        SdkError::Arrow(msg) => {
-            assert!(
-                msg.contains("out of bounds") || msg.contains("schema") || msg.contains("column")
-            );
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Field mismatch at index 1"));
         }
-        other => panic!("expected SdkError::Arrow, got {other:?}"),
+        other => panic!("expected SdkError::SchemaMismatch, got {other:?}"),
     }
 }
 
@@ -494,4 +491,66 @@ fn test_wasm_panic_hook_does_not_crash_on_non_string_payload() {
     });
     std::panic::set_hook(prev_hook);
     assert!(caught.is_err());
+}
+
+#[test]
+fn test_nullify_column_rejects_reordered_target_schema() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    // Reordered target schema: [col_b, col_a]
+    let reordered_target = Arc::new(Schema::new(vec![
+        Field::new("col_b", DataType::Utf8, true),
+        Field::new("col_a", DataType::Utf8, false),
+    ]));
+
+    let res = nullify_column(&batch, reordered_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Field mismatch at index 0"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullify_column_rejects_non_nullable_target_field() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    // Matching order, but col_b is marked not nullable in target schema
+    let non_nullable_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+
+    let res = nullify_column(&batch, non_nullable_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Target schema field 'col_b' must be nullable"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
 }
