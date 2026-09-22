@@ -15,6 +15,12 @@ updates:
           - "arrow*"
           - "parquet*"
           - "iceberg*"
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry*"
+        exclude-patterns:
+          - "opentelemetry-datalake*"
     ignore:
       - dependency-name: "arrow"
         versions: [">= 59.0.0"]
