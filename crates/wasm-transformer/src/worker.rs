@@ -16,6 +16,9 @@ use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use wasmtime::{Instance, Memory, Module, Store, TypedFunc};
 
+/// Size of the C-ABI `TransformResponseHeader` in bytes.
+pub const RESPONSE_HEADER_SIZE: usize = 20;
+
 /// The outcome of processing a batch of telemetry records through the WASM worker.
 #[derive(Debug)]
 pub enum WorkerOutcome {
@@ -93,12 +96,7 @@ pub struct WasmWorker {
     config: WasmTransformerConfig,
     filtered_env: std::collections::HashMap<String, String>,
     registry: Arc<MetricRegistry>,
-    store: Store<HostState>,
-    instance: Instance,
-    alloc_fn: TypedFunc<u32, u32>,
-    dealloc_fn: TypedFunc<(u32, u32), ()>,
-    transform_fn: TransformFunc,
-    memory: Memory,
+    guest: Option<GuestComponents>,
     batches_processed: u64,
     local_generation: u64,
     rejuvenate_threshold_bytes: usize,
@@ -156,6 +154,7 @@ impl WasmWorker {
             &module,
             init_deadline_ticks,
             Arc::clone(&registry),
+            &filtered_env,
         )?;
         Self::initialize_guest(&mut guest, &config)?;
         let local_generation = engine.module_generation();
@@ -170,12 +169,7 @@ impl WasmWorker {
             config,
             filtered_env,
             registry,
-            store: guest.store,
-            instance: guest.instance,
-            alloc_fn: guest.alloc_fn,
-            dealloc_fn: guest.dealloc_fn,
-            transform_fn: guest.transform_fn,
-            memory: guest.memory,
+            guest: Some(guest),
             batches_processed: 0,
             local_generation,
             rejuvenate_threshold_bytes,
@@ -206,115 +200,50 @@ impl WasmWorker {
     ) -> Result<WorkerOutcome, WasmTransformError> {
         self.check_hot_reload()?;
 
-        self.store.set_epoch_deadline(self.epoch_deadline_ticks);
-
-        let record_batch = match &batch {
-            SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
-        };
-
-        // 1. Serialize input RecordBatch to Arrow IPC Stream
-        let ipc_buf = serialize_batch_to_ipc(record_batch)?;
-        let ipc_len = u32::try_from(ipc_buf.len()).map_err(|_| {
-            WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string())
+        let mut guest = self.guest.take().ok_or_else(|| {
+            WasmTransformError::Pipeline("WASM worker guest components missing".into())
         })?;
 
-        // 2. Allocate buffer in guest linear memory and copy payload
-        let ipc_ptr = match self.alloc_fn.call(&mut self.store, ipc_len) {
-            Ok(ptr) => ptr,
+        let epoch_deadline_ticks = self.epoch_deadline_ticks;
+        let schema_guard = self.config.schema_guard;
+        let module_path = self.config.module_path.clone();
+        let worker_id = self.id;
+
+        let run_transform =
+            move || -> (GuestComponents, Result<WorkerOutcome, WasmTransformError>) {
+                let res = execute_batch_in_guest(
+                    &mut guest,
+                    batch,
+                    epoch_deadline_ticks,
+                    schema_guard,
+                    &module_path,
+                    worker_id,
+                );
+                (guest, res)
+            };
+
+        let (guest, outcome) = if tokio::runtime::Handle::try_current().is_ok() {
+            let handle = tokio::task::spawn_blocking(run_transform);
+            handle.await.map_err(|e| {
+                WasmTransformError::Pipeline(format!("Blocking task join error: {e}"))
+            })?
+        } else {
+            run_transform()
+        };
+
+        self.guest = Some(guest);
+
+        match outcome {
+            Ok(outcome) => {
+                self.batches_processed = self.batches_processed.saturating_add(1);
+                self.check_rejuvenation()?;
+                Ok(outcome)
+            }
             Err(e) => {
                 let _ = self.rejuvenate();
-                return Err(WasmTransformError::Wasmtime(e));
-            }
-        };
-        if ipc_ptr == 0 && ipc_len > 0 {
-            let _ = self.rejuvenate();
-            return Err(WasmTransformError::Oom {
-                module: self.config.module_path.clone(),
-                instance: self.id,
-            });
-        }
-        if let Err(e) = self
-            .memory
-            .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
-        {
-            let _ = self.rejuvenate();
-            return Err(WasmTransformError::Pipeline(e.to_string()));
-        }
-
-        // 3. Invoke datalake_transform and free input buffer
-        let transform_res = match &self.transform_fn {
-            TransformFunc::V1(func) => {
-                let signal_type = match &batch {
-                    SignalBatch::Logs(_) => 0u32,
-                    SignalBatch::Metrics(_) => 1u32,
-                    SignalBatch::Traces(_) => 2u32,
-                };
-                func.call(&mut self.store, (signal_type, ipc_ptr, ipc_len))
-                    .map(|packed| {
-                        let ptr = (packed >> 32) as u32;
-                        let len = (packed & 0xFFFF_FFFF) as u32;
-                        if ptr == 0 && len > 0 { len } else { ptr }
-                    })
-            }
-            TransformFunc::V0(func) => func.call(&mut self.store, (ipc_ptr, ipc_len)),
-        };
-        if transform_res.is_ok()
-            && let Err(e) = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len))
-        {
-            let _ = self.rejuvenate();
-            return Err(WasmTransformError::Wasmtime(e));
-        }
-        let header_ptr = match transform_res {
-            Ok(ptr) => ptr,
-            Err(e) => {
-                let _ = self.rejuvenate();
-                return Err(WasmTransformError::Wasmtime(e));
-            }
-        };
-
-        // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
-        let header = match self.read_response_header(header_ptr) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = self.rejuvenate();
-                return Err(e);
-            }
-        };
-        let message = read_guest_message(
-            &self.memory,
-            &self.store,
-            header.message_ptr,
-            header.message_len,
-        );
-
-        let mut allocs_to_free = vec![(header_ptr, 20)];
-        if header.message_ptr > 0 && header.message_len > 0 {
-            allocs_to_free.push((header.message_ptr, header.message_len));
-        }
-        if header.batch_count > 0 && header.batches_ptr > 0 {
-            allocs_to_free.push((header.batches_ptr, header.batch_count.saturating_mul(8)));
-        }
-
-        // 5. Dispatch outcome and extract transformed batches while guest memory is intact
-        let outcome = match self.dispatch_outcome(&header, &message, batch, &mut allocs_to_free) {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = self.rejuvenate();
-                return Err(e);
-            }
-        };
-
-        // 6. Free guest allocations on the happy path to prevent memory growth
-        for (ptr, len) in allocs_to_free {
-            if let Err(_) = self.dealloc_fn.call(&mut self.store, (ptr, len)) {
-                let _ = self.rejuvenate();
-                break;
+                Err(e)
             }
         }
-
-        self.batches_processed = self.batches_processed.saturating_add(1);
-        self.check_rejuvenation()?;
-        Ok(outcome)
     }
 
     /// Rejuvenates the worker by discarding its store and creating a fresh instance.
@@ -329,14 +258,10 @@ impl WasmWorker {
             &self.module,
             self.epoch_deadline_ticks,
             Arc::clone(&self.registry),
+            &self.filtered_env,
         )?;
         Self::initialize_guest(&mut guest, &self.config)?;
-        self.store = guest.store;
-        self.instance = guest.instance;
-        self.alloc_fn = guest.alloc_fn;
-        self.dealloc_fn = guest.dealloc_fn;
-        self.transform_fn = guest.transform_fn;
-        self.memory = guest.memory;
+        self.guest = Some(guest);
         self.batches_processed = 0;
         Ok(())
     }
@@ -359,10 +284,10 @@ impl WasmWorker {
         self.rejuvenate_threshold_bytes
     }
 
-    /// Returns a reference to the active Wasmtime [`Instance`].
+    /// Returns an optional reference to the active Wasmtime [`Instance`].
     #[must_use]
-    pub fn instance(&self) -> &Instance {
-        &self.instance
+    pub fn instance(&self) -> Option<&Instance> {
+        self.guest.as_ref().map(|g| &g.instance)
     }
 
     /// Returns a reference to the underlying [`Module`].
@@ -385,67 +310,28 @@ impl WasmWorker {
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.
     fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
-        if self.local_generation != self.engine.module_generation()
-            && let Some(new_mod) = self.engine.module()
+        let (current_module, current_gen) = self.engine.current_module();
+        if self.local_generation != current_gen
+            && let Some(new_mod) = current_module
         {
             self.module = new_mod;
             self.rejuvenate()?;
-            self.local_generation = self.engine.module_generation();
+            self.local_generation = current_gen;
         }
         Ok(())
     }
 
-    /// Reads and parses the 20-byte `TransformResponseHeader` from guest memory.
-    fn read_response_header(&self, header_ptr: u32) -> Result<ParsedHeader, WasmTransformError> {
-        let mut header_bytes = [0u8; 20];
-        self.memory
-            .read(&self.store, header_ptr as usize, &mut header_bytes)
-            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
-
-        let status = u32::from_le_bytes([
-            header_bytes[0],
-            header_bytes[1],
-            header_bytes[2],
-            header_bytes[3],
-        ]);
-        let batch_count = u32::from_le_bytes([
-            header_bytes[4],
-            header_bytes[5],
-            header_bytes[6],
-            header_bytes[7],
-        ]);
-        let batches_ptr = u32::from_le_bytes([
-            header_bytes[8],
-            header_bytes[9],
-            header_bytes[10],
-            header_bytes[11],
-        ]);
-        let message_ptr = u32::from_le_bytes([
-            header_bytes[12],
-            header_bytes[13],
-            header_bytes[14],
-            header_bytes[15],
-        ]);
-        let message_len = u32::from_le_bytes([
-            header_bytes[16],
-            header_bytes[17],
-            header_bytes[18],
-            header_bytes[19],
-        ]);
-
-        Ok(ParsedHeader {
-            status,
-            batch_count,
-            batches_ptr,
-            message_ptr,
-            message_len,
-        })
-    }
-
     /// Rejuvenates the guest instance if batch count or memory limits are exceeded.
     fn check_rejuvenation(&mut self) -> Result<(), WasmTransformError> {
-        let memory_exceeded = self.rejuvenate_threshold_bytes > 0
-            && self.memory.data_size(&self.store) >= self.rejuvenate_threshold_bytes;
+        let memory_exceeded = if self.rejuvenate_threshold_bytes > 0 {
+            if let Some(guest) = &self.guest {
+                guest.memory.data_size(&guest.store) >= self.rejuvenate_threshold_bytes
+            } else {
+                false
+            }
+        } else {
+            false
+        };
 
         if (self.config.rejuvenate_batches > 0
             && self.batches_processed >= self.config.rejuvenate_batches)
@@ -456,76 +342,21 @@ impl WasmWorker {
         Ok(())
     }
 
-    /// Dispatches the response status code into a [`WorkerOutcome`].
-    fn dispatch_outcome(
-        &self,
-        header: &ParsedHeader,
-        message: &str,
-        batch: SignalBatch,
-        allocs_to_free: &mut Vec<(u32, u32)>,
-    ) -> Result<WorkerOutcome, WasmTransformError> {
-        match header.status {
-            0 => {
-                if header.batch_count == 0 {
-                    Ok(WorkerOutcome::Emitted(vec![]))
-                } else if header.batches_ptr == 0 {
-                    Err(WasmTransformError::Pipeline(
-                        "Malformed response: positive batch_count with null descriptor pointer"
-                            .into(),
-                    ))
-                } else {
-                    let out_batches = extract_output_batches(
-                        &self.memory,
-                        &self.store,
-                        header.batches_ptr,
-                        header.batch_count,
-                        &batch,
-                        self.config.schema_guard,
-                        allocs_to_free,
-                    )?;
-                    Ok(WorkerOutcome::Emitted(out_batches))
-                }
-            }
-            1 => Ok(WorkerOutcome::Discarded),
-            2 => {
-                let reason = if message.is_empty() {
-                    "Guest rejected batch".to_string()
-                } else {
-                    message.to_string()
-                };
-                Ok(WorkerOutcome::Rejected {
-                    reason,
-                    original: batch,
-                })
-            }
-            _ => {
-                let reason = if message.is_empty() {
-                    format!("Guest returned error status {}", header.status)
-                } else {
-                    message.to_string()
-                };
-                Ok(WorkerOutcome::Errored {
-                    reason,
-                    original: batch,
-                })
-            }
-        }
-    }
-
     /// Helper to instantiate a guest module and extract required ABI exports.
     fn instantiate_guest(
         engine: &wasmtime::Engine,
         module: &Module,
         init_deadline_ticks: u64,
         registry: Arc<MetricRegistry>,
+        env: &std::collections::HashMap<String, String>,
     ) -> Result<GuestComponents, WasmTransformError> {
-        let mut store = Store::new(
-            engine,
-            HostState {
-                phase: HostPhase::Init,
-                registry,
-            },
-        );
+        let mut wasi_builder = wasmtime_wasi::WasiCtxBuilder::new();
+        let env_pairs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        wasi_builder.envs(&env_pairs);
+        let wasi = wasi_builder.build_p1();
+
+        let mut store = Store::new(engine, HostState::new(HostPhase::Init, registry, wasi));
         store.set_epoch_deadline(init_deadline_ticks);
         let linker = build_host_linker(engine)?;
         let instance = linker.instantiate(&mut store, module)?;
@@ -635,6 +466,214 @@ impl WasmWorker {
         }
         Ok(())
     }
+}
+
+impl GuestComponents {
+    /// Reads and parses the 20-byte `TransformResponseHeader` from guest memory.
+    fn read_response_header(&self, header_ptr: u32) -> Result<ParsedHeader, WasmTransformError> {
+        let mut header_bytes = [0u8; 20];
+        self.memory
+            .read(&self.store, header_ptr as usize, &mut header_bytes)
+            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+
+        let status = u32::from_le_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        let batch_count = u32::from_le_bytes([
+            header_bytes[4],
+            header_bytes[5],
+            header_bytes[6],
+            header_bytes[7],
+        ]);
+        let batches_ptr = u32::from_le_bytes([
+            header_bytes[8],
+            header_bytes[9],
+            header_bytes[10],
+            header_bytes[11],
+        ]);
+        let message_ptr = u32::from_le_bytes([
+            header_bytes[12],
+            header_bytes[13],
+            header_bytes[14],
+            header_bytes[15],
+        ]);
+        let message_len = u32::from_le_bytes([
+            header_bytes[16],
+            header_bytes[17],
+            header_bytes[18],
+            header_bytes[19],
+        ]);
+
+        Ok(ParsedHeader {
+            status,
+            batch_count,
+            batches_ptr,
+            message_ptr,
+            message_len,
+        })
+    }
+
+    /// Dispatches the response status code into a [`WorkerOutcome`].
+    fn dispatch_outcome(
+        &self,
+        header: &ParsedHeader,
+        message: &str,
+        batch: SignalBatch,
+        schema_guard: pipeline_core::config::SchemaGuardMode,
+        allocs_to_free: &mut Vec<(u32, u32)>,
+    ) -> Result<WorkerOutcome, WasmTransformError> {
+        match header.status {
+            0 => {
+                if header.batch_count == 0 {
+                    Ok(WorkerOutcome::Emitted(vec![]))
+                } else if header.batches_ptr == 0 {
+                    Err(WasmTransformError::Pipeline(
+                        "Malformed response: positive batch_count with null descriptor pointer"
+                            .into(),
+                    ))
+                } else {
+                    let out_batches = extract_output_batches(
+                        &self.memory,
+                        &self.store,
+                        header.batches_ptr,
+                        header.batch_count,
+                        &batch,
+                        schema_guard,
+                        allocs_to_free,
+                    )?;
+                    Ok(WorkerOutcome::Emitted(out_batches))
+                }
+            }
+            1 => Ok(WorkerOutcome::Discarded),
+            2 => {
+                let reason = if message.is_empty() {
+                    "Guest rejected batch".to_string()
+                } else {
+                    message.to_string()
+                };
+                Ok(WorkerOutcome::Rejected {
+                    reason,
+                    original: batch,
+                })
+            }
+            _ => {
+                let reason = if message.is_empty() {
+                    format!("Guest returned error status {}", header.status)
+                } else {
+                    message.to_string()
+                };
+                Ok(WorkerOutcome::Errored {
+                    reason,
+                    original: batch,
+                })
+            }
+        }
+    }
+}
+
+fn execute_batch_in_guest(
+    guest: &mut GuestComponents,
+    batch: SignalBatch,
+    epoch_deadline_ticks: u64,
+    schema_guard: pipeline_core::config::SchemaGuardMode,
+    module_path: &str,
+    worker_id: usize,
+) -> Result<WorkerOutcome, WasmTransformError> {
+    guest.store.set_epoch_deadline(epoch_deadline_ticks);
+
+    let record_batch = match &batch {
+        SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
+    };
+
+    // 1. Serialize input RecordBatch to Arrow IPC Stream
+    let ipc_buf = serialize_batch_to_ipc(record_batch)?;
+    let ipc_len = u32::try_from(ipc_buf.len())
+        .map_err(|_| WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string()))?;
+
+    // 2. Allocate buffer in guest linear memory and copy payload
+    let ipc_ptr = guest
+        .alloc_fn
+        .call(&mut guest.store, ipc_len)
+        .map_err(WasmTransformError::Wasmtime)?;
+    if ipc_ptr == 0 && ipc_len > 0 {
+        return Err(WasmTransformError::Oom {
+            module: module_path.to_string(),
+            instance: worker_id,
+        });
+    }
+    guest
+        .memory
+        .write(&mut guest.store, ipc_ptr as usize, &ipc_buf)
+        .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+
+    // 3. Invoke datalake_transform and free input buffer
+    let transform_res: Result<u32, WasmTransformError> = match &guest.transform_fn {
+        TransformFunc::V1(func) => {
+            let signal_type = match &batch {
+                SignalBatch::Logs(_) => 0u32,
+                SignalBatch::Metrics(_) => 1u32,
+                SignalBatch::Traces(_) => 2u32,
+            };
+            match func.call(&mut guest.store, (signal_type, ipc_ptr, ipc_len)) {
+                Ok(packed) => {
+                    let ptr = (packed >> 32) as u32;
+                    let len = (packed & 0xFFFF_FFFF) as u32;
+                    if ptr == 0 || (len as usize) < RESPONSE_HEADER_SIZE {
+                        Err(WasmTransformError::Pipeline(format!(
+                            "Malformed C-ABI v1 response header: ptr={ptr}, len={len} (minimum required: {RESPONSE_HEADER_SIZE} bytes)"
+                        )))
+                    } else {
+                        Ok(ptr)
+                    }
+                }
+                Err(e) => Err(WasmTransformError::Wasmtime(e)),
+            }
+        }
+        TransformFunc::V0(func) => func
+            .call(&mut guest.store, (ipc_ptr, ipc_len))
+            .map_err(WasmTransformError::Wasmtime),
+    };
+    if transform_res.is_ok() {
+        guest
+            .dealloc_fn
+            .call(&mut guest.store, (ipc_ptr, ipc_len))
+            .map_err(WasmTransformError::Wasmtime)?;
+    }
+    let header_ptr = transform_res?;
+
+    // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
+    let header = guest.read_response_header(header_ptr)?;
+    let message = read_guest_message(
+        &guest.memory,
+        &guest.store,
+        header.message_ptr,
+        header.message_len,
+    );
+
+    let mut allocs_to_free = vec![(header_ptr, 20)];
+    if header.message_ptr > 0 && header.message_len > 0 {
+        allocs_to_free.push((header.message_ptr, header.message_len));
+    }
+    if header.batch_count > 0 && header.batches_ptr > 0 {
+        allocs_to_free.push((header.batches_ptr, header.batch_count.saturating_mul(8)));
+    }
+
+    // 5. Dispatch outcome and extract transformed batches while guest memory is intact
+    let outcome =
+        guest.dispatch_outcome(&header, &message, batch, schema_guard, &mut allocs_to_free)?;
+
+    // 6. Free guest allocations on the happy path to prevent memory growth
+    for (ptr, len) in allocs_to_free {
+        guest
+            .dealloc_fn
+            .call(&mut guest.store, (ptr, len))
+            .map_err(WasmTransformError::Wasmtime)?;
+    }
+
+    Ok(outcome)
 }
 
 /// Serializes an Arrow [`RecordBatch`] to an Arrow IPC stream buffer.

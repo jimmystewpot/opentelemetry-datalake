@@ -680,7 +680,7 @@ fn test_worker_debug_formatting_and_getters() {
     assert_eq!(worker.id, 42);
     assert!(Arc::ptr_eq(worker.module(), &module));
     assert_eq!(worker.config().id, "worker_test");
-    let _instance = worker.instance();
+    assert!(worker.instance().is_some());
 }
 
 #[tokio::test]
@@ -1482,4 +1482,115 @@ async fn test_worker_strict_schema_guard_rejects_schema_drift() {
         ),
         "Unexpected error: {err}"
     );
+}
+
+fn malformed_zero_ptr_v1_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            ;; ptr = 0, len = 20 -> (0 << 32) | 20 = 20
+            (i64.const 20)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_guards_c_abi_v1_zero_pointer() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(malformed_zero_ptr_v1_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(68, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Malformed C-ABI v1 response header"),
+        "Unexpected error: {err}"
+    );
+}
+
+fn malformed_undersized_len_v1_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            ;; ptr = 256, len = 10 (< 20) -> (256 << 32) | 10 = 1099511627786
+            (i64.const 1099511627786)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_guards_c_abi_v1_undersized_length() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(malformed_undersized_len_v1_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(69, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let err = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Malformed C-ABI v1 response header"),
+        "Unexpected error: {err}"
+    );
+}
+
+fn wasi_preview1_wat() -> &'static str {
+    r#"(module
+        (import "wasi_snapshot_preview1" "environ_sizes_get" (func $environ_sizes_get (param i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            ;; Call environ_sizes_get(100, 104) -> stores count at 100, total_len at 104
+            (drop (call $environ_sizes_get (i32.const 100) (i32.const 104)))
+            ;; Return status 0, batch_count 0 at 256
+            (i32.store (i32.const 256) (i32.const 0))
+            (i32.store (i32.const 260) (i32.const 0))
+            (i64.const 1099511627804)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_instantiates_wasi_preview1_module_and_reads_env() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(wasi_preview1_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.env
+        .insert("WASI_TEST_KEY".to_string(), "wasi_val".to_string());
+    let mut worker = WasmWorker::new(70, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
 }

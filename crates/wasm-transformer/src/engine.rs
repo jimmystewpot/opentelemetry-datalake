@@ -4,7 +4,7 @@ use crate::error::WasmTransformError;
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, Module, PoolingAllocationConfig};
 
@@ -14,12 +14,17 @@ fn compute_sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, Default, Clone)]
+struct CachedState {
+    module: Option<Arc<Module>>,
+    generation: u64,
+}
+
 /// Engine cache maintaining a compiled WebAssembly module and generation counter.
 #[derive(Debug)]
 pub struct EngineCache {
     engine: Engine,
-    module: RwLock<Option<Arc<Module>>>,
-    generation: AtomicU64,
+    state: RwLock<CachedState>,
     is_running: Arc<AtomicBool>,
 }
 
@@ -55,19 +60,28 @@ impl EngineCache {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
         let engine_clone = engine.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            while is_running_clone.load(Ordering::Relaxed) {
-                interval.tick().await;
-                engine_clone.increment_epoch();
-            }
-        });
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                while is_running_clone.load(Ordering::Relaxed) {
+                    interval.tick().await;
+                    engine_clone.increment_epoch();
+                }
+            });
+        } else {
+            std::thread::spawn(move || {
+                while is_running_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    engine_clone.increment_epoch();
+                }
+            });
+        }
 
         Ok(Self {
             engine,
-            module: RwLock::new(None),
-            generation: AtomicU64::new(0),
+            state: RwLock::new(CachedState::default()),
             is_running,
         })
     }
@@ -80,10 +94,10 @@ impl EngineCache {
     pub fn compile_module(&self, bytes: &[u8]) -> Result<Arc<Module>, WasmTransformError> {
         let module = Arc::new(Module::new(&self.engine, bytes)?);
         let mut guard = self
-            .module
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(Arc::clone(&module));
+        guard.module = Some(Arc::clone(&module));
         Ok(module)
     }
 
@@ -111,26 +125,37 @@ impl EngineCache {
         self.compile_module(bytes)
     }
 
+    /// Returns the currently compiled module and its generation counter as an atomic snapshot.
+    #[must_use]
+    pub fn current_module(&self) -> (Option<Arc<Module>>, u64) {
+        let guard = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.module.clone(), guard.generation)
+    }
+
     /// Retrieves the currently compiled module from the cache, if available.
     #[must_use]
     pub fn module(&self) -> Option<Arc<Module>> {
-        let guard = self
-            .module
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.clone()
+        self.current_module().0
     }
 
     /// Returns the current module generation counter.
     #[must_use]
     pub fn module_generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.current_module().1
     }
 
     /// Increments the module generation counter and returns the new generation.
     #[must_use]
     pub fn advance_generation(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        let mut guard = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.generation = guard.generation.saturating_add(1);
+        guard.generation
     }
 
     /// Returns a reference to the underlying Wasmtime [`Engine`].

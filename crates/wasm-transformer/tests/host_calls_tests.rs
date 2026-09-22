@@ -25,10 +25,7 @@ fn test_host_linker_defines_required_guest_imports() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let test_fn = instance
@@ -84,10 +81,7 @@ fn test_edge_case_missing_memory_export() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Init,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -126,10 +120,7 @@ fn test_edge_case_out_of_bounds_memory_reads() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -194,10 +185,7 @@ fn test_edge_case_duration_nanos_counter_recording() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -205,7 +193,15 @@ fn test_edge_case_duration_nanos_counter_recording() {
         .unwrap();
 
     assert!(func.call(&mut store, ()).is_ok());
-    assert_eq!(registry.read_counter("latency_nanos"), 7_500_000);
+    // Duration metric must not be stored as a monotonic counter
+    assert_eq!(registry.read_counter("latency_nanos"), 0);
+    // Duration metric must preserve observation count, sum, min, max, and last sample
+    let duration = registry.read_duration("latency_nanos").unwrap();
+    assert_eq!(duration.count, 2);
+    assert_eq!(duration.sum_nanos, 7_500_000);
+    assert_eq!(duration.min_nanos, 2_500_000);
+    assert_eq!(duration.max_nanos, 5_000_000);
+    assert_eq!(duration.last_nanos, 2_500_000);
 }
 
 #[test]
@@ -237,10 +233,7 @@ fn test_edge_case_log_levels_1_through_4_and_default_trace() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -315,10 +308,7 @@ fn test_edge_case_metric_name_allocation_capping() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -352,10 +342,7 @@ fn test_edge_case_unknown_metric_type_and_empty_name() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -389,10 +376,7 @@ fn test_edge_case_gauge_metric_emission_from_wasm() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -423,10 +407,7 @@ fn test_edge_case_memory_export_not_a_memory() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Init,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -456,10 +437,7 @@ fn test_edge_case_log_message_allocation_capping() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance

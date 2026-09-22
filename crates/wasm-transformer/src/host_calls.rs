@@ -33,6 +33,22 @@ pub enum HostPhase {
     Execution,
 }
 
+/// A summary of duration observations capturing sample count, cumulative duration in nanoseconds,
+/// minimum, maximum, and the latest duration observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurationSummary {
+    /// Total number of duration samples recorded.
+    pub count: u64,
+    /// Cumulative sum of observed duration in nanoseconds.
+    pub sum_nanos: u64,
+    /// Minimum observed duration in nanoseconds.
+    pub min_nanos: u64,
+    /// Maximum observed duration in nanoseconds.
+    pub max_nanos: u64,
+    /// Most recent observed duration in nanoseconds.
+    pub last_nanos: u64,
+}
+
 /// A stored metric value in the [`MetricRegistry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricValue {
@@ -40,6 +56,8 @@ pub enum MetricValue {
     Counter(u64),
     /// A gauge value represented as raw IEEE 754 64-bit binary bits.
     Gauge(u64),
+    /// A duration metric tracking observation count and distribution metrics in nanoseconds.
+    Duration(DurationSummary),
 }
 
 /// Thread-safe concurrent registry for metrics emitted by guest WebAssembly transformers.
@@ -108,6 +126,45 @@ impl MetricRegistry {
         self.metrics.insert(key, MetricValue::Gauge(bits));
     }
 
+    /// Records a duration observation in nanoseconds with bounded entry capacity.
+    pub fn record_duration(&self, name: &str, nanos: u64) {
+        let key = self.format_key(name);
+        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new duration metric registration"
+            );
+            return;
+        }
+        self.metrics
+            .entry(key)
+            .and_modify(|val| {
+                if let MetricValue::Duration(d) = val {
+                    d.count = d.count.saturating_add(1);
+                    d.sum_nanos = d.sum_nanos.saturating_add(nanos);
+                    d.min_nanos = d.min_nanos.min(nanos);
+                    d.max_nanos = d.max_nanos.max(nanos);
+                    d.last_nanos = nanos;
+                } else {
+                    *val = MetricValue::Duration(DurationSummary {
+                        count: 1,
+                        sum_nanos: nanos,
+                        min_nanos: nanos,
+                        max_nanos: nanos,
+                        last_nanos: nanos,
+                    });
+                }
+            })
+            .or_insert(MetricValue::Duration(DurationSummary {
+                count: 1,
+                sum_nanos: nanos,
+                min_nanos: nanos,
+                max_nanos: nanos,
+                last_nanos: nanos,
+            }));
+    }
+
     /// Reads the current value of a counter, returning `0` if not found.
     #[must_use]
     pub fn read_counter(&self, name: &str) -> u64 {
@@ -128,6 +185,16 @@ impl MetricRegistry {
         }
     }
 
+    /// Reads the current duration metric summary, returning `None` if not found.
+    #[must_use]
+    pub fn read_duration(&self, name: &str) -> Option<DurationSummary> {
+        let key = self.format_key(name);
+        match self.metrics.get(&key).as_deref() {
+            Some(&MetricValue::Duration(d)) => Some(d),
+            _ => None,
+        }
+    }
+
     /// Returns the component identifier configured for this registry.
     #[must_use]
     pub fn component_id(&self) -> &str {
@@ -142,12 +209,49 @@ impl MetricRegistry {
 }
 
 /// Host execution context stored within the Wasmtime [`wasmtime::Store`].
-#[derive(Debug, Clone)]
 pub struct HostState {
     /// Current execution phase of the host worker.
     pub phase: HostPhase,
     /// Shared metric registry for collecting guest metrics.
     pub registry: Arc<MetricRegistry>,
+    /// WASI Preview 1 execution context.
+    pub wasi: wasmtime_wasi::p1::WasiP1Ctx,
+}
+
+impl std::fmt::Debug for HostState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostState")
+            .field("phase", &self.phase)
+            .field("registry", &self.registry)
+            .field("wasi", &"<WasiP1Ctx>")
+            .finish()
+    }
+}
+
+impl HostState {
+    /// Creates a new `HostState` with a provided WASI preview 1 context.
+    #[must_use]
+    pub fn new(
+        phase: HostPhase,
+        registry: Arc<MetricRegistry>,
+        wasi: wasmtime_wasi::p1::WasiP1Ctx,
+    ) -> Self {
+        Self {
+            phase,
+            registry,
+            wasi,
+        }
+    }
+
+    /// Creates a new `HostState` with default zero-trust WASI preview 1 configuration.
+    #[must_use]
+    pub fn with_default_wasi(phase: HostPhase, registry: Arc<MetricRegistry>) -> Self {
+        Self {
+            phase,
+            registry,
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build_p1(),
+        }
+    }
 }
 
 /// Safely reads a string from guest linear memory, checking bounds and capping allocation size.
@@ -193,15 +297,18 @@ fn read_guest_string(
 
 /// Builds and configures a Wasmtime [`Linker`] with standard host functions.
 ///
-/// Links the following imports into the `"env"` module namespace:
-/// - `"datalake_host_metric_emit"`: Safe metric emission from guest to [`MetricRegistry`].
-/// - `"datalake_host_log"`: Safe logging forwarding from guest to host [`tracing`].
+/// Links the following imports:
+/// - `"wasi_snapshot_preview1"`: WASI Preview 1 host imports from [`wasmtime_wasi::p1`].
+/// - `"env:datalake_host_metric_emit"`: Safe metric emission from guest to [`MetricRegistry`].
+/// - `"env:datalake_host_log"`: Safe logging forwarding from guest to host [`tracing`].
 ///
 /// # Errors
 ///
 /// Returns [`WasmTransformError`] if function definition in the linker fails.
 pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTransformError> {
     let mut linker = Linker::new(engine);
+
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)?;
 
     linker.func_wrap(
         "env",
@@ -223,11 +330,14 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
             }
 
             match metric_type {
-                METRIC_TYPE_COUNTER | METRIC_TYPE_DURATION => {
+                METRIC_TYPE_COUNTER => {
                     caller.data().registry.record_counter(&name, value);
                 }
                 METRIC_TYPE_GAUGE => {
                     caller.data().registry.record_gauge(&name, value);
+                }
+                METRIC_TYPE_DURATION => {
+                    caller.data().registry.record_duration(&name, value);
                 }
                 _ => {
                     tracing::warn!(
