@@ -110,15 +110,18 @@
 //!
 //!    [dependencies]
 //!    opentelemetry-datalake-wasm-sdk = "0.1.0"
-//!    arrow = { version = "54", default-features = false, features = ["ipc"] }
+//!    arrow = { version = "59", default-features = false, features = ["ipc"] }
 //!    ```
+//!
+//!    Alternatively, plugins can import Arrow types directly via the SDK's re-exported
+//!    [`arrow`] module without adding an explicit `arrow` dependency.
 //!
 //! 2. Implement [`traits::BatchTransformer`] and export your type with [`export_transformer!`]:
 //!
 //! ```rust
 //! use opentelemetry_datalake_wasm_sdk::traits::{BatchTransformer, SignalType, TransformResult};
 //! use opentelemetry_datalake_wasm_sdk::export_transformer;
-//! use arrow::record_batch::RecordBatch;
+//! use opentelemetry_datalake_wasm_sdk::arrow::record_batch::RecordBatch;
 //!
 //! pub struct MyTransformer;
 //!
@@ -155,6 +158,12 @@ pub mod metrics;
 pub mod panic;
 pub mod traits;
 
+/// Re-exported Arrow crate matching the workspace Arrow version (Arrow 59).
+///
+/// Plugin authors can use `opentelemetry_datalake_wasm_sdk::arrow` to guarantee type
+/// compatibility with the SDK and avoid version mismatches.
+pub use arrow;
+
 /// Exports the C-ABI v1 entry points for a guest transform module.
 ///
 /// This macro generates:
@@ -167,7 +176,7 @@ pub mod traits;
 /// ```rust
 /// use opentelemetry_datalake_wasm_sdk::traits::{BatchTransformer, SignalType, TransformResult};
 /// use opentelemetry_datalake_wasm_sdk::export_transformer;
-/// use arrow::record_batch::RecordBatch;
+/// use opentelemetry_datalake_wasm_sdk::arrow::record_batch::RecordBatch;
 ///
 /// struct MyTransformer;
 ///
