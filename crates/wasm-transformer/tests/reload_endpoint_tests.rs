@@ -6,7 +6,10 @@ use std::{path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use wasm_transformer::{
     engine::EngineCache,
-    reload::{build_admin_router, build_admin_router_with_sha, spawn_sighup_listener},
+    reload::{
+        build_admin_router, build_admin_router_multi, build_admin_router_with_sha,
+        spawn_sighup_listener, spawn_sighup_listener_multi,
+    },
 };
 
 #[tokio::test]
@@ -308,4 +311,55 @@ async fn test_admin_router_with_configured_sha_fallback_mismatch() {
     assert_eq!(engine.module_generation(), 0);
 
     let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_multi_engine_reload_success() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "multi_engine_success_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine1 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let engine2 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine1.module_generation(), 0);
+    assert_eq!(engine2.module_generation(), 0);
+
+    let router = build_admin_router_multi(vec![Arc::clone(&engine1), Arc::clone(&engine2)], None);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(engine1.module_generation(), 1);
+    assert_eq!(engine2.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_sighup_listener_multi_returns_none_when_empty_or_disabled() {
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert!(
+        spawn_sighup_listener_multi(vec![], PathBuf::from("/tmp/test.wasm"), None, true).is_none()
+    );
+    assert!(
+        spawn_sighup_listener_multi(vec![engine], PathBuf::from("/tmp/test.wasm"), None, false)
+            .is_none()
+    );
 }
