@@ -2867,6 +2867,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "id-arena"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6007,6 +6013,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-metadata"
+version = "0.254.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b01df5f3b4ca7881e843f3bc0fb8a3905d79c68692250dcb8e33e698705ccdb6"
+dependencies = [
+ "anyhow",
+ "indexmap 2.14.2",
+ "wasm-encoder 0.254.0",
+ "wasmparser 0.254.0",
+]
+
+[[package]]
 name = "wasm-streams"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6066,6 +6084,7 @@ dependencies = [
  "bumpalo",
  "cc",
  "futures",
+ "gimli",
  "libc",
  "log",
  "mach2",
@@ -6081,6 +6100,7 @@ dependencies = [
  "target-lexicon",
  "wasmparser 0.254.0",
  "wasmtime-environ",
+ "wasmtime-internal-component-macro",
  "wasmtime-internal-core",
  "wasmtime-internal-cranelift",
  "wasmtime-internal-fiber",
@@ -6120,6 +6140,21 @@ dependencies = [
  "wasmprinter",
  "wasmtime-internal-component-util",
  "wasmtime-internal-core",
+]
+
+[[package]]
+name = "wasmtime-internal-component-macro"
+version = "48.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5af067a5d17e17a424f99d31f08e08c5132dcc53a0f031a7be9279719a936b71"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "wasmtime-internal-component-util",
+ "wasmtime-internal-wit-bindgen",
+ "wit-parser",
 ]
 
 [[package]]
@@ -6221,6 +6256,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "wasmtime-internal-wit-bindgen"
+version = "48.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ec33585b420181c41e26ac6153f0d18aa200e6aba9457dff6f8ebba3feedf98"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "heck",
+ "indexmap 2.14.2",
+ "wit-component",
+ "wit-parser",
 ]
 
 [[package]]
@@ -6501,6 +6550,44 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "wit-component"
+version = "0.254.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0e65bb94c369b3c4741ce3d1d2704b1fec93db7c540df0e521a097e7ceeb5be"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.2",
+ "indexmap 2.14.2",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder 0.254.0",
+ "wasm-metadata",
+ "wasmparser 0.254.0",
+ "wit-parser",
+]
+
+[[package]]
+name = "wit-parser"
+version = "0.254.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1655131e4f7d3f0cb141f6eca71315ca40eff0f3d4de7cff0a82bacedd8c89b4"
+dependencies = [
+ "anyhow",
+ "hashbrown 0.17.1",
+ "id-arena",
+ "indexmap 2.14.2",
+ "log",
+ "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "unicode-ident",
+ "wasmparser 0.254.0",
+]
 
 [[package]]
 name = "writeable"
