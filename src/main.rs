@@ -989,7 +989,7 @@ mod tests {
         assert_eq!(handles.len(), 1);
         assert_eq!(
             handles.into_iter().flatten().count(),
-            if cfg!(unix) { 1 } else { 0 }
+            usize::from(cfg!(unix))
         );
         let _ = std::fs::remove_file(&path);
     }
