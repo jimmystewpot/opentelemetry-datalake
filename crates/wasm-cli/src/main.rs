@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use datalake_wasm_tool::{bench, tester, validator};
+use datalake_wasm_tool::{bench, helpers, tester, validator};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -25,11 +25,23 @@ enum Commands {
     Test {
         /// Path to the compiled .wasm binary.
         path: PathBuf,
+        /// Signal type to test: 'logs' (default), 'metrics', or 'traces'.
+        #[arg(short, long, default_value = "logs")]
+        signal: String,
+        /// Optional path to a JSON configuration file, or inline JSON string for module init.
+        #[arg(short, long)]
+        config: Option<String>,
     },
     /// Run local latency and throughput benchmarks.
     Bench {
         /// Path to the compiled .wasm binary.
         path: PathBuf,
+        /// Signal type to benchmark: 'logs' (default), 'metrics', or 'traces'.
+        #[arg(short, long, default_value = "logs")]
+        signal: String,
+        /// Optional path to a JSON configuration file, or inline JSON string for module init.
+        #[arg(short, long)]
+        config: Option<String>,
     },
 }
 
@@ -41,13 +53,29 @@ fn main() -> Result<()> {
             validator::validate_wasm_bytes(&bytes)?;
             println!("✓ {} is a valid ABI v1 module", path.display());
         }
-        Commands::Test { path } => {
+        Commands::Test {
+            path,
+            signal,
+            config,
+        } => {
             let bytes = std::fs::read(&path)?;
-            tester::run_immutability_suite(&bytes)?;
+            let signal_code = helpers::parse_signal(&signal)?;
+            let config_payload = helpers::resolve_config_payload(config.as_deref(), signal_code)?;
+            tester::run_immutability_suite_with_options(
+                &bytes,
+                signal_code,
+                config_payload.as_deref(),
+            )?;
         }
-        Commands::Bench { path } => {
+        Commands::Bench {
+            path,
+            signal,
+            config,
+        } => {
             let bytes = std::fs::read(&path)?;
-            bench::run_benchmark_with_disclaimer(&bytes)?;
+            let signal_code = helpers::parse_signal(&signal)?;
+            let config_payload = helpers::resolve_config_payload(config.as_deref(), signal_code)?;
+            bench::run_benchmark_with_options(&bytes, signal_code, config_payload.as_deref())?;
         }
     }
     Ok(())

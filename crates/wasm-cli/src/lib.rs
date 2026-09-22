@@ -6,6 +6,7 @@
 #![allow(clippy::print_stdout)]
 
 pub mod bench;
+pub mod helpers;
 pub mod tester;
 pub mod validator;
 

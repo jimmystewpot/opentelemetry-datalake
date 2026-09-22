@@ -148,12 +148,13 @@ fn test_verify_batch_immutability_when_immutable_column_not_in_input() {
 #[test]
 fn test_run_immutability_suite_conformant_module() {
     let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
-        (memory (export "memory") 1)
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_immutability_suite(&wasm).is_ok());
@@ -162,12 +163,13 @@ fn test_run_immutability_suite_conformant_module() {
 #[test]
 fn test_run_benchmark_with_disclaimer_conformant_module() {
     let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
-        (memory (export "memory") 1)
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
@@ -288,11 +290,12 @@ fn test_run_benchmark_with_unknown_imports() {
     let wat_src = r#"(module
         (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
         (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
@@ -344,4 +347,133 @@ fn test_run_benchmark_accepts_discard_status() {
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_null_response_pointer() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("null response header pointer"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_benchmark_rejects_null_response_pointer() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_benchmark_with_disclaimer(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("null response header pointer"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_short_response_header() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177674))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(err.contains("invalid header length"), "actual err: {err}");
+}
+
+#[test]
+fn test_run_immutability_suite_with_metrics_signal() {
+    use datalake_wasm_tool::tester::run_immutability_suite_with_options;
+
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Verify signal is 1 (metrics)
+            (if (i32.ne (local.get $sig) (i32.const 1))
+                (then (unreachable))
+            )
+            (i64.const 70368744177684)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_immutability_suite_with_options(&wasm, 1, None).is_ok());
+}
+
+#[test]
+fn test_run_immutability_suite_with_config_payload() {
+    use datalake_wasm_tool::tester::run_immutability_suite_with_options;
+
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            ;; Verify config is non-empty
+            (if (i32.eqz (local.get $len))
+                (then (return (i32.const 1)))
+            )
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    // With config -> succeeds
+    assert!(run_immutability_suite_with_options(&wasm, 0, Some(r#"{"key":"value"}"#)).is_ok());
+    // Without config -> init returns 1, suite fails
+    assert!(run_immutability_suite_with_options(&wasm, 0, None).is_err());
+}
+
+#[test]
+fn test_run_benchmark_with_options() {
+    use datalake_wasm_tool::bench::run_benchmark_with_options;
+
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Verify signal is 2 (traces)
+            (if (i32.ne (local.get $sig) (i32.const 2))
+                (then (unreachable))
+            )
+            (i64.const 70368744177684)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_benchmark_with_options(&wasm, 2, Some(r#"{"signal":"traces"}"#)).is_ok());
 }

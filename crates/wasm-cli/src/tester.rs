@@ -105,12 +105,18 @@ fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
-/// Executes the full immutability and conformance test suite against guest WASM bytecode.
+/// Executes the full immutability and conformance test suite against guest WASM bytecode
+/// with an explicit signal type and optional initialization configuration payload.
 ///
 /// # Errors
 ///
-/// Returns an error if the module fails validation, instantiation, execution, or immutability checks.
-pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
+/// Returns an error if the module fails validation, instantiation, initialization,
+/// execution, or immutability checks.
+pub fn run_immutability_suite_with_options(
+    bytes: &[u8],
+    signal: u32,
+    config_payload: Option<&str>,
+) -> Result<()> {
     validate_wasm_bytes(bytes)?;
 
     let mut config = Config::new();
@@ -122,16 +128,6 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
 
     let linker = crate::create_default_linker(&engine, &module).map_err(wasm_err)?;
     let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
-
-    if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_init") {
-        let init_res = init_fn.call(&mut store, (0, 0)).map_err(wasm_err)?;
-        if init_res != 0 {
-            anyhow::bail!("datalake_init returned non-zero code: {init_res}");
-        }
-    }
-
-    let input_batch = build_canonical_test_batch()?;
-    let buffer = serialize_batch_to_ipc(&input_batch)?;
 
     let alloc_fn = instance
         .get_typed_func::<u32, u32>(&mut store, "datalake_alloc")
@@ -147,6 +143,47 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow::anyhow!("Module missing memory export"))?;
 
+    if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_init") {
+        let (config_ptr, config_len) = if let Some(cfg) = config_payload {
+            let cfg_bytes = cfg.as_bytes();
+            let len = u32::try_from(cfg_bytes.len())?;
+            if len > 0 {
+                let ptr = alloc_fn.call(&mut store, len).map_err(wasm_err)?;
+                let mem_len = memory.data(&store).len();
+                let start = ptr as usize;
+                let end = start
+                    .checked_add(len as usize)
+                    .ok_or_else(|| anyhow::anyhow!("Overflow computing config buffer end"))?;
+                if end > mem_len {
+                    anyhow::bail!("Allocated config buffer out of guest memory bounds");
+                }
+                memory.data_mut(&mut store)[start..end].copy_from_slice(cfg_bytes);
+                (ptr, len)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+
+        let init_res = init_fn
+            .call(&mut store, (config_ptr, config_len))
+            .map_err(wasm_err)?;
+
+        if config_ptr != 0 && config_len > 0 {
+            dealloc_fn
+                .call(&mut store, (config_ptr, config_len))
+                .map_err(wasm_err)?;
+        }
+
+        if init_res != 0 {
+            anyhow::bail!("datalake_init returned non-zero code: {init_res}");
+        }
+    }
+
+    let input_batch = build_canonical_test_batch()?;
+    let buffer = serialize_batch_to_ipc(&input_batch)?;
+
     let input_len = u32::try_from(buffer.len())?;
     let input_ptr = alloc_fn.call(&mut store, input_len).map_err(wasm_err)?;
 
@@ -161,12 +198,12 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
     memory.data_mut(&mut store)[start..end].copy_from_slice(&buffer);
 
     let packed = transform_fn
-        .call(&mut store, (0, input_ptr, input_len))
+        .call(&mut store, (signal, input_ptr, input_len))
         .map_err(wasm_err)?;
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    verify_transform_response(&memory, &store, header_ptr, &input_batch)?;
+    verify_transform_response(&memory, &store, header_ptr, header_len, &input_batch)?;
 
     reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
 
@@ -177,24 +214,40 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Executes the full immutability and conformance test suite against guest WASM bytecode
+/// using default signal (`Logs` / `0`) and no configuration.
+///
+/// # Errors
+///
+/// Returns an error if the module fails validation, instantiation, execution, or immutability checks.
+pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
+    run_immutability_suite_with_options(bytes, 0, None)
+}
+
 /// Reads and verifies the response status in the [`opentelemetry_datalake_wasm_sdk::abi::TransformResponseHeader`].
 ///
 /// # Errors
 ///
-/// Returns an error if the header pointer is out of memory bounds, or if the
-/// guest reported an error or rejection status.
+/// Returns an error if the header pointer is null or out of memory bounds, if the header length
+/// is less than the required 20 bytes, or if the guest reported an error or rejection status.
 pub fn verify_transform_status(
     memory: &wasmtime::Memory,
     store: &Store<()>,
     header_ptr: u32,
+    header_len: u32,
 ) -> Result<()> {
     if header_ptr == 0 {
-        return Ok(());
+        anyhow::bail!("datalake_transform returned a null response header pointer");
+    }
+    if header_len < 20 {
+        anyhow::bail!(
+            "datalake_transform returned invalid header length: expected at least 20 bytes, got {header_len}"
+        );
     }
 
     let h_start = header_ptr as usize;
     let h_end = h_start
-        .checked_add(20)
+        .checked_add(header_len as usize)
         .ok_or_else(|| anyhow::anyhow!("Overflow in header range"))?;
     let mem = memory.data(store);
     if h_end > mem.len() {
@@ -241,12 +294,10 @@ fn verify_transform_response(
     memory: &wasmtime::Memory,
     store: &Store<()>,
     header_ptr: u32,
+    header_len: u32,
     input_batch: &RecordBatch,
 ) -> Result<()> {
-    verify_transform_status(memory, store, header_ptr)?;
-    if header_ptr == 0 {
-        return Ok(());
-    }
+    verify_transform_status(memory, store, header_ptr, header_len)?;
 
     let h_start = header_ptr as usize;
     let mem = memory.data(store);

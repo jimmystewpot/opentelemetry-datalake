@@ -15,12 +15,17 @@ fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
 
-/// Executes local latency/throughput benchmarks for a guest WASM module.
+/// Executes local latency/throughput benchmarks for a guest WASM module
+/// with an explicit signal type and optional initialization configuration payload.
 ///
 /// # Errors
 ///
 /// Returns an error if benchmarking fails.
-pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
+pub fn run_benchmark_with_options(
+    bytes: &[u8],
+    signal: u32,
+    config_payload: Option<&str>,
+) -> Result<()> {
     println!(
         "WARNING: This bench measures raw IPC round-trip for profiling only.\n         The CI latency gate is: cargo test --test latency_gate_tests"
     );
@@ -41,13 +46,6 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     let linker = crate::create_default_linker(&engine, &module).map_err(wasm_err)?;
     let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
 
-    if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_init") {
-        let init_res = init_fn.call(&mut store, (0, 0)).map_err(wasm_err)?;
-        if init_res != 0 {
-            anyhow::bail!("datalake_init returned non-zero code: {init_res}");
-        }
-    }
-
     let alloc_fn = instance
         .get_typed_func::<u32, u32>(&mut store, "datalake_alloc")
         .map_err(wasm_err)?;
@@ -61,6 +59,44 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| anyhow::anyhow!("Module missing memory export"))?;
+
+    if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_init") {
+        let (config_ptr, config_len) = if let Some(cfg) = config_payload {
+            let cfg_bytes = cfg.as_bytes();
+            let len = u32::try_from(cfg_bytes.len())?;
+            if len > 0 {
+                let ptr = alloc_fn.call(&mut store, len).map_err(wasm_err)?;
+                let mem_len = memory.data(&store).len();
+                let start = ptr as usize;
+                let end = start
+                    .checked_add(len as usize)
+                    .ok_or_else(|| anyhow::anyhow!("Overflow computing config buffer end"))?;
+                if end > mem_len {
+                    anyhow::bail!("Allocated config buffer out of guest memory bounds");
+                }
+                memory.data_mut(&mut store)[start..end].copy_from_slice(cfg_bytes);
+                (ptr, len)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (0, 0)
+        };
+
+        let init_res = init_fn
+            .call(&mut store, (config_ptr, config_len))
+            .map_err(wasm_err)?;
+
+        if config_ptr != 0 && config_len > 0 {
+            dealloc_fn
+                .call(&mut store, (config_ptr, config_len))
+                .map_err(wasm_err)?;
+        }
+
+        if init_res != 0 {
+            anyhow::bail!("datalake_init returned non-zero code: {init_res}");
+        }
+    }
 
     let input_len = u32::try_from(buffer.len())?;
     let input_ptr = alloc_fn.call(&mut store, input_len).map_err(wasm_err)?;
@@ -77,11 +113,11 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
 
     for _ in 0..5 {
         let packed = transform_fn
-            .call(&mut store, (0, input_ptr, input_len))
+            .call(&mut store, (signal, input_ptr, input_len))
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        verify_transform_status(&memory, &store, header_ptr)?;
+        verify_transform_status(&memory, &store, header_ptr, header_len)?;
         reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
 
@@ -89,11 +125,11 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     let start_time = Instant::now();
     for _ in 0..iterations {
         let packed = transform_fn
-            .call(&mut store, (0, input_ptr, input_len))
+            .call(&mut store, (signal, input_ptr, input_len))
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        verify_transform_status(&memory, &store, header_ptr)?;
+        verify_transform_status(&memory, &store, header_ptr, header_len)?;
         reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
     let total_elapsed = start_time.elapsed();
@@ -116,4 +152,14 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
         .call(&mut store, (input_ptr, input_len))
         .map_err(wasm_err)?;
     Ok(())
+}
+
+/// Executes local latency/throughput benchmarks for a guest WASM module
+/// using default signal (`Logs` / `0`) and no configuration.
+///
+/// # Errors
+///
+/// Returns an error if benchmarking fails.
+pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
+    run_benchmark_with_options(bytes, 0, None)
 }

@@ -170,12 +170,13 @@ fn test_validate_accepts_module_with_wasi_or_unknown_imports() {
 fn test_cli_subcommand_test_conformant_module() {
     let bin = env!("CARGO_BIN_EXE_datalake-wasm");
     let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
-        (memory (export "memory") 1)
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     let temp_path = std::env::temp_dir().join(format!(
@@ -201,12 +202,13 @@ fn test_cli_subcommand_test_conformant_module() {
 fn test_cli_subcommand_bench_conformant_module() {
     let bin = env!("CARGO_BIN_EXE_datalake-wasm");
     let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
-        (memory (export "memory") 1)
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
     let temp_path = std::env::temp_dir().join(format!(
@@ -224,6 +226,55 @@ fn test_cli_subcommand_bench_conformant_module() {
     assert!(
         output.status.success(),
         "Expected datalake-wasm bench to succeed, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn test_cli_subcommand_test_with_signal_and_config() {
+    let bin = env!("CARGO_BIN_EXE_datalake-wasm");
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            ;; Verify config is non-empty
+            (if (i32.eqz (local.get $len))
+                (then (return (i32.const 1)))
+            )
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Verify signal is 1 (metrics)
+            (if (i32.ne (local.get $sig) (i32.const 1))
+                (then (unreachable))
+            )
+            (i64.const 70368744177684)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let temp_path =
+        std::env::temp_dir().join(format!("datalake_signal_test_{}.wasm", std::process::id()));
+    std::fs::write(&temp_path, &wasm).unwrap();
+
+    let output = std::process::Command::new(bin)
+        .args([
+            "test",
+            temp_path.to_str().unwrap(),
+            "--signal",
+            "metrics",
+            "--config",
+            r#"{"signal":"metrics","custom":123}"#,
+        ])
+        .output()
+        .expect("Failed to execute datalake-wasm process");
+
+    let _ = std::fs::remove_file(&temp_path);
+    assert!(
+        output.status.success(),
+        "Expected datalake-wasm test with signal/config to succeed, got stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
