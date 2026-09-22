@@ -21,6 +21,9 @@ pub const MAX_METRIC_NAME_LEN: usize = 256;
 /// Maximum allowed length in bytes for log messages read from guest memory (64 KiB).
 pub const MAX_LOG_MESSAGE_LEN: usize = 65_536;
 
+/// Maximum distinct metric entries permitted in a [`MetricRegistry`] to prevent unbounded memory growth.
+pub const MAX_METRIC_ENTRIES: usize = 2048;
+
 /// Lifecycle execution phase of the host worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostPhase {
@@ -45,6 +48,7 @@ pub enum MetricValue {
 #[derive(Debug)]
 pub struct MetricRegistry {
     component_id: String,
+    prefix: String,
     metrics: DashMap<String, MetricValue>,
 }
 
@@ -54,18 +58,30 @@ impl MetricRegistry {
     pub fn new(component_id: &str) -> Self {
         Self {
             component_id: component_id.to_string(),
+            prefix: format!("datalake_transformers_{component_id}_"),
             metrics: DashMap::new(),
         }
     }
 
-    /// Formats a metric name into its full scoped key.
+    /// Formats a metric name into its full scoped key with pre-allocated capacity.
     fn format_key(&self, name: &str) -> String {
-        format!("datalake_transformers_{}_{name}", self.component_id)
+        let mut key = String::with_capacity(self.prefix.len() + name.len());
+        key.push_str(&self.prefix);
+        key.push_str(name);
+        key
     }
 
-    /// Records a counter increment with saturating addition.
+    /// Records a counter increment with saturating addition and bounded entry capacity.
     pub fn record_counter(&self, name: &str, delta: u64) {
         let key = self.format_key(name);
+        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new counter metric registration"
+            );
+            return;
+        }
         self.metrics
             .entry(key)
             .and_modify(|val| {
@@ -78,9 +94,17 @@ impl MetricRegistry {
             .or_insert(MetricValue::Counter(delta));
     }
 
-    /// Records an instantaneous gauge bitcast value.
+    /// Records an instantaneous gauge bitcast value with bounded entry capacity.
     pub fn record_gauge(&self, name: &str, bits: u64) {
         let key = self.format_key(name);
+        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new gauge metric registration"
+            );
+            return;
+        }
         self.metrics.insert(key, MetricValue::Gauge(bits));
     }
 
@@ -142,37 +166,26 @@ fn read_guest_string(
         return None;
     };
 
-    let Ok(offset) = usize::try_from(ptr) else {
-        tracing::warn!(ptr, "WASM guest memory pointer out of usize range");
-        return None;
-    };
-    let Ok(raw_len) = usize::try_from(len) else {
-        tracing::warn!(len, "WASM guest memory length out of usize range");
+    let Some(end_u32) = ptr.checked_add(len) else {
+        tracing::warn!(ptr, len, "WASM guest memory address addition overflow");
         return None;
     };
 
     let mem_data = memory.data(caller);
-
-    let Some(total_end) = offset.checked_add(raw_len) else {
-        tracing::warn!(
-            offset,
-            raw_len,
-            "WASM guest memory address addition overflow"
-        );
-        return None;
-    };
+    let offset = ptr as usize;
+    let total_end = end_u32 as usize;
 
     if total_end > mem_data.len() {
         tracing::warn!(
             offset,
-            raw_len,
+            raw_len = len as usize,
             memory_len = mem_data.len(),
             "WASM guest memory read out of bounds"
         );
         return None;
     }
 
-    let read_len = raw_len.min(max_len);
+    let read_len = (len as usize).min(max_len);
     let end = offset.saturating_add(read_len);
 
     Some(String::from_utf8_lossy(&mem_data[offset..end]).into_owned())
@@ -187,10 +200,7 @@ fn read_guest_string(
 /// # Errors
 ///
 /// Returns [`WasmTransformError`] if function definition in the linker fails.
-pub fn build_host_linker(
-    engine: &Engine,
-    _registry: Arc<MetricRegistry>,
-) -> Result<Linker<HostState>, WasmTransformError> {
+pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTransformError> {
     let mut linker = Linker::new(engine);
 
     linker.func_wrap(
@@ -239,12 +249,21 @@ pub fn build_host_linker(
                 return;
             };
 
+            let comp_id = caller.data().registry.component_id();
             match level {
-                LOG_LEVEL_ERROR => tracing::error!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_WARN => tracing::warn!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_INFO => tracing::info!(target: "wasm_guest", "{msg}"),
-                LOG_LEVEL_DEBUG => tracing::debug!(target: "wasm_guest", "{msg}"),
-                _ => tracing::trace!(target: "wasm_guest", "{msg}"),
+                LOG_LEVEL_ERROR => {
+                    tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_WARN => {
+                    tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_INFO => {
+                    tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_DEBUG => {
+                    tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
             }
         },
     )?;

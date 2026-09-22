@@ -113,6 +113,91 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A tuple containing signal-isolated transformers for logs, traces, and metrics, along with SIGHUP listener handles.
+type SignalTransformers = (
+    Box<dyn Transform>,
+    Box<dyn Transform>,
+    Box<dyn Transform>,
+    Vec<Option<tokio::task::JoinHandle<()>>>,
+);
+
+/// Initializes the pipeline transformers based on the provided application configuration.
+/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
+/// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
+fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransformers> {
+    let mut sighup_handles = Vec::new();
+    let (logs_transformer, traces_transformer, metrics_transformer): (
+        Box<dyn Transform>,
+        Box<dyn Transform>,
+        Box<dyn Transform>,
+    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
+        tracing::info!(
+            transformer_id = %wasm_cfg.id,
+            module_path = %wasm_cfg.module_path,
+            "Initializing 3x signal-isolated WasmTransformer instances"
+        );
+        let mut logs_cfg = wasm_cfg.clone();
+        logs_cfg
+            .env
+            .insert("signal".to_string(), "logs".to_string());
+        let logs_wasm = wasm_transformer::WasmTransformer::new(logs_cfg, None, None)?;
+
+        let mut traces_cfg = wasm_cfg.clone();
+        traces_cfg
+            .env
+            .insert("signal".to_string(), "traces".to_string());
+        let traces_wasm = wasm_transformer::WasmTransformer::new(traces_cfg, None, None)?;
+
+        let mut metrics_cfg = wasm_cfg.clone();
+        metrics_cfg
+            .env
+            .insert("signal".to_string(), "metrics".to_string());
+        let metrics_wasm = wasm_transformer::WasmTransformer::new(metrics_cfg, None, None)?;
+
+        if wasm_cfg.enable_sighup {
+            let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
+            let expected_sha = wasm_cfg.sha256.clone();
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(logs_wasm.engine()),
+                module_path.clone(),
+                expected_sha.clone(),
+                true,
+            ));
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(traces_wasm.engine()),
+                module_path.clone(),
+                expected_sha.clone(),
+                true,
+            ));
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+                std::sync::Arc::clone(metrics_wasm.engine()),
+                module_path,
+                expected_sha,
+                true,
+            ));
+        }
+
+        (
+            Box::new(logs_wasm),
+            Box::new(traces_wasm),
+            Box::new(metrics_wasm),
+        )
+    } else {
+        (
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+            Box::new(noop_transformer::NoopTransformer::new()),
+        )
+    };
+
+    Ok((
+        logs_transformer,
+        traces_transformer,
+        metrics_transformer,
+        sighup_handles,
+    ))
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -202,52 +287,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
-    let mut sighup_handles = Vec::new();
-    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer): (
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
-        tracing::info!(
-            transformer_id = %wasm_cfg.id,
-            module_path = %wasm_cfg.module_path,
-            "Initializing 3x signal-isolated WasmTransformer instances"
-        );
-        let logs_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
-        let traces_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
-        let metrics_wasm = wasm_transformer::WasmTransformer::new(wasm_cfg.clone(), None, None)?;
-
-        if wasm_cfg.enable_sighup {
-            let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
-                std::sync::Arc::clone(logs_wasm.engine()),
-                module_path.clone(),
-                true,
-            ));
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
-                std::sync::Arc::clone(traces_wasm.engine()),
-                module_path.clone(),
-                true,
-            ));
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
-                std::sync::Arc::clone(metrics_wasm.engine()),
-                module_path,
-                true,
-            ));
-        }
-
-        (
-            Box::new(logs_wasm),
-            Box::new(traces_wasm),
-            Box::new(metrics_wasm),
-        )
-    } else {
-        (
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-        )
-    };
+    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer, sighup_handles) =
+        initialize_transformers(&config)?;
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
@@ -838,5 +879,108 @@ mod tests {
             .expect("Router should handle request");
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn test_initialize_transformers_noop() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
+        assert!(handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_transformers_wasm() {
+        let valid_wat = r#"
+        (module
+          (func (export "transform") (param i32 i32) (result i32)
+            i32.const 0
+          )
+        )"#;
+        let wasm_bytes = wat::parse_str(valid_wat).unwrap();
+        let path = std::env::temp_dir().join(format!("test_wasm_{}.wasm", std::process::id()));
+        std::fs::write(&path, wasm_bytes).unwrap();
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [wasm_transformer]
+            id = "test_wasm"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "drop"
+            on_reject = "drop"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = true
+            "#,
+            path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
+
+        assert_eq!(handles.len(), 3);
+        assert_eq!(
+            handles.into_iter().flatten().count(),
+            if cfg!(unix) { 3 } else { 0 }
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_initialize_transformers_wasm_error() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [wasm_transformer]
+        id = "test_wasm"
+        type = "wasm"
+        module_path = "/nonexistent.wasm"
+        on_error = "drop"
+        on_reject = "drop"
+        concurrency = 1
+        worker_channel_capacity = 1
+        max_memory = "16MiB"
+        rejuvenate_threshold = "8MiB"
+        rejuvenate_batches = 1000
+        init_timeout = "1s"
+        allow_unmasked_passthrough = true
+        schema_guard = "defensive"
+        env_whitelist = []
+        enable_sighup = true
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = initialize_transformers(&config);
+        assert!(res.is_err());
     }
 }

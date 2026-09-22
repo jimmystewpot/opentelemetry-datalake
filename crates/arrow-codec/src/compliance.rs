@@ -202,13 +202,13 @@ mod tests {
         ]));
 
         let resource_attrs = match service_name {
-            Some(name) => format!(r#"{{"service.name":"{}"}}"#, name),
-            None => r#"{}"#.to_string(),
+            Some(name) => format!(r#"{{"service.name":"{name}"}}"#),
+            None => r"{}".to_string(),
         };
 
         let attrs = match legacy_key {
-            Some(key) => format!(r#"{{"{}":"GET"}}"#, key),
-            None => r#"{}"#.to_string(),
+            Some(key) => format!(r#"{{"{key}":"GET"}}"#),
+            None => r"{}".to_string(),
         };
 
         let attrs_array = Arc::new(StringArray::from(vec![attrs])) as ArrayRef;
@@ -268,7 +268,7 @@ mod tests {
         }
     }
 
-    /// Malformed JSON in resource_attributes must cause the compliance
+    /// Malformed JSON in `resource_attributes` must cause the compliance
     /// check to return false (non-compliant) instead of panicking.
     #[test]
     fn test_compliance_engine_malformed_json() {
@@ -277,7 +277,7 @@ mod tests {
             Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
-        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#])) as ArrayRef;
+        let attrs_array = Arc::new(StringArray::from(vec![r"{}"])) as ArrayRef;
         let res_array = Arc::new(StringArray::from(vec!["not valid json {{{"])) as ArrayRef;
 
         let batch = RecordBatch::try_new(schema, vec![attrs_array, res_array]).unwrap();
@@ -290,7 +290,7 @@ mod tests {
         );
     }
 
-    /// Null entries in resource_attributes must be treated as non-compliant.
+    /// Null entries in `resource_attributes` must be treated as non-compliant.
     #[test]
     fn test_compliance_engine_null_attributes() {
         let schema = Arc::new(Schema::new(vec![
@@ -320,7 +320,7 @@ mod tests {
             Field::new("resource_attributes", DataType::Utf8, false),
         ]));
 
-        let attrs_array = Arc::new(StringArray::from(vec![r#"{}"#, r#"{}"#])) as ArrayRef;
+        let attrs_array = Arc::new(StringArray::from(vec![r"{}", r"{}"])) as ArrayRef;
         let res_array = Arc::new(StringArray::from(vec![
             r#"{"service.name":"svc-a"}"#,
             // Second row is missing service.name

@@ -40,6 +40,7 @@ pub struct WasmTransformer {
     module: Arc<Module>,
     reroute_error: Option<PipelineSender>,
     reroute_reject: Option<PipelineSender>,
+    registry: Arc<crate::host_calls::MetricRegistry>,
 }
 
 impl WasmTransformer {
@@ -119,12 +120,15 @@ impl WasmTransformer {
             .compile_module(&wasm_bytes)
             .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
+        let registry = Arc::new(crate::host_calls::MetricRegistry::new(&config.id));
+
         Ok(Self {
             config,
             engine,
             module,
             reroute_error,
             reroute_reject,
+            registry,
         })
     }
 
@@ -144,6 +148,12 @@ impl WasmTransformer {
     #[must_use]
     pub fn module(&self) -> &Arc<Module> {
         &self.module
+    }
+
+    /// Returns a reference to the shared [`crate::host_calls::MetricRegistry`].
+    #[must_use]
+    pub fn metric_registry(&self) -> &Arc<crate::host_calls::MetricRegistry> {
+        &self.registry
     }
 }
 
@@ -165,11 +175,96 @@ impl Transform for WasmTransformer {
             output,
             self.reroute_error.clone(),
             self.reroute_reject.clone(),
+            Arc::clone(&self.registry),
         );
 
         dispatcher
             .run(input)
             .await
             .map_err(|e| PipelineError::Internal(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, SchemaGuardMode};
+
+    fn base_config(path: String) -> WasmTransformerConfig {
+        WasmTransformerConfig {
+            id: "test".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: path,
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "64MiB".to_string(),
+            rejuvenate_threshold: "16MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: false,
+            on_reject: OnRejectPolicy::Drop,
+            schema_guard: SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: false,
+        }
+    }
+
+    #[test]
+    fn test_new_topological_sink_missing_error() {
+        let mut config = base_config("dummy".to_string());
+        config.on_error = OnErrorPolicy::Reroute;
+        let res = WasmTransformer::new(config, None, None);
+        assert!(matches!(res, Err(PipelineError::TopologicalSinkMissing(_))));
+    }
+
+    #[test]
+    fn test_new_topological_sink_missing_reject() {
+        let mut config = base_config("dummy".to_string());
+        config.on_reject = OnRejectPolicy::Reroute;
+        let res = WasmTransformer::new(config, None, None);
+        assert!(matches!(res, Err(PipelineError::TopologicalSinkMissing(_))));
+    }
+
+    #[test]
+    fn test_new_missing_module_path() {
+        let config = base_config("/invalid/path/that/does/not/exist.wasm".to_string());
+        let res = WasmTransformer::new(config, None, None);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("Failed to read WASM module"))
+        );
+    }
+
+    #[test]
+    fn test_new_sha256_mismatch() {
+        let path = std::env::temp_dir().join("test_new_sha256_mismatch.wasm");
+        std::fs::write(&path, b"invalid wasm bytes").unwrap();
+
+        let mut config = base_config(path.to_str().unwrap().to_string());
+        config.sha256 =
+            Some("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+
+        let res = WasmTransformer::new(config, None, None);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("SHA256 mismatch"))
+        );
+    }
+
+    #[test]
+    fn test_new_invalid_wasm_compilation() {
+        let path = std::env::temp_dir().join("test_new_invalid_wasm_compilation.wasm");
+        std::fs::write(&path, b"invalid wasm bytes").unwrap();
+
+        let config = base_config(path.to_str().unwrap().to_string());
+        let res = WasmTransformer::new(config, None, None);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(res, Err(PipelineError::Internal(_))));
     }
 }

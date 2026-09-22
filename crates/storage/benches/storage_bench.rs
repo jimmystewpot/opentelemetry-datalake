@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_wrap)]
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;

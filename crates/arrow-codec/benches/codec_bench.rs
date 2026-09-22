@@ -1,3 +1,4 @@
+#![allow(clippy::cast_precision_loss)]
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
 use arrow_codec::compliance::{ComplianceEngine, ComplianceMode};
@@ -179,13 +180,13 @@ fn make_test_batch_size(
 
     for _ in 0..n {
         let resource_attrs = match service_name {
-            Some(name) => format!(r#"{{"service.name":"{}"}}"#, name),
-            None => r#"{}"#.to_string(),
+            Some(name) => format!(r#"{{"service.name":"{name}"}}"#),
+            None => r"{}".to_string(),
         };
 
         let attrs = match legacy_key {
-            Some(key) => format!(r#"{{"{}":"GET"}}"#, key),
-            None => r#"{}"#.to_string(),
+            Some(key) => format!(r#"{{"{key}":"GET"}}"#),
+            None => r"{}".to_string(),
         };
         attrs_vec.push(attrs);
         res_vec.push(resource_attrs);

@@ -991,7 +991,7 @@ mod tests {
         );
 
         let mut config2 = base_config();
-        config2.database = "".to_string();
+        config2.database = String::new();
         let err2 = StarRocksSink::try_new(config2).unwrap_err();
         assert!(
             matches!(err2, PipelineError::Internal(ref msg) if msg.contains("database")),
@@ -1017,7 +1017,7 @@ mod tests {
         assert_eq!(default_max_payload_bytes(), 104_857_600);
     }
 
-    /// All StarRocksFormat variants must produce expected Display strings.
+    /// All `StarRocksFormat` variants must produce expected Display strings.
     #[test]
     fn test_starrocks_format_display() {
         assert_eq!(StarRocksFormat::Ipc.to_string(), "ipc");
@@ -1025,7 +1025,7 @@ mod tests {
         assert_eq!(StarRocksFormat::Csv.to_string(), "csv");
     }
 
-    /// make_label must produce distinct labels for all three signal type prefixes.
+    /// `make_label` must produce distinct labels for all three signal type prefixes.
     #[test]
     fn test_make_label_for_all_signal_types() {
         let logs_label = StarRocksSink::make_label("logs");
@@ -1041,7 +1041,7 @@ mod tests {
         assert_ne!(logs_label, traces_label);
     }
 
-    /// inject_signal_type_column must successfully add a discriminator
+    /// `inject_signal_type_column` must successfully add a discriminator
     /// column even when the input batch has zero rows.
     #[test]
     fn test_inject_signal_type_column_empty_batch() {
@@ -1067,7 +1067,7 @@ mod tests {
         assert_eq!(*col.data_type(), DataType::Utf8);
     }
 
-    /// inject_signal_type_column for a metrics signal must use "metrics" as the value.
+    /// `inject_signal_type_column` for a metrics signal must use "metrics" as the value.
     #[test]
     fn test_inject_signal_type_column_metrics_signal() {
         use arrow::array::{AsArray, Int64Array};
@@ -1089,12 +1089,12 @@ mod tests {
         assert_eq!(sig_col.value(1), "metrics");
     }
 
-    /// Helper: alias for base_config for plan compatibility.
+    /// Helper: alias for `base_config` for plan compatibility.
     fn make_config() -> StarRocksSinkConfig {
         base_config()
     }
 
-    /// The PerSignal table mapping must correctly select the right table
+    /// The `PerSignal` table mapping must correctly select the right table
     /// for each signal type.
     #[test]
     fn test_table_mapping_per_signal_selects_correct_table() {
@@ -1369,8 +1369,7 @@ mod tests {
 
         assert!(
             matches!(result, Err(PipelineError::DownstreamClosed)),
-            "Task should have failed on flush attempt, got: {:?}",
-            result
+            "Task should have failed on flush attempt, got: {result:?}"
         );
     }
 }

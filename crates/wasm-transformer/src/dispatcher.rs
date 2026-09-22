@@ -6,6 +6,7 @@
 
 use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
+use crate::host_calls::MetricRegistry;
 use crate::worker::{WasmWorker, WorkerOutcome};
 use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, WasmTransformerConfig};
 use pipeline_core::pipeline::{PipelineReceiver, PipelineSender, SignalBatch};
@@ -38,11 +39,13 @@ pub struct WasmDispatcher {
     output: PipelineSender,
     reroute_error: Option<PipelineSender>,
     reroute_reject: Option<PipelineSender>,
+    registry: Arc<crate::host_calls::MetricRegistry>,
 }
 
 impl WasmDispatcher {
     /// Creates a new `WasmDispatcher`.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: DispatcherConfig,
         engine: Arc<EngineCache>,
@@ -51,6 +54,7 @@ impl WasmDispatcher {
         output: PipelineSender,
         reroute_error: Option<PipelineSender>,
         reroute_reject: Option<PipelineSender>,
+        registry: Arc<crate::host_calls::MetricRegistry>,
     ) -> Self {
         Self {
             config,
@@ -60,7 +64,14 @@ impl WasmDispatcher {
             output,
             reroute_error,
             reroute_reject,
+            registry,
         }
+    }
+
+    /// Returns a reference to the shared [`MetricRegistry`].
+    #[must_use]
+    pub fn registry(&self) -> &Arc<MetricRegistry> {
+        &self.registry
     }
 
     /// Runs the dispatcher loop until the `input` channel is closed, then drains workers.
@@ -76,7 +87,9 @@ impl WasmDispatcher {
         let mut next_worker = 0usize;
         while let Some(batch) = input.recv().await {
             if !Self::dispatch_batch(batch, &worker_txs, &mut next_worker, concurrency).await {
-                break;
+                return Err(WasmTransformError::Pipeline(
+                    "Dispatcher worker channel closed".into(),
+                ));
             }
         }
 
@@ -105,28 +118,59 @@ impl WasmDispatcher {
             let output = self.output.clone();
             let err_tx = self.reroute_error.clone();
             let rej_tx = self.reroute_reject.clone();
+            let registry = Arc::clone(&self.registry);
 
             worker_handles.push(tokio::spawn(async move {
-                let mut worker = match WasmWorker::new(worker_id, engine, module, tf_cfg.clone()) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        warn!(worker_id, "Worker initialization failed: {e}");
-                        return;
-                    }
-                };
+                let mut worker =
+                    match WasmWorker::new(worker_id, engine, module, tf_cfg.clone(), registry) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            warn!(worker_id, "Worker initialization failed: {e}");
+                            return;
+                        }
+                    };
 
                 while let Some(batch) = wrx.recv().await {
-                    let outcome = worker.execute_batch(batch).await;
-                    Self::handle_worker_outcome(
-                        worker_id,
-                        outcome,
-                        &mut worker,
-                        &tf_cfg,
-                        &output,
-                        err_tx.as_ref(),
-                        rej_tx.as_ref(),
-                    )
-                    .await;
+                    match worker.execute_batch(batch).await {
+                        Ok(outcome) => {
+                            if !Self::handle_worker_outcome(
+                                worker_id,
+                                outcome,
+                                &tf_cfg,
+                                &output,
+                                err_tx.as_ref(),
+                                rej_tx.as_ref(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    worker_id,
+                                    "Downstream output channel closed; terminating worker task"
+                                );
+                                break;
+                            }
+                        }
+                        Err((original_batch, e)) => {
+                            warn!(worker_id, "Worker execution trap or error: {e}");
+                            let _ = worker.rejuvenate();
+                            if !Self::handle_errored(
+                                worker_id,
+                                e.to_string(),
+                                original_batch,
+                                &tf_cfg,
+                                &output,
+                                err_tx.as_ref(),
+                            )
+                            .await
+                            {
+                                warn!(
+                                    worker_id,
+                                    "Downstream output channel closed; terminating worker task"
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
                 info!(worker_id, "Worker drain complete");
             }));
@@ -136,35 +180,34 @@ impl WasmDispatcher {
     }
 
     /// Handles an individual execution outcome from a worker.
+    ///
+    /// Returns `true` if processing should continue, or `false` if downstream channels
+    /// are closed and the worker should terminate.
     async fn handle_worker_outcome(
         worker_id: usize,
-        outcome: Result<WorkerOutcome, WasmTransformError>,
-        worker: &mut WasmWorker,
+        outcome: WorkerOutcome,
         tf_cfg: &WasmTransformerConfig,
         output: &PipelineSender,
         err_tx: Option<&PipelineSender>,
         rej_tx: Option<&PipelineSender>,
-    ) {
+    ) -> bool {
         match outcome {
-            Ok(WorkerOutcome::Emitted(batches)) => {
+            WorkerOutcome::Emitted(batches) => {
                 for b in batches {
                     if let Err(e) = output.send(b).await {
                         warn!(worker_id, "Failed to forward emitted batch to output: {e}");
-                        break;
+                        return false;
                     }
                 }
+                true
             }
-            Ok(WorkerOutcome::Discarded) => {}
-            Ok(WorkerOutcome::Rejected { reason, original }) => {
+            WorkerOutcome::Discarded => true,
+            WorkerOutcome::Rejected { reason, original } => {
                 Self::handle_rejected(worker_id, reason, original, tf_cfg.on_reject, rej_tx).await;
+                true
             }
-            Ok(WorkerOutcome::Errored { reason, original }) => {
-                Self::handle_errored(worker_id, reason, original, tf_cfg.on_error, output, err_tx)
-                    .await;
-            }
-            Err(e) => {
-                warn!(worker_id, "Worker execution trap or error: {e}");
-                let _ = worker.rejuvenate();
+            WorkerOutcome::Errored { reason, original } => {
+                Self::handle_errored(worker_id, reason, original, tf_cfg, output, err_tx).await
             }
         }
     }
@@ -193,15 +236,18 @@ impl WasmDispatcher {
     }
 
     /// Routes an errored batch according to the error policy.
+    ///
+    /// Returns `true` if downstream channel is healthy, or `false` if output channel closed.
     async fn handle_errored(
         worker_id: usize,
         reason: String,
         original: SignalBatch,
-        policy: OnErrorPolicy,
+        tf_cfg: &WasmTransformerConfig,
         output: &PipelineSender,
         err_tx: Option<&PipelineSender>,
-    ) {
-        match policy {
+    ) -> bool {
+        let mut healthy = true;
+        match tf_cfg.on_error {
             OnErrorPolicy::Reroute => {
                 if let Some(etx) = err_tx {
                     if let Err(e) = etx.send(original).await {
@@ -215,13 +261,22 @@ impl WasmDispatcher {
                 }
             }
             OnErrorPolicy::Passthrough => {
-                if let Err(e) = output.send(original).await {
-                    warn!(worker_id, "Failed to send passthrough batch to output: {e}");
+                if tf_cfg.allow_unmasked_passthrough {
+                    if let Err(e) = output.send(original).await {
+                        warn!(worker_id, "Failed to send passthrough batch to output: {e}");
+                        healthy = false;
+                    }
+                } else {
+                    warn!(
+                        worker_id,
+                        "Dropping errored batch: allow_unmasked_passthrough is false"
+                    );
                 }
             }
             OnErrorPolicy::Drop => {}
         }
         warn!(worker_id, %reason, "Batch error in guest execution");
+        healthy
     }
 
     /// Dispatches an incoming batch to the least-loaded worker with backpressure fallback.
@@ -235,8 +290,11 @@ impl WasmDispatcher {
 
         for offset in 0..concurrency {
             let idx = (next_worker.saturating_add(offset)) % concurrency;
+            let Some(target_tx) = worker_txs.get(idx) else {
+                continue;
+            };
             if let Some(b) = pending_batch.take() {
-                match worker_txs[idx].try_send(b) {
+                match target_tx.try_send(b) {
                     Ok(()) => {
                         *next_worker = (idx.saturating_add(1)) % concurrency;
                         break;
@@ -252,10 +310,14 @@ impl WasmDispatcher {
         }
 
         if let Some(b) = pending_batch {
-            if worker_txs[*next_worker].send(b).await.is_err() {
+            let Some(target_tx) = worker_txs.get(*next_worker) else {
+                return false;
+            };
+            if target_tx.send(b).await.is_err() {
                 warn!(
-                    "Worker channel closed during backpressure send. Dropping batch to maintain dispatcher liveness."
+                    "Worker channel closed during backpressure send. Aborting dispatch loop to propagate backpressure and prevent data loss."
                 );
+                return false;
             }
             *next_worker = (next_worker.saturating_add(1)) % concurrency;
         }
@@ -268,6 +330,8 @@ impl WasmDispatcher {
         let timeout_dur =
             parse_duration(drain_timeout_str).unwrap_or_else(|| std::time::Duration::from_secs(10));
 
+        let abort_handles: Vec<_> = handles.iter().map(JoinHandle::abort_handle).collect();
+
         let drain_result = tokio::time::timeout(timeout_dur, async {
             for handle in handles {
                 if let Err(e) = handle.await {
@@ -278,7 +342,10 @@ impl WasmDispatcher {
         .await;
 
         if drain_result.is_err() {
-            warn!("Worker drain timed out after {timeout_dur:?}");
+            warn!("Worker drain timed out after {timeout_dur:?}; aborting lingering workers");
+            for abort_handle in abort_handles {
+                abort_handle.abort();
+            }
         }
     }
 }
@@ -320,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_batch_drops_batch_on_worker_channel_closed_without_terminating() {
+    async fn test_dispatch_batch_aborts_on_worker_channel_closed() {
         let (tx0, _rx0) = mpsc::channel::<SignalBatch>(1);
         let (tx1, rx1) = mpsc::channel::<SignalBatch>(1);
 
@@ -333,15 +400,12 @@ mod tests {
         let worker_txs = vec![tx0, tx1];
         let mut next_worker = 1;
 
-        // In the unpatched code, fallback send to worker_txs[1] fails and returns false.
-        // In the patched code, it drops the batch, logs a warning, advances next_worker to 0, and returns true.
         let live =
             WasmDispatcher::dispatch_batch(empty_batch(), &worker_txs, &mut next_worker, 2).await;
         assert!(
-            live,
-            "dispatcher must remain live when worker channel is closed"
+            !live,
+            "dispatcher must abort when worker channel is closed during backpressure"
         );
-        assert_eq!(next_worker, 0, "next_worker must advance to next worker");
     }
 
     #[test]
@@ -361,6 +425,39 @@ mod tests {
         assert_eq!(
             parse_duration("10"),
             Some(std::time::Duration::from_secs(10))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_workers_aborts_lingering_tasks_on_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropDetector(Arc<AtomicBool>);
+        impl Drop for DropDetector {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_clone = Arc::clone(&dropped);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _detector = DropDetector(dropped_clone);
+            let _ = started_tx.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let _ = started_rx.await;
+
+        WasmDispatcher::drain_workers(vec![handle], "10ms").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "Lingering worker task must be aborted and dropped on drain timeout"
         );
     }
 }
