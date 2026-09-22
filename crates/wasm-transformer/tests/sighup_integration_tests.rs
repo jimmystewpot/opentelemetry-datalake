@@ -1,5 +1,8 @@
 use std::sync::Arc;
-use wasm_transformer::{engine::EngineCache, reload::spawn_sighup_listener};
+use wasm_transformer::{
+    engine::EngineCache,
+    reload::{spawn_sighup_listener, spawn_sighup_listener_multi},
+};
 
 fn valid_wat() -> &'static str {
     r#"(module
@@ -271,6 +274,188 @@ async fn test_spawn_sighup_listener_with_mismatching_expected_sha() {
             engine.module_generation(),
             0,
             "module generation should remain 0 when expected_sha mismatches"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = tokio::fs::remove_file(&module_path).await;
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_sighup_listener_multi_triggers_reload() {
+    #[cfg(unix)]
+    {
+        let _guard = SIGHUP_MUTEX.lock().await;
+        let engine1 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let engine2 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+
+        let temp_dir = std::env::temp_dir();
+        let module_path = temp_dir.join(format!(
+            "sighup_multi_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+        tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+        assert_eq!(engine1.module_generation(), 0);
+        assert_eq!(engine2.module_generation(), 0);
+
+        let handle = spawn_sighup_listener_multi(
+            vec![Arc::clone(&engine1), Arc::clone(&engine2)],
+            module_path.clone(),
+            None,
+            true,
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pid = std::process::id().to_string();
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(&pid)
+            .status()
+            .unwrap();
+
+        let mut reloaded = false;
+        for _ in 0..50 {
+            if engine1.module_generation() == 1 && engine2.module_generation() == 1 {
+                reloaded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            reloaded,
+            "both engine generations should be 1 after SIGHUP with multi-engine listener"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = tokio::fs::remove_file(&module_path).await;
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_sighup_listener_multi_with_matching_expected_sha() {
+    #[cfg(unix)]
+    {
+        let _guard = SIGHUP_MUTEX.lock().await;
+        let engine1 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let engine2 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+
+        let temp_dir = std::env::temp_dir();
+        let module_path = temp_dir.join(format!(
+            "sighup_multi_matching_sha_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+        tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+        let sha = wasm_transformer::reload::compute_sha256(&wasm_bytes);
+
+        assert_eq!(engine1.module_generation(), 0);
+        assert_eq!(engine2.module_generation(), 0);
+
+        let handle = spawn_sighup_listener_multi(
+            vec![Arc::clone(&engine1), Arc::clone(&engine2)],
+            module_path.clone(),
+            Some(sha),
+            true,
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pid = std::process::id().to_string();
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(&pid)
+            .status()
+            .unwrap();
+
+        let mut reloaded = false;
+        for _ in 0..50 {
+            if engine1.module_generation() == 1 && engine2.module_generation() == 1 {
+                reloaded = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            reloaded,
+            "both engine generations should be 1 after SIGHUP with matching expected_sha"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = tokio::fs::remove_file(&module_path).await;
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_sighup_listener_multi_with_mismatching_expected_sha() {
+    #[cfg(unix)]
+    {
+        let _guard = SIGHUP_MUTEX.lock().await;
+        let engine1 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let engine2 = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+
+        let temp_dir = std::env::temp_dir();
+        let module_path = temp_dir.join(format!(
+            "sighup_multi_mismatching_sha_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+        tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+        assert_eq!(engine1.module_generation(), 0);
+        assert_eq!(engine2.module_generation(), 0);
+
+        let handle = spawn_sighup_listener_multi(
+            vec![Arc::clone(&engine1), Arc::clone(&engine2)],
+            module_path.clone(),
+            Some("0000000000000000000000000000000000000000000000000000000000000000".to_string()),
+            true,
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pid = std::process::id().to_string();
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(&pid)
+            .status()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(
+            engine1.module_generation(),
+            0,
+            "engine1 generation should remain 0 when expected_sha mismatches"
+        );
+        assert_eq!(
+            engine2.module_generation(),
+            0,
+            "engine2 generation should remain 0 when expected_sha mismatches"
         );
 
         handle.abort();

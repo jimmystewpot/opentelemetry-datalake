@@ -3,7 +3,7 @@
 use crate::error::WasmTransformError;
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, Module, PoolingAllocationConfig};
 
@@ -12,6 +12,7 @@ pub struct EngineCache {
     engine: Engine,
     module: RwLock<Option<Arc<Module>>>,
     generation: AtomicU64,
+    stop_epoch_ticker: Arc<AtomicBool>,
 }
 
 impl EngineCache {
@@ -31,13 +32,30 @@ impl EngineCache {
         pool_cfg.max_memory_size(max_memory_bytes);
 
         let mut config = Config::new();
+        config.epoch_interruption(true);
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool_cfg));
 
         let engine = Engine::new(&config)?;
+
+        let stop_epoch_ticker = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop_epoch_ticker);
+        let engine_clone = engine.clone();
+
+        std::thread::Builder::new()
+            .name("wasm-epoch-ticker".into())
+            .spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    engine_clone.increment_epoch();
+                }
+            })
+            .map_err(WasmTransformError::Io)?;
+
         Ok(Self {
             engine,
             module: RwLock::new(None),
             generation: AtomicU64::new(0),
+            stop_epoch_ticker,
         })
     }
 
@@ -114,5 +132,11 @@ impl EngineCache {
     #[must_use]
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+}
+
+impl Drop for EngineCache {
+    fn drop(&mut self) {
+        self.stop_epoch_ticker.store(true, Ordering::Relaxed);
     }
 }

@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use tokio::task::JoinHandle;
 
 use crate::engine::EngineCache;
+use crate::error::WasmTransformError;
 
 /// Computes the lowercase hex-encoded SHA-256 digest of the provided bytes.
 #[must_use]
@@ -13,21 +14,21 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
     encode(Sha256::digest(bytes))
 }
 
-/// Spawns an asynchronous background task listening for `SIGHUP` signals to trigger module reload.
+/// Spawns an asynchronous background task listening for `SIGHUP` signals to trigger module reload
+/// across multiple [`EngineCache`] instances simultaneously.
 ///
 /// When receiving `SIGHUP`, the listener reads the module from `module_path` and offloads
-/// module compilation and validation (including optional verification against `expected_sha`)
-/// to a dedicated blocking task via [`tokio::task::spawn_blocking`].
+/// module compilation and atomic swapping for each engine to [`tokio::task::spawn_blocking`].
 ///
-/// If `enabled` is `false` or when compiled on non-Unix platforms, returns `None`.
+/// If `enabled` is `false`, `engines` is empty, or when compiled on non-Unix platforms, returns `None`.
 #[must_use]
-pub fn spawn_sighup_listener(
-    engine: Arc<EngineCache>,
+pub fn spawn_sighup_listener_multi(
+    engines: Vec<Arc<EngineCache>>,
     module_path: PathBuf,
     expected_sha: Option<String>,
     enabled: bool,
 ) -> Option<JoinHandle<()>> {
-    if !enabled {
+    if !enabled || engines.is_empty() {
         return None;
     }
 
@@ -49,11 +50,26 @@ pub fn spawn_sighup_listener(
                 );
                 match tokio::fs::read(&module_path).await {
                     Ok(bytes) => {
-                        let engine = Arc::clone(&engine);
+                        let engines_clone = engines.clone();
                         let sha = expected_sha.clone();
-                        let compile_res = tokio::task::spawn_blocking(move || {
-                            engine.reload_from_bytes(&bytes, sha.as_deref())
-                        })
+                        let compile_res = tokio::task::spawn_blocking(
+                            move || -> Result<u64, WasmTransformError> {
+                                if let Some(ref expected) = sha {
+                                    let actual = compute_sha256(&bytes);
+                                    if !actual.eq_ignore_ascii_case(expected) {
+                                        return Err(WasmTransformError::Sha256Mismatch {
+                                            expected: expected.clone(),
+                                            actual,
+                                        });
+                                    }
+                                }
+                                let mut last_gen = 0;
+                                for engine in &engines_clone {
+                                    last_gen = engine.reload_from_bytes(&bytes, None)?;
+                                }
+                                Ok(last_gen)
+                            },
+                        )
                         .await;
 
                         match compile_res {
@@ -72,9 +88,24 @@ pub fn spawn_sighup_listener(
 
     #[cfg(not(unix))]
     {
-        let _ = (engine, module_path, expected_sha);
+        let _ = (engines, module_path, expected_sha);
         None
     }
+}
+
+/// Spawns an asynchronous background task listening for `SIGHUP` signals to trigger module reload.
+///
+/// Convenience wrapper around [`spawn_sighup_listener_multi`] for a single [`EngineCache`].
+///
+/// If `enabled` is `false` or when compiled on non-Unix platforms, returns `None`.
+#[must_use]
+pub fn spawn_sighup_listener(
+    engine: Arc<EngineCache>,
+    module_path: PathBuf,
+    expected_sha: Option<String>,
+    enabled: bool,
+) -> Option<JoinHandle<()>> {
+    spawn_sighup_listener_multi(vec![engine], module_path, expected_sha, enabled)
 }
 
 /// Request body for the WASM hot-reload REST endpoint.
@@ -90,18 +121,27 @@ pub struct WasmReloadRequest {
 /// State provided to the WASM hot-reload REST endpoint handler.
 #[derive(Clone)]
 pub struct WasmReloadState {
-    /// Reference to the shared [`EngineCache`].
-    pub engine: Arc<EngineCache>,
+    /// References to the shared [`EngineCache`] instances to update upon reload.
+    pub engines: Vec<Arc<EngineCache>>,
     /// Optional configured fallback SHA-256 digest pinned at initialization.
     pub configured_sha: Option<String>,
 }
 
 impl WasmReloadState {
-    /// Creates a new [`WasmReloadState`] with the given engine and optional configured digest.
+    /// Creates a new [`WasmReloadState`] with a single engine and optional configured digest.
     #[must_use]
     pub fn new(engine: Arc<EngineCache>, configured_sha: Option<String>) -> Self {
         Self {
-            engine,
+            engines: vec![engine],
+            configured_sha,
+        }
+    }
+
+    /// Creates a new [`WasmReloadState`] with multiple engines and optional configured digest.
+    #[must_use]
+    pub fn new_multi(engines: Vec<Arc<EngineCache>>, configured_sha: Option<String>) -> Self {
+        Self {
+            engines,
             configured_sha,
         }
     }
@@ -109,24 +149,22 @@ impl WasmReloadState {
 
 impl From<Arc<EngineCache>> for WasmReloadState {
     fn from(engine: Arc<EngineCache>) -> Self {
-        Self {
-            engine,
-            configured_sha: None,
-        }
+        Self::new(engine, None)
     }
 }
 
 /// Handler for the WASM hot-reload REST endpoint.
 ///
 /// Extracts the JSON payload containing `module_path`, emits a security audit warning,
-/// offloads compilation and atomic module swapping to [`tokio::task::spawn_blocking`],
+/// offloads compilation and atomic module swapping across all configured engines to [`tokio::task::spawn_blocking`],
 /// and returns an acceptance response.
 ///
 /// # Errors
 ///
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
-/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if the module compilation or SHA-256 verification fails.
+/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if no engines are configured, or if the module compilation
+/// or SHA-256 verification fails.
 pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
@@ -136,28 +174,49 @@ pub async fn wasm_reload_handler(
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
 
+    if state.engines.is_empty() {
+        tracing::warn!("Hot-reload REST: no engines configured in state");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
     let bytes = tokio::fs::read(&payload.module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to read module: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let engine = Arc::clone(&state.engine);
+    let engines = state.engines.clone();
     let expected_sha = payload.expected_sha.or(state.configured_sha);
 
-    tokio::task::spawn_blocking(move || engine.reload_from_bytes(&bytes, expected_sha.as_deref()))
-        .await
-        .map_err(|e| {
-            tracing::warn!("Hot-reload REST blocking task panicked: {e}");
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .map_err(|e| {
-            tracing::warn!("Hot-reload REST: reload failed: {e}");
-            axum::http::StatusCode::BAD_REQUEST
-        })?;
+    let generation = tokio::task::spawn_blocking(move || -> Result<u64, WasmTransformError> {
+        if let Some(ref expected) = expected_sha {
+            let actual = compute_sha256(&bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(WasmTransformError::Sha256Mismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
+        let mut last_gen = 0;
+        for engine in &engines {
+            last_gen = engine.reload_from_bytes(&bytes, None)?;
+        }
+        Ok(last_gen)
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!("Hot-reload REST blocking task panicked: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .map_err(|e| {
+        tracing::warn!("Hot-reload REST: reload failed: {e}");
+        axum::http::StatusCode::BAD_REQUEST
+    })?;
 
     Ok(axum::Json(serde_json::json!({
         "status": "reload successful",
         "path": payload.module_path,
+        "generation": generation,
     })))
 }
 
@@ -172,7 +231,16 @@ pub fn build_admin_router_with_sha(
     engine: Arc<EngineCache>,
     configured_sha: Option<String>,
 ) -> axum::Router {
-    let state = WasmReloadState::new(engine, configured_sha);
+    build_admin_router_multi(vec![engine], configured_sha)
+}
+
+/// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`
+/// across multiple [`EngineCache`] instances with an optional configured fallback SHA-256 digest.
+pub fn build_admin_router_multi(
+    engines: Vec<Arc<EngineCache>>,
+    configured_sha: Option<String>,
+) -> axum::Router {
+    let state = WasmReloadState::new_multi(engines, configured_sha);
     axum::Router::new()
         .route(
             "/api/v1/transforms/wasm/reload",

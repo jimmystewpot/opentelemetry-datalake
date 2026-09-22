@@ -129,6 +129,32 @@ pub fn verify_structural_immutability(
     Ok(())
 }
 
+/// Verifies that the output [`RecordBatch`] schema fields strictly match the input schema fields.
+///
+/// In strict schema guard mode (`SchemaGuardMode::Strict`), any mutation to the schema fields
+/// (including adding new columns, dropping non-immutable columns, reordering columns, or altering
+/// column data types and nullability) is strictly forbidden.
+///
+/// # Errors
+///
+/// Returns [`WasmTransformError::Pipeline`] if `output.schema().fields()` does not equal
+/// `input.schema().fields()`.
+pub fn verify_strict_schema_equality(
+    input: &RecordBatch,
+    output: &RecordBatch,
+) -> Result<(), WasmTransformError> {
+    if input.schema() != output.schema() {
+        return Err(WasmTransformError::Pipeline(format!(
+            "Strict schema guard violation: output schema does not match input schema. Expected fields {:?} and metadata {:?}, got fields {:?} and metadata {:?}",
+            input.schema().fields(),
+            input.schema().metadata(),
+            output.schema().fields(),
+            output.schema().metadata()
+        )));
+    }
+    Ok(())
+}
+
 /// Backfills any missing columns from `input_schema` into `output` using typed null arrays,
 /// preserving input column ordering and merging schema metadata.
 ///

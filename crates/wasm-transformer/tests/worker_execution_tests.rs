@@ -7,6 +7,7 @@ use pipeline_core::config::WasmTransformerConfig;
 use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use wasm_transformer::engine::EngineCache;
+use wasm_transformer::error::WasmTransformError;
 use wasm_transformer::worker::{WasmWorker, WorkerOutcome};
 
 fn test_registry() -> Arc<wasm_transformer::host_calls::MetricRegistry> {
@@ -156,10 +157,7 @@ async fn test_worker_executes_batch_through_real_wasmtime_instance() {
     let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let outcome = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     match outcome {
         WorkerOutcome::Emitted(batches) => {
             assert_eq!(batches.len(), 1);
@@ -183,10 +181,7 @@ async fn test_worker_handles_discarded_status_1() {
     let mut worker = WasmWorker::new(1, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let outcome = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     assert!(matches!(outcome, WorkerOutcome::Discarded));
 }
 
@@ -201,10 +196,7 @@ async fn test_worker_handles_rejected_status_2_with_custom_message() {
     let mut worker = WasmWorker::new(2, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let outcome = worker
-        .execute_batch(SignalBatch::Metrics(batch))
-        .await
-        .unwrap();
+    let outcome = worker.execute_batch(SignalBatch::Metrics(batch)).unwrap();
     match outcome {
         WorkerOutcome::Rejected { reason, original } => {
             assert_eq!(reason, "Rate limit exceeded");
@@ -228,10 +220,7 @@ async fn test_worker_handles_errored_status_3_with_custom_message() {
     let mut worker = WasmWorker::new(3, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let outcome = worker
-        .execute_batch(SignalBatch::Traces(batch))
-        .await
-        .unwrap();
+    let outcome = worker.execute_batch(SignalBatch::Traces(batch)).unwrap();
     match outcome {
         WorkerOutcome::Errored { reason, original } => {
             assert_eq!(reason, "Fatal transform panic");
@@ -255,10 +244,7 @@ async fn test_worker_handles_errored_status_without_message_fallback() {
     let mut worker = WasmWorker::new(4, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let outcome = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     match outcome {
         WorkerOutcome::Errored { reason, original } => {
             assert_eq!(reason, "Guest returned error status 4");
@@ -289,15 +275,11 @@ async fn test_worker_soft_rejuvenation_resets_batch_counter() {
     // Batch 1: processed count becomes 1 (< 2, no rejuvenation)
     let _ = worker
         .execute_batch(SignalBatch::Logs(batch.clone()))
-        .await
         .unwrap();
     assert_eq!(worker.batches_processed(), 1);
 
     // Batch 2: processed count reaches 2, triggering soft rejuvenation (reset to 0)
-    let _ = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let _ = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     assert_eq!(worker.batches_processed(), 0);
 }
 
@@ -316,7 +298,6 @@ async fn test_worker_hot_reload_on_generation_advance() {
     // Batch 1 uses V1 (passthrough)
     let outcome1 = worker
         .execute_batch(SignalBatch::Logs(batch.clone()))
-        .await
         .unwrap();
     assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
     assert_eq!(worker.local_generation(), 0);
@@ -329,10 +310,7 @@ async fn test_worker_hot_reload_on_generation_advance() {
     assert_eq!(new_gen, 1);
 
     // Batch 2 should detect generation mismatch, reload module V2, and discard the batch
-    let outcome2 = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let outcome2 = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     assert!(matches!(outcome2, WorkerOutcome::Discarded));
     assert_eq!(worker.local_generation(), 1);
 }
@@ -419,7 +397,6 @@ async fn test_worker_extracts_batch_count_greater_than_zero_with_rejuvenation() 
 
     let outcome = worker
         .execute_batch(SignalBatch::Logs(batch.clone()))
-        .await
         .unwrap();
 
     match outcome {
@@ -440,10 +417,7 @@ async fn test_worker_extracts_batch_count_greater_than_zero_with_rejuvenation() 
     assert_eq!(worker.batches_processed(), 0);
 
     // The rejuvenated instance can immediately process another batch cleanly
-    let outcome2 = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap();
+    let outcome2 = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     assert!(matches!(outcome2, WorkerOutcome::Emitted(_)));
     assert_eq!(worker.batches_processed(), 0);
 }
@@ -459,10 +433,7 @@ async fn test_worker_guards_out_of_bounds_batch_descriptors() {
     let mut worker = WasmWorker::new(8, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let (_batch, err) = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap_err();
+    let (_batch, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
     assert!(
         err.to_string()
             .contains("Batch descriptors array bounds exceed guest memory size"),
@@ -481,10 +452,7 @@ async fn test_worker_guards_out_of_bounds_batch_buffer() {
     let mut worker = WasmWorker::new(9, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let (_batch, err) = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap_err();
+    let (_batch, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
     assert!(
         err.to_string()
             .contains("Batch IPC buffer bounds exceed guest memory size"),
@@ -554,10 +522,7 @@ async fn test_worker_guards_excessive_batch_count() {
     let mut worker = WasmWorker::new(12, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = create_test_record_batch();
 
-    let (_batch, err) = worker
-        .execute_batch(SignalBatch::Logs(batch))
-        .await
-        .unwrap_err();
+    let (_batch, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
     assert!(
         err.to_string()
             .contains("Guest batch count 1025 exceeds maximum allowed limit of 1024"),
@@ -598,7 +563,7 @@ async fn test_worker_host_calls_metric_and_log_emit() {
     let mut worker =
         WasmWorker::new(13, Arc::clone(&cache), module, cfg, Arc::clone(&registry)).unwrap();
     let batch = SignalBatch::Logs(create_test_record_batch());
-    let outcome = worker.execute_batch(batch).await.unwrap();
+    let outcome = worker.execute_batch(batch).unwrap();
     assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
 
     assert_eq!(registry.read_counter("records_processed"), 42);
@@ -628,7 +593,7 @@ async fn test_worker_trap_returns_original_batch() {
     let mut worker = WasmWorker::new(14, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let batch = SignalBatch::Logs(create_test_record_batch());
 
-    let (returned_batch, err) = worker.execute_batch(batch).await.unwrap_err();
+    let (returned_batch, err) = worker.execute_batch(batch).unwrap_err();
     assert!(
         matches!(
             err,
@@ -702,7 +667,7 @@ async fn test_worker_schema_guard_strict_mode_rejects_dropped_immutable_column()
     let mut worker = WasmWorker::new(15, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let input_batch = SignalBatch::Logs(create_test_record_batch());
 
-    let (returned_batch, err) = worker.execute_batch(input_batch).await.unwrap_err();
+    let (returned_batch, err) = worker.execute_batch(input_batch).unwrap_err();
     assert!(
         err.to_string()
             .contains("Immutability violation: core field 'trace_id' was dropped by guest"),
@@ -761,7 +726,7 @@ async fn test_worker_schema_guard_defensive_mode_backfills_dropped_column() {
     let mut worker = WasmWorker::new(16, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
     let input_batch = SignalBatch::Logs(create_test_record_batch());
 
-    let outcome = worker.execute_batch(input_batch).await.unwrap();
+    let outcome = worker.execute_batch(input_batch).unwrap();
     match outcome {
         WorkerOutcome::Emitted(batches) => {
             assert_eq!(batches.len(), 1);
@@ -777,5 +742,194 @@ async fn test_worker_schema_guard_defensive_mode_backfills_dropped_column() {
             }
         }
         _ => panic!("Expected WorkerOutcome::Emitted"),
+    }
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenation_with_single_concurrency_reserved_headroom() {
+    let concurrency: usize = 1;
+    let pool_capacity = concurrency.saturating_add(1);
+    let cache = Arc::new(EngineCache::new_pooling(pool_capacity, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.concurrency = concurrency;
+    let mut worker = WasmWorker::new(17, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    let _ = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .unwrap();
+    assert_eq!(worker.batches_processed(), 1);
+
+    // Rejuvenation succeeds because pool_capacity has saturating_add(1) headroom.
+    assert!(worker.rejuvenate().is_ok());
+    assert_eq!(worker.batches_processed(), 0);
+
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.batches_processed(), 1);
+}
+
+#[tokio::test]
+async fn test_worker_strict_mode_rejects_dropped_column() {
+    let dropped_body_batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec!["trace_1"]))],
+    )
+    .unwrap();
+    let ipc_bytes = serialize_test_batch(&dropped_body_batch);
+
+    let wat = format!(
+        r#"(module
+            (memory (export "memory") 1)
+            (data (i32.const 2000) "{escaped}")
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "datalake_transform") (param i32 i32) (result i32)
+                (i32.store (i32.const 0) (i32.const 0))
+                (i32.store (i32.const 4) (i32.const 1))
+                (i32.store (i32.const 8) (i32.const 24))
+                (i32.store (i32.const 12) (i32.const 0))
+                (i32.store (i32.const 16) (i32.const 0))
+                (i32.store (i32.const 24) (i32.const 2000))
+                (i32.store (i32.const 28) (i32.const {ipc_len}))
+                (i32.const 0)
+            )
+        )"#,
+        escaped = escape_wat_bytes(&ipc_bytes),
+        ipc_len = ipc_bytes.len(),
+    );
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(&wat).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.schema_guard = pipeline_core::config::SchemaGuardMode::Strict;
+
+    let mut worker = WasmWorker::new(18, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let input_batch = SignalBatch::Logs(create_test_record_batch());
+
+    let res = worker.execute_batch(input_batch);
+    match res {
+        Err((original, err)) => {
+            assert!(err.to_string().contains("Strict schema guard violation"));
+            match original {
+                SignalBatch::Logs(rb) => assert_eq!(rb.num_rows(), 1),
+                _ => panic!("Expected Logs signal in original batch"),
+            }
+        }
+        Ok(_) => panic!("Expected strict schema guard to reject altered output"),
+    }
+}
+
+#[tokio::test]
+async fn test_worker_datalake_init_success_with_config_payload() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            (if (i32.gt_u (local.get $len) (i32.const 0))
+                (then (return (i32.const 0)))
+            )
+            (i32.const 1)
+        )
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.env.insert("signal".to_string(), "traces".to_string());
+    cfg.config = Some(serde_json::json!({ "sample_rate": 0.5 }));
+
+    let worker = WasmWorker::new(19, Arc::clone(&cache), module, cfg, test_registry());
+    assert!(
+        worker.is_ok(),
+        "Worker instantiation with valid datalake_init must succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_datalake_init_failure_fails_instantiation() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 42))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let worker = WasmWorker::new(20, Arc::clone(&cache), module, cfg, test_registry());
+    match worker {
+        Err(WasmTransformError::InitFailed(msg)) => {
+            assert!(
+                msg.contains("42"),
+                "Expected error message to contain status code 42, got: {msg}"
+            );
+        }
+        Err(e) => panic!("Expected InitFailed error, got: {e:?}"),
+        Ok(_) => {
+            panic!("Expected worker instantiation to fail when datalake_init returns non-zero")
+        }
+    }
+}
+#[tokio::test]
+async fn test_worker_execution_deadline_interrupts_infinite_loop() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (loop $infinite (br $infinite))
+            (i32.const 0)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.max_execution_duration = "50ms".into();
+
+    let mut worker = WasmWorker::new(21, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let input_batch = SignalBatch::Logs(create_test_record_batch());
+
+    let start = std::time::Instant::now();
+    let res = worker.execute_batch(input_batch);
+    let elapsed = start.elapsed();
+
+    // Must return ExecutionTimeout within a reasonable bound (< 2s) rather than hanging
+    assert!(elapsed < std::time::Duration::from_secs(2));
+    match res {
+        Err((original, WasmTransformError::ExecutionTimeout(ms))) => {
+            assert_eq!(ms, 50);
+            match original {
+                SignalBatch::Logs(rb) => assert_eq!(rb.num_rows(), 1),
+                _ => panic!("Expected Logs signal in original batch"),
+            }
+        }
+        Err((_, e)) => panic!("Expected ExecutionTimeout error, got: {e:?}"),
+        Ok(_) => panic!("Expected infinite loop to be interrupted with timeout"),
     }
 }

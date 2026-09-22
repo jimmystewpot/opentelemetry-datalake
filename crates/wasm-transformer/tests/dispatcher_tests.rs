@@ -797,3 +797,93 @@ async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
         "Output channel must receive nothing on trap reroute"
     );
 }
+
+#[tokio::test]
+async fn test_dlq_error_channel_closed_terminates_worker() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let wasm_bytes = wat::parse_str(trap_wat()).unwrap();
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Drop, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    // Drop err_rx immediately so DLQ sends fail
+    drop(err_rx);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx),
+        None,
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    // Send batch that triggers error
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    // Give worker time to encounter closed DLQ and terminate
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send another batch; worker is dead so dispatch loop should exit or backpressure
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[tokio::test]
+async fn test_dlq_reject_channel_closed_terminates_worker() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (rej_tx, rej_rx) = mpsc::channel::<SignalBatch>(8);
+
+    // Drop rej_rx immediately so DLQ sends fail
+    drop(rej_rx);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(rej_tx),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    // Send batch that triggers reject
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    // Give worker time to encounter closed DLQ and terminate
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send another batch
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
