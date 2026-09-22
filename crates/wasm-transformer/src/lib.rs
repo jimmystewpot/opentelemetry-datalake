@@ -40,6 +40,7 @@ pub struct WasmTransformer {
     module: Arc<Module>,
     reroute_error: Option<PipelineSender>,
     reroute_reject: Option<PipelineSender>,
+    registry: Arc<crate::host_calls::MetricRegistry>,
 }
 
 impl WasmTransformer {
@@ -119,12 +120,15 @@ impl WasmTransformer {
             .compile_module(&wasm_bytes)
             .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
+        let registry = Arc::new(crate::host_calls::MetricRegistry::new(&config.id));
+
         Ok(Self {
             config,
             engine,
             module,
             reroute_error,
             reroute_reject,
+            registry,
         })
     }
 
@@ -144,6 +148,12 @@ impl WasmTransformer {
     #[must_use]
     pub fn module(&self) -> &Arc<Module> {
         &self.module
+    }
+
+    /// Returns a reference to the shared [`crate::host_calls::MetricRegistry`].
+    #[must_use]
+    pub fn metric_registry(&self) -> &Arc<crate::host_calls::MetricRegistry> {
+        &self.registry
     }
 }
 
@@ -165,6 +175,7 @@ impl Transform for WasmTransformer {
             output,
             self.reroute_error.clone(),
             self.reroute_reject.clone(),
+            Arc::clone(&self.registry),
         );
 
         dispatcher

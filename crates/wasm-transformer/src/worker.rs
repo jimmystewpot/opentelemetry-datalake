@@ -6,6 +6,7 @@
 
 use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
+use crate::host_calls::{HostPhase, HostState, MetricRegistry};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -39,7 +40,7 @@ pub enum WorkerOutcome {
 
 /// Internal container for guest Wasmtime execution state and exported entry points.
 struct GuestComponents {
-    store: Store<()>,
+    store: Store<HostState>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
@@ -67,7 +68,8 @@ pub struct WasmWorker {
     engine: Arc<EngineCache>,
     module: Arc<Module>,
     config: WasmTransformerConfig,
-    store: Store<()>,
+    registry: Arc<MetricRegistry>,
+    store: Store<HostState>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
@@ -105,6 +107,7 @@ impl WasmWorker {
         engine: Arc<EngineCache>,
         module: Arc<Module>,
         config: WasmTransformerConfig,
+        registry: Arc<MetricRegistry>,
     ) -> Result<Self, WasmTransformError> {
         let trimmed_threshold = config.rejuvenate_threshold.trim();
         let rejuvenate_threshold_bytes = if trimmed_threshold.is_empty() {
@@ -118,7 +121,7 @@ impl WasmWorker {
             })?
         };
 
-        let guest = Self::instantiate_guest(engine.engine(), &module)?;
+        let guest = Self::instantiate_guest(engine.engine(), &module, &registry)?;
         let local_generation = engine.module_generation();
 
         Ok(Self {
@@ -126,6 +129,7 @@ impl WasmWorker {
             engine,
             module,
             config,
+            registry,
             store: guest.store,
             instance: guest.instance,
             alloc_fn: guest.alloc_fn,
@@ -144,40 +148,67 @@ impl WasmWorker {
     /// memory, and processed by calling `datalake_transform`. The returned response header
     /// is decoded to produce the corresponding [`WorkerOutcome`].
     ///
+    /// Executes a transformation over a [`SignalBatch`].
+    ///
+    /// The incoming batch is serialized into an Arrow IPC stream, transferred into guest
+    /// memory, and processed by calling `datalake_transform`. The returned response header
+    /// is decoded to produce the corresponding [`WorkerOutcome`].
+    ///
     /// # Errors
     ///
-    /// Returns [`WasmTransformError`] if IPC serialization fails, guest execution traps,
-    /// or guest memory bounds are violated.
+    /// Returns `Err((batch, err))` with the preserved input batch if IPC serialization fails,
+    /// guest execution traps, or guest memory bounds are violated.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn execute_batch(
         &mut self,
         batch: SignalBatch,
-    ) -> Result<WorkerOutcome, WasmTransformError> {
-        self.check_hot_reload()?;
+    ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
+        if let Err(e) = self.check_hot_reload() {
+            return Err((batch, e));
+        }
 
         let record_batch = match &batch {
             SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
         };
 
         // 1. Serialize input RecordBatch to Arrow IPC Stream
-        let ipc_buf = serialize_batch_to_ipc(record_batch)?;
-        let ipc_len = u32::try_from(ipc_buf.len()).map_err(|_| {
-            WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string())
-        })?;
+        let ipc_buf = match serialize_batch_to_ipc(record_batch) {
+            Ok(buf) => buf,
+            Err(e) => return Err((batch, e)),
+        };
+        let Ok(ipc_len) = u32::try_from(ipc_buf.len()) else {
+            return Err((
+                batch,
+                WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string()),
+            ));
+        };
 
         // 2. Allocate buffer in guest linear memory and copy payload
-        let ipc_ptr = self.alloc_fn.call(&mut self.store, ipc_len)?;
-        self.memory
+        let ipc_ptr = match self.alloc_fn.call(&mut self.store, ipc_len) {
+            Ok(ptr) => ptr,
+            Err(e) => return Err((batch, e.into())),
+        };
+        if let Err(e) = self
+            .memory
             .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
-            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+        {
+            let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+            return Err((batch, WasmTransformError::Pipeline(e.to_string())));
+        }
 
         // 3. Invoke datalake_transform and free input buffer
         let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
         let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
-        let header_ptr = transform_res?;
+        let header_ptr = match transform_res {
+            Ok(ptr) => ptr,
+            Err(e) => return Err((batch, e.into())),
+        };
 
         // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
-        let header = self.read_response_header(header_ptr)?;
+        let header = match self.read_response_header(header_ptr) {
+            Ok(h) => h,
+            Err(e) => return Err((batch, e)),
+        };
         let message = read_guest_message(
             &self.memory,
             &self.store,
@@ -188,7 +219,9 @@ impl WasmWorker {
         // 5. Dispatch outcome and extract transformed batches while guest memory is intact
         let outcome = self.dispatch_outcome(&header, &message, batch)?;
         self.batches_processed = self.batches_processed.saturating_add(1);
-        self.check_rejuvenation()?;
+        if let Err(e) = self.check_rejuvenation() {
+            tracing::warn!(worker_id = self.id, "Post-batch rejuvenation failed: {e}");
+        }
         Ok(outcome)
     }
 
@@ -198,7 +231,7 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let guest = Self::instantiate_guest(self.engine.engine(), &self.module)?;
+        let guest = Self::instantiate_guest(self.engine.engine(), &self.module, &self.registry)?;
         self.store = guest.store;
         self.instance = guest.instance;
         self.alloc_fn = guest.alloc_fn;
@@ -243,6 +276,12 @@ impl WasmWorker {
     #[must_use]
     pub fn config(&self) -> &WasmTransformerConfig {
         &self.config
+    }
+
+    /// Returns a reference to the shared [`MetricRegistry`].
+    #[must_use]
+    pub fn registry(&self) -> &Arc<MetricRegistry> {
+        &self.registry
     }
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.
@@ -324,19 +363,59 @@ impl WasmWorker {
         header: &ParsedHeader,
         message: &str,
         batch: SignalBatch,
-    ) -> Result<WorkerOutcome, WasmTransformError> {
+    ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
         match header.status {
             0 => {
                 if header.batch_count == 0 || header.batches_ptr == 0 {
                     Ok(WorkerOutcome::Emitted(vec![batch]))
                 } else {
-                    let out_batches = extract_output_batches(
+                    let mut out_batches = match extract_output_batches(
                         &self.memory,
                         &self.store,
                         header.batches_ptr,
                         header.batch_count,
                         &batch,
-                    )?;
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => return Err((batch, e)),
+                    };
+
+                    let in_rb = match &batch {
+                        SignalBatch::Logs(rb)
+                        | SignalBatch::Metrics(rb)
+                        | SignalBatch::Traces(rb) => rb,
+                    };
+
+                    for out_batch in &mut out_batches {
+                        let out_rb = match &*out_batch {
+                            SignalBatch::Logs(rb)
+                            | SignalBatch::Metrics(rb)
+                            | SignalBatch::Traces(rb) => rb,
+                        };
+
+                        if let Err(e) = crate::guard::verify_structural_immutability(in_rb, out_rb)
+                        {
+                            return Err((batch, e));
+                        }
+
+                        if self.config.schema_guard
+                            == pipeline_core::config::SchemaGuardMode::Defensive
+                        {
+                            let backfilled = match crate::guard::backfill_missing_columns(
+                                &in_rb.schema(),
+                                out_rb.clone(),
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => return Err((batch, e)),
+                            };
+                            *out_batch = match out_batch {
+                                SignalBatch::Logs(_) => SignalBatch::Logs(backfilled),
+                                SignalBatch::Metrics(_) => SignalBatch::Metrics(backfilled),
+                                SignalBatch::Traces(_) => SignalBatch::Traces(backfilled),
+                            };
+                        }
+                    }
+
                     Ok(WorkerOutcome::Emitted(out_batches))
                 }
             }
@@ -370,9 +449,15 @@ impl WasmWorker {
     fn instantiate_guest(
         engine: &wasmtime::Engine,
         module: &Module,
+        registry: &Arc<MetricRegistry>,
     ) -> Result<GuestComponents, WasmTransformError> {
-        let mut store = Store::new(engine, ());
-        let instance = Instance::new(&mut store, module, &[])?;
+        let host_state = HostState {
+            phase: HostPhase::Execution,
+            registry: Arc::clone(registry),
+        };
+        let mut store = Store::new(engine, host_state);
+        let linker = crate::host_calls::build_host_linker(engine)?;
+        let instance = linker.instantiate(&mut store, module)?;
 
         let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
         let dealloc_fn =
@@ -413,7 +498,7 @@ const MAX_GUEST_MESSAGE_LEN: usize = 64 * 1024;
 /// Reads an optional UTF-8 message string from guest memory.
 fn read_guest_message(
     memory: &Memory,
-    store: &Store<()>,
+    store: &Store<HostState>,
     message_ptr: u32,
     message_len: u32,
 ) -> String {
@@ -439,7 +524,7 @@ const MAX_GUEST_BATCH_COUNT: u32 = 1024;
 /// Extracts transformed output batches from guest memory via a `BatchDescriptor` array.
 fn extract_output_batches(
     memory: &Memory,
-    store: &Store<()>,
+    store: &Store<HostState>,
     batches_ptr: u32,
     batch_count: u32,
     input_batch: &SignalBatch,
@@ -475,18 +560,22 @@ fn extract_output_batches(
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
 
-        if (b_ptr as usize).saturating_add(b_len as usize) > mem_size {
+        let start = b_ptr as usize;
+        let end = start.saturating_add(b_len as usize);
+
+        if end > mem_size {
             return Err(WasmTransformError::Pipeline(format!(
                 "Batch IPC buffer bounds exceed guest memory size {mem_size}"
             )));
         }
 
-        let mut out_ipc_bytes = vec![0u8; b_len as usize];
-        memory
-            .read(store, b_ptr as usize, &mut out_ipc_bytes)
-            .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
+        let slice = memory.data(store).get(start..end).ok_or_else(|| {
+            WasmTransformError::Pipeline(format!(
+                "Batch IPC slice bounds exceed guest memory size {mem_size}"
+            ))
+        })?;
 
-        let cursor = std::io::Cursor::new(out_ipc_bytes);
+        let cursor = std::io::Cursor::new(slice);
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
         for maybe_rb in reader {

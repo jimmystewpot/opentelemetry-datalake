@@ -9,6 +9,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use wasm_transformer::dispatcher::{DispatcherConfig, WasmDispatcher};
 use wasm_transformer::engine::EngineCache;
+use wasm_transformer::host_calls::MetricRegistry;
+
+fn test_registry() -> Arc<MetricRegistry> {
+    Arc::new(MetricRegistry::new("test"))
+}
 
 fn passthrough_wat() -> &'static str {
     r#"(module
@@ -138,6 +143,7 @@ async fn test_dispatcher_executes_batches_and_drains_on_close() {
         output_tx,
         None,
         None,
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -188,6 +194,7 @@ async fn test_dispatcher_error_reroute_policy_routes_to_reroute_error() {
         output_tx,
         Some(err_tx),
         None,
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -230,7 +237,8 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
         .compile_module(&wat::parse_str(error_wat()).expect("valid wat"))
         .expect("compile module");
 
-    let cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = true;
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
     let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
@@ -247,6 +255,7 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
         output_tx,
         Some(err_tx),
         None,
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -283,6 +292,67 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
 }
 
 #[tokio::test]
+async fn test_dispatcher_error_passthrough_disabled_drops_batch() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(error_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = false;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let mut out_received = 0;
+    while output_rx.recv().await.is_some() {
+        out_received += 1;
+    }
+    assert_eq!(
+        out_received, 0,
+        "errored batch must be dropped when allow_unmasked_passthrough is false"
+    );
+
+    let mut err_received = 0;
+    while err_rx.try_recv().is_ok() {
+        err_received += 1;
+    }
+    assert_eq!(
+        err_received, 0,
+        "passthrough policy must not forward to DLQ error channel"
+    );
+}
+
+#[tokio::test]
 async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
     let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
     let module = cache
@@ -306,6 +376,7 @@ async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
         output_tx,
         None,
         Some(rej_tx),
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -365,6 +436,7 @@ async fn test_dispatcher_reject_drop_policy_drops_batch() {
         output_tx,
         None,
         Some(rej_tx),
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -417,6 +489,7 @@ async fn test_dispatcher_discard_outcome_drops_batch() {
         output_tx,
         None,
         None,
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -464,6 +537,7 @@ async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
         output_tx,
         None,
         None,
+        test_registry(),
     );
 
     tokio::spawn(async move {
@@ -546,6 +620,7 @@ async fn test_dispatcher_worker_init_failure() {
         out_tx,
         Some(err_tx),
         Some(rej_tx),
+        test_registry(),
     );
 
     // The worker spawn task will fail initializing WasmWorker, causing it to return early.
@@ -595,6 +670,7 @@ async fn test_dispatcher_output_channel_closed() {
         out_tx,
         Some(err_tx),
         Some(rej_tx),
+        test_registry(),
     );
     let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
 
@@ -614,5 +690,110 @@ async fn test_dispatcher_output_channel_closed() {
     assert!(
         res.is_ok(),
         "Run should finish gracefully when input closes"
+    );
+}
+
+fn trap_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (unreachable)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_dispatcher_trap_passthrough_policy_routes_to_output() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = true;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch");
+    drop(input_tx);
+
+    let received = output_rx.recv().await;
+    assert!(
+        received.is_some(),
+        "Trap with passthrough policy must route original batch to output"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch");
+    drop(input_tx);
+
+    let received = err_rx.recv().await;
+    assert!(
+        received.is_some(),
+        "Trap with reroute policy must route original batch to DLQ"
+    );
+    assert!(
+        output_rx.try_recv().is_err(),
+        "Output channel must receive nothing on trap reroute"
     );
 }

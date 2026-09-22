@@ -6176,6 +6176,7 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "wasmtime",
  "wasmtime-wasi",
  "wat",
