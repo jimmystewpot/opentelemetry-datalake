@@ -4,7 +4,7 @@
 //! including required function and memory exports and matching ABI versions.
 
 use thiserror::Error;
-use wasmtime::{Caller, Config, Engine, ExternType, Linker, Module, Store, ValType};
+use wasmtime::{Config, Engine, ExternType, Module, Store, ValType};
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -138,21 +138,8 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
         .set_fuel(100_000)
         .map_err(ValidationError::EngineInit)?;
 
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "datalake_host_log",
-            |_caller: Caller<'_, ()>, _level: u32, _msg_ptr: u32, _msg_len: u32| {},
-        )
-        .map_err(ValidationError::EngineInit)?;
-    linker
-        .func_wrap(
-            "env",
-            "datalake_host_metric_emit",
-            |_caller: Caller<'_, ()>, _type: u32, _name_ptr: u32, _name_len: u32, _val: u64| {},
-        )
-        .map_err(ValidationError::EngineInit)?;
+    let linker =
+        crate::create_default_linker(&engine, &module).map_err(ValidationError::EngineInit)?;
 
     let instance = linker
         .instantiate(&mut store, &module)

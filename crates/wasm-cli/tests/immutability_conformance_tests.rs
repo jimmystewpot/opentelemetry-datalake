@@ -261,3 +261,39 @@ fn test_run_immutability_suite_succeeds_with_returned_batch() {
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_immutability_suite(&wasm).is_ok());
 }
+
+#[test]
+fn test_run_immutability_suite_with_unknown_imports() {
+    let wat_src = r#"(module
+        (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+        (import "custom_ext" "external_lookup" (func $ext (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\01\00\00\00\14\40\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            (i32.store (i32.const 16404) (local.get $ptr))
+            (i32.store (i32.const 16408) (local.get $len))
+            (i32.const 16384)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_immutability_suite(&wasm).is_ok());
+}
+
+#[test]
+fn test_run_benchmark_with_unknown_imports() {
+    let wat_src = r#"(module
+        (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
+}

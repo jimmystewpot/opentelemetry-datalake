@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use wasmtime::{Caller, Config, Engine, Linker, Module, Store};
+use wasmtime::{Config, Engine, Module, Store};
 
 use crate::tester::{build_canonical_test_batch, serialize_batch_to_ipc};
 use crate::validator::validate_wasm_bytes;
@@ -35,22 +35,7 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     let mut store: Store<()> = Store::new(&engine, ());
     store.set_fuel(10_000_000_000).map_err(wasm_err)?;
 
-    let mut linker: Linker<()> = Linker::new(&engine);
-    linker
-        .func_wrap(
-            "env",
-            "datalake_host_log",
-            |_caller: Caller<'_, ()>, _level: u32, _msg_ptr: u32, _msg_len: u32| {},
-        )
-        .map_err(wasm_err)?;
-    linker
-        .func_wrap(
-            "env",
-            "datalake_host_metric_emit",
-            |_caller: Caller<'_, ()>, _type: u32, _name_ptr: u32, _name_len: u32, _val: u64| {},
-        )
-        .map_err(wasm_err)?;
-
+    let linker = crate::create_default_linker(&engine, &module).map_err(wasm_err)?;
     let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_init") {
