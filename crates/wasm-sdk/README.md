@@ -126,14 +126,16 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 opentelemetry-datalake-wasm-sdk = "0.1.0"
-arrow = { version = "54", default-features = false, features = ["ipc"] }
+arrow = { version = "59", default-features = false, features = ["ipc"] }
 ```
+
+> **Tip:** The SDK re-exports the workspace Arrow crate (`pub use arrow;`). You can import Arrow types directly from `opentelemetry_datalake_wasm_sdk::arrow` (e.g. `use opentelemetry_datalake_wasm_sdk::arrow::record_batch::RecordBatch;`) to guarantee type and binary compatibility without having to add a separate `arrow` dependency.
 
 ### 2. Implement `BatchTransformer`
 Define your transformer struct, implement the `BatchTransformer` trait, and export it using `export_transformer!`:
 
 ```rust
-use arrow::record_batch::RecordBatch;
+use opentelemetry_datalake_wasm_sdk::arrow::record_batch::RecordBatch;
 use opentelemetry_datalake_wasm_sdk::export_transformer;
 use opentelemetry_datalake_wasm_sdk::metrics::counter;
 use opentelemetry_datalake_wasm_sdk::traits::{
