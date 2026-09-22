@@ -2,8 +2,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::Result;
-use arrow::array::{Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Float64Array, Int32Array, StringArray, TimestampNanosecondArray, UInt32Array};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -54,36 +54,170 @@ pub fn verify_batch_immutability(
     Ok(())
 }
 
-/// Builds a canonical test Arrow [`RecordBatch`] containing immutable OpenTelemetry fields
-/// and a mutable `custom_data` column.
+/// Builds a canonical test Arrow [`RecordBatch`] matching the production schema
+/// for the specified signal type:
+/// - `0` (Logs): Canonical logs schema matching `arrow-codec::logs`.
+/// - `1` (Metrics): Canonical metrics schema matching `arrow-codec::metrics`.
+/// - `2` (Traces): Canonical traces schema matching `arrow-codec::traces`.
+///
+/// # Errors
+///
+/// Returns an error if the record batch cannot be created.
+pub fn build_canonical_test_batch_for_signal(signal: u32) -> Result<RecordBatch> {
+    match signal {
+        1 => {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("description", DataType::Utf8, false),
+                Field::new("unit", DataType::Utf8, false),
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new("value", DataType::Float64, false),
+                Field::new("attributes", DataType::Utf8, false),
+                Field::new("service_name", DataType::Utf8, false),
+                Field::new("resource_attributes", DataType::Utf8, false),
+                Field::new("scope_name", DataType::Utf8, false),
+                Field::new("scope_version", DataType::Utf8, false),
+            ]));
+
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["http.server.request.duration"])),
+                    Arc::new(StringArray::from(vec!["Duration of HTTP server requests"])),
+                    Arc::new(StringArray::from(vec!["ms"])),
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1_700_000_000_000_000_000_i64,
+                    ])),
+                    Arc::new(Float64Array::from(vec![42.5_f64])),
+                    Arc::new(StringArray::from(vec![r#"{"http.method":"GET"}"#])),
+                    Arc::new(StringArray::from(vec!["auth-service"])),
+                    Arc::new(StringArray::from(vec![r#"{"host.name":"node-1"}"#])),
+                    Arc::new(StringArray::from(vec!["my.scope"])),
+                    Arc::new(StringArray::from(vec!["1.0.0"])),
+                ],
+            )?;
+            Ok(batch)
+        }
+        2 => {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("trace_id", DataType::Utf8, false),
+                Field::new("span_id", DataType::Utf8, false),
+                Field::new("trace_state", DataType::Utf8, false),
+                Field::new("parent_span_id", DataType::Utf8, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("kind", DataType::Int32, false),
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new(
+                    "end_time",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new("attributes", DataType::Utf8, false),
+                Field::new("service_name", DataType::Utf8, false),
+                Field::new("resource_attributes", DataType::Utf8, false),
+                Field::new("scope_name", DataType::Utf8, false),
+                Field::new("scope_version", DataType::Utf8, false),
+                Field::new("status_code", DataType::Int32, false),
+                Field::new("status_message", DataType::Utf8, false),
+            ]));
+
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(vec!["4bf92f3577b34da6a3ce929d0e0e4736"])),
+                    Arc::new(StringArray::from(vec!["00f067aa0ba902b7"])),
+                    Arc::new(StringArray::from(vec!["congo=t61rcWkgMzE"])),
+                    Arc::new(StringArray::from(vec!["0000000000000000"])),
+                    Arc::new(StringArray::from(vec!["HTTP GET /api/v1/resource"])),
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1_700_000_000_000_000_000_i64,
+                    ])),
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1_700_000_000_050_000_000_i64,
+                    ])),
+                    Arc::new(StringArray::from(vec![
+                        r#"{"http.route":"/api/v1/resource"}"#,
+                    ])),
+                    Arc::new(StringArray::from(vec!["auth-service"])),
+                    Arc::new(StringArray::from(vec![r#"{"host.name":"node-1"}"#])),
+                    Arc::new(StringArray::from(vec!["my.scope"])),
+                    Arc::new(StringArray::from(vec!["1.0.0"])),
+                    Arc::new(Int32Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec!["OK"])),
+                ],
+            )?;
+            Ok(batch)
+        }
+        _ => {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new(
+                    "timestamp",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new(
+                    "observed_timestamp",
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                ),
+                Field::new("severity_number", DataType::Int32, false),
+                Field::new("severity_text", DataType::Utf8, false),
+                Field::new("body", DataType::Utf8, false),
+                Field::new("trace_id", DataType::Utf8, false),
+                Field::new("span_id", DataType::Utf8, false),
+                Field::new("flags", DataType::UInt32, false),
+                Field::new("attributes", DataType::Utf8, false),
+                Field::new("service_name", DataType::Utf8, false),
+                Field::new("resource_attributes", DataType::Utf8, false),
+                Field::new("scope_name", DataType::Utf8, false),
+                Field::new("scope_version", DataType::Utf8, false),
+            ]));
+
+            let batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1_700_000_000_000_000_000_i64,
+                    ])),
+                    Arc::new(TimestampNanosecondArray::from(vec![
+                        1_700_000_000_100_000_000_i64,
+                    ])),
+                    Arc::new(Int32Array::from(vec![9])),
+                    Arc::new(StringArray::from(vec!["INFO"])),
+                    Arc::new(StringArray::from(vec![
+                        "HTTP request processed successfully",
+                    ])),
+                    Arc::new(StringArray::from(vec!["4bf92f3577b34da6a3ce929d0e0e4736"])),
+                    Arc::new(StringArray::from(vec!["00f067aa0ba902b7"])),
+                    Arc::new(UInt32Array::from(vec![1])),
+                    Arc::new(StringArray::from(vec![r#"{"http.status_code":200}"#])),
+                    Arc::new(StringArray::from(vec!["auth-service"])),
+                    Arc::new(StringArray::from(vec![r#"{"host.name":"node-1"}"#])),
+                    Arc::new(StringArray::from(vec!["my.scope"])),
+                    Arc::new(StringArray::from(vec!["1.0.0"])),
+                ],
+            )?;
+            Ok(batch)
+        }
+    }
+}
+
+/// Builds a canonical test Arrow [`RecordBatch`] for default logs signal.
 ///
 /// # Errors
 ///
 /// Returns an error if the record batch cannot be created.
 pub fn build_canonical_test_batch() -> Result<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("trace_id", DataType::Utf8, false),
-        Field::new("span_id", DataType::Utf8, false),
-        Field::new("timestamp", DataType::Int64, false),
-        Field::new("observed_timestamp", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("type", DataType::Utf8, false),
-        Field::new("custom_data", DataType::Utf8, true),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(StringArray::from(vec!["4bf92f3577b34da6a3ce929d0e0e4736"])),
-            Arc::new(StringArray::from(vec!["00f067aa0ba902b7"])),
-            Arc::new(Int64Array::from(vec![1_700_000_000_000_000_000_i64])),
-            Arc::new(Int64Array::from(vec![1_700_000_000_100_000_000_i64])),
-            Arc::new(StringArray::from(vec!["http_request"])),
-            Arc::new(StringArray::from(vec!["span"])),
-            Arc::new(StringArray::from(vec!["custom_value"])),
-        ],
-    )?;
-    Ok(batch)
+    build_canonical_test_batch_for_signal(0)
 }
 
 /// Serializes an Arrow [`RecordBatch`] to IPC stream bytes.
@@ -124,7 +258,7 @@ pub fn run_immutability_suite_with_options(
     let engine = Engine::new(&config).map_err(wasm_err)?;
     let module = Module::new(&engine, bytes).map_err(wasm_err)?;
     let mut store: Store<()> = Store::new(&engine, ());
-    store.set_fuel(1_000_000_000).map_err(wasm_err)?;
+    store.set_fuel(10_000_000_000).map_err(wasm_err)?;
 
     let linker = crate::create_default_linker(&engine, &module).map_err(wasm_err)?;
     let instance = linker.instantiate(&mut store, &module).map_err(wasm_err)?;
@@ -149,6 +283,11 @@ pub fn run_immutability_suite_with_options(
             let len = u32::try_from(cfg_bytes.len())?;
             if len > 0 {
                 let ptr = alloc_fn.call(&mut store, len).map_err(wasm_err)?;
+                if ptr == 0 {
+                    anyhow::bail!(
+                        "datalake_alloc returned null pointer when allocating config buffer of length {len}"
+                    );
+                }
                 let mem_len = memory.data(&store).len();
                 let start = ptr as usize;
                 let end = start
@@ -181,11 +320,16 @@ pub fn run_immutability_suite_with_options(
         }
     }
 
-    let input_batch = build_canonical_test_batch()?;
+    let input_batch = build_canonical_test_batch_for_signal(signal)?;
     let buffer = serialize_batch_to_ipc(&input_batch)?;
 
     let input_len = u32::try_from(buffer.len())?;
     let input_ptr = alloc_fn.call(&mut store, input_len).map_err(wasm_err)?;
+    if input_ptr == 0 && input_len > 0 {
+        anyhow::bail!(
+            "datalake_alloc returned null pointer when allocating input buffer of length {input_len}"
+        );
+    }
 
     let mem_len = memory.data(&store).len();
     let start = input_ptr as usize;
@@ -229,7 +373,7 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if the header pointer is null or out of memory bounds, if the header length
-/// is less than the required 20 bytes, or if the guest reported an error or rejection status.
+/// is not exactly 20 bytes as required by ABI v1, or if the guest reported an error or rejection status.
 pub fn verify_transform_status(
     memory: &wasmtime::Memory,
     store: &Store<()>,
@@ -239,9 +383,9 @@ pub fn verify_transform_status(
     if header_ptr == 0 {
         anyhow::bail!("datalake_transform returned a null response header pointer");
     }
-    if header_len < 20 {
+    if header_len != 20 {
         anyhow::bail!(
-            "datalake_transform returned invalid header length: expected at least 20 bytes, got {header_len}"
+            "datalake_transform returned invalid header length: expected exactly 20 bytes, got {header_len}"
         );
     }
 

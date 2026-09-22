@@ -32,32 +32,52 @@ pub fn parse_signal(s: &str) -> Result<u32> {
 /// Resolves an optional CLI configuration argument into an initialization payload string.
 ///
 /// - If `config_arg` is a valid file path, reads and returns the file content.
-/// - If `config_arg` is provided as an inline string, returns it directly.
+/// - If `config_arg` is provided as an inline string, uses it.
+/// - If configuration is provided, it is parsed as a JSON object, and the CLI-selected
+///   `signal` name is injected/merged into the top-level object so SDK-generated modules
+///   and signal-specific transformers always receive the correct signal.
 /// - If `config_arg` is `None` but `signal_code != 0`, synthesizes a minimal JSON config
 ///   `{"signal":"..."}` so that guest modules can detect the target signal type on initialization.
 /// - If `config_arg` is `None` and `signal_code == 0`, returns `None`.
 ///
 /// # Errors
 ///
-/// Returns an error if reading the specified configuration file fails.
+/// Returns an error if reading the specified configuration file fails, or if
+/// the provided configuration payload is not a valid JSON object.
 pub fn resolve_config_payload(
     config_arg: Option<&str>,
     signal_code: u32,
 ) -> Result<Option<String>> {
+    let signal_name = match signal_code {
+        1 => "metrics",
+        2 => "traces",
+        _ => "logs",
+    };
+
     if let Some(arg) = config_arg {
-        let p = Path::new(arg);
-        if p.exists() {
-            let content = std::fs::read_to_string(p)?;
-            Ok(Some(content))
-        } else {
-            Ok(Some(arg.to_string()))
+        let raw_content = {
+            let p = Path::new(arg);
+            if p.exists() {
+                std::fs::read_to_string(p)?
+            } else {
+                arg.to_string()
+            }
+        };
+
+        let mut val: serde_json::Value = serde_json::from_str(&raw_content)
+            .map_err(|e| anyhow::anyhow!("Configuration payload must be valid JSON: {e}"))?;
+
+        match val {
+            serde_json::Value::Object(ref mut map) => {
+                map.insert(
+                    "signal".to_string(),
+                    serde_json::Value::String(signal_name.to_string()),
+                );
+                Ok(Some(serde_json::to_string(&val)?))
+            }
+            _ => anyhow::bail!("Configuration payload must be a JSON object"),
         }
     } else if signal_code != 0 {
-        let signal_name = match signal_code {
-            1 => "metrics",
-            2 => "traces",
-            _ => "logs",
-        };
         Ok(Some(format!(r#"{{"signal":"{signal_name}"}}"#)))
     } else {
         Ok(None)
@@ -104,10 +124,28 @@ mod tests {
             resolve_config_payload(None, 2).unwrap(),
             Some(r#"{"signal":"traces"}"#.to_string())
         );
-        assert_eq!(
-            resolve_config_payload(Some(r#"{"custom":"val"}"#), 0).unwrap(),
-            Some(r#"{"custom":"val"}"#.to_string())
-        );
+
+        let custom_res = resolve_config_payload(Some(r#"{"custom":"val"}"#), 0)
+            .unwrap()
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&custom_res).unwrap();
+        assert_eq!(val["custom"], "val");
+        assert_eq!(val["signal"], "logs");
+
+        // Overrides conflicting signal with CLI-selected signal
+        let override_res = resolve_config_payload(Some(r#"{"signal":"logs","threshold":5}"#), 1)
+            .unwrap()
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&override_res).unwrap();
+        assert_eq!(val["threshold"], 5);
+        assert_eq!(val["signal"], "metrics");
+    }
+
+    #[test]
+    fn test_resolve_config_payload_invalid_json_or_non_object() {
+        assert!(resolve_config_payload(Some("not-json"), 0).is_err());
+        assert!(resolve_config_payload(Some("[1, 2, 3]"), 0).is_err());
+        assert!(resolve_config_payload(Some("\"string\""), 0).is_err());
     }
 
     #[test]
@@ -116,8 +154,12 @@ mod tests {
             std::env::temp_dir().join(format!("test_config_{}.json", std::process::id()));
         std::fs::write(&temp_file, r#"{"test_file":true}"#).unwrap();
 
-        let res = resolve_config_payload(Some(temp_file.to_str().unwrap()), 0).unwrap();
+        let res = resolve_config_payload(Some(temp_file.to_str().unwrap()), 2)
+            .unwrap()
+            .unwrap();
         let _ = std::fs::remove_file(&temp_file);
-        assert_eq!(res, Some(r#"{"test_file":true}"#.to_string()));
+        let val: serde_json::Value = serde_json::from_str(&res).unwrap();
+        assert_eq!(val["test_file"], true);
+        assert_eq!(val["signal"], "traces");
     }
 }

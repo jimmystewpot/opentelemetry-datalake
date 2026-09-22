@@ -477,3 +477,152 @@ fn test_run_benchmark_with_options() {
     let wasm = wat::parse_str(wat_src).unwrap();
     assert!(run_benchmark_with_options(&wasm, 2, Some(r#"{"signal":"traces"}"#)).is_ok());
 }
+
+#[test]
+fn test_run_immutability_suite_rejects_oversized_response_header() {
+    // 16384 << 32 | 24 = 70368744177688
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177688))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("expected exactly 20 bytes, got 24"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_null_alloc_for_config() {
+    use datalake_wasm_tool::tester::run_immutability_suite_with_options;
+
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite_with_options(&wasm, 0, Some(r#"{"test":1}"#));
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("datalake_alloc returned null pointer when allocating config buffer"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_null_alloc_for_input() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("datalake_alloc returned null pointer when allocating input buffer"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_benchmark_rejects_null_alloc() {
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_benchmark_with_disclaimer(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("datalake_alloc returned null pointer when allocating input buffer"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_canonical_batches_match_production_signal_schemas() {
+    use arrow::datatypes::TimeUnit;
+    use datalake_wasm_tool::tester::build_canonical_test_batch_for_signal;
+
+    // Signal 0: Logs
+    let logs_batch = build_canonical_test_batch_for_signal(0).unwrap();
+    let logs_schema = logs_batch.schema();
+    assert_eq!(logs_batch.num_rows(), 1);
+    assert!(logs_schema.field_with_name("body").is_ok());
+    assert!(logs_schema.field_with_name("trace_id").is_ok());
+    assert!(logs_schema.field_with_name("span_id").is_ok());
+    assert_eq!(
+        logs_schema
+            .field_with_name("timestamp")
+            .unwrap()
+            .data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+
+    // Signal 1: Metrics
+    let metrics_batch = build_canonical_test_batch_for_signal(1).unwrap();
+    let metrics_schema = metrics_batch.schema();
+    assert_eq!(metrics_batch.num_rows(), 1);
+    assert!(metrics_schema.field_with_name("name").is_ok());
+    assert!(metrics_schema.field_with_name("description").is_ok());
+    assert!(metrics_schema.field_with_name("unit").is_ok());
+    assert_eq!(
+        metrics_schema.field_with_name("value").unwrap().data_type(),
+        &DataType::Float64
+    );
+    assert_eq!(
+        metrics_schema
+            .field_with_name("timestamp")
+            .unwrap()
+            .data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+
+    // Signal 2: Traces
+    let traces_batch = build_canonical_test_batch_for_signal(2).unwrap();
+    let traces_schema = traces_batch.schema();
+    assert_eq!(traces_batch.num_rows(), 1);
+    assert!(traces_schema.field_with_name("trace_id").is_ok());
+    assert!(traces_schema.field_with_name("span_id").is_ok());
+    assert!(traces_schema.field_with_name("status_code").is_ok());
+    assert_eq!(
+        traces_schema.field_with_name("kind").unwrap().data_type(),
+        &DataType::Int32
+    );
+    assert_eq!(
+        traces_schema
+            .field_with_name("timestamp")
+            .unwrap()
+            .data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+    assert_eq!(
+        traces_schema
+            .field_with_name("end_time")
+            .unwrap()
+            .data_type(),
+        &DataType::Timestamp(TimeUnit::Nanosecond, None)
+    );
+}

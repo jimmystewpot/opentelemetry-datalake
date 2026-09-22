@@ -28,6 +28,7 @@ anyhow = { workspace = true }
 wasmtime = { workspace = true }
 arrow = { workspace = true, features = ["ipc"] }
 opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

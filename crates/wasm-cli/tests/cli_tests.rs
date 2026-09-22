@@ -278,3 +278,53 @@ fn test_cli_subcommand_test_with_signal_and_config() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn test_cli_subcommand_test_injects_signal_into_arbitrary_config() {
+    let bin = env!("CARGO_BIN_EXE_datalake-wasm");
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            ;; Verify config is non-empty and at least 20 bytes (since {"threshold":5,"signal":"metrics"} is ~36 bytes)
+            (if (i32.lt_u (local.get $len) (i32.const 20))
+                (then (return (i32.const 1)))
+            )
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+            (if (i32.ne (local.get $sig) (i32.const 1))
+                (then (unreachable))
+            )
+            (i64.const 70368744177684)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let temp_path = std::env::temp_dir().join(format!(
+        "datalake_signal_inject_test_{}.wasm",
+        std::process::id()
+    ));
+    std::fs::write(&temp_path, &wasm).unwrap();
+
+    let output = std::process::Command::new(bin)
+        .args([
+            "test",
+            temp_path.to_str().unwrap(),
+            "--signal",
+            "metrics",
+            "--config",
+            r#"{"threshold":5}"#,
+        ])
+        .output()
+        .expect("Failed to execute datalake-wasm process");
+
+    let _ = std::fs::remove_file(&temp_path);
+    assert!(
+        output.status.success(),
+        "Expected datalake-wasm test with arbitrary config to succeed, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

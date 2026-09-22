@@ -6,7 +6,7 @@ use anyhow::Result;
 use wasmtime::{Config, Engine, Module, Store};
 
 use crate::tester::{
-    build_canonical_test_batch, reclaim_transform_response, serialize_batch_to_ipc,
+    build_canonical_test_batch_for_signal, reclaim_transform_response, serialize_batch_to_ipc,
     verify_transform_status,
 };
 use crate::validator::validate_wasm_bytes;
@@ -32,7 +32,7 @@ pub fn run_benchmark_with_options(
 
     validate_wasm_bytes(bytes)?;
 
-    let batch = build_canonical_test_batch()?;
+    let batch = build_canonical_test_batch_for_signal(signal)?;
     let buffer = serialize_batch_to_ipc(&batch)?;
     let num_records = batch.num_rows();
 
@@ -66,6 +66,11 @@ pub fn run_benchmark_with_options(
             let len = u32::try_from(cfg_bytes.len())?;
             if len > 0 {
                 let ptr = alloc_fn.call(&mut store, len).map_err(wasm_err)?;
+                if ptr == 0 {
+                    anyhow::bail!(
+                        "datalake_alloc returned null pointer when allocating config buffer of length {len}"
+                    );
+                }
                 let mem_len = memory.data(&store).len();
                 let start = ptr as usize;
                 let end = start
@@ -100,6 +105,11 @@ pub fn run_benchmark_with_options(
 
     let input_len = u32::try_from(buffer.len())?;
     let input_ptr = alloc_fn.call(&mut store, input_len).map_err(wasm_err)?;
+    if input_ptr == 0 && input_len > 0 {
+        anyhow::bail!(
+            "datalake_alloc returned null pointer when allocating input buffer of length {input_len}"
+        );
+    }
 
     let mem_len = memory.data(&store).len();
     let start = input_ptr as usize;
