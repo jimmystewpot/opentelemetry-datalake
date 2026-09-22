@@ -219,18 +219,20 @@ pub extern "C" fn datalake_dealloc(ptr: u32, size: u32) {
 ///
 /// # Safety
 ///
-/// When targeting `wasm32`, `ptr` must refer to a valid, aligned linear memory buffer
-/// allocated with capacity at least `src.len()` (typically allocated via [`datalake_alloc`]).
-/// Calling this with an unallocated or out-of-bounds pointer leads to undefined behavior.
-/// On non-`wasm32` targets, memory safety is enforced via the thread-safe mock allocation map.
-pub fn write_guest_memory(ptr: u32, src: &[u8]) {
+/// The caller must ensure that:
+/// - `ptr` is a valid, non-null pointer to an allocated region in guest linear memory of at least `src.len()` bytes.
+/// - The memory region starting at `ptr` and spanning `src.len()` bytes is valid for writes and does not overlap with `src`.
+/// - When targeting `wasm32`, `ptr` must refer to memory allocated via [`datalake_alloc`] (or equivalent allocator) with capacity >= `src.len()`.
+/// - The memory at `ptr` satisfies any target alignment requirements for the written data.
+/// - On non-`wasm32` targets, memory safety is checked against the thread-safe mock allocation map.
+pub unsafe fn write_guest_memory(ptr: u32, src: &[u8]) {
     if ptr == 0 || src.is_empty() {
         return;
     }
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: `ptr` was allocated by `datalake_alloc` in wasm32 linear memory
-        // with capacity >= `src.len()`.
+        // SAFETY: Caller guarantees `ptr` was allocated with capacity >= `src.len()`
+        // in wasm32 linear memory and does not overlap with `src`.
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), ptr as *mut u8, src.len());
         }
@@ -254,11 +256,13 @@ pub fn write_guest_memory(ptr: u32, src: &[u8]) {
 ///
 /// # Safety
 ///
-/// When targeting `wasm32`, `ptr` must refer to a valid, initialized linear memory buffer
-/// of at least `len` bytes. Reading beyond allocated guest memory bounds leads to undefined behavior.
-/// On non-`wasm32` targets, memory bounds are checked against the mock allocation map.
+/// The caller must ensure that:
+/// - `ptr` is a valid, non-null pointer to an allocated, contiguous region in guest linear memory of at least `len` bytes.
+/// - The memory region starting at `ptr` and spanning `len` bytes is fully initialized and remains valid for reads throughout the call.
+/// - When targeting `wasm32`, reading from an unallocated or out-of-bounds pointer leads to undefined behavior.
+/// - On non-`wasm32` targets, memory bounds are checked against the thread-safe mock allocation map.
 #[must_use]
-pub fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
+pub unsafe fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
     if ptr == 0 {
         return None;
     }
@@ -267,8 +271,8 @@ pub fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        // SAFETY: `ptr` is a valid non-null address in wasm32 linear memory
-        // containing at least `len` initialized bytes.
+        // SAFETY: Caller guarantees `ptr` points to at least `len` initialized, valid bytes
+        // in wasm32 linear memory.
         unsafe {
             let slice = std::slice::from_raw_parts(ptr as *const u8, len);
             Some(slice.to_vec())
@@ -291,9 +295,18 @@ pub fn read_guest_memory(ptr: u32, len: usize) -> Option<Vec<u8>> {
 }
 
 /// Reads and parses a [`TransformResponseHeader`] from guest memory at `ptr`.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - `ptr` is a valid, non-null pointer pointing to an allocated and fully initialized
+///   [`TransformResponseHeader`] struct in guest linear memory (at least `std::mem::size_of::<TransformResponseHeader>()` bytes).
+/// - The memory at `ptr` satisfies the 4-byte alignment requirement of [`TransformResponseHeader`].
+/// - The memory region remains valid for reads throughout the call.
 #[must_use]
-pub fn read_response_header(ptr: u32) -> Option<TransformResponseHeader> {
-    let bytes = read_guest_memory(ptr, std::mem::size_of::<TransformResponseHeader>())?;
+pub unsafe fn read_response_header(ptr: u32) -> Option<TransformResponseHeader> {
+    // SAFETY: Caller guarantees `ptr` points to an allocated, initialized TransformResponseHeader of required size and alignment.
+    let bytes = unsafe { read_guest_memory(ptr, std::mem::size_of::<TransformResponseHeader>()) }?;
     if bytes.len() != std::mem::size_of::<TransformResponseHeader>() {
         return None;
     }
@@ -312,13 +325,23 @@ pub fn read_response_header(ptr: u32) -> Option<TransformResponseHeader> {
 }
 
 /// Reads an array of [`BatchDescriptor`] structs from guest memory at `ptr`.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - If `count > 0`, `ptr` is a valid, non-null pointer pointing to `count` contiguous, allocated,
+///   and fully initialized [`BatchDescriptor`] structs in guest linear memory
+///   (at least `count * std::mem::size_of::<BatchDescriptor>()` bytes).
+/// - The memory at `ptr` satisfies the 4-byte alignment requirement of [`BatchDescriptor`].
+/// - The memory region remains valid for reads throughout the call.
 #[must_use]
-pub fn read_batch_descriptors(ptr: u32, count: usize) -> Option<Vec<BatchDescriptor>> {
+pub unsafe fn read_batch_descriptors(ptr: u32, count: usize) -> Option<Vec<BatchDescriptor>> {
     if count == 0 {
         return Some(Vec::new());
     }
     let byte_len = count.checked_mul(std::mem::size_of::<BatchDescriptor>())?;
-    let bytes = read_guest_memory(ptr, byte_len)?;
+    // SAFETY: Caller guarantees `ptr` points to `count` initialized BatchDescriptor structs totaling `byte_len` bytes.
+    let bytes = unsafe { read_guest_memory(ptr, byte_len) }?;
     if bytes.len() != byte_len {
         return None;
     }
@@ -337,12 +360,20 @@ pub fn read_batch_descriptors(ptr: u32, count: usize) -> Option<Vec<BatchDescrip
 }
 
 /// Reads a UTF-8 string from guest memory at `ptr` with length `len`.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - If `len > 0`, `ptr` is a valid, non-null pointer pointing to at least `len` bytes of allocated,
+///   initialized guest linear memory.
+/// - The memory region remains valid for reads throughout the call.
 #[must_use]
-pub fn read_guest_string(ptr: u32, len: usize) -> Option<String> {
+pub unsafe fn read_guest_string(ptr: u32, len: usize) -> Option<String> {
     if len == 0 {
         return Some(String::new());
     }
-    let bytes = read_guest_memory(ptr, len)?;
+    // SAFETY: Caller guarantees `ptr` points to at least `len` initialized bytes of guest memory.
+    let bytes = unsafe { read_guest_memory(ptr, len) }?;
     String::from_utf8(bytes).ok()
 }
 
