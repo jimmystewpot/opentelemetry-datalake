@@ -251,7 +251,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "criterion",
- "opentelemetry-proto 0.32.0",
+ "opentelemetry-proto",
  "opentelemetry-semantic-conventions",
  "pipeline-core",
  "prost",
@@ -1437,7 +1437,7 @@ dependencies = [
  "ciborium",
  "clap",
  "criterion-plot",
- "itertools 0.13.0",
+ "itertools",
  "num-traits",
  "oorandom",
  "page_size",
@@ -1456,7 +1456,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8d80a2f4f5b554395e47b5d8305bc3d27813bacb73493eb1001e8f76dae29ea"
 dependencies = [
  "cast",
- "itertools 0.13.0",
+ "itertools",
 ]
 
 [[package]]
@@ -1834,7 +1834,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2421,7 +2421,7 @@ dependencies = [
  "form_urlencoded",
  "futures",
  "iceberg-property-macro",
- "itertools 0.13.0",
+ "itertools",
  "moka",
  "murmur3",
  "once_cell",
@@ -2471,7 +2471,7 @@ dependencies = [
  "chrono",
  "http 1.5.0",
  "iceberg",
- "itertools 0.13.0",
+ "itertools",
  "reqwest 0.12.28",
  "serde",
  "serde_derive",
@@ -2692,15 +2692,6 @@ name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -3459,7 +3450,7 @@ checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
 dependencies = [
  "http 1.5.0",
  "opentelemetry 0.33.0",
- "opentelemetry-proto 0.33.0",
+ "opentelemetry-proto",
  "opentelemetry_sdk 0.33.0",
  "prost",
  "thiserror",
@@ -3470,29 +3461,16 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
-dependencies = [
- "base64 0.22.1",
- "const-hex",
- "opentelemetry 0.32.0",
- "opentelemetry_sdk 0.32.1",
- "prost",
- "serde",
- "tonic",
- "tonic-prost",
-]
-
-[[package]]
-name = "opentelemetry-proto"
 version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
 dependencies = [
+ "base64 0.22.1",
+ "const-hex",
  "opentelemetry 0.33.0",
  "opentelemetry_sdk 0.33.0",
  "prost",
+ "serde",
  "tonic",
  "tonic-prost",
 ]
@@ -3565,7 +3543,7 @@ dependencies = [
  "async-trait",
  "axum",
  "criterion",
- "opentelemetry-proto 0.32.0",
+ "opentelemetry-proto",
  "pipeline-core",
  "prost",
  "serde",
@@ -3866,7 +3844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3951,7 +3929,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4353,7 +4331,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4411,7 +4389,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4943,7 +4921,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5704,7 +5682,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
