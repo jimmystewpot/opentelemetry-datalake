@@ -158,6 +158,81 @@ impl WasmTransformer {
     pub fn metric_registry(&self) -> &Arc<crate::host_calls::MetricRegistry> {
         &self.registry
     }
+
+    /// Validates the WASM transformer configuration, verifying module path readability,
+    /// SHA-256 integrity, memory configuration, duration strings, and WASM module compilation.
+    pub fn validate_config(config: &WasmTransformerConfig) -> Result<(), PipelineError> {
+        if config.module_path.is_empty() {
+            return Err(PipelineError::Internal(
+                "wasm_transformer.module_path cannot be empty".to_string(),
+            ));
+        }
+
+        let max_memory_bytes =
+            crate::worker::parse_byte_size(&config.max_memory).ok_or_else(|| {
+                PipelineError::Internal(format!(
+                    "Invalid wasm_transformer.max_memory '{}'",
+                    config.max_memory
+                ))
+            })?;
+
+        if crate::worker::parse_byte_size(&config.rejuvenate_threshold).is_none() {
+            return Err(PipelineError::Internal(format!(
+                "Invalid wasm_transformer.rejuvenate_threshold '{}'",
+                config.rejuvenate_threshold
+            )));
+        }
+
+        if crate::worker::parse_duration(&config.max_execution_duration).is_none() {
+            return Err(PipelineError::Internal(format!(
+                "Invalid wasm_transformer.max_execution_duration '{}'",
+                config.max_execution_duration
+            )));
+        }
+
+        if crate::worker::parse_duration(&config.drain_timeout).is_none() {
+            return Err(PipelineError::Internal(format!(
+                "Invalid wasm_transformer.drain_timeout '{}'",
+                config.drain_timeout
+            )));
+        }
+
+        if crate::worker::parse_duration(&config.init_timeout).is_none() {
+            return Err(PipelineError::Internal(format!(
+                "Invalid wasm_transformer.init_timeout '{}'",
+                config.init_timeout
+            )));
+        }
+
+        let wasm_bytes = std::fs::read(&config.module_path).map_err(|e| {
+            PipelineError::Internal(format!(
+                "Failed to read WASM module '{}': {e}",
+                config.module_path
+            ))
+        })?;
+
+        if let Some(ref expected_hash) = config.sha256 {
+            let mut hasher = Sha256::new();
+            hasher.update(&wasm_bytes);
+            let calculated = hex::encode(hasher.finalize());
+            if !calculated.eq_ignore_ascii_case(expected_hash) {
+                return Err(PipelineError::Internal(format!(
+                    "SHA256 mismatch for WASM module '{}': expected {expected_hash}, got {calculated}",
+                    config.module_path
+                )));
+            }
+        }
+
+        let pool_capacity = config.concurrency.saturating_add(1);
+        let engine = EngineCache::new_pooling(pool_capacity, max_memory_bytes)
+            .map_err(|e| PipelineError::Internal(e.to_string()))?;
+
+        engine
+            .compile_module(&wasm_bytes)
+            .map_err(|e| PipelineError::Internal(e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]

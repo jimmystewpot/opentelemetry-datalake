@@ -82,7 +82,27 @@ impl WasmDispatcher {
     pub async fn run(self, mut input: PipelineReceiver) -> Result<(), WasmTransformError> {
         let concurrency = self.config.concurrency.max(1);
         let cap = self.config.worker_channel_capacity.max(1);
-        let (worker_txs, worker_handles) = self.spawn_workers(concurrency, cap);
+        let (worker_txs, worker_handles, init_rxs) = self.spawn_workers(concurrency, cap);
+
+        let mut successful_workers = 0;
+        let mut last_err = String::new();
+        for rx in init_rxs {
+            if let Ok(res) = rx.await {
+                match res {
+                    Ok(()) => successful_workers += 1,
+                    Err(e) => last_err = e,
+                }
+            }
+        }
+
+        if successful_workers == 0 {
+            for handle in &worker_handles {
+                handle.abort();
+            }
+            return Err(WasmTransformError::Pipeline(format!(
+                "All workers failed to initialize. Last error: {last_err}"
+            )));
+        }
 
         let mut next_worker = 0usize;
         while let Some(batch) = input.recv().await {
@@ -99,18 +119,27 @@ impl WasmDispatcher {
         Ok(())
     }
 
-    /// Spawns worker tasks and returns their channel senders and task join handles.
+    /// Spawns worker tasks and returns their channel senders, task join handles, and initialization result receivers.
+    #[allow(clippy::type_complexity)]
     fn spawn_workers(
         &self,
         concurrency: usize,
         cap: usize,
-    ) -> (Vec<mpsc::Sender<SignalBatch>>, Vec<JoinHandle<()>>) {
+    ) -> (
+        Vec<mpsc::Sender<SignalBatch>>,
+        Vec<JoinHandle<()>>,
+        Vec<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    ) {
         let mut worker_txs = Vec::with_capacity(concurrency);
         let mut worker_handles = Vec::with_capacity(concurrency);
+        let mut init_rxs = Vec::with_capacity(concurrency);
 
         for worker_id in 0..concurrency {
             let (wtx, mut wrx) = mpsc::channel::<SignalBatch>(cap);
             worker_txs.push(wtx);
+
+            let (init_tx, init_rx) = tokio::sync::oneshot::channel();
+            init_rxs.push(init_rx);
 
             let engine = Arc::clone(&self.engine);
             let module = Arc::clone(&self.module);
@@ -123,9 +152,13 @@ impl WasmDispatcher {
             worker_handles.push(tokio::spawn(async move {
                 let mut worker =
                     match WasmWorker::new(worker_id, engine, module, tf_cfg.clone(), registry) {
-                        Ok(w) => w,
+                        Ok(w) => {
+                            let _ = init_tx.send(Ok(()));
+                            w
+                        }
                         Err(e) => {
                             warn!(worker_id, "Worker initialization failed: {e}");
+                            let _ = init_tx.send(Err(e.to_string()));
                             return;
                         }
                     };
@@ -192,7 +225,7 @@ impl WasmDispatcher {
             }));
         }
 
-        (worker_txs, worker_handles)
+        (worker_txs, worker_handles, init_rxs)
     }
 
     /// Handles an individual execution outcome from a worker.

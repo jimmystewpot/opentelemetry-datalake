@@ -78,6 +78,11 @@ struct Cli {
 
 /// Validates that required sink configuration constraints are satisfied.
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
+    if let Some(ref wasm_cfg) = config.wasm_transformer {
+        wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    }
+
     if let Some(ref iceberg_cfg) = config.iceberg {
         let logs_table = iceberg_cfg
             .logs_table_identifier
@@ -121,6 +126,8 @@ type SignalTransformers = (
     Vec<Option<tokio::task::JoinHandle<()>>>,
 );
 
+static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Creates a bounded DLQ channel and spawns a background logging task to drain diverted batches.
 fn setup_dlq_channel(
     transformer_id: &str,
@@ -142,7 +149,7 @@ fn setup_dlq_channel(
             .join(&role);
         if let Err(e) = tokio::fs::create_dir_all(&dlq_dir).await {
             tracing::error!(
-                "Failed to create DLQ directory {}: {}",
+                "Failed to create DLQ directory {}: {}. Terminating DLQ task to propagate backpressure.",
                 dlq_dir.display(),
                 e
             );
@@ -160,33 +167,59 @@ fn setup_dlq_channel(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}.arrow"));
+            let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
 
             let mut buf = Vec::new();
-            if let Ok(mut writer) =
-                arrow::ipc::writer::StreamWriter::try_new(&mut buf, &record_batch.schema())
-            {
-                let write_ok = writer.write(record_batch).is_ok();
-                let finish_ok = writer.finish().is_ok();
-                if write_ok && finish_ok {
-                    if let Err(e) = tokio::fs::write(&file_path, buf).await {
-                        tracing::error!(
-                            "Failed to persist DLQ batch to {}: {}",
-                            file_path.display(),
-                            e
-                        );
-                    } else {
-                        tracing::warn!(
-                            transformer_id = %transformer_id,
-                            signal = %signal,
-                            role = %role,
-                            rows = record_batch.num_rows(),
-                            path = %file_path.display(),
-                            "DLQ: Persisted diverted batch to disk"
-                        );
-                    }
+            let mut writer = match arrow::ipc::writer::StreamWriter::try_new(
+                &mut buf,
+                &record_batch.schema(),
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to initialize Arrow IPC writer for DLQ batch: {e}. Terminating DLQ task to propagate backpressure."
+                    );
+                    return;
                 }
+            };
+
+            if let Err(e) = writer.write(record_batch).and_then(|()| writer.finish()) {
+                tracing::error!(
+                    "Failed to write DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
+                );
+                return;
             }
+
+            let write_res = match tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file_path)
+                .await
+            {
+                Ok(mut file) => {
+                    use tokio::io::AsyncWriteExt;
+                    file.write_all(&buf).await
+                }
+                Err(e) => Err(e),
+            };
+
+            if let Err(e) = write_res {
+                tracing::error!(
+                    "Failed to persist DLQ batch to {}: {e}. Terminating DLQ task to propagate backpressure.",
+                    file_path.display()
+                );
+                return;
+            }
+
+            tracing::warn!(
+                transformer_id = %transformer_id,
+                signal = %signal,
+                role = %role,
+                rows = record_batch.num_rows(),
+                path = %file_path.display(),
+                "DLQ: Persisted diverted batch to disk"
+            );
         }
     });
     (tx, handle)
@@ -196,6 +229,7 @@ fn setup_dlq_channel(
 fn instantiate_signal_wasm_transformer(
     cfg: &pipeline_core::config::WasmTransformerConfig,
     signal: &str,
+    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<wasm_transformer::WasmTransformer> {
     let mut signal_cfg = cfg.clone();
     signal_cfg
@@ -205,14 +239,16 @@ fn instantiate_signal_wasm_transformer(
     let capacity = signal_cfg.worker_channel_capacity.max(16);
 
     let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
-        let (tx, _) = setup_dlq_channel(&signal_cfg.id, signal, "error", capacity);
+        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "error", capacity);
+        dlq_handles.push(h);
         Some(tx)
     } else {
         None
     };
 
     let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
-        let (tx, _) = setup_dlq_channel(&signal_cfg.id, signal, "reject", capacity);
+        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "reject", capacity);
+        dlq_handles.push(h);
         Some(tx)
     } else {
         None
@@ -226,7 +262,10 @@ fn instantiate_signal_wasm_transformer(
 /// Initializes the pipeline transformers based on the provided application configuration.
 /// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
 /// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
-fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransformers> {
+fn initialize_transformers(
+    config: &AppConfig,
+    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<SignalTransformers> {
     let mut sighup_handles = Vec::new();
     let (logs_transformer, traces_transformer, metrics_transformer): (
         Box<dyn Transform>,
@@ -238,9 +277,9 @@ fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransform
             module_path = %wasm_cfg.module_path,
             "Initializing 3x signal-isolated WasmTransformer instances"
         );
-        let logs_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "logs")?;
-        let traces_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "traces")?;
-        let metrics_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "metrics")?;
+        let logs_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "logs", dlq_handles)?;
+        let traces_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "traces", dlq_handles)?;
+        let metrics_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "metrics", dlq_handles)?;
 
         if wasm_cfg.enable_sighup {
             let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
@@ -367,9 +406,9 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     );
 
-    // Create Transformers (WASM if configured, otherwise Noop)
+    let mut dlq_handles = Vec::new();
     let (mut logs_transformer, mut traces_transformer, mut metrics_transformer, sighup_handles) =
-        initialize_transformers(&config)?;
+        initialize_transformers(&config, &mut dlq_handles)?;
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
@@ -615,6 +654,13 @@ async fn main() -> anyhow::Result<()> {
 
     for h in sighup_handles.into_iter().flatten() {
         h.abort();
+    }
+
+    // Wait for DLQ tasks to drain
+    for dlq_handle in dlq_handles {
+        if let Err(e) = dlq_handle.await {
+            tracing::error!("DLQ drain task panicked: {e}");
+        }
     }
 
     tracing::info!("Shutdown complete.");
@@ -974,8 +1020,11 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
+        let mut dlq_handles = Vec::new();
+        let (_logs, _traces, _metrics, handles) =
+            initialize_transformers(&config, &mut dlq_handles).unwrap();
         assert!(handles.is_empty());
+        assert!(dlq_handles.is_empty());
     }
 
     #[tokio::test]
@@ -1021,13 +1070,16 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
+        let mut dlq_handles = Vec::new();
+        let (_logs, _traces, _metrics, handles) =
+            initialize_transformers(&config, &mut dlq_handles).unwrap();
 
         assert_eq!(handles.len(), 1);
         assert_eq!(
             handles.into_iter().flatten().count(),
             usize::from(cfg!(unix))
         );
+        assert!(dlq_handles.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1061,7 +1113,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let res = initialize_transformers(&config);
+        let mut dlq_handles = Vec::new();
+        let res = initialize_transformers(&config, &mut dlq_handles);
         assert!(res.is_err());
     }
 
@@ -1121,13 +1174,65 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let res = initialize_transformers(&config);
+        let mut dlq_handles = Vec::new();
+        let res = initialize_transformers(&config, &mut dlq_handles);
         let _ = std::fs::remove_file(&wasm_path);
 
         assert!(
             res.is_ok(),
             "Transformers with reroute policies and DLQ wiring must initialize successfully: {:?}",
             res.err()
+        );
+        assert_eq!(
+            dlq_handles.len(),
+            6,
+            "Expected 6 DLQ handles (2 per signal)"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_with_wasm_transformer() {
+        let toml_invalid_module = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+
+        [wasm_transformer]
+        id = "test_validate"
+        type = "wasm"
+        module_path = "/nonexistent/path/module.wasm"
+        on_error = "drop"
+        on_reject = "drop"
+        concurrency = 1
+        worker_channel_capacity = 1
+        max_memory = "16MiB"
+        rejuvenate_threshold = "8MiB"
+        rejuvenate_batches = 1000
+        init_timeout = "1s"
+        allow_unmasked_passthrough = true
+        schema_guard = "defensive"
+        env_whitelist = []
+        enable_sighup = true
+        "#;
+
+        let config_invalid: AppConfig = Figment::new()
+            .merge(Toml::string(toml_invalid_module))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res_invalid = validate_config(&config_invalid);
+        assert!(
+            res_invalid.is_err(),
+            "validate_config must fail when WASM module path does not exist"
         );
     }
 }
