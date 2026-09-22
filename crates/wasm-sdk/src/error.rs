@@ -24,4 +24,8 @@ pub enum SdkError {
     /// An invalid signal type raw code was encountered.
     #[error("Invalid signal type: {0}")]
     InvalidSignalType(u32),
+
+    /// Target schema does not match the record batch schema.
+    #[error("Schema mismatch: {0}")]
+    SchemaMismatch(String),
 }
