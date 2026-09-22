@@ -70,21 +70,25 @@ fn test_encode_response_success() {
     );
     assert_ne!(header_ptr, 0, "header_ptr must be non-zero");
 
-    let header = read_response_header(header_ptr).expect("valid response header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid response header");
     assert_eq!(header.status, STATUS_SUCCESS);
     assert_eq!(header.batch_count, 1);
     assert_ne!(header.batches_ptr, 0);
     assert_eq!(header.message_ptr, 0);
     assert_eq!(header.message_len, 0);
 
-    let descriptors = read_batch_descriptors(header.batches_ptr, header.batch_count as usize)
-        .expect("descriptors");
+    // SAFETY: `header.batches_ptr` was allocated by `encode_response` with capacity for `batch_count` BatchDescriptor structs.
+    let descriptors =
+        unsafe { read_batch_descriptors(header.batches_ptr, header.batch_count as usize) }
+            .expect("descriptors");
     assert_eq!(descriptors.len(), 1);
     assert_ne!(descriptors[0].ptr, 0);
     assert!(descriptors[0].len > 0);
 
-    let ipc_data =
-        read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize).expect("ipc data");
+    // SAFETY: `descriptors[0].ptr` was allocated by `encode_response` with capacity `descriptors[0].len`.
+    let ipc_data = unsafe { read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize) }
+        .expect("ipc data");
     let decoded_batch = decode_ipc_stream(&ipc_data).expect("decoded batch");
     assert_eq!(decoded_batch, batch);
 
@@ -112,7 +116,8 @@ fn test_encode_response_discard() {
     );
     assert_ne!(header_ptr, 0);
 
-    let header = read_response_header(header_ptr).expect("valid response header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid response header");
     assert_eq!(header.status, STATUS_DISCARD);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
@@ -136,14 +141,16 @@ fn test_encode_response_reject() {
     );
     assert_ne!(header_ptr, 0);
 
-    let header = read_response_header(header_ptr).expect("valid response header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid response header");
     assert_eq!(header.status, STATUS_REJECT);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
     assert_ne!(header.message_ptr, 0);
     assert_eq!(header.message_len, reason.len() as u32);
 
-    let msg = read_guest_string(header.message_ptr, header.message_len as usize)
+    // SAFETY: `header.message_ptr` was allocated by `encode_response` with capacity `header.message_len`.
+    let msg = unsafe { read_guest_string(header.message_ptr, header.message_len as usize) }
         .expect("valid reject string");
     assert_eq!(msg, reason);
 
@@ -165,14 +172,16 @@ fn test_encode_response_error() {
     );
     assert_ne!(header_ptr, 0);
 
-    let header = read_response_header(header_ptr).expect("valid response header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `create_error_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid response header");
     assert_eq!(header.status, STATUS_ERROR);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
     assert_ne!(header.message_ptr, 0);
     assert_eq!(header.message_len, reason.len() as u32);
 
-    let msg = read_guest_string(header.message_ptr, header.message_len as usize)
+    // SAFETY: `header.message_ptr` was allocated by `create_error_response` with capacity `header.message_len`.
+    let msg = unsafe { read_guest_string(header.message_ptr, header.message_len as usize) }
         .expect("valid error string");
     assert_eq!(msg, reason);
 
@@ -197,17 +206,23 @@ fn test_encode_response_success_multiple_batches() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_SUCCESS);
     assert_eq!(header.batch_count, 2);
     assert_ne!(header.batches_ptr, 0);
 
-    let descriptors = read_batch_descriptors(header.batches_ptr, header.batch_count as usize)
-        .expect("descriptors");
+    // SAFETY: `header.batches_ptr` was allocated by `encode_response` with capacity for `batch_count` BatchDescriptor structs.
+    let descriptors =
+        unsafe { read_batch_descriptors(header.batches_ptr, header.batch_count as usize) }
+            .expect("descriptors");
     assert_eq!(descriptors.len(), 2);
 
-    let ipc_data1 = read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize).unwrap();
-    let ipc_data2 = read_guest_memory(descriptors[1].ptr, descriptors[1].len as usize).unwrap();
+    // SAFETY: Descriptor pointers were allocated by `encode_response` with corresponding byte lengths.
+    let ipc_data1 =
+        unsafe { read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize) }.unwrap();
+    let ipc_data2 =
+        unsafe { read_guest_memory(descriptors[1].ptr, descriptors[1].len as usize) }.unwrap();
 
     assert_eq!(decode_ipc_stream(&ipc_data1).unwrap(), batch1);
     assert_eq!(decode_ipc_stream(&ipc_data2).unwrap(), batch2);
@@ -227,7 +242,8 @@ fn test_encode_response_continue_empty() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_SUCCESS);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
@@ -244,14 +260,16 @@ fn test_encode_response_error_delegation() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_ERROR);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
     assert_ne!(header.message_ptr, 0);
     assert_eq!(header.message_len, reason.len() as u32);
 
-    let msg = read_guest_string(header.message_ptr, header.message_len as usize)
+    // SAFETY: `header.message_ptr` was allocated by `encode_response` with capacity `header.message_len`.
+    let msg = unsafe { read_guest_string(header.message_ptr, header.message_len as usize) }
         .expect("valid error string");
     assert_eq!(msg, reason);
 
@@ -265,7 +283,8 @@ fn test_create_error_response_empty_message() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `create_error_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_ERROR);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
@@ -281,7 +300,8 @@ fn test_encode_response_reject_empty_reason() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_REJECT);
     assert_eq!(header.batch_count, 0);
     assert_eq!(header.batches_ptr, 0);
@@ -300,7 +320,8 @@ fn test_create_error_response_allocation_failure_resets_len() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `create_error_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_ERROR);
     assert_eq!(header.message_ptr, 0);
     assert_eq!(
@@ -320,7 +341,8 @@ fn test_encode_response_reject_allocation_failure_resets_len() {
     let header_ptr = (packed >> 32) as u32;
     let header_len = (packed & 0xffff_ffff) as u32;
 
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader allocated by `encode_response`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_REJECT);
     assert_eq!(header.message_ptr, 0);
     assert_eq!(
@@ -393,7 +415,10 @@ fn test_dispatch_init_with_config() {
     let cfg_len = cfg_bytes.len() as u32;
     let cfg_ptr = datalake_alloc(cfg_len);
     assert_ne!(cfg_ptr, 0);
-    write_guest_memory(cfg_ptr, cfg_bytes);
+    // SAFETY: `cfg_ptr` was allocated via `datalake_alloc` with capacity `cfg_len`.
+    unsafe {
+        write_guest_memory(cfg_ptr, cfg_bytes);
+    }
 
     let status = dispatch_init::<TestInitTransformer>(&state, cfg_ptr, cfg_len);
     assert_eq!(status, 0);
@@ -419,7 +444,10 @@ fn test_dispatch_init_with_config() {
     // Test initialization failure returns 1
     let fail_config = r#"{"signal":"logs","fail_init":true}"#;
     let fail_ptr = datalake_alloc(fail_config.len() as u32);
-    write_guest_memory(fail_ptr, fail_config.as_bytes());
+    // SAFETY: `fail_ptr` was allocated via `datalake_alloc` with capacity `fail_config.len()`.
+    unsafe {
+        write_guest_memory(fail_ptr, fail_config.as_bytes());
+    }
     let state_fail = std::sync::Mutex::new(None);
     let status_fail =
         dispatch_init::<TestInitTransformer>(&state_fail, fail_ptr, fail_config.len() as u32);
@@ -430,7 +458,10 @@ fn test_dispatch_init_with_config() {
     // Test invalid UTF-8 returns 1
     let invalid_utf8 = [0xff, 0xfe, 0xfd];
     let invalid_ptr = datalake_alloc(invalid_utf8.len() as u32);
-    write_guest_memory(invalid_ptr, &invalid_utf8);
+    // SAFETY: `invalid_ptr` was allocated via `datalake_alloc` with capacity `invalid_utf8.len()`.
+    unsafe {
+        write_guest_memory(invalid_ptr, &invalid_utf8);
+    }
     let state_invalid = std::sync::Mutex::new(None);
     let status_invalid = dispatch_init::<TestInitTransformer>(
         &state_invalid,
@@ -465,7 +496,10 @@ fn test_dispatch_transform_execution() {
     let ipc_len = ipc_bytes.len() as u32;
     let ipc_ptr = datalake_alloc(ipc_len);
     assert_ne!(ipc_ptr, 0);
-    write_guest_memory(ipc_ptr, &ipc_bytes);
+    // SAFETY: `ipc_ptr` was allocated via `datalake_alloc` with capacity `ipc_len`.
+    unsafe {
+        write_guest_memory(ipc_ptr, &ipc_bytes);
+    }
 
     // Valid call: signal 0 = Logs
     let packed = dispatch_transform(&state, 0, ipc_ptr, ipc_len);
@@ -477,16 +511,20 @@ fn test_dispatch_transform_execution() {
     );
     assert_ne!(header_ptr, 0);
 
-    let header = read_response_header(header_ptr).expect("valid response header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader returned by `dispatch_transform`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid response header");
     assert_eq!(header.status, STATUS_SUCCESS);
     assert_eq!(header.batch_count, 1);
     assert_ne!(header.batches_ptr, 0);
 
+    // SAFETY: `header.batches_ptr` was allocated by `dispatch_transform` with capacity for `batch_count` BatchDescriptor structs.
     let descriptors =
-        read_batch_descriptors(header.batches_ptr, header.batch_count as usize).unwrap();
+        unsafe { read_batch_descriptors(header.batches_ptr, header.batch_count as usize) }.unwrap();
     assert_eq!(descriptors.len(), 1);
 
-    let out_ipc = read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize).unwrap();
+    // SAFETY: `descriptors[0].ptr` was allocated by `dispatch_transform` with capacity `descriptors[0].len`.
+    let out_ipc =
+        unsafe { read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize) }.unwrap();
     let out_batch = decode_ipc_stream(&out_ipc).unwrap();
     assert_eq!(out_batch, batch);
 
@@ -509,10 +547,13 @@ fn test_dispatch_transform_execution() {
     // Test invalid signal type (e.g. 99) returns error response
     let invalid_signal_packed = dispatch_transform(&state, 99, 0, 0);
     let err_header_ptr = (invalid_signal_packed >> 32) as u32;
-    let err_header = read_response_header(err_header_ptr).expect("error header");
+    // SAFETY: `err_header_ptr` points to the TransformResponseHeader returned by `dispatch_transform`.
+    let err_header = unsafe { read_response_header(err_header_ptr) }.expect("error header");
     assert_eq!(err_header.status, STATUS_ERROR);
+    // SAFETY: `err_header.message_ptr` was allocated by `dispatch_transform` with capacity `err_header.message_len`.
     let err_msg =
-        read_guest_string(err_header.message_ptr, err_header.message_len as usize).unwrap();
+        unsafe { read_guest_string(err_header.message_ptr, err_header.message_len as usize) }
+            .unwrap();
     assert!(err_msg.contains("Invalid signal type"));
     datalake_dealloc(err_header.message_ptr, err_header.message_len);
     datalake_dealloc(err_header_ptr, 20);
@@ -523,16 +564,23 @@ fn test_dispatch_transform_execution() {
     let ipc_bytes2 = encode_batch_to_ipc(&batch2).unwrap();
     let ipc_len2 = ipc_bytes2.len() as u32;
     let ipc_ptr2 = datalake_alloc(ipc_len2);
-    write_guest_memory(ipc_ptr2, &ipc_bytes2);
+    // SAFETY: `ipc_ptr2` was allocated via `datalake_alloc` with capacity `ipc_len2`.
+    unsafe {
+        write_guest_memory(ipc_ptr2, &ipc_bytes2);
+    }
 
     let lazy_packed = dispatch_transform::<TestTransformMock>(&lazy_state, 1, ipc_ptr2, ipc_len2);
     let lazy_header_ptr = (lazy_packed >> 32) as u32;
-    let lazy_header = read_response_header(lazy_header_ptr).expect("valid header");
+    // SAFETY: `lazy_header_ptr` points to the TransformResponseHeader returned by `dispatch_transform`.
+    let lazy_header = unsafe { read_response_header(lazy_header_ptr) }.expect("valid header");
     assert_eq!(lazy_header.status, STATUS_SUCCESS);
     assert_eq!(lazy_header.batch_count, 1);
 
-    let lazy_desc =
-        read_batch_descriptors(lazy_header.batches_ptr, lazy_header.batch_count as usize).unwrap();
+    // SAFETY: `lazy_header.batches_ptr` was allocated by `dispatch_transform` with capacity for `batch_count` BatchDescriptor structs.
+    let lazy_desc = unsafe {
+        read_batch_descriptors(lazy_header.batches_ptr, lazy_header.batch_count as usize)
+    }
+    .unwrap();
     datalake_dealloc(lazy_desc[0].ptr, lazy_desc[0].len);
     datalake_dealloc(
         lazy_header.batches_ptr,
@@ -572,7 +620,10 @@ fn test_export_transformer_macro_compilation() {
     let cfg_bytes = config.as_bytes();
     let cfg_len = cfg_bytes.len() as u32;
     let cfg_ptr = datalake_alloc(cfg_len);
-    write_guest_memory(cfg_ptr, cfg_bytes);
+    // SAFETY: `cfg_ptr` was allocated via `datalake_alloc` with capacity `cfg_len`.
+    unsafe {
+        write_guest_memory(cfg_ptr, cfg_bytes);
+    }
 
     let init_status = mock_plugin::datalake_init(cfg_ptr, cfg_len);
     assert_eq!(init_status, 0);
@@ -582,18 +633,25 @@ fn test_export_transformer_macro_compilation() {
     let ipc_bytes = encode_batch_to_ipc(&batch).unwrap();
     let ipc_len = ipc_bytes.len() as u32;
     let ipc_ptr = datalake_alloc(ipc_len);
-    write_guest_memory(ipc_ptr, &ipc_bytes);
+    // SAFETY: `ipc_ptr` was allocated via `datalake_alloc` with capacity `ipc_len`.
+    unsafe {
+        write_guest_memory(ipc_ptr, &ipc_bytes);
+    }
 
     // Traces = 2
     let packed = mock_plugin::datalake_transform(2, ipc_ptr, ipc_len);
     let header_ptr = (packed >> 32) as u32;
-    let header = read_response_header(header_ptr).expect("valid header");
+    // SAFETY: `header_ptr` points to the TransformResponseHeader returned by `datalake_transform`.
+    let header = unsafe { read_response_header(header_ptr) }.expect("valid header");
     assert_eq!(header.status, STATUS_SUCCESS);
     assert_eq!(header.batch_count, 1);
 
+    // SAFETY: `header.batches_ptr` was allocated by `datalake_transform` with capacity for `batch_count` BatchDescriptor structs.
     let descriptors =
-        read_batch_descriptors(header.batches_ptr, header.batch_count as usize).unwrap();
-    let out_ipc = read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize).unwrap();
+        unsafe { read_batch_descriptors(header.batches_ptr, header.batch_count as usize) }.unwrap();
+    // SAFETY: `descriptors[0].ptr` was allocated by `datalake_transform` with capacity `descriptors[0].len`.
+    let out_ipc =
+        unsafe { read_guest_memory(descriptors[0].ptr, descriptors[0].len as usize) }.unwrap();
     let out_batch = decode_ipc_stream(&out_ipc).unwrap();
     assert_eq!(out_batch, batch);
 

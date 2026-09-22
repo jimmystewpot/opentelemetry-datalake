@@ -84,7 +84,11 @@ pub fn encode_response(result: &TransformResult) -> u64 {
                         return create_error_response("Memory allocation failed for batch buffer");
                     }
                     if buf_ptr != 0 {
-                        write_guest_memory(buf_ptr, buf);
+                        // SAFETY: `buf_ptr` was allocated via `datalake_alloc` with capacity `buf_len` (buf.len()),
+                        // and `buf` is a valid slice of length `buf_len`.
+                        unsafe {
+                            write_guest_memory(buf_ptr, buf);
+                        }
                     }
                     descriptors.push(BatchDescriptor {
                         ptr: buf_ptr,
@@ -108,7 +112,11 @@ pub fn encode_response(result: &TransformResult) -> u64 {
                         desc_bytes.extend_from_slice(&d.ptr.to_le_bytes());
                         desc_bytes.extend_from_slice(&d.len.to_le_bytes());
                     }
-                    write_guest_memory(desc_ptr, &desc_bytes);
+                    // SAFETY: `desc_ptr` was allocated via `datalake_alloc` with capacity `desc_len_u32` (desc_byte_len),
+                    // and `desc_bytes` is a valid slice containing exactly `desc_byte_len` bytes.
+                    unsafe {
+                        write_guest_memory(desc_ptr, &desc_bytes);
+                    }
                 }
 
                 #[allow(clippy::cast_possible_truncation)]
@@ -129,7 +137,11 @@ pub fn encode_response(result: &TransformResult) -> u64 {
                     msg_len = 0;
                     0
                 } else {
-                    write_guest_memory(ptr, reason_bytes);
+                    // SAFETY: `ptr` was allocated via `datalake_alloc` with capacity `msg_len` (reason_bytes.len()),
+                    // and `reason_bytes` is a valid slice of length `msg_len`.
+                    unsafe {
+                        write_guest_memory(ptr, reason_bytes);
+                    }
                     ptr
                 }
             };
@@ -153,7 +165,11 @@ pub fn create_error_response(message: &str) -> u64 {
             msg_len = 0;
             0
         } else {
-            write_guest_memory(ptr, msg_bytes);
+            // SAFETY: `ptr` was allocated via `datalake_alloc` with capacity `msg_len` (msg_bytes.len()),
+            // and `msg_bytes` is a valid slice of length `msg_len`.
+            unsafe {
+                write_guest_memory(ptr, msg_bytes);
+            }
             ptr
         }
     };
@@ -178,7 +194,11 @@ fn write_and_pack_header(
     let header_size = std::mem::size_of::<TransformResponseHeader>() as u32;
     let header_ptr = datalake_alloc(header_size);
     if header_ptr != 0 {
-        write_guest_memory(header_ptr, &header_bytes);
+        // SAFETY: `header_ptr` was allocated via `datalake_alloc` with capacity `header_size`
+        // (std::mem::size_of::<TransformResponseHeader>() == 20), matching `header_bytes.len()`.
+        unsafe {
+            write_guest_memory(header_ptr, &header_bytes);
+        }
     }
     pack_header(header_ptr)
 }
@@ -286,7 +306,10 @@ pub fn dispatch_init<T: BatchTransformer>(
     config_len: u32,
 ) -> u32 {
     let (signal, config_json_payload) = if config_ptr != 0 && config_len > 0 {
-        let Some(bytes) = read_guest_memory(config_ptr, config_len as usize) else {
+        // SAFETY: `config_ptr` and `config_len` were supplied by the host runtime across the ABI boundary.
+        // Both `config_ptr != 0` and `config_len > 0` are verified, and the buffer is allocated and initialized by the host.
+        let bytes_opt = unsafe { read_guest_memory(config_ptr, config_len as usize) };
+        let Some(bytes) = bytes_opt else {
             crate::panic::log_error("Failed to read configuration payload from guest memory");
             return 1;
         };
@@ -368,7 +391,10 @@ pub fn dispatch_transform<T: BatchTransformer>(
         return create_error_response("Empty or null IPC stream pointer");
     }
 
-    let Some(ipc_bytes) = read_guest_memory(ipc_ptr, ipc_len as usize) else {
+    // SAFETY: `ipc_ptr` and `ipc_len` were supplied by the host runtime across the ABI boundary.
+    // Both are verified non-zero above, and the host runtime allocated and populated the buffer with `ipc_len` bytes.
+    let ipc_bytes_opt = unsafe { read_guest_memory(ipc_ptr, ipc_len as usize) };
+    let Some(ipc_bytes) = ipc_bytes_opt else {
         return create_error_response("Failed to read IPC stream payload from guest memory");
     };
 
