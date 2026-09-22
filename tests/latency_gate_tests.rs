@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasm_transformer::engine::EngineCache;
 use wasm_transformer::host_calls::MetricRegistry;
-use wasm_transformer::worker::WasmWorker;
+use wasm_transformer::worker::{WasmWorker, WorkerOutcome};
 
 const WARMUP: usize = 50;
 const SAMPLES: usize = 1_000;
@@ -23,14 +23,21 @@ const P99_LIMIT: Duration = Duration::from_micros(3_000);
 
 fn passthrough_wat() -> &'static str {
     r#"(module
-        (memory (export "memory") 16)
+        (memory (export "memory") 32)
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32)
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            ;; TransformResponseHeader: status=0, batch_count=1, batches_ptr=24, message_ptr=0, message_len=0
             (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            ;; BatchDescriptor: ptr=$ptr, len=$len
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
             (i32.const 0)
         )
     )"#
@@ -42,7 +49,10 @@ fn make_batch(rows: usize) -> RecordBatch {
         Field::new("body", DataType::Utf8, true),
     ]));
     let ids: Vec<String> = (0..rows).map(|i| format!("trace_{i:032x}")).collect();
-    let bodies: Vec<String> = (0..rows).map(|i| format!("body_{i}")).collect();
+    // 2,000 rows with ~200-byte bodies yields an uncompressed Arrow IPC stream of ~500 KB,
+    // matching Section 3.5 of the WASM transformer design specification.
+    let pad = "x".repeat(200);
+    let bodies: Vec<String> = (0..rows).map(|i| format!("body_{i}_{pad}")).collect();
     RecordBatch::try_new(
         schema,
         vec![
@@ -96,12 +106,32 @@ async fn test_real_wasm_boundary_latency_within_budget() {
         WasmWorker::new(0, cache, module, cfg, registry).expect("worker should initialize");
     let batch = make_batch(2000);
 
+    // Verify batch serializes to ~500 KB uncompressed IPC stream per spec Section 3.5
+    let mut ipc_buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc_buf, &batch.schema())
+            .expect("ipc writer should initialize");
+        writer.write(&batch).expect("batch should write to ipc");
+        writer.finish().expect("ipc writer should finish");
+    }
+    assert!(
+        (450_000..=600_000).contains(&ipc_buf.len()),
+        "Expected ~500 KB payload, got {} bytes",
+        ipc_buf.len()
+    );
+
     // Warmup
     for _ in 0..WARMUP {
-        let _ = worker
+        let outcome = worker
             .execute_batch(SignalBatch::Logs(batch.clone()))
             .await
             .expect("warmup execution should succeed");
+        match outcome {
+            WorkerOutcome::Emitted(batches) => {
+                assert_eq!(batches.len(), 1, "expected exactly 1 emitted batch");
+            }
+            _ => panic!("expected WorkerOutcome::Emitted"),
+        }
     }
 
     // Measured samples

@@ -20,14 +20,21 @@ use wasm_transformer::worker::WasmWorker;
 
 fn passthrough_wat() -> &'static str {
     r#"(module
-        (memory (export "memory") 32)
+        (memory (export "memory") 64)
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32)
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            ;; TransformResponseHeader: status=0, batch_count=1, batches_ptr=24, message_ptr=0, message_len=0
             (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            ;; BatchDescriptor: ptr=$ptr, len=$len
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
             (i32.const 0)
         )
     )"#
@@ -39,7 +46,10 @@ fn make_batch(rows: usize) -> RecordBatch {
         Field::new("body", DataType::Utf8, true),
     ]));
     let ids: Vec<String> = (0..rows).map(|i| format!("trace_{i:032x}")).collect();
-    let bodies: Vec<String> = (0..rows).map(|i| format!("body_{i}")).collect();
+    // 2,000 rows with ~200-byte bodies yields an uncompressed Arrow IPC stream of ~500 KB,
+    // matching Section 3.5 of the WASM transformer design specification.
+    let pad = "x".repeat(200);
+    let bodies: Vec<String> = (0..rows).map(|i| format!("body_{i}_{pad}")).collect();
     let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let body_refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
     RecordBatch::try_new(
