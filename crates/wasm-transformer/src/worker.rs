@@ -158,13 +158,29 @@ impl WasmWorker {
     ///
     /// Returns `Err((batch, err))` with the preserved input batch if IPC serialization fails,
     /// guest execution traps, or guest memory bounds are violated.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    pub async fn execute_batch(
+    #[allow(clippy::unused_async_trait_impl)]
+    pub fn execute_batch(
         &mut self,
         batch: SignalBatch,
     ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
         if let Err(e) = self.check_hot_reload() {
             return Err((batch, e));
+        }
+
+        let num_rows = match &batch {
+            SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => {
+                rb.num_rows()
+            }
+        };
+
+        let max_rows = self.config.max_batch_rows;
+        if max_rows > 0 && num_rows > max_rows {
+            return Err((
+                batch,
+                WasmTransformError::Pipeline(format!(
+                    "Batch size {num_rows} exceeds configured maximum {max_rows}",
+                )),
+            ));
         }
 
         let record_batch = match &batch {
@@ -524,7 +540,7 @@ impl WasmWorker {
         {
             let init_payload = serde_json::json!({
                 "signal": config.env.get("signal").map_or("unknown", |s| s.as_str()),
-                "env": config.env,
+                "env": crate::wasi_env::filter_environment_variables(&config.env_whitelist, &config.env),
                 "config": config.config,
             });
             let init_bytes = serde_json::to_vec(&init_payload)

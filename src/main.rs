@@ -136,20 +136,57 @@ fn setup_dlq_channel(
     let signal = signal.to_string();
     let role = role.to_string();
     let handle = tokio::spawn(async move {
-        while let Some(batch) = rx.recv().await {
-            let (batch_signal, rows) = match &batch {
-                pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb.num_rows()),
-                pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb.num_rows()),
-                pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb.num_rows()),
-            };
-            tracing::warn!(
-                transformer_id = %transformer_id,
-                signal = %signal,
-                batch_signal = %batch_signal,
-                role = %role,
-                rows,
-                "DLQ: Received batch diverted from WASM transformer"
+        let dlq_dir = std::path::PathBuf::from("dlq")
+            .join(&transformer_id)
+            .join(&signal)
+            .join(&role);
+        if let Err(e) = tokio::fs::create_dir_all(&dlq_dir).await {
+            tracing::error!(
+                "Failed to create DLQ directory {}: {}",
+                dlq_dir.display(),
+                e
             );
+            return;
+        }
+
+        while let Some(batch) = rx.recv().await {
+            let (batch_signal, record_batch) = match &batch {
+                pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb),
+                pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb),
+                pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb),
+            };
+
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}.arrow"));
+
+            let mut buf = Vec::new();
+            if let Ok(mut writer) =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buf, &record_batch.schema())
+            {
+                let write_ok = writer.write(record_batch).is_ok();
+                let finish_ok = writer.finish().is_ok();
+                if write_ok && finish_ok {
+                    if let Err(e) = tokio::fs::write(&file_path, buf).await {
+                        tracing::error!(
+                            "Failed to persist DLQ batch to {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    } else {
+                        tracing::warn!(
+                            transformer_id = %transformer_id,
+                            signal = %signal,
+                            role = %role,
+                            rows = record_batch.num_rows(),
+                            path = %file_path.display(),
+                            "DLQ: Persisted diverted batch to disk"
+                        );
+                    }
+                }
+            }
         }
     });
     (tx, handle)
