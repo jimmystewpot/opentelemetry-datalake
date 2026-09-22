@@ -208,20 +208,13 @@ fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransform
         if wasm_cfg.enable_sighup {
             let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
             let expected_sha = wasm_cfg.sha256.clone();
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
+            let engines = vec![
                 std::sync::Arc::clone(logs_wasm.engine()),
-                module_path.clone(),
-                expected_sha.clone(),
-                true,
-            ));
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(traces_wasm.engine()),
-                module_path.clone(),
-                expected_sha.clone(),
-                true,
-            ));
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener(
                 std::sync::Arc::clone(metrics_wasm.engine()),
+            ];
+            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener_multi(
+                engines,
                 module_path,
                 expected_sha,
                 true,
@@ -993,10 +986,10 @@ mod tests {
 
         let (_logs, _traces, _metrics, handles) = initialize_transformers(&config).unwrap();
 
-        assert_eq!(handles.len(), 3);
+        assert_eq!(handles.len(), 1);
         assert_eq!(
             handles.into_iter().flatten().count(),
-            if cfg!(unix) { 3 } else { 0 }
+            if cfg!(unix) { 1 } else { 0 }
         );
         let _ = std::fs::remove_file(&path);
     }
