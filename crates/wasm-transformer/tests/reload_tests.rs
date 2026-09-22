@@ -199,14 +199,14 @@ fn test_compute_sha256_known_vectors() {
 #[test]
 fn test_spawn_sighup_listener_disabled_returns_none() {
     let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-    let handle = spawn_sighup_listener(cache, PathBuf::from("nonexistent.wasm"), false);
+    let handle = spawn_sighup_listener(cache, PathBuf::from("nonexistent.wasm"), None, false);
     assert!(handle.is_none());
 }
 
 #[tokio::test]
 async fn test_spawn_sighup_listener_enabled() {
     let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-    let handle = spawn_sighup_listener(cache, PathBuf::from("dummy.wasm"), true);
+    let handle = spawn_sighup_listener(cache, PathBuf::from("dummy.wasm"), None, true);
 
     #[cfg(unix)]
     {

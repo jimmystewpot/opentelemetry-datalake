@@ -6,13 +6,13 @@ use std::{path::PathBuf, sync::Arc};
 use tower::ServiceExt;
 use wasm_transformer::{
     engine::EngineCache,
-    reload::{build_admin_router, spawn_sighup_listener},
+    reload::{build_admin_router, build_admin_router_with_sha, spawn_sighup_listener},
 };
 
 #[tokio::test]
 async fn test_sighup_listener_returns_none_when_disabled() {
     let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-    let handle = spawn_sighup_listener(engine, PathBuf::from("/tmp/test.wasm"), false);
+    let handle = spawn_sighup_listener(engine, PathBuf::from("/tmp/test.wasm"), None, false);
     assert!(
         handle.is_none(),
         "disabled SIGHUP listener must return None"
@@ -22,7 +22,7 @@ async fn test_sighup_listener_returns_none_when_disabled() {
 #[tokio::test]
 async fn test_sighup_listener_returns_some_when_enabled() {
     let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-    let handle = spawn_sighup_listener(engine, PathBuf::from("/tmp/test.wasm"), true);
+    let handle = spawn_sighup_listener(engine, PathBuf::from("/tmp/test.wasm"), None, true);
     #[cfg(unix)]
     {
         assert!(
@@ -222,6 +222,88 @@ async fn test_admin_router_reload_endpoint_mismatching_expected_sha() {
 
     let response = router.oneshot(req).await.unwrap();
     // Expecting 400 Bad Request because the sha verification fails
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(engine.module_generation(), 0);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_with_configured_sha_fallback_success() {
+    use wasm_transformer::reload::compute_sha256;
+
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "configured_sha_success_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let sha = compute_sha256(&wasm_bytes);
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    // Initialize router with configured SHA
+    let router = build_admin_router_with_sha(Arc::clone(&engine), Some(sha));
+    // Omit expected_sha in payload to verify fallback to configured SHA
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(engine.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_with_configured_sha_fallback_mismatch() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "configured_sha_mismatch_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    assert_eq!(engine.module_generation(), 0);
+
+    // Initialize router with mismatching configured SHA
+    let router = build_admin_router_with_sha(
+        Arc::clone(&engine),
+        Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()),
+    );
+    // Omit expected_sha in payload; configured SHA check must fail
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(engine.module_generation(), 0);
 
