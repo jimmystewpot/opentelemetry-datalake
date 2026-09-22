@@ -13,6 +13,7 @@ use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use wasm_transformer::engine::EngineCache;
+use wasm_transformer::host_calls::MetricRegistry;
 use wasm_transformer::worker::WasmWorker;
 
 const WARMUP: usize = 50;
@@ -90,7 +91,9 @@ async fn test_real_wasm_boundary_latency_within_budget() {
         enable_sighup: false,
     };
 
-    let mut worker = WasmWorker::new(0, cache, module, cfg).expect("worker should initialize");
+    let registry = Arc::new(MetricRegistry::new("latency_gate"));
+    let mut worker =
+        WasmWorker::new(0, cache, module, cfg, registry).expect("worker should initialize");
     let batch = make_batch(2000);
 
     // Warmup

@@ -15,6 +15,7 @@ use pipeline_core::config::{
 use pipeline_core::pipeline::SignalBatch;
 use std::sync::Arc;
 use wasm_transformer::engine::EngineCache;
+use wasm_transformer::host_calls::MetricRegistry;
 use wasm_transformer::worker::WasmWorker;
 
 fn passthrough_wat() -> &'static str {
@@ -85,7 +86,9 @@ fn bench_wasm_boundary(c: &mut Criterion) {
         enable_sighup: false,
     };
 
-    let mut worker = WasmWorker::new(0, cache, module, cfg).expect("worker should initialize");
+    let registry = Arc::new(MetricRegistry::new("bench"));
+    let mut worker =
+        WasmWorker::new(0, cache, module, cfg, registry).expect("worker should initialize");
 
     let mut group = c.benchmark_group("wasm_boundary_roundtrip");
     for rows in [100, 500, 2000, 10_000] {
