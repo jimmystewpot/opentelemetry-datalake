@@ -177,7 +177,7 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Reads and verifies the response status in the [`TransformResponseHeader`].
+/// Reads and verifies the response status in the [`opentelemetry_datalake_wasm_sdk::abi::TransformResponseHeader`].
 ///
 /// # Errors
 ///
