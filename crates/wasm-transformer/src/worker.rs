@@ -121,7 +121,7 @@ impl WasmWorker {
             })?
         };
 
-        let guest = Self::instantiate_guest(engine.engine(), &module, &registry)?;
+        let guest = Self::instantiate_guest(engine.engine(), &module, &registry, &config)?;
         let local_generation = engine.module_generation();
 
         Ok(Self {
@@ -183,10 +183,30 @@ impl WasmWorker {
             ));
         };
 
+        // Parse execution deadline from config
+        let timeout_dur = parse_duration(&self.config.max_execution_duration)
+            .unwrap_or_else(|| std::time::Duration::from_millis(500));
+        let timeout_ms = u64::try_from(timeout_dur.as_millis()).unwrap_or(500);
+        let ticks = u64::try_from((timeout_dur.as_millis().saturating_add(9)) / 10)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.store.set_epoch_deadline(ticks);
+
         // 2. Allocate buffer in guest linear memory and copy payload
         let ipc_ptr = match self.alloc_fn.call(&mut self.store, ipc_len) {
             Ok(ptr) => ptr,
-            Err(e) => return Err((batch, e.into())),
+            Err(e) => {
+                let err_chain = format!("{e:#}");
+                let is_timeout = err_chain.contains("interrupt")
+                    || err_chain.contains("epoch deadline")
+                    || err_chain.contains("deadline")
+                    || e.downcast_ref::<wasmtime::Trap>()
+                        .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt));
+                if is_timeout {
+                    return Err((batch, WasmTransformError::ExecutionTimeout(timeout_ms)));
+                }
+                return Err((batch, e.into()));
+            }
         };
         if let Err(e) = self
             .memory
@@ -196,12 +216,24 @@ impl WasmWorker {
             return Err((batch, WasmTransformError::Pipeline(e.to_string())));
         }
 
-        // 3. Invoke datalake_transform and free input buffer
+        // 3. Reset deadline for transform invocation, invoke datalake_transform and free input buffer
+        self.store.set_epoch_deadline(ticks);
         let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
         let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
         let header_ptr = match transform_res {
             Ok(ptr) => ptr,
-            Err(e) => return Err((batch, e.into())),
+            Err(e) => {
+                let err_chain = format!("{e:#}");
+                let is_timeout = err_chain.contains("interrupt")
+                    || err_chain.contains("epoch deadline")
+                    || err_chain.contains("deadline")
+                    || e.downcast_ref::<wasmtime::Trap>()
+                        .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt));
+                if is_timeout {
+                    return Err((batch, WasmTransformError::ExecutionTimeout(timeout_ms)));
+                }
+                return Err((batch, e.into()));
+            }
         };
 
         // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
@@ -231,7 +263,12 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let guest = Self::instantiate_guest(self.engine.engine(), &self.module, &self.registry)?;
+        let guest = Self::instantiate_guest(
+            self.engine.engine(),
+            &self.module,
+            &self.registry,
+            &self.config,
+        )?;
         self.store = guest.store;
         self.instance = guest.instance;
         self.alloc_fn = guest.alloc_fn;
@@ -398,21 +435,28 @@ impl WasmWorker {
                             return Err((batch, e));
                         }
 
-                        if self.config.schema_guard
-                            == pipeline_core::config::SchemaGuardMode::Defensive
-                        {
-                            let backfilled = match crate::guard::backfill_missing_columns(
-                                &in_rb.schema(),
-                                out_rb.clone(),
-                            ) {
-                                Ok(b) => b,
-                                Err(e) => return Err((batch, e)),
-                            };
-                            *out_batch = match out_batch {
-                                SignalBatch::Logs(_) => SignalBatch::Logs(backfilled),
-                                SignalBatch::Metrics(_) => SignalBatch::Metrics(backfilled),
-                                SignalBatch::Traces(_) => SignalBatch::Traces(backfilled),
-                            };
+                        match self.config.schema_guard {
+                            pipeline_core::config::SchemaGuardMode::Strict => {
+                                if let Err(e) =
+                                    crate::guard::verify_strict_schema_equality(in_rb, out_rb)
+                                {
+                                    return Err((batch, e));
+                                }
+                            }
+                            pipeline_core::config::SchemaGuardMode::Defensive => {
+                                let backfilled = match crate::guard::backfill_missing_columns(
+                                    &in_rb.schema(),
+                                    out_rb.clone(),
+                                ) {
+                                    Ok(b) => b,
+                                    Err(e) => return Err((batch, e)),
+                                };
+                                *out_batch = match out_batch {
+                                    SignalBatch::Logs(_) => SignalBatch::Logs(backfilled),
+                                    SignalBatch::Metrics(_) => SignalBatch::Metrics(backfilled),
+                                    SignalBatch::Traces(_) => SignalBatch::Traces(backfilled),
+                                };
+                            }
                         }
                     }
 
@@ -445,17 +489,25 @@ impl WasmWorker {
         }
     }
 
-    /// Helper to instantiate a guest module and extract required ABI exports.
+    /// Helper to instantiate a guest module, invoke `datalake_init` if exported, and extract required ABI exports.
     fn instantiate_guest(
         engine: &wasmtime::Engine,
         module: &Module,
         registry: &Arc<MetricRegistry>,
+        config: &WasmTransformerConfig,
     ) -> Result<GuestComponents, WasmTransformError> {
         let host_state = HostState {
-            phase: HostPhase::Execution,
+            phase: HostPhase::Init,
             registry: Arc::clone(registry),
         };
         let mut store = Store::new(engine, host_state);
+        let init_timeout_dur = parse_duration(&config.init_timeout)
+            .unwrap_or_else(|| std::time::Duration::from_secs(2));
+        let init_ticks = u64::try_from((init_timeout_dur.as_millis().saturating_add(9)) / 10)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        store.set_epoch_deadline(init_ticks);
+
         let linker = crate::host_calls::build_host_linker(engine)?;
         let instance = linker.instantiate(&mut store, module)?;
 
@@ -467,6 +519,52 @@ impl WasmWorker {
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmTransformError::MissingExport("memory".into()))?;
+
+        if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init")
+        {
+            let init_payload = serde_json::json!({
+                "signal": config.env.get("signal").map_or("unknown", |s| s.as_str()),
+                "env": config.env,
+                "config": config.config,
+            });
+            let init_bytes = serde_json::to_vec(&init_payload)
+                .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
+            let len = u32::try_from(init_bytes.len()).map_err(|_| {
+                WasmTransformError::InitFailed("Config JSON exceeds u32 limit".into())
+            })?;
+
+            let ptr = alloc_fn
+                .call(&mut store, len)
+                .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
+
+            memory
+                .write(&mut store, ptr as usize, &init_bytes)
+                .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
+
+            let status = init_fn
+                .call(&mut store, (ptr, len))
+                .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
+
+            let _ = dealloc_fn.call(&mut store, (ptr, len));
+
+            if status != 0 {
+                return Err(WasmTransformError::InitFailed(format!(
+                    "datalake_init returned non-zero status code: {status}"
+                )));
+            }
+        } else if let Ok(init_fn) = instance.get_typed_func::<(), i32>(&mut store, "datalake_init")
+        {
+            let status = init_fn
+                .call(&mut store, ())
+                .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
+            if status != 0 {
+                return Err(WasmTransformError::InitFailed(format!(
+                    "datalake_init returned non-zero status code: {status}"
+                )));
+            }
+        }
+
+        store.data_mut().phase = HostPhase::Execution;
 
         Ok(GuestComponents {
             store,
@@ -614,6 +712,32 @@ pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
         num.trim().parse::<usize>().ok()
     } else {
         trimmed.parse::<usize>().ok()
+    }
+}
+
+/// Parses a duration string (e.g. "500ms", "5s", "1m") into a [`std::time::Duration`].
+pub(crate) fn parse_duration(s: &str) -> Option<std::time::Duration> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("ms") {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
+    } else if let Some(num) = trimmed.strip_suffix('m') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
+    } else {
+        trimmed
+            .parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_secs)
     }
 }
 
