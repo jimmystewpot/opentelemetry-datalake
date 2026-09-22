@@ -12,14 +12,25 @@ fn valid_wat() -> &'static str {
     )"#
 }
 
+#[cfg(unix)]
+static SIGHUP_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn test_spawn_sighup_listener_triggers_reload() {
     #[cfg(unix)]
     {
+        let _guard = SIGHUP_MUTEX.lock().await;
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
 
         let temp_dir = std::env::temp_dir();
-        let module_path = temp_dir.join(format!("sighup_test_module_{}.wasm", std::process::id()));
+        let module_path = temp_dir.join(format!(
+            "sighup_test_module_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
 
         let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
         tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
@@ -40,14 +51,16 @@ async fn test_spawn_sighup_listener_triggers_reload() {
             .unwrap();
 
         // Wait for it to process
-        for _ in 0..10 {
+        let mut reloaded = false;
+        for _ in 0..50 {
             if engine.module_generation() == 1 {
+                reloaded = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        assert_eq!(engine.module_generation(), 1);
+        assert!(reloaded, "module generation should be 1 after first SIGHUP");
 
         // Send again to verify multiple reloads
         std::process::Command::new("kill")
@@ -56,16 +69,22 @@ async fn test_spawn_sighup_listener_triggers_reload() {
             .status()
             .unwrap();
 
-        for _ in 0..10 {
+        let mut reloaded2 = false;
+        for _ in 0..50 {
             if engine.module_generation() == 2 {
+                reloaded2 = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        assert_eq!(engine.module_generation(), 2);
+        assert!(
+            reloaded2,
+            "module generation should be 2 after second SIGHUP"
+        );
 
         handle.abort();
+        let _ = handle.await;
         let _ = tokio::fs::remove_file(&module_path).await;
     }
 }
@@ -74,12 +93,17 @@ async fn test_spawn_sighup_listener_triggers_reload() {
 async fn test_spawn_sighup_listener_triggers_reload_failure_missing_file() {
     #[cfg(unix)]
     {
+        let _guard = SIGHUP_MUTEX.lock().await;
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
 
         let temp_dir = std::env::temp_dir();
         let module_path = temp_dir.join(format!(
-            "sighup_test_module_missing_{}.wasm",
-            std::process::id()
+            "sighup_test_module_missing_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         // File doesn't exist
 
@@ -98,6 +122,7 @@ async fn test_spawn_sighup_listener_triggers_reload_failure_missing_file() {
 
         assert_eq!(engine.module_generation(), 0);
         handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -105,12 +130,17 @@ async fn test_spawn_sighup_listener_triggers_reload_failure_missing_file() {
 async fn test_spawn_sighup_listener_triggers_reload_failure_invalid_wasm() {
     #[cfg(unix)]
     {
+        let _guard = SIGHUP_MUTEX.lock().await;
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
 
         let temp_dir = std::env::temp_dir();
         let module_path = temp_dir.join(format!(
-            "sighup_test_module_invalid_{}.wasm",
-            std::process::id()
+            "sighup_test_module_invalid_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
 
         tokio::fs::write(&module_path, b"invalid").await.unwrap();
@@ -131,6 +161,7 @@ async fn test_spawn_sighup_listener_triggers_reload_failure_invalid_wasm() {
         assert_eq!(engine.module_generation(), 0);
 
         handle.abort();
+        let _ = handle.await;
         let _ = tokio::fs::remove_file(&module_path).await;
     }
 }
