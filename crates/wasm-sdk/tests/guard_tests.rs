@@ -390,3 +390,67 @@ fn test_nullify_column_preserves_and_merges_schema_metadata() {
         Some("wasm_processed")
     );
 }
+
+#[test]
+fn test_nullify_column_rejects_untouched_column_nullability_mutation() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("val_a"), None])),
+            Arc::new(StringArray::from(vec![Some("val_b1"), Some("val_b2")])),
+        ],
+    )
+    .unwrap();
+
+    // Target schema attempts to change untouched field col_a from nullable to non-nullable
+    let invalid_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+
+    let res = nullify_column(&batch, invalid_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(
+                msg.contains("nullability cannot be changed"),
+                "expected nullability mismatch error, got: {msg}"
+            );
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullify_column_succeeds_with_untouched_nullable_column_containing_nulls() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("val_a"), None])),
+            Arc::new(StringArray::from(vec![Some("val_b1"), Some("val_b2")])),
+        ],
+    )
+    .unwrap();
+
+    let valid_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+
+    let res = nullify_column(&batch, valid_target, "col_b").unwrap();
+    assert_eq!(res.num_rows(), 2);
+    // col_a remains untouched with its null
+    assert_eq!(res.column(0).null_count(), 1);
+    assert!(res.schema().field(0).is_nullable());
+    // col_b is nullified
+    assert_eq!(res.column(1).null_count(), 2);
+    assert!(res.schema().field(1).is_nullable());
+}

@@ -64,6 +64,16 @@ pub fn nullify_column(
                 target_field.data_type()
             )));
         }
+        if batch_field.name() != column_name
+            && batch_field.is_nullable() != target_field.is_nullable()
+        {
+            return Err(SdkError::SchemaMismatch(format!(
+                "Field mismatch at index {i}: field '{}' nullability cannot be changed (expected {}, found {})",
+                batch_field.name(),
+                batch_field.is_nullable(),
+                target_field.is_nullable()
+            )));
+        }
     }
 
     let src_idx = batch_schema
