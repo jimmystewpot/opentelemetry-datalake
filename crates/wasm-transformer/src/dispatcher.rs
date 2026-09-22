@@ -13,7 +13,7 @@ use pipeline_core::pipeline::{PipelineReceiver, PipelineSender, SignalBatch};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use wasmtime::Module;
 
 /// Configuration for the WASM batch dispatcher and worker pool.
@@ -132,15 +132,19 @@ impl WasmDispatcher {
 
                 while let Some(batch) = wrx.recv().await {
                     let mut w = worker;
-                    let (res, returned_worker) = tokio::task::spawn_blocking(move || {
+                    let Ok((res, returned_worker)) = tokio::task::spawn_blocking(move || {
                         // execute_batch is synchronous, so we can call it inside the blocking closure
                         let res = w.execute_batch(batch);
                         (res, w)
                     })
                     .await
-                    .unwrap_or_else(|e| {
-                        panic!("WasmWorker blocking task panicked or was cancelled: {e}");
-                    });
+                    else {
+                        error!(
+                            worker_id,
+                            "WasmWorker blocking task failed or was cancelled; terminating worker"
+                        );
+                        return;
+                    };
                     worker = returned_worker;
 
                     match res {
@@ -392,8 +396,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_batch_aborts_on_worker_channel_closed() {
-        let (tx0, _rx0) = mpsc::channel::<SignalBatch>(1);
+    async fn test_dispatch_batch_backpressures_on_live_worker_when_another_is_closed() {
+        let (tx0, mut rx0) = mpsc::channel::<SignalBatch>(1);
         let (tx1, rx1) = mpsc::channel::<SignalBatch>(1);
 
         // Fill tx0 so try_send to tx0 will return Full
@@ -402,14 +406,41 @@ mod tests {
         // Close rx1 so tx1 is closed
         drop(rx1);
 
+        // Spawn a background task to drain rx0 so the backpressure send succeeds without dropping the receiver
+        let drain_handle = tokio::spawn(async move {
+            let _ = rx0.recv().await;
+            let _ = rx0.recv().await;
+        });
+
         let worker_txs = vec![tx0, tx1];
         let mut next_worker = 1;
 
         let live =
             WasmDispatcher::dispatch_batch(empty_batch(), &worker_txs, &mut next_worker, 2).await;
         assert!(
+            live,
+            "dispatcher must backpressure on live worker and succeed rather than aborting on closed worker"
+        );
+        drain_handle.await.expect("drain task");
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_batch_aborts_when_all_workers_are_closed() {
+        let (tx0, rx0) = mpsc::channel::<SignalBatch>(1);
+        let (tx1, rx1) = mpsc::channel::<SignalBatch>(1);
+
+        // Close both worker receivers
+        drop(rx0);
+        drop(rx1);
+
+        let worker_txs = vec![tx0, tx1];
+        let mut next_worker = 0;
+
+        let live =
+            WasmDispatcher::dispatch_batch(empty_batch(), &worker_txs, &mut next_worker, 2).await;
+        assert!(
             !live,
-            "dispatcher must abort when worker channel is closed during backpressure"
+            "dispatcher must abort when all worker channels are closed"
         );
     }
 
