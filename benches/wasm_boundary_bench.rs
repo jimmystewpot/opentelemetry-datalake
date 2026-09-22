@@ -63,7 +63,6 @@ fn make_batch(rows: usize) -> RecordBatch {
 }
 
 fn bench_wasm_boundary(c: &mut Criterion) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime should initialize");
     let cache = Arc::new(
         EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("pooling allocator should initialize"),
     );
@@ -105,12 +104,9 @@ fn bench_wasm_boundary(c: &mut Criterion) {
         let batch = make_batch(rows);
         group.bench_with_input(BenchmarkId::new("rows", rows), &rows, |b, _| {
             b.iter(|| {
-                rt.block_on(async {
-                    let _ = worker
-                        .execute_batch(SignalBatch::Logs(batch.clone()))
-                        .await
-                        .expect("execute batch should succeed");
-                });
+                let _ = worker
+                    .execute_batch(SignalBatch::Logs(batch.clone()))
+                    .expect("execute batch should succeed");
             });
         });
     }

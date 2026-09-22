@@ -67,8 +67,8 @@ fn make_batch(rows: usize) -> RecordBatch {
     .expect("valid record batch")
 }
 
-#[tokio::test]
-async fn test_real_wasm_boundary_latency_within_budget() {
+#[test]
+fn test_real_wasm_boundary_latency_within_budget() {
     let cache = Arc::new(
         EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("pooling allocator should initialize"),
     );
@@ -124,7 +124,6 @@ async fn test_real_wasm_boundary_latency_within_budget() {
     for _ in 0..WARMUP {
         let outcome = worker
             .execute_batch(SignalBatch::Logs(batch.clone()))
-            .await
             .expect("warmup execution should succeed");
         match outcome {
             WorkerOutcome::Emitted(batches) => {
@@ -140,7 +139,6 @@ async fn test_real_wasm_boundary_latency_within_budget() {
         let t0 = Instant::now();
         let _ = worker
             .execute_batch(SignalBatch::Logs(batch.clone()))
-            .await
             .expect("measured execution should succeed");
         samples.push(t0.elapsed());
     }
