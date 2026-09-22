@@ -64,9 +64,9 @@ const REQUIRED_FUNCS: &[FuncExportSpec] = &[
     },
     FuncExportSpec {
         name: "datalake_transform",
-        expected: "(i32, i32) -> (i32)",
-        params: &[ValType::I32, ValType::I32],
-        results: &[ValType::I32],
+        expected: "(i32, i32, i32) -> (i64)",
+        params: &[ValType::I32, ValType::I32, ValType::I32],
+        results: &[ValType::I64],
     },
 ];
 

@@ -5,7 +5,10 @@ use std::time::Instant;
 use anyhow::Result;
 use wasmtime::{Config, Engine, Module, Store};
 
-use crate::tester::{build_canonical_test_batch, serialize_batch_to_ipc, verify_transform_status};
+use crate::tester::{
+    build_canonical_test_batch, reclaim_transform_response, serialize_batch_to_ipc,
+    verify_transform_status,
+};
 use crate::validator::validate_wasm_bytes;
 
 fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
@@ -52,7 +55,7 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
         .get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")
         .map_err(wasm_err)?;
     let transform_fn = instance
-        .get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
+        .get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
         .map_err(wasm_err)?;
 
     let memory = instance
@@ -73,19 +76,25 @@ pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
     memory.data_mut(&mut store)[start..end].copy_from_slice(&buffer);
 
     for _ in 0..5 {
-        let header_ptr = transform_fn
-            .call(&mut store, (input_ptr, input_len))
+        let packed = transform_fn
+            .call(&mut store, (0, input_ptr, input_len))
             .map_err(wasm_err)?;
+        let header_ptr = (packed >> 32) as u32;
+        let header_len = (packed & 0xffff_ffff) as u32;
         verify_transform_status(&memory, &store, header_ptr)?;
+        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
 
     let iterations: u32 = 50;
     let start_time = Instant::now();
     for _ in 0..iterations {
-        let header_ptr = transform_fn
-            .call(&mut store, (input_ptr, input_len))
+        let packed = transform_fn
+            .call(&mut store, (0, input_ptr, input_len))
             .map_err(wasm_err)?;
+        let header_ptr = (packed >> 32) as u32;
+        let header_len = (packed & 0xffff_ffff) as u32;
         verify_transform_status(&memory, &store, header_ptr)?;
+        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
     let total_elapsed = start_time.elapsed();
 

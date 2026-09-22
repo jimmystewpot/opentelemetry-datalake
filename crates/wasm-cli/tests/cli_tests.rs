@@ -27,7 +27,7 @@ fn test_validate_rejects_missing_alloc_export() {
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -47,7 +47,7 @@ fn test_validate_rejects_abi_version_mismatch() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -67,7 +67,7 @@ fn test_validate_rejects_memory_exported_as_function() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (func (export "memory"))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -87,7 +87,7 @@ fn test_validate_rejects_invalid_alloc_signature() {
         (func (export "datalake_alloc") (result i32) (i32.const 0))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -129,7 +129,7 @@ fn test_validate_accepts_module_with_host_sdk_imports() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -143,7 +143,7 @@ fn test_validate_accepts_conformant_module() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -159,7 +159,7 @@ fn test_validate_accepts_module_with_wasi_or_unknown_imports() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -174,7 +174,7 @@ fn test_cli_subcommand_test_conformant_module() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
@@ -205,7 +205,7 @@ fn test_cli_subcommand_bench_conformant_module() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();

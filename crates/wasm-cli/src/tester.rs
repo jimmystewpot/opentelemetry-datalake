@@ -7,6 +7,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use opentelemetry_datalake_wasm_sdk::abi::{STATUS_DISCARD, STATUS_SUCCESS};
 use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 use thiserror::Error;
 use wasmtime::{Config, Engine, Module, Store};
@@ -139,7 +140,7 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
         .get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")
         .map_err(wasm_err)?;
     let transform_fn = instance
-        .get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
+        .get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
         .map_err(wasm_err)?;
 
     let memory = instance
@@ -159,11 +160,15 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
     }
     memory.data_mut(&mut store)[start..end].copy_from_slice(&buffer);
 
-    let header_ptr = transform_fn
-        .call(&mut store, (input_ptr, input_len))
+    let packed = transform_fn
+        .call(&mut store, (0, input_ptr, input_len))
         .map_err(wasm_err)?;
+    let header_ptr = (packed >> 32) as u32;
+    let header_len = (packed & 0xffff_ffff) as u32;
 
     verify_transform_response(&memory, &store, header_ptr, &input_batch)?;
+
+    reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
 
     dealloc_fn
         .call(&mut store, (input_ptr, input_len))
@@ -212,7 +217,7 @@ pub fn verify_transform_status(
             .map_err(|e| anyhow::anyhow!("Failed to read message_len: {e}"))?,
     );
 
-    if status != 0 {
+    if status != STATUS_SUCCESS && status != STATUS_DISCARD {
         let msg = if message_len > 0 {
             let m_start = message_ptr as usize;
             let m_end = m_start
@@ -245,6 +250,15 @@ fn verify_transform_response(
 
     let h_start = header_ptr as usize;
     let mem = memory.data(store);
+
+    let status = u32::from_le_bytes(
+        mem[h_start..h_start + 4]
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to read status: {e}"))?,
+    );
+    if status == STATUS_DISCARD {
+        return Ok(());
+    }
 
     let batch_count = u32::from_le_bytes(
         mem[h_start + 4..h_start + 8]
@@ -296,6 +310,122 @@ fn verify_transform_response(
             verify_batch_immutability(input_batch, &out_batch)?;
         }
     }
+    Ok(())
+}
+
+/// Reclaims guest-allocated response memory (header, descriptor array, IPC output buffers, error message).
+///
+/// # Errors
+///
+/// Returns an error if memory offsets are invalid or if guest dealloc traps.
+pub fn reclaim_transform_response(
+    memory: &wasmtime::Memory,
+    store: &mut Store<()>,
+    dealloc_fn: &wasmtime::TypedFunc<(u32, u32), ()>,
+    header_ptr: u32,
+    header_len: u32,
+) -> Result<()> {
+    if header_ptr == 0 {
+        return Ok(());
+    }
+
+    let h_start = header_ptr as usize;
+    let h_end = h_start
+        .checked_add(header_len as usize)
+        .ok_or_else(|| anyhow::anyhow!("Overflow in header range"))?;
+    if header_len < 20 {
+        anyhow::bail!("Header length {header_len} is less than required 20 bytes for reclamation");
+    }
+
+    let (batch_count, batches_ptr, message_ptr, message_len) = {
+        let mem = memory.data(&*store);
+        if h_end > mem.len() {
+            anyhow::bail!("Header out of memory bounds during response reclamation");
+        }
+
+        let batch_count = u32::from_le_bytes(
+            mem[h_start + 4..h_start + 8]
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to read batch_count: {e}"))?,
+        );
+        let batches_ptr = u32::from_le_bytes(
+            mem[h_start + 8..h_start + 12]
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to read batches_ptr: {e}"))?,
+        );
+        let message_ptr = u32::from_le_bytes(
+            mem[h_start + 12..h_start + 16]
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to read message_ptr: {e}"))?,
+        );
+        let message_len = u32::from_le_bytes(
+            mem[h_start + 16..h_start + 20]
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Failed to read message_len: {e}"))?,
+        );
+        (batch_count, batches_ptr, message_ptr, message_len)
+    };
+
+    // Free message string if present
+    if message_ptr != 0 && message_len > 0 {
+        dealloc_fn
+            .call(&mut *store, (message_ptr, message_len))
+            .map_err(wasm_err)?;
+    }
+
+    // Free batch buffers and descriptor array
+    if batches_ptr != 0 && batch_count > 0 {
+        let desc_size = 8_u32;
+        let total_desc_bytes = batch_count
+            .checked_mul(desc_size)
+            .ok_or_else(|| anyhow::anyhow!("Overflow in descriptor array size"))?;
+        let desc_start = batches_ptr as usize;
+        let desc_end = desc_start
+            .checked_add(total_desc_bytes as usize)
+            .ok_or_else(|| anyhow::anyhow!("Overflow in descriptor range"))?;
+
+        let batch_buffers = {
+            let mem = memory.data(&*store);
+            if desc_end > mem.len() {
+                anyhow::bail!("Descriptor array out of bounds during response reclamation");
+            }
+            let mut bufs = Vec::with_capacity(batch_count as usize);
+            for i in 0..batch_count {
+                let offset = desc_start + (i as usize * 8);
+                let b_ptr = u32::from_le_bytes(
+                    mem[offset..offset + 4]
+                        .try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to read b_ptr: {e}"))?,
+                );
+                let b_len = u32::from_le_bytes(
+                    mem[offset + 4..offset + 8]
+                        .try_into()
+                        .map_err(|e| anyhow::anyhow!("Failed to read b_len: {e}"))?,
+                );
+                if b_ptr != 0 && b_len > 0 {
+                    bufs.push((b_ptr, b_len));
+                }
+            }
+            bufs
+        };
+
+        for (b_ptr, b_len) in batch_buffers {
+            dealloc_fn
+                .call(&mut *store, (b_ptr, b_len))
+                .map_err(wasm_err)?;
+        }
+        dealloc_fn
+            .call(&mut *store, (batches_ptr, total_desc_bytes))
+            .map_err(wasm_err)?;
+    }
+
+    // Free header
+    if header_len > 0 {
+        dealloc_fn
+            .call(&mut *store, (header_ptr, header_len))
+            .map_err(wasm_err)?;
+    }
+
     Ok(())
 }
 
