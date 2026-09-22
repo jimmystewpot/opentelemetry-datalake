@@ -456,7 +456,7 @@ impl WasmWorker {
             registry: Arc::clone(registry),
         };
         let mut store = Store::new(engine, host_state);
-        let linker = crate::host_calls::build_host_linker(engine, Arc::clone(registry))?;
+        let linker = crate::host_calls::build_host_linker(engine)?;
         let instance = linker.instantiate(&mut store, module)?;
 
         let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
