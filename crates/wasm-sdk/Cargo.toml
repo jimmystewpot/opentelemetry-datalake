@@ -6,4 +6,5 @@ license = { workspace = true }
 
 [dependencies]
 arrow = { workspace = true, features = ["ipc"] }
+serde_json = { workspace = true }
 thiserror = { workspace = true }

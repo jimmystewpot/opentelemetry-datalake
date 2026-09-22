@@ -626,3 +626,115 @@ fn test_canonical_batches_match_production_signal_schemas() {
         &DataType::Timestamp(TimeUnit::Nanosecond, None)
     );
 }
+
+#[test]
+fn test_run_immutability_suite_rejects_discard_with_payload() {
+    // 20-byte header with status = 1 (STATUS_DISCARD), but batch_count = 1 (invalid!)
+    // Status 1: \01\00\00\00, batch_count 1: \01\00\00\00
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\01\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("Discard response header must have zero batches and no message payload"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_verify_batch_immutability_allows_filtered_empty_batch() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1"]))],
+    )
+    .unwrap();
+    let empty_output = RecordBatch::new_empty(schema);
+
+    assert_eq!(empty_output.num_rows(), 0);
+    assert!(verify_batch_immutability(&input, &empty_output).is_ok());
+}
+
+#[test]
+fn test_verify_batch_immutability_allows_filtered_subset_rows() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1", "trace_2"]))],
+    )
+    .unwrap();
+    let filtered_output =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["trace_2"]))]).unwrap();
+
+    assert_eq!(filtered_output.num_rows(), 1);
+    assert!(verify_batch_immutability(&input, &filtered_output).is_ok());
+}
+
+#[test]
+fn test_verify_batch_immutability_allows_split_batches() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1", "trace_2"]))],
+    )
+    .unwrap();
+
+    let batch_1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1"]))],
+    )
+    .unwrap();
+    let batch_2 =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["trace_2"]))]).unwrap();
+
+    assert!(verify_batch_immutability(&input, &batch_1).is_ok());
+    assert!(verify_batch_immutability(&input, &batch_2).is_ok());
+}
+
+#[test]
+fn test_verify_batch_immutability_rejects_tampered_value_in_subset() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1", "trace_2"]))],
+    )
+    .unwrap();
+    let tampered_output = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec!["trace_mutated"]))],
+    )
+    .unwrap();
+
+    let res = verify_batch_immutability(&input, &tampered_output);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Value mismatch in immutable column trace_id")
+    );
+}

@@ -497,6 +497,45 @@ fn test_dispatch_init_missing_signal_returns_error() {
 }
 
 #[test]
+fn test_dispatch_init_nested_signal_ignored() {
+    // Top-level signal is metrics, nested signal inside 'a' is logs.
+    // Must initialize with SignalType::Metrics.
+    let config = r#"{"a":{"signal":"logs"},"signal":"metrics"}"#;
+    let cfg_bytes = config.as_bytes();
+    let cfg_len = cfg_bytes.len() as u32;
+    let cfg_ptr = datalake_alloc(cfg_len);
+    assert_ne!(cfg_ptr, 0);
+    // SAFETY: `cfg_ptr` was allocated via `datalake_alloc` with capacity `cfg_len`.
+    unsafe {
+        write_guest_memory(cfg_ptr, cfg_bytes);
+    }
+
+    let state = std::sync::Mutex::new(None);
+    let status = dispatch_init::<TestInitTransformer>(&state, cfg_ptr, cfg_len);
+    assert_eq!(status, 0);
+    let guard = state.lock().unwrap();
+    let transformer = guard.as_ref().expect("transformer initialized");
+    assert_eq!(transformer.signal, SignalType::Metrics);
+    drop(guard);
+
+    datalake_dealloc(cfg_ptr, cfg_len);
+
+    // Only nested signal, missing top-level signal: must fail with 1.
+    let nested_only = r#"{"nested":{"signal":"traces"}}"#;
+    let n_bytes = nested_only.as_bytes();
+    let n_len = n_bytes.len() as u32;
+    let n_ptr = datalake_alloc(n_len);
+    // SAFETY: allocated via datalake_alloc
+    unsafe {
+        write_guest_memory(n_ptr, n_bytes);
+    }
+    let state_nested = std::sync::Mutex::new(None);
+    let status_nested = dispatch_init::<TestInitTransformer>(&state_nested, n_ptr, n_len);
+    assert_eq!(status_nested, 1, "nested-only signal must be rejected");
+    datalake_dealloc(n_ptr, n_len);
+}
+
+#[test]
 fn test_dispatch_init_invalid_signal_returns_error() {
     let config = r#"{"signal":"unknown_signal"}"#;
     let cfg_bytes = config.as_bytes();

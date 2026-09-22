@@ -25,8 +25,10 @@ pub enum TesterError {
 /// Verifies that immutable OpenTelemetry columns are preserved between input and output batches.
 ///
 /// Ensures that any canonical immutable column (`trace_id`, `span_id`, `timestamp`,
-/// `observed_timestamp`, `name`, `type`) present in `input` is also present in `output`,
-/// and that its array contents remain unchanged.
+/// `observed_timestamp`, `name`, `type`) present in `input` is also present in `output.schema()`,
+/// and that emitted rows preserve their immutable values without alteration.
+/// Filtered batches (with zero or fewer rows) and split batches (`ok_multiple`) are supported
+/// by verifying that every row present in `output` matches a corresponding row in `input`.
 ///
 /// # Errors
 ///
@@ -38,19 +40,80 @@ pub fn verify_batch_immutability(
 ) -> std::result::Result<(), TesterError> {
     let in_schema = input.schema();
     let out_schema = output.schema();
+
+    // 1. Verify schema preservation: every immutable column in input must be present in output schema.
     for &col_name in IMMUTABLE_COLUMNS {
-        if let (Ok(i_idx), Ok(o_idx)) =
-            (in_schema.index_of(col_name), out_schema.index_of(col_name))
-        {
-            let in_col = input.column(i_idx);
-            let out_col = output.column(o_idx);
-            if in_col != out_col {
-                return Err(TesterError::ValueMismatch(col_name));
-            }
-        } else if in_schema.index_of(col_name).is_ok() {
+        if in_schema.index_of(col_name).is_ok() && out_schema.index_of(col_name).is_err() {
             return Err(TesterError::MissingColumn(col_name));
         }
     }
+
+    // 2. If output has no rows (e.g. filtered batch), schema check passed and no emitted values were mutated.
+    if output.num_rows() == 0 {
+        return Ok(());
+    }
+
+    // 3. Collect all immutable column array pairs present in both input and output.
+    let col_pairs: Vec<(
+        &'static str,
+        &arrow::array::ArrayRef,
+        &arrow::array::ArrayRef,
+    )> = IMMUTABLE_COLUMNS
+        .iter()
+        .filter_map(|&col_name| {
+            if let (Ok(i_idx), Ok(o_idx)) =
+                (in_schema.index_of(col_name), out_schema.index_of(col_name))
+            {
+                Some((col_name, input.column(i_idx), output.column(o_idx)))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if col_pairs.is_empty() {
+        return Ok(());
+    }
+
+    // 4. If row counts are identical and 1:1 match holds, do fast direct array equality comparison.
+    if input.num_rows() == output.num_rows() {
+        for &(col_name, in_col, out_col) in &col_pairs {
+            if in_col != out_col {
+                return Err(TesterError::ValueMismatch(col_name));
+            }
+        }
+        return Ok(());
+    }
+
+    // 5. For filtered subsets or split batches (output.num_rows() != input.num_rows()):
+    // Every output row must match an input row across all common immutable columns.
+    for o in 0..output.num_rows() {
+        let mut matched = false;
+        let mut candidate_mismatched_col: Option<&'static str> = None;
+
+        for i in 0..input.num_rows() {
+            let mut all_cols_match = true;
+            for &(col_name, in_col, out_col) in &col_pairs {
+                if in_col.slice(i, 1) != out_col.slice(o, 1) {
+                    all_cols_match = false;
+                    if candidate_mismatched_col.is_none() {
+                        candidate_mismatched_col = Some(col_name);
+                    }
+                    break;
+                }
+            }
+            if all_cols_match {
+                matched = true;
+                break;
+            }
+        }
+
+        if !matched {
+            let col = candidate_mismatched_col.unwrap_or(col_pairs[0].0);
+            return Err(TesterError::ValueMismatch(col));
+        }
+    }
+
     Ok(())
 }
 
@@ -403,6 +466,16 @@ pub fn verify_transform_status(
             .try_into()
             .map_err(|e| anyhow::anyhow!("Failed to read status: {e}"))?,
     );
+    let batch_count = u32::from_le_bytes(
+        mem[h_start + 4..h_start + 8]
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to read batch_count: {e}"))?,
+    );
+    let batches_ptr = u32::from_le_bytes(
+        mem[h_start + 8..h_start + 12]
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Failed to read batches_ptr: {e}"))?,
+    );
     let message_ptr = u32::from_le_bytes(
         mem[h_start + 12..h_start + 16]
             .try_into()
@@ -414,7 +487,16 @@ pub fn verify_transform_status(
             .map_err(|e| anyhow::anyhow!("Failed to read message_len: {e}"))?,
     );
 
-    if status != STATUS_SUCCESS && status != STATUS_DISCARD {
+    if status == STATUS_DISCARD {
+        if batch_count != 0 || batches_ptr != 0 || message_ptr != 0 || message_len != 0 {
+            anyhow::bail!(
+                "Discard response header must have zero batches and no message payload: batch_count={batch_count}, batches_ptr={batches_ptr}, message_ptr={message_ptr}, message_len={message_len}"
+            );
+        }
+        return Ok(());
+    }
+
+    if status != STATUS_SUCCESS {
         let msg = if message_len > 0 {
             let m_start = message_ptr as usize;
             let m_end = m_start
