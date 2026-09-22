@@ -79,5 +79,17 @@ pub fn nullify_column(
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
     columns[src_idx] = new_null_array(target_schema.field(src_idx).data_type(), batch.num_rows());
 
-    RecordBatch::try_new(target_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
+    let mut merged_metadata = batch_schema.metadata().clone();
+    merged_metadata.extend(target_schema.metadata().clone());
+
+    let final_schema = if target_schema.metadata() == &merged_metadata {
+        target_schema
+    } else {
+        Arc::new(Schema::new_with_metadata(
+            target_schema.fields().clone(),
+            merged_metadata,
+        ))
+    };
+
+    RecordBatch::try_new(final_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
 }

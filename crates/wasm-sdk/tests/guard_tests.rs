@@ -317,3 +317,76 @@ fn test_sdk_error_schema_mismatch_display() {
         SdkError::SchemaMismatch("field mismatch at index 0".to_string())
     );
 }
+
+#[test]
+fn test_nullify_column_preserves_and_merges_schema_metadata() {
+    let mut input_metadata = std::collections::HashMap::new();
+    input_metadata.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    input_metadata.insert("source".to_string(), "otel".to_string());
+
+    let schema = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("scope_attributes", DataType::Utf8, true),
+        ],
+        input_metadata,
+    ));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["abc"])),
+            Arc::new(StringArray::from(vec!["attr"])),
+        ],
+    )
+    .unwrap();
+
+    // Target schema without metadata (e.g. constructed via Schema::new)
+    let target_schema_no_meta = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("scope_attributes", DataType::Utf8, true),
+    ]));
+
+    let res_no_meta = nullify_column(&batch, target_schema_no_meta, "scope_attributes").unwrap();
+    let res_no_meta_schema = res_no_meta.schema();
+    let res_no_meta_map = res_no_meta_schema.metadata();
+    assert_eq!(
+        res_no_meta_map
+            .get("otel::compliance::status")
+            .map(String::as_str),
+        Some("verified")
+    );
+    assert_eq!(
+        res_no_meta_map.get("source").map(String::as_str),
+        Some("otel")
+    );
+
+    // Target schema with custom metadata
+    let mut target_metadata = std::collections::HashMap::new();
+    target_metadata.insert("custom_tag".to_string(), "wasm_processed".to_string());
+    let target_schema_with_meta = Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("scope_attributes", DataType::Utf8, true),
+        ],
+        target_metadata,
+    ));
+
+    let res = nullify_column(&batch, target_schema_with_meta, "scope_attributes").unwrap();
+    let res_schema = res.schema();
+    let res_metadata = res_schema.metadata();
+    assert_eq!(
+        res_metadata
+            .get("otel::compliance::status")
+            .map(String::as_str),
+        Some("verified")
+    );
+    assert_eq!(res_metadata.get("source").map(String::as_str), Some("otel"));
+    assert_eq!(
+        res_metadata.get("custom_tag").map(String::as_str),
+        Some("wasm_processed")
+    );
+}
