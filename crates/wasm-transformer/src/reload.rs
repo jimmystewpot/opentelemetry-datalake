@@ -54,9 +54,18 @@ pub fn spawn_sighup_listener_multi(
                         let sha = expected_sha.clone();
                         let compile_res = tokio::task::spawn_blocking(
                             move || -> Result<u64, WasmTransformError> {
+                                if let Some(ref expected) = sha {
+                                    let actual = compute_sha256(&bytes);
+                                    if !actual.eq_ignore_ascii_case(expected) {
+                                        return Err(WasmTransformError::Sha256Mismatch {
+                                            expected: expected.clone(),
+                                            actual,
+                                        });
+                                    }
+                                }
                                 let mut last_gen = 0;
                                 for engine in &engines_clone {
-                                    last_gen = engine.reload_from_bytes(&bytes, sha.as_deref())?;
+                                    last_gen = engine.reload_from_bytes(&bytes, None)?;
                                 }
                                 Ok(last_gen)
                             },
@@ -154,7 +163,8 @@ impl From<Arc<EngineCache>> for WasmReloadState {
 ///
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
-/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if the module compilation or SHA-256 verification fails.
+/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if no engines are configured, or if the module compilation
+/// or SHA-256 verification fails.
 pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
@@ -163,6 +173,11 @@ pub async fn wasm_reload_handler(
         path = %payload.module_path,
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
+
+    if state.engines.is_empty() {
+        tracing::warn!("Hot-reload REST: no engines configured in state");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
 
     let bytes = tokio::fs::read(&payload.module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to read module: {e}");
@@ -173,9 +188,18 @@ pub async fn wasm_reload_handler(
     let expected_sha = payload.expected_sha.or(state.configured_sha);
 
     let generation = tokio::task::spawn_blocking(move || -> Result<u64, WasmTransformError> {
+        if let Some(ref expected) = expected_sha {
+            let actual = compute_sha256(&bytes);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(WasmTransformError::Sha256Mismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
+            }
+        }
         let mut last_gen = 0;
         for engine in &engines {
-            last_gen = engine.reload_from_bytes(&bytes, expected_sha.as_deref())?;
+            last_gen = engine.reload_from_bytes(&bytes, None)?;
         }
         Ok(last_gen)
     })
