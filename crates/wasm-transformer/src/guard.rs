@@ -143,11 +143,13 @@ pub fn verify_strict_schema_equality(
     input: &RecordBatch,
     output: &RecordBatch,
 ) -> Result<(), WasmTransformError> {
-    if input.schema().fields() != output.schema().fields() {
+    if input.schema() != output.schema() {
         return Err(WasmTransformError::Pipeline(format!(
-            "Strict schema guard violation: output schema fields do not match input schema fields. Expected {:?}, got {:?}",
+            "Strict schema guard violation: output schema does not match input schema. Expected fields {:?} and metadata {:?}, got fields {:?} and metadata {:?}",
             input.schema().fields(),
-            output.schema().fields()
+            input.schema().metadata(),
+            output.schema().fields(),
+            output.schema().metadata()
         )));
     }
     Ok(())

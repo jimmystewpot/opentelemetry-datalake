@@ -131,7 +131,19 @@ impl WasmDispatcher {
                     };
 
                 while let Some(batch) = wrx.recv().await {
-                    match worker.execute_batch(batch).await {
+                    let mut w = worker;
+                    let (res, returned_worker) = tokio::task::spawn_blocking(move || {
+                        // execute_batch is synchronous, so we can call it inside the blocking closure
+                        let res = w.execute_batch(batch);
+                        (res, w)
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("WasmWorker blocking task panicked or was cancelled: {e}");
+                    });
+                    worker = returned_worker;
+
+                    match res {
                         Ok(outcome) => {
                             if !Self::handle_worker_outcome(
                                 worker_id,
@@ -292,6 +304,7 @@ impl WasmDispatcher {
         concurrency: usize,
     ) -> bool {
         let mut pending_batch = Some(batch);
+        let mut first_full_idx: Option<usize> = None;
 
         for offset in 0..concurrency {
             let idx = (next_worker.saturating_add(offset)) % concurrency;
@@ -302,12 +315,15 @@ impl WasmDispatcher {
                 match target_tx.try_send(b) {
                     Ok(()) => {
                         *next_worker = (idx.saturating_add(1)) % concurrency;
-                        break;
+                        return true;
                     }
-                    Err(
-                        mpsc::error::TrySendError::Full(returned)
-                        | mpsc::error::TrySendError::Closed(returned),
-                    ) => {
+                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                        if first_full_idx.is_none() {
+                            first_full_idx = Some(idx);
+                        }
+                        pending_batch = Some(returned);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(returned)) => {
                         pending_batch = Some(returned);
                     }
                 }
@@ -315,16 +331,24 @@ impl WasmDispatcher {
         }
 
         if let Some(b) = pending_batch {
-            let Some(target_tx) = worker_txs.get(*next_worker) else {
+            let Some(full_idx) = first_full_idx else {
+                warn!(
+                    "All worker channels are closed. Aborting dispatch loop to propagate backpressure and prevent data loss."
+                );
                 return false;
             };
+
+            let Some(target_tx) = worker_txs.get(full_idx) else {
+                return false;
+            };
+
             if target_tx.send(b).await.is_err() {
                 warn!(
                     "Worker channel closed during backpressure send. Aborting dispatch loop to propagate backpressure and prevent data loss."
                 );
                 return false;
             }
-            *next_worker = (next_worker.saturating_add(1)) % concurrency;
+            *next_worker = (full_idx.saturating_add(1)) % concurrency;
         }
 
         true

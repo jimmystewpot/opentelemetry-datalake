@@ -828,6 +828,33 @@ fn test_strict_schema_equality_added_column_fails() {
 }
 
 #[test]
+fn test_strict_schema_equality_dropped_metadata_fails() {
+    let mut in_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    in_schema.metadata = meta;
+    let in_schema = Arc::new(in_schema);
+
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+
+    let in_batch =
+        RecordBatch::try_new(in_schema, vec![Arc::new(StringArray::from(vec!["val"]))]).unwrap();
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["val"]))]).unwrap();
+
+    let res = verify_strict_schema_equality(&in_batch, &out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Strict schema guard violation")
+    );
+}
+
+#[test]
 fn test_strict_schema_equality_mutated_field_type_fails() {
     let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
     let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Int64, true)]));
