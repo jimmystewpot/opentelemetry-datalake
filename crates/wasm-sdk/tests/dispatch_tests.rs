@@ -473,6 +473,75 @@ fn test_dispatch_init_with_config() {
     datalake_dealloc(invalid_ptr, invalid_utf8.len() as u32);
 }
 
+#[test]
+fn test_dispatch_init_missing_signal_returns_error() {
+    let config = r#"{"setting":"value"}"#;
+    let cfg_bytes = config.as_bytes();
+    let cfg_len = cfg_bytes.len() as u32;
+    let cfg_ptr = datalake_alloc(cfg_len);
+    assert_ne!(cfg_ptr, 0);
+    // SAFETY: `cfg_ptr` was allocated via `datalake_alloc` with capacity `cfg_len`.
+    unsafe {
+        write_guest_memory(cfg_ptr, cfg_bytes);
+    }
+
+    let state = std::sync::Mutex::new(None);
+    let status = dispatch_init::<TestInitTransformer>(&state, cfg_ptr, cfg_len);
+    assert_eq!(
+        status, 1,
+        "missing 'signal' field in configuration must return 1"
+    );
+    assert!(state.lock().unwrap().is_none());
+
+    datalake_dealloc(cfg_ptr, cfg_len);
+}
+
+#[test]
+fn test_dispatch_init_invalid_signal_returns_error() {
+    let config = r#"{"signal":"unknown_signal"}"#;
+    let cfg_bytes = config.as_bytes();
+    let cfg_len = cfg_bytes.len() as u32;
+    let cfg_ptr = datalake_alloc(cfg_len);
+    assert_ne!(cfg_ptr, 0);
+    // SAFETY: `cfg_ptr` was allocated via `datalake_alloc` with capacity `cfg_len`.
+    unsafe {
+        write_guest_memory(cfg_ptr, cfg_bytes);
+    }
+
+    let state = std::sync::Mutex::new(None);
+    let status = dispatch_init::<TestInitTransformer>(&state, cfg_ptr, cfg_len);
+    assert_eq!(
+        status, 1,
+        "invalid 'signal' field in configuration must return 1"
+    );
+    assert!(state.lock().unwrap().is_none());
+
+    datalake_dealloc(cfg_ptr, cfg_len);
+}
+
+#[test]
+fn test_dispatch_init_empty_or_null_config_defaults_to_logs() {
+    // Null pointer and 0 length
+    let state_null = std::sync::Mutex::new(None);
+    let status_null = dispatch_init::<TestInitTransformer>(&state_null, 0, 0);
+    assert_eq!(status_null, 0);
+    let guard_null = state_null.lock().unwrap();
+    let transformer_null = guard_null.as_ref().expect("transformer initialized");
+    assert_eq!(transformer_null.signal, SignalType::Logs);
+    assert_eq!(transformer_null.config, None);
+    drop(guard_null);
+
+    // Non-zero pointer but 0 length
+    let state_zero_len = std::sync::Mutex::new(None);
+    let status_zero_len = dispatch_init::<TestInitTransformer>(&state_zero_len, 100, 0);
+    assert_eq!(status_zero_len, 0);
+    let guard_zero_len = state_zero_len.lock().unwrap();
+    let transformer_zero_len = guard_zero_len.as_ref().expect("transformer initialized");
+    assert_eq!(transformer_zero_len.signal, SignalType::Logs);
+    assert_eq!(transformer_zero_len.config, None);
+    drop(guard_zero_len);
+}
+
 struct TestTransformMock {
     call_count: u32,
 }

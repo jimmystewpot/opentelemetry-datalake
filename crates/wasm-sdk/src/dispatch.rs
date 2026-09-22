@@ -296,6 +296,10 @@ pub fn parse_signal_from_config(config: &str) -> Option<SignalType> {
 /// resolves the target signal type from configuration, invokes [`BatchTransformer::init`],
 /// and stores the initialized instance into `state`.
 ///
+/// If a configuration payload is provided (`config_ptr != 0 && config_len > 0`), it must
+/// specify a valid signal, or initialization fails and returns `1`. If configuration is absent
+/// (`config_ptr == 0 || config_len == 0`), the signal defaults to [`SignalType::Logs`].
+///
 /// # Returns
 ///
 /// `0` on success, or `1` on error (with error logged via [`crate::panic::log_error`]).
@@ -320,9 +324,9 @@ pub fn dispatch_init<T: BatchTransformer>(
                 return 1;
             }
         };
-        let sig = match parse_signal_from_config(&s) {
-            Some(sig) => sig,
-            None => SignalType::Logs,
+        let Some(sig) = parse_signal_from_config(&s) else {
+            crate::panic::log_error("Configuration payload missing or invalid 'signal' field");
+            return 1;
         };
         (sig, Some(s))
     } else {
