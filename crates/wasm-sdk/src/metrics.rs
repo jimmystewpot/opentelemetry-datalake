@@ -34,6 +34,7 @@ pub fn duration_to_nanos(duration: Duration) -> u64 {
 
 #[cfg(target_arch = "wasm32")]
 // SAFETY: Declaring host runtime imports provided by the wasm-transformer host environment.
+#[link(wasm_import_module = "env")]
 unsafe extern "C" {
     fn datalake_host_metric_emit(metric_type: u32, name_ptr: u32, name_len: u32, value: u64);
 }

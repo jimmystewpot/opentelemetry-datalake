@@ -16,4 +16,8 @@ pub enum SdkError {
     /// The specified column was not found in the record batch schema.
     #[error("Column not found in schema: {0}")]
     ColumnNotFound(String),
+
+    /// Target schema does not match the record batch schema.
+    #[error("Schema mismatch: {0}")]
+    SchemaMismatch(String),
 }

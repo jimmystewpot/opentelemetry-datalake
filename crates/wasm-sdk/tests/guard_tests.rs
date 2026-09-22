@@ -16,7 +16,7 @@ fn test_nullify_immutable_column_fails_fast() {
         Field::new("scope_attributes", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(StringArray::from(vec!["abc"])),
             Arc::new(StringArray::from(vec!["attr"])),
@@ -24,7 +24,7 @@ fn test_nullify_immutable_column_fails_fast() {
     )
     .unwrap();
 
-    let err = nullify_column(&batch, "trace_id").unwrap_err();
+    let err = nullify_column(&batch, schema, "trace_id").unwrap_err();
     assert_eq!(
         err,
         SdkError::ImmutableFieldViolation("trace_id".to_string())
@@ -42,7 +42,7 @@ fn test_nullify_mutable_column_succeeds() {
         Field::new("scope_attributes", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(StringArray::from(vec!["abc", "def"])),
             Arc::new(StringArray::from(vec!["attr1", "attr2"])),
@@ -50,7 +50,7 @@ fn test_nullify_mutable_column_succeeds() {
     )
     .unwrap();
 
-    let ok_batch = nullify_column(&batch, "scope_attributes").unwrap();
+    let ok_batch = nullify_column(&batch, schema, "scope_attributes").unwrap();
     assert_eq!(ok_batch.column(1).null_count(), 2);
     assert_eq!(ok_batch.num_rows(), 2);
     // Trace ID remains unmodified
@@ -69,9 +69,9 @@ fn test_nullify_empty_batch() {
         Field::new("trace_id", DataType::Utf8, false),
         Field::new("body", DataType::Utf8, true),
     ]));
-    let empty_batch = RecordBatch::new_empty(schema);
+    let empty_batch = RecordBatch::new_empty(schema.clone());
 
-    let ok_batch = nullify_column(&empty_batch, "body").unwrap();
+    let ok_batch = nullify_column(&empty_batch, schema, "body").unwrap();
     assert_eq!(ok_batch.num_rows(), 0);
     assert_eq!(ok_batch.column(1).null_count(), 0);
 }
@@ -83,7 +83,7 @@ fn test_nullify_nonexistent_column_returns_column_not_found() {
         Field::new("scope_attributes", DataType::Utf8, true),
     ]));
     let batch = RecordBatch::try_new(
-        schema,
+        schema.clone(),
         vec![
             Arc::new(StringArray::from(vec!["abc"])),
             Arc::new(StringArray::from(vec!["attr"])),
@@ -91,7 +91,7 @@ fn test_nullify_nonexistent_column_returns_column_not_found() {
     )
     .unwrap();
 
-    let err = nullify_column(&batch, "nonexistent").unwrap_err();
+    let err = nullify_column(&batch, schema, "nonexistent").unwrap_err();
     assert_eq!(err, SdkError::ColumnNotFound("nonexistent".to_string()));
     assert_eq!(err.to_string(), "Column not found in schema: nonexistent");
 }
@@ -180,4 +180,140 @@ fn test_batch_transformer_trait_mock() {
         }
         _ => panic!("expected TransformResult::Continue"),
     }
+}
+
+#[test]
+fn test_nullify_column_rejects_reordered_target_schema() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    // Reordered target schema: [col_b, col_a]
+    let reordered_target = Arc::new(Schema::new(vec![
+        Field::new("col_b", DataType::Utf8, true),
+        Field::new("col_a", DataType::Utf8, false),
+    ]));
+
+    let res = nullify_column(&batch, reordered_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Field mismatch at index 0"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullify_column_rejects_non_nullable_target_field() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    // Matching order, but col_b is marked not nullable in target schema
+    let non_nullable_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+
+    let res = nullify_column(&batch, non_nullable_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Target schema field 'col_b' must be nullable"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullify_column_rejects_column_count_mismatch() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    let count_mismatch_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, true),
+        Field::new("col_c", DataType::Utf8, true),
+    ]));
+
+    let res = nullify_column(&batch, count_mismatch_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Column count mismatch: batch has 2, target schema has 3"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_nullify_column_rejects_data_type_mismatch() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, false),
+        Field::new("col_b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["val_a"])),
+            Arc::new(StringArray::from(vec!["val_b"])),
+        ],
+    )
+    .unwrap();
+
+    let type_mismatch_target = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Int32, false),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+
+    let res = nullify_column(&batch, type_mismatch_target, "col_b");
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        SdkError::SchemaMismatch(msg) => {
+            assert!(msg.contains("Field mismatch at index 0"));
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_sdk_error_schema_mismatch_display() {
+    let err = SdkError::SchemaMismatch("field mismatch at index 0".to_string());
+    assert_eq!(
+        err.to_string(),
+        "Schema mismatch: field mismatch at index 0"
+    );
+    assert_eq!(
+        err,
+        SdkError::SchemaMismatch("field mismatch at index 0".to_string())
+    );
 }

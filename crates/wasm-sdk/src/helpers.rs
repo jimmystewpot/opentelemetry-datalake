@@ -2,6 +2,7 @@
 
 use crate::error::SdkError;
 use arrow::array::new_null_array;
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
@@ -23,19 +24,60 @@ pub fn is_immutable_column(column: &str) -> bool {
     IMMUTABLE_COLUMNS.contains(&column)
 }
 
-/// Nullifies a column in the given [`RecordBatch`] while preserving schema and metadata.
+/// Nullifies a column in the given [`RecordBatch`] using the provided `target_schema`.
 ///
-/// Returns an error if the column is immutable or not found in the schema.
-pub fn nullify_column(batch: &RecordBatch, column_name: &str) -> Result<RecordBatch, SdkError> {
+/// Returns an error if the column is immutable, not found in the schema, the target schema
+/// does not match the batch schema's field names, order, or data types, or the target column
+/// is not nullable.
+pub fn nullify_column(
+    batch: &RecordBatch,
+    target_schema: Arc<Schema>,
+    column_name: &str,
+) -> Result<RecordBatch, SdkError> {
     if is_immutable_column(column_name) {
         return Err(SdkError::ImmutableFieldViolation(column_name.to_string()));
     }
-    let schema = batch.schema();
-    let idx = schema
+
+    if batch.num_columns() != target_schema.fields().len() {
+        return Err(SdkError::SchemaMismatch(format!(
+            "Column count mismatch: batch has {}, target schema has {}",
+            batch.num_columns(),
+            target_schema.fields().len()
+        )));
+    }
+
+    let batch_schema = batch.schema();
+    for i in 0..batch.num_columns() {
+        let batch_field = batch_schema.field(i);
+        let target_field = target_schema.field(i);
+        if batch_field.name() != target_field.name() {
+            return Err(SdkError::SchemaMismatch(format!(
+                "Field mismatch at index {i}: expected '{}', found '{}'",
+                batch_field.name(),
+                target_field.name()
+            )));
+        }
+        if batch_field.data_type() != target_field.data_type() {
+            return Err(SdkError::SchemaMismatch(format!(
+                "Field mismatch at index {i}: expected '{}', found '{}'",
+                batch_field.data_type(),
+                target_field.data_type()
+            )));
+        }
+    }
+
+    let src_idx = batch_schema
         .index_of(column_name)
         .map_err(|_| SdkError::ColumnNotFound(column_name.to_string()))?;
+
+    if !target_schema.field(src_idx).is_nullable() {
+        return Err(SdkError::SchemaMismatch(format!(
+            "Target schema field '{column_name}' must be nullable"
+        )));
+    }
+
     let mut columns: Vec<Arc<dyn arrow::array::Array>> = batch.columns().to_vec();
-    let field = schema.field(idx);
-    columns[idx] = new_null_array(field.data_type(), batch.num_rows());
-    RecordBatch::try_new(schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
+    columns[src_idx] = new_null_array(target_schema.field(src_idx).data_type(), batch.num_rows());
+
+    RecordBatch::try_new(target_schema, columns).map_err(|e| SdkError::Arrow(e.to_string()))
 }

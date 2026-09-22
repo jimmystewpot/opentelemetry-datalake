@@ -8,6 +8,7 @@ use crate::abi::LOG_LEVEL_ERROR;
 
 #[cfg(target_arch = "wasm32")]
 // SAFETY: Declaring host logging import provided by the wasm-transformer host environment.
+#[link(wasm_import_module = "env")]
 unsafe extern "C" {
     fn datalake_host_log(level: u32, msg_ptr: u32, msg_len: u32);
 }
