@@ -203,8 +203,7 @@ impl WasmDispatcher {
             }
             WorkerOutcome::Discarded => true,
             WorkerOutcome::Rejected { reason, original } => {
-                Self::handle_rejected(worker_id, reason, original, tf_cfg.on_reject, rej_tx).await;
-                true
+                Self::handle_rejected(worker_id, reason, original, tf_cfg.on_reject, rej_tx).await
             }
             WorkerOutcome::Errored { reason, original } => {
                 Self::handle_errored(worker_id, reason, original, tf_cfg, output, err_tx).await
@@ -213,17 +212,21 @@ impl WasmDispatcher {
     }
 
     /// Routes a rejected batch according to the rejection policy.
+    ///
+    /// Returns `true` if downstream channel is healthy, or `false` if DLQ channel closed.
     async fn handle_rejected(
         worker_id: usize,
         reason: String,
         original: SignalBatch,
         policy: OnRejectPolicy,
         rej_tx: Option<&PipelineSender>,
-    ) {
+    ) -> bool {
+        let mut healthy = true;
         if policy == OnRejectPolicy::Reroute {
             if let Some(rtx) = rej_tx {
                 if let Err(e) = rtx.send(original).await {
                     warn!(worker_id, "Failed to send rejected batch to DLQ: {e}");
+                    healthy = false;
                 }
             } else {
                 warn!(
@@ -233,6 +236,7 @@ impl WasmDispatcher {
             }
         }
         warn!(worker_id, %reason, "Batch rejected by guest");
+        healthy
     }
 
     /// Routes an errored batch according to the error policy.
@@ -252,6 +256,7 @@ impl WasmDispatcher {
                 if let Some(etx) = err_tx {
                     if let Err(e) = etx.send(original).await {
                         warn!(worker_id, "Failed to send errored batch to DLQ: {e}");
+                        healthy = false;
                     }
                 } else {
                     warn!(
@@ -350,31 +355,7 @@ impl WasmDispatcher {
     }
 }
 
-/// Parses a duration string (e.g. "500ms", "5s", "1m") into a [`std::time::Duration`].
-fn parse_duration(s: &str) -> Option<std::time::Duration> {
-    let trimmed = s.trim();
-    if let Some(num) = trimmed.strip_suffix("ms") {
-        num.trim()
-            .parse::<u64>()
-            .ok()
-            .map(std::time::Duration::from_millis)
-    } else if let Some(num) = trimmed.strip_suffix('s') {
-        num.trim()
-            .parse::<u64>()
-            .ok()
-            .map(std::time::Duration::from_secs)
-    } else if let Some(num) = trimmed.strip_suffix('m') {
-        num.trim()
-            .parse::<u64>()
-            .ok()
-            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
-    } else {
-        trimmed
-            .parse::<u64>()
-            .ok()
-            .map(std::time::Duration::from_secs)
-    }
-}
+use crate::worker::parse_duration;
 
 #[cfg(test)]
 mod tests {

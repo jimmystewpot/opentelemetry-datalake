@@ -89,8 +89,11 @@ impl WasmTransformer {
         let max_memory_bytes =
             crate::worker::parse_byte_size(&config.max_memory).unwrap_or(64 * 1024 * 1024);
 
+        // Sizing pooling allocator with 1 slot of headroom ensures workers can
+        // instantiate a replacement guest instance during rejuvenation before the old store is dropped.
+        let pool_capacity = config.concurrency.saturating_add(1);
         let engine = Arc::new(
-            EngineCache::new_pooling(config.concurrency, max_memory_bytes)
+            EngineCache::new_pooling(pool_capacity, max_memory_bytes)
                 .map_err(|e| PipelineError::Internal(e.to_string()))?,
         );
 

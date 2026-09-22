@@ -121,6 +121,71 @@ type SignalTransformers = (
     Vec<Option<tokio::task::JoinHandle<()>>>,
 );
 
+/// Creates a bounded DLQ channel and spawns a background logging task to drain diverted batches.
+fn setup_dlq_channel(
+    transformer_id: &str,
+    signal: &str,
+    role: &str,
+    capacity: usize,
+) -> (
+    pipeline_core::pipeline::PipelineSender,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<pipeline_core::pipeline::SignalBatch>(capacity);
+    let transformer_id = transformer_id.to_string();
+    let signal = signal.to_string();
+    let role = role.to_string();
+    let handle = tokio::spawn(async move {
+        while let Some(batch) = rx.recv().await {
+            let (batch_signal, rows) = match &batch {
+                pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb.num_rows()),
+                pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb.num_rows()),
+                pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb.num_rows()),
+            };
+            tracing::warn!(
+                transformer_id = %transformer_id,
+                signal = %signal,
+                batch_signal = %batch_signal,
+                role = %role,
+                rows,
+                "DLQ: Received batch diverted from WASM transformer"
+            );
+        }
+    });
+    (tx, handle)
+}
+
+/// Instantiates a signal-isolated [`wasm_transformer::WasmTransformer`], setting up DLQ reroute channels as needed.
+fn instantiate_signal_wasm_transformer(
+    cfg: &pipeline_core::config::WasmTransformerConfig,
+    signal: &str,
+) -> anyhow::Result<wasm_transformer::WasmTransformer> {
+    let mut signal_cfg = cfg.clone();
+    signal_cfg
+        .env
+        .insert("signal".to_string(), signal.to_string());
+
+    let capacity = signal_cfg.worker_channel_capacity.max(16);
+
+    let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
+        let (tx, _) = setup_dlq_channel(&signal_cfg.id, signal, "error", capacity);
+        Some(tx)
+    } else {
+        None
+    };
+
+    let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
+        let (tx, _) = setup_dlq_channel(&signal_cfg.id, signal, "reject", capacity);
+        Some(tx)
+    } else {
+        None
+    };
+
+    let transformer =
+        wasm_transformer::WasmTransformer::new(signal_cfg, reroute_error, reroute_reject)?;
+    Ok(transformer)
+}
+
 /// Initializes the pipeline transformers based on the provided application configuration.
 /// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
 /// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
@@ -136,23 +201,9 @@ fn initialize_transformers(config: &AppConfig) -> anyhow::Result<SignalTransform
             module_path = %wasm_cfg.module_path,
             "Initializing 3x signal-isolated WasmTransformer instances"
         );
-        let mut logs_cfg = wasm_cfg.clone();
-        logs_cfg
-            .env
-            .insert("signal".to_string(), "logs".to_string());
-        let logs_wasm = wasm_transformer::WasmTransformer::new(logs_cfg, None, None)?;
-
-        let mut traces_cfg = wasm_cfg.clone();
-        traces_cfg
-            .env
-            .insert("signal".to_string(), "traces".to_string());
-        let traces_wasm = wasm_transformer::WasmTransformer::new(traces_cfg, None, None)?;
-
-        let mut metrics_cfg = wasm_cfg.clone();
-        metrics_cfg
-            .env
-            .insert("signal".to_string(), "metrics".to_string());
-        let metrics_wasm = wasm_transformer::WasmTransformer::new(metrics_cfg, None, None)?;
+        let logs_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "logs")?;
+        let traces_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "traces")?;
+        let metrics_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "metrics")?;
 
         if wasm_cfg.enable_sighup {
             let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
@@ -982,5 +1033,71 @@ mod tests {
 
         let res = initialize_transformers(&config);
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_transformers_wasm_with_reroute_policies() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let wasm_path = temp_dir.join(format!(
+            "test_wasm_reroute_{}_{}.wasm",
+            std::process::id(),
+            now_nanos
+        ));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [wasm_transformer]
+            id = "test_reroute_wasm"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "reroute"
+            on_reject = "reroute"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = true
+            "#,
+            wasm_path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = initialize_transformers(&config);
+        let _ = std::fs::remove_file(&wasm_path);
+
+        assert!(
+            res.is_ok(),
+            "Transformers with reroute policies and DLQ wiring must initialize successfully: {:?}",
+            res.err()
+        );
     }
 }

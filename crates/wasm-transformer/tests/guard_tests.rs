@@ -4,7 +4,9 @@ use arrow::record_batch::RecordBatch;
 use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 use std::collections::HashMap;
 use std::sync::Arc;
-use wasm_transformer::guard::{backfill_missing_columns, verify_structural_immutability};
+use wasm_transformer::guard::{
+    backfill_missing_columns, verify_strict_schema_equality, verify_structural_immutability,
+};
 
 #[test]
 fn test_o1_immutability_check_detects_all_null_immutable_column() {
@@ -725,4 +727,156 @@ fn test_backfill_nested_map_and_list_views_nullability() {
     } else {
         panic!("Expected LargeListView");
     }
+}
+
+#[test]
+fn test_strict_schema_equality_identical_schemas_pass() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("severity_number", DataType::Int64, true),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let batch1 = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["t1"])),
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+    let batch2 = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["t2"])),
+            Arc::new(Int64Array::from(vec![20])),
+            Arc::new(StringArray::from(vec!["world"])),
+        ],
+    )
+    .unwrap();
+
+    assert!(verify_strict_schema_equality(&batch1, &batch2).is_ok());
+}
+
+#[test]
+fn test_strict_schema_equality_dropped_non_immutable_column_fails() {
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("severity_number", DataType::Int64, true),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("severity_number", DataType::Int64, true),
+    ]));
+    let in_batch = RecordBatch::try_new(
+        in_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["t1"])),
+            Arc::new(Int64Array::from(vec![10])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .unwrap();
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["t1"])),
+            Arc::new(Int64Array::from(vec![10])),
+        ],
+    )
+    .unwrap();
+
+    let res = verify_strict_schema_equality(&in_batch, &out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Strict schema guard violation")
+    );
+}
+
+#[test]
+fn test_strict_schema_equality_added_column_fails() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("new_col", DataType::Utf8, true),
+    ]));
+    let in_batch =
+        RecordBatch::try_new(in_schema, vec![Arc::new(StringArray::from(vec!["t1"]))]).unwrap();
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["t1"])),
+            Arc::new(StringArray::from(vec!["extra"])),
+        ],
+    )
+    .unwrap();
+
+    let res = verify_strict_schema_equality(&in_batch, &out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Strict schema guard violation")
+    );
+}
+
+#[test]
+fn test_strict_schema_equality_mutated_field_type_fails() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Int64, true)]));
+    let in_batch =
+        RecordBatch::try_new(in_schema, vec![Arc::new(StringArray::from(vec!["123"]))]).unwrap();
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(Int64Array::from(vec![123]))]).unwrap();
+
+    let res = verify_strict_schema_equality(&in_batch, &out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Strict schema guard violation")
+    );
+}
+
+#[test]
+fn test_strict_schema_equality_reordered_fields_fail() {
+    let in_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("col_b", DataType::Utf8, true),
+    ]));
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("col_b", DataType::Utf8, true),
+        Field::new("col_a", DataType::Utf8, true),
+    ]));
+    let in_batch = RecordBatch::try_new(
+        in_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(StringArray::from(vec!["b"])),
+        ],
+    )
+    .unwrap();
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["b"])),
+            Arc::new(StringArray::from(vec!["a"])),
+        ],
+    )
+    .unwrap();
+
+    let res = verify_strict_schema_equality(&in_batch, &out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Strict schema guard violation")
+    );
 }
