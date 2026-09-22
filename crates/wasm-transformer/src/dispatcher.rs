@@ -120,7 +120,7 @@ impl WasmDispatcher {
     }
 
     /// Spawns worker tasks and returns their channel senders, task join handles, and initialization result receivers.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_lines)]
     fn spawn_workers(
         &self,
         concurrency: usize,
@@ -150,18 +150,33 @@ impl WasmDispatcher {
             let registry = Arc::clone(&self.registry);
 
             worker_handles.push(tokio::spawn(async move {
-                let mut worker =
-                    match WasmWorker::new(worker_id, engine, module, tf_cfg.clone(), registry) {
-                        Ok(w) => {
-                            let _ = init_tx.send(Ok(()));
-                            w
-                        }
+                let tf_cfg_init = tf_cfg.clone();
+                let init_outcome = tokio::task::spawn_blocking(move || {
+                    match WasmWorker::new(worker_id, engine, module, tf_cfg_init, registry) {
+                        Ok(w) => (Ok(()), Some(w)),
                         Err(e) => {
                             warn!(worker_id, "Worker initialization failed: {e}");
-                            let _ = init_tx.send(Err(e.to_string()));
-                            return;
+                            (Err(e.to_string()), None)
                         }
-                    };
+                    }
+                })
+                .await;
+
+                let (worker_init_status, worker_opt) = match init_outcome {
+                    Ok(pair) => pair,
+                    Err(join_err) => {
+                        error!(
+                            worker_id,
+                            "Worker init blocking task join failed: {join_err}"
+                        );
+                        (Err(format!("Worker init join error: {join_err}")), None)
+                    }
+                };
+
+                let _ = init_tx.send(worker_init_status);
+                let Some(mut worker) = worker_opt else {
+                    return;
+                };
 
                 while let Some(batch) = wrx.recv().await {
                     let mut w = worker;

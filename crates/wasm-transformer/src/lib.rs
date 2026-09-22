@@ -76,21 +76,33 @@ impl WasmTransformer {
             )));
         }
 
-        // 2. Security audit logging for passthrough policy
+        // 2. Concurrency validation
+        if config.concurrency == 0 {
+            return Err(PipelineError::Internal(
+                "wasm_transformer.concurrency must be greater than 0".to_string(),
+            ));
+        }
+
+        // 3. Security audit logging and passthrough policy validation
         if config.on_error == OnErrorPolicy::Passthrough {
+            if !config.allow_unmasked_passthrough {
+                return Err(PipelineError::Internal(
+                    "Invalid configuration: on_error is set to 'passthrough' but allow_unmasked_passthrough is false; this would silently drop errored batches".to_string(),
+                ));
+            }
             warn!(
                 transformer_id = %config.id,
                 "SECURITY AUDIT: on_error=passthrough enabled. Input batches will bypass transformation on guest failure. Verify threat model."
             );
         }
 
-        // 3. EngineCache initialization with pooling allocator
+        // 4. EngineCache initialization with pooling allocator
         let max_memory_bytes =
             crate::worker::parse_byte_size(&config.max_memory).unwrap_or(64 * 1024 * 1024);
 
         // Sizing pooling allocator with 1 slot of headroom ensures workers can
         // instantiate a replacement guest instance during rejuvenation before the old store is dropped.
-        let pool_capacity = config.concurrency.saturating_add(1);
+        let pool_capacity = config.concurrency.max(1).saturating_add(1);
         let engine = Arc::new(
             EngineCache::new_pooling(pool_capacity, max_memory_bytes)
                 .map_err(|e| PipelineError::Internal(e.to_string()))?,
@@ -167,6 +179,18 @@ impl WasmTransformer {
             ));
         }
 
+        if config.concurrency == 0 {
+            return Err(PipelineError::Internal(
+                "wasm_transformer.concurrency must be greater than 0".to_string(),
+            ));
+        }
+
+        if config.on_error == OnErrorPolicy::Passthrough && !config.allow_unmasked_passthrough {
+            return Err(PipelineError::Internal(
+                "Invalid configuration: on_error is set to 'passthrough' but allow_unmasked_passthrough is false; this would silently drop errored batches".to_string(),
+            ));
+        }
+
         let max_memory_bytes =
             crate::worker::parse_byte_size(&config.max_memory).ok_or_else(|| {
                 PipelineError::Internal(format!(
@@ -222,7 +246,7 @@ impl WasmTransformer {
             }
         }
 
-        let pool_capacity = config.concurrency.saturating_add(1);
+        let pool_capacity = config.concurrency.max(1).saturating_add(1);
         let engine = EngineCache::new_pooling(pool_capacity, max_memory_bytes)
             .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
@@ -343,5 +367,47 @@ mod tests {
         let res = WasmTransformer::new(config, None, None);
         let _ = std::fs::remove_file(&path);
         assert!(matches!(res, Err(PipelineError::Internal(_))));
+    }
+
+    #[test]
+    fn test_new_rejects_zero_concurrency() {
+        let mut config = base_config("dummy".to_string());
+        config.concurrency = 0;
+        let res = WasmTransformer::new(config, None, None);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_zero_concurrency() {
+        let mut config = base_config("dummy".to_string());
+        config.concurrency = 0;
+        let res = WasmTransformer::validate_config(&config);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be greater than 0"))
+        );
+    }
+
+    #[test]
+    fn test_new_rejects_passthrough_without_allow_unmasked() {
+        let mut config = base_config("dummy".to_string());
+        config.on_error = OnErrorPolicy::Passthrough;
+        config.allow_unmasked_passthrough = false;
+        let res = WasmTransformer::new(config, None, None);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("on_error is set to 'passthrough' but allow_unmasked_passthrough is false"))
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_passthrough_without_allow_unmasked() {
+        let mut config = base_config("dummy".to_string());
+        config.on_error = OnErrorPolicy::Passthrough;
+        config.allow_unmasked_passthrough = false;
+        let res = WasmTransformer::validate_config(&config);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("on_error is set to 'passthrough' but allow_unmasked_passthrough is false"))
+        );
     }
 }

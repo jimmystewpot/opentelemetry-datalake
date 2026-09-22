@@ -579,7 +579,7 @@ fn test_tf_cfg() -> WasmTransformerConfig {
         rejuvenate_batches: 0,
         init_timeout: "1s".to_string(),
         allow_unmasked_passthrough: false,
-        on_error: OnErrorPolicy::Passthrough,
+        on_error: OnErrorPolicy::Drop,
         on_reject: OnRejectPolicy::Drop,
         schema_guard: SchemaGuardMode::Defensive,
         env: std::collections::HashMap::new(),
