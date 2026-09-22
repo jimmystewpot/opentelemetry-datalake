@@ -94,7 +94,7 @@ parquet = { version = "59", default-features = false, features = ["async", "arro
 
 # Codec & OTLP Parsing
 prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }
-opentelemetry-proto = { version = "0.32.0", default-features = false, features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "with-serde"] }
+opentelemetry-proto = { version = "0.33.0", default-features = false, features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "with-serde"] }
 
 # Networking
 tonic = { version = "0.14.6", default-features = false, features = ["transport", "codegen", "router"] }
