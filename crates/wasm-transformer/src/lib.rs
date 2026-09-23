@@ -243,7 +243,10 @@ impl WasmTransformer {
             .compile_module(&wasm_bytes)
             .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
-        let registry = Arc::new(crate::host_calls::MetricRegistry::new(&config.id));
+        let signal = config.env.get("signal").map_or("", String::as_str);
+        let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+            &config.id, signal,
+        ));
 
         // 7. Surface worker initialization failures early by probing guest instantiation
         // across active runtime signal contexts.

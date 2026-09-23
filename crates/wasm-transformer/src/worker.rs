@@ -171,17 +171,11 @@ impl WasmWorker {
     /// memory, and processed by calling `datalake_transform`. The returned response header
     /// is decoded to produce the corresponding [`WorkerOutcome`].
     ///
-    /// Executes a transformation over a [`SignalBatch`].
-    ///
-    /// The incoming batch is serialized into an Arrow IPC stream, transferred into guest
-    /// memory, and processed by calling `datalake_transform`. The returned response header
-    /// is decoded to produce the corresponding [`WorkerOutcome`].
-    ///
     /// # Errors
     ///
     /// Returns `Err((batch, err))` with the preserved input batch if IPC serialization fails,
     /// guest execution traps, or guest memory bounds are violated.
-    #[allow(clippy::unused_async_trait_impl, clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)]
     pub fn execute_batch(
         &mut self,
         batch: SignalBatch,
@@ -789,6 +783,12 @@ fn extract_output_batches(
             u32::from_le_bytes([desc_bytes[0], desc_bytes[1], desc_bytes[2], desc_bytes[3]]);
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
+
+        if b_ptr == 0 {
+            return Err(WasmTransformError::Pipeline(
+                "Protocol error: batch descriptor contained null IPC buffer pointer".to_string(),
+            ));
+        }
 
         let start = b_ptr as usize;
         let end = start.saturating_add(b_len as usize);

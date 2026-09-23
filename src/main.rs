@@ -381,8 +381,8 @@ fn spawn_sighup_reload_task(
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         tracing::debug!("SIGHUP listener shutting down");
                         break;
                     }
@@ -1675,6 +1675,65 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = task_handle.await;
+        let _ = std::fs::remove_file(&wasm_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_sighup_reload_task_terminates_on_shutdown_channel_drop() {
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_sighup_drop_{}.wasm", std::process::id()));
+        let wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
+        )"#;
+        let wasm_bytes = wat::parse_str(wat).expect("wat");
+        std::fs::write(&wasm_path, wasm_bytes).expect("write wasm");
+
+        let wasm_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "test_sighup_drop".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: wasm_path.display().to_string(),
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "16MiB".to_string(),
+            rejuvenate_threshold: "8MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: true,
+            on_reject: pipeline_core::config::OnRejectPolicy::Drop,
+            schema_guard: pipeline_core::config::SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: true,
+        };
+
+        let engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(2, 16 * 1024 * 1024).expect("pool"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_handle =
+            spawn_sighup_reload_task(wasm_cfg, std::sync::Arc::clone(&engine), shutdown_rx);
+
+        // Drop shutdown_tx immediately without setting to true
+        drop(shutdown_tx);
+
+        let timeout_res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            timeout_res.is_ok(),
+            "SIGHUP reload task must exit cleanly on shutdown channel drop without spinning"
+        );
         let _ = std::fs::remove_file(&wasm_path);
     }
 }

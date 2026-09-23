@@ -76,11 +76,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Pipeli
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(telemetry)
         .with(tracing_subscriber::fmt::layer())
-        .init();
+        .try_init();
 
     // Set as global providers to ensure library traces and metrics are captured
     opentelemetry::global::set_tracer_provider(provider.clone());
