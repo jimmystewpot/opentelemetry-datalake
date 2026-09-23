@@ -94,11 +94,12 @@ impl EngineCache {
             .snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let new_gen = self.generation.load(Ordering::Relaxed) + 1;
         *guard = Some(ModuleSnapshot {
             module,
             generation: new_gen,
         });
+        self.generation.store(new_gen, Ordering::Release);
         new_gen
     }
 
@@ -152,10 +153,13 @@ impl EngineCache {
     /// ensuring that callers never observe a newer generation paired with an older module pointer.
     #[must_use]
     pub fn current_module(&self) -> (Option<Arc<Module>>, u64) {
-        if let Some(snap) = self.current_snapshot() {
-            (Some(snap.module), snap.generation)
-        } else {
-            (None, self.generation.load(Ordering::Acquire))
+        let guard = self
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *guard {
+            Some(ref snap) => (Some(Arc::clone(&snap.module)), snap.generation),
+            None => (None, 0),
         }
     }
 
