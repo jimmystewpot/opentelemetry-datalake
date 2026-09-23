@@ -210,8 +210,9 @@ fn pack_header(header_ptr: u32) -> u64 {
 
 /// Extracts the target [`SignalType`] from a configuration string, matching C-ABI conventions.
 ///
-/// Supports JSON configuration containing a `"signal"` key (e.g. `{"signal":"metrics"}` or `{"signal": 1}`)
+/// Supports JSON configuration containing a top-level `"signal"` key (e.g. `{"signal":"metrics"}` or `{"signal": 1}`)
 /// as well as plain signal names (e.g. `"metrics"`, `"logs"`, `"traces"`).
+/// Nested `"signal"` keys in child objects are ignored.
 #[must_use]
 pub fn parse_signal_from_config(config: &str) -> Option<SignalType> {
     fn match_signal_token(token: &str) -> Option<SignalType> {
@@ -241,49 +242,22 @@ pub fn parse_signal_from_config(config: &str) -> Option<SignalType> {
         return Some(signal);
     }
 
-    // Look for `"signal"` key in JSON-like configuration
-    let mut search_idx = 0;
-    while let Some(pos) = config[search_idx..].find("\"signal\"") {
-        let key_end = search_idx + pos + 8; // len of `"signal"` is 8
-        search_idx = key_end;
-
-        // Skip whitespace to colon
-        let after_key = &config[key_end..];
-        let Some((colon_offset, ':')) =
-            after_key.char_indices().find(|(_, ch)| !ch.is_whitespace())
-        else {
-            continue;
-        };
-
-        // After colon, find start of value
-        let after_colon = &after_key[colon_offset + 1..];
-        let Some((start_offset, _)) = after_colon
-            .char_indices()
-            .find(|(_, ch)| !ch.is_whitespace())
-        else {
-            continue;
-        };
-
-        let val_slice = &after_colon[start_offset..];
-        if let Some(stripped) = val_slice.strip_prefix('"') {
-            // Quoted string value: find closing quote
-            if let Some(end_quote) = stripped.find('"') {
-                let token = &stripped[..end_quote];
-                if let Some(sig) = match_signal_token(token) {
-                    return Some(sig);
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(sig_val) = map.get("signal")
+    {
+        match sig_val {
+            serde_json::Value::String(s) => return match_signal_token(s),
+            serde_json::Value::Number(n) => {
+                if let Some(v) = n.as_u64() {
+                    return match v {
+                        0 => Some(SignalType::Logs),
+                        1 => Some(SignalType::Metrics),
+                        2 => Some(SignalType::Traces),
+                        _ => None,
+                    };
                 }
             }
-        } else {
-            // Unquoted token (e.g. number 0, 1, 2)
-            let end_idx = match val_slice.find(|c: char| c == ',' || c == '}' || c.is_whitespace())
-            {
-                Some(idx) => idx,
-                None => val_slice.len(),
-            };
-            let token = &val_slice[..end_idx];
-            if let Some(sig) = match_signal_token(token) {
-                return Some(sig);
-            }
+            _ => return None,
         }
     }
 

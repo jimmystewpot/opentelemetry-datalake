@@ -84,6 +84,7 @@ async-trait = "0.1"
 # Serialization & Config
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+humantime-serde = "1.1.1"
 uuid = { version = "1.24.1", default-features = false, features = ["v7", "std"] }
 figment = { version = "0.10", default-features = false, features = ["env", "toml"] }
 toml = { version = "1.1.6", default-features = false, features = ["parse", "serde"] }
