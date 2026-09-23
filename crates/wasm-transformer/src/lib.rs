@@ -38,7 +38,7 @@ pub const MAX_CONCURRENCY: usize = 10_000;
 /// Trait for Dead Letter Queue (DLQ) sinks that receive diverted or rejected batches.
 #[async_trait]
 pub trait DlqSink: Send + Sync + std::fmt::Debug {
-    /// Persists or forwards a diverted [`SignalBatch`].
+    /// Persists or forwards a diverted [`pipeline_core::pipeline::SignalBatch`].
     ///
     /// # Errors
     ///

@@ -121,7 +121,7 @@ impl MetricRegistry {
         key
     }
 
-    /// Records a counter increment with saturating addition, caching and calling an OpenTelemetry [`Counter`].
+    /// Records a counter increment with saturating addition, caching and calling an OpenTelemetry [`opentelemetry::metrics::Counter`].
     pub fn record_counter(&self, name: &str, delta: u64) {
         if !is_valid_metric_name(name) {
             tracing::warn!(name, "WASM guest emitted counter with invalid name");
@@ -182,7 +182,7 @@ impl MetricRegistry {
         );
     }
 
-    /// Records an instantaneous gauge bitcast value, caching and calling an OpenTelemetry [`Gauge`].
+    /// Records an instantaneous gauge bitcast value, caching and calling an OpenTelemetry [`opentelemetry::metrics::Gauge`].
     pub fn record_gauge(&self, name: &str, bits: u64) {
         if !is_valid_metric_name(name) {
             tracing::warn!(name, "WASM guest emitted gauge with invalid name");
@@ -235,7 +235,7 @@ impl MetricRegistry {
         );
     }
 
-    /// Records a duration observation in nanoseconds, converting to seconds and recording to an OpenTelemetry [`Histogram`].
+    /// Records a duration observation in nanoseconds, converting to seconds and recording to an OpenTelemetry [`opentelemetry::metrics::Histogram`].
     pub fn record_duration(&self, name: &str, nanos: u64) {
         if !is_valid_metric_name(name) {
             tracing::warn!(name, "WASM guest emitted duration with invalid name");
