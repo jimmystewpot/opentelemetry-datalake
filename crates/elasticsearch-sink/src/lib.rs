@@ -1,5 +1,12 @@
 //! Elasticsearch and `OpenSearch` sink for the `opentelemetry-datalake` pipeline.
 
+// Compile-time guard: at least one TLS root store feature must be enabled.
+#[cfg(not(any(feature = "tls-native-roots", feature = "tls-webpki-roots")))]
+compile_error!(
+    "At least one TLS root store feature must be enabled in `elasticsearch-sink`: \
+     enable `tls-native-roots` and/or `tls-webpki-roots`."
+);
+
 pub mod client;
 pub mod config;
 pub mod error;

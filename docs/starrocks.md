@@ -137,7 +137,20 @@ The `figment` config loader merges environment variables with the `OTEL_DATALAKE
 
 ## TLS Configuration
 
-By default, `starrocks-sink` is compiled with `rustls` (no system TLS dependencies required). If your organisation mandates platform / system TLS, rebuild with `tls-native-tls`:
+The StarRocks sink supports standard TLS configuration for secure HTTPS stream loads:
+
+```toml
+[starrocks.tls]
+ca_cert_path = "/etc/ssl/certs/starrocks-ca.pem"
+verification = "full" # "full" (default)
+```
+
+- `ca_cert_path`: Optional path to custom CA certificate (validated at startup). Note: when using `tls-native-tls`, custom CAs must be installed in the host OS trust store.
+- `verification`: `"full"` (default; validates certificate and hostname). Disabling verification is prohibited for security (CWE-295).
+
+### Compile-time TLS Backends
+
+By default, `starrocks-sink` is compiled with `rustls` (`tls-rustls`, no system TLS dependencies required). If your organisation mandates platform / system TLS, rebuild with `tls-native-tls`:
 
 ```toml
 # In the root Cargo.toml or your binary's Cargo.toml:

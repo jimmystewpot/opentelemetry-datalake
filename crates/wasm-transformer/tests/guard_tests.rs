@@ -907,3 +907,214 @@ fn test_strict_schema_equality_reordered_fields_fail() {
             .contains("Strict schema guard violation")
     );
 }
+
+#[test]
+fn test_backfill_rejects_mutated_data_type() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Int64, true)]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("data type mutated from Utf8 to Int64")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_nullability_mutation() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("nullability mutated from non-nullable to nullable")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_non_nullable_new_column() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("col_a", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("new_required_col", DataType::Int64, false),
+    ]));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("newly added column 'new_required_col' must be nullable")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_tampered_compliance_metadata() {
+    let mut in_meta = HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    let in_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        in_meta,
+    ));
+
+    let mut out_meta = HashMap::new();
+    out_meta.insert("otel::compliance::status".to_string(), "forged".to_string());
+    let out_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        out_meta,
+    ));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("guest attempted to mutate compliance metadata 'otel::compliance::status'")
+    );
+}
+
+#[test]
+fn test_backfill_preserves_upstream_metadata_on_conflict() {
+    let mut in_meta = HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    in_meta.insert("conflict_key".to_string(), "upstream_value".to_string());
+    let in_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        in_meta,
+    ));
+
+    let mut out_meta = HashMap::new();
+    out_meta.insert("conflict_key".to_string(), "guest_override".to_string());
+    out_meta.insert("guest_key".to_string(), "guest_value".to_string());
+    let out_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        out_meta,
+    ));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&in_schema, out_batch).unwrap();
+    let backfilled_schema = backfilled.schema();
+    let meta = backfilled_schema.metadata();
+    assert_eq!(
+        meta.get("conflict_key").map(String::as_str),
+        Some("upstream_value")
+    );
+    assert_eq!(
+        meta.get("guest_key").map(String::as_str),
+        Some("guest_value")
+    );
+    assert_eq!(
+        meta.get("otel::compliance::status").map(String::as_str),
+        Some("verified")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_nullable_to_non_nullable_mutation() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("col_a", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new(
+        "col_a",
+        DataType::Utf8,
+        false,
+    )]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("column 'col_a' nullability mutated from nullable to non-nullable")
+    );
+}
+
+/// Regression: `backfill_missing_columns` previously used O(n²) linear scan for field lookup.
+/// This test verifies correctness of the O(n) HashMap-based implementation with a large schema.
+#[test]
+fn test_backfill_on_schema_missing_multiple_columns_is_correct() {
+    // Build a 50-column input schema
+    let mut input_fields: Vec<Field> = (0..50)
+        .map(|i| Field::new(format!("col_{i}").as_str(), DataType::Int64, true))
+        .collect();
+    input_fields.push(Field::new("trace_id", DataType::Utf8, false));
+    let input_schema = Arc::new(Schema::new(input_fields));
+
+    // Output has only 10 of the 50 columns (guest dropped 40) plus 2 new guest columns
+    let mut output_fields: Vec<Field> = (0..10)
+        .map(|i| Field::new(format!("col_{i}").as_str(), DataType::Int64, true))
+        .collect();
+    output_fields.push(Field::new("trace_id", DataType::Utf8, false));
+    output_fields.push(Field::new("guest_col_a", DataType::Utf8, true));
+    output_fields.push(Field::new("guest_col_b", DataType::Int64, true));
+    let output_schema = Arc::new(Schema::new(output_fields));
+
+    let array_len = 3usize;
+    let mut arrays: Vec<Arc<dyn arrow::array::Array>> = (0..10)
+        .map(|_| Arc::new(Int64Array::from(vec![1i64, 2, 3])) as Arc<dyn arrow::array::Array>)
+        .collect();
+    arrays.push(Arc::new(StringArray::from(vec!["a", "b", "c"])));
+    arrays.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+    arrays.push(Arc::new(Int64Array::from(vec![10i64, 20, 30])));
+    let output_batch = RecordBatch::try_new(output_schema, arrays).unwrap();
+
+    let result = backfill_missing_columns(&input_schema, output_batch).unwrap();
+    let result_schema = result.schema();
+
+    // Verify all input columns are present (40 missing → backfilled as nulls)
+    for i in 0..50 {
+        let col_name = format!("col_{i}");
+        assert!(
+            result_schema.index_of(&col_name).is_ok(),
+            "col_{i} must be present after backfill"
+        );
+        if i >= 10 {
+            // Dropped columns must be null arrays
+            let idx = result_schema.index_of(&col_name).unwrap();
+            assert_eq!(
+                result.column(idx).null_count(),
+                array_len,
+                "col_{i} must be all-null after backfill"
+            );
+        }
+    }
+    // trace_id must be present
+    assert!(result_schema.index_of("trace_id").is_ok());
+    // New guest columns must be preserved
+    assert!(result_schema.index_of("guest_col_a").is_ok());
+    assert!(result_schema.index_of("guest_col_b").is_ok());
+    // Total columns: 50 input + 1 trace_id + 2 guest = 53
+    assert_eq!(result_schema.fields().len(), 53);
+}

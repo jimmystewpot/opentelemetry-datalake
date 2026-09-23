@@ -32,6 +32,8 @@ pub fn spawn_sighup_listener_multi(
         return None;
     }
 
+    let expected_sha = expected_sha.filter(|s| !s.trim().is_empty());
+
     #[cfg(unix)]
     {
         Some(tokio::spawn(async move {
@@ -118,6 +120,17 @@ pub struct WasmReloadRequest {
     pub expected_sha: Option<String>,
 }
 
+/// Response body returned by the WASM hot-reload REST endpoint upon successful reload.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct WasmReloadResponse {
+    /// Human-readable status message confirming successful reload.
+    pub status: String,
+    /// Filesystem path of the reloaded WebAssembly module.
+    pub path: String,
+    /// New active module generation counter across the reloaded engines.
+    pub generation: u64,
+}
+
 /// State provided to the WASM hot-reload REST endpoint handler.
 #[derive(Clone)]
 pub struct WasmReloadState {
@@ -133,7 +146,7 @@ impl WasmReloadState {
     pub fn new(engine: Arc<EngineCache>, configured_sha: Option<String>) -> Self {
         Self {
             engines: vec![engine],
-            configured_sha,
+            configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
         }
     }
 
@@ -142,7 +155,7 @@ impl WasmReloadState {
     pub fn new_multi(engines: Vec<Arc<EngineCache>>, configured_sha: Option<String>) -> Self {
         Self {
             engines,
-            configured_sha,
+            configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -163,29 +176,38 @@ impl From<Arc<EngineCache>> for WasmReloadState {
 ///
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
-/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if no engines are configured, or if the module compilation
-/// or SHA-256 verification fails.
+/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if `module_path` is empty or whitespace, if no engines
+/// are configured, or if the module compilation or SHA-256 verification fails.
 pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
-) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+) -> Result<axum::Json<WasmReloadResponse>, axum::http::StatusCode> {
+    let module_path = payload.module_path.trim();
     tracing::warn!(
-        path = %payload.module_path,
+        path = %module_path,
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
+
+    if module_path.is_empty() {
+        tracing::warn!("Hot-reload REST: empty or blank module_path provided");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
 
     if state.engines.is_empty() {
         tracing::warn!("Hot-reload REST: no engines configured in state");
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let bytes = tokio::fs::read(&payload.module_path).await.map_err(|e| {
+    let bytes = tokio::fs::read(module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to read module: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     let engines = state.engines.clone();
-    let expected_sha = payload.expected_sha.or(state.configured_sha);
+    let expected_sha = payload
+        .expected_sha
+        .filter(|s| !s.trim().is_empty())
+        .or(state.configured_sha);
 
     let generation = tokio::task::spawn_blocking(move || -> Result<u64, WasmTransformError> {
         if let Some(ref expected) = expected_sha {
@@ -213,11 +235,11 @@ pub async fn wasm_reload_handler(
         axum::http::StatusCode::BAD_REQUEST
     })?;
 
-    Ok(axum::Json(serde_json::json!({
-        "status": "reload successful",
-        "path": payload.module_path,
-        "generation": generation,
-    })))
+    Ok(axum::Json(WasmReloadResponse {
+        status: "reload successful".to_string(),
+        path: module_path.to_string(),
+        generation,
+    }))
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.

@@ -25,10 +25,7 @@ fn test_host_linker_defines_required_guest_imports() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let test_fn = instance
@@ -84,10 +81,7 @@ fn test_edge_case_missing_memory_export() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Init,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -126,10 +120,7 @@ fn test_edge_case_out_of_bounds_memory_reads() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -194,10 +185,7 @@ fn test_edge_case_duration_nanos_counter_recording() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -205,7 +193,16 @@ fn test_edge_case_duration_nanos_counter_recording() {
         .unwrap();
 
     assert!(func.call(&mut store, ()).is_ok());
-    assert_eq!(registry.read_counter("latency_nanos"), 7_500_000);
+    // Duration is exported as a histogram, not a cumulative counter
+    assert_eq!(registry.read_counter("latency_nanos"), 0);
+    // Duration metric must preserve observation count, sum, min, max, and last sample
+    let duration = registry.read_duration("latency_nanos").unwrap();
+    assert_eq!(duration.count, 2);
+    assert_eq!(duration.sum_nanos, 7_500_000);
+    assert_eq!(duration.min_nanos, 2_500_000);
+    assert_eq!(duration.max_nanos, 5_000_000);
+    assert_eq!(duration.last_nanos, 2_500_000);
+    assert!(registry.handles().contains_key("latency_nanos"));
 }
 
 #[test]
@@ -219,17 +216,10 @@ fn test_edge_case_log_levels_1_through_4_and_default_trace() {
         (memory (export "memory") 1)
         (data (i32.const 0) "test log payload")
         (func (export "emit_logs")
-            ;; Level 1 (Error)
             (call $log (i32.const 1) (i32.const 0) (i32.const 16))
-            ;; Level 2 (Warn)
             (call $log (i32.const 2) (i32.const 0) (i32.const 16))
-            ;; Level 3 (Info)
             (call $log (i32.const 3) (i32.const 0) (i32.const 16))
-            ;; Level 4 (Debug)
             (call $log (i32.const 4) (i32.const 0) (i32.const 16))
-            ;; Level 5 (Trace)
-            (call $log (i32.const 5) (i32.const 0) (i32.const 16))
-            ;; Level 99 (Default fallback -> Trace)
             (call $log (i32.const 99) (i32.const 0) (i32.const 16))
         )
     )"#;
@@ -237,10 +227,7 @@ fn test_edge_case_log_levels_1_through_4_and_default_trace() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -315,10 +302,7 @@ fn test_edge_case_metric_name_allocation_capping() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -352,10 +336,7 @@ fn test_edge_case_unknown_metric_type_and_empty_name() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -389,10 +370,7 @@ fn test_edge_case_gauge_metric_emission_from_wasm() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -423,10 +401,7 @@ fn test_edge_case_memory_export_not_a_memory() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Init,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -456,10 +431,7 @@ fn test_edge_case_log_message_allocation_capping() {
     let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
     let mut store = Store::new(
         &engine,
-        HostState {
-            phase: HostPhase::Execution,
-            registry: Arc::clone(&registry),
-        },
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
     );
     let instance = linker.instantiate(&mut store, &module).unwrap();
     let func = instance
@@ -491,4 +463,235 @@ fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
     // Updating existing entries still succeeds
     registry.record_counter("counter_0", 5);
     assert_eq!(registry.read_counter("counter_0"), 6);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_bridge_metrics_to_opentelemetry_multi_signals() {
+    let registry = Arc::new(MetricRegistry::new("test_signals"));
+    registry.record_counter("processed_count", 100);
+    let gauge_val = 1.5_f64;
+    registry.record_gauge("heap_size", gauge_val.to_bits());
+
+    let handle_logs =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "logs");
+    let handle_traces =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "traces");
+    let handle_metrics =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "metrics");
+
+    assert!(format!("{handle_logs:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_traces:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_metrics:?}").contains("MetricBridgeHandle"));
+
+    assert_eq!(registry.read_counter("processed_count"), 100);
+    assert_eq!(registry.read_gauge("heap_size"), Some(gauge_val.to_bits()));
+    assert_eq!(
+        f64::from_bits(registry.read_gauge("heap_size").unwrap()),
+        gauge_val
+    );
+}
+
+#[test]
+fn test_metric_name_validation_rules() {
+    let registry = Arc::new(MetricRegistry::new("valid_test"));
+    // Valid names
+    registry.record_counter("valid_counter_1", 10);
+    assert_eq!(registry.read_counter("valid_counter_1"), 10);
+    assert!(registry.handles().contains_key("valid_counter_1"));
+
+    registry.record_gauge("valid_gauge_2", 100);
+    assert_eq!(registry.read_gauge("valid_gauge_2"), Some(100));
+    assert!(registry.handles().contains_key("valid_gauge_2"));
+
+    registry.record_duration("valid_duration_3", 500);
+    assert_eq!(
+        registry
+            .read_duration("valid_duration_3")
+            .map(|d| d.last_nanos),
+        Some(500)
+    );
+    assert!(registry.handles().contains_key("valid_duration_3"));
+
+    // Invalid names: empty, special characters, too long
+    registry.record_counter("", 1);
+    assert_eq!(registry.read_counter(""), 0);
+
+    registry.record_counter("invalid-name-with-dash", 1);
+    assert_eq!(registry.read_counter("invalid-name-with-dash"), 0);
+    assert!(!registry.handles().contains_key("invalid-name-with-dash"));
+
+    registry.record_gauge("invalid.name.with.dots", 1);
+    assert_eq!(registry.read_gauge("invalid.name.with.dots"), None);
+    assert!(!registry.handles().contains_key("invalid.name.with.dots"));
+
+    registry.record_duration("invalid name with spaces", 1);
+    assert_eq!(registry.read_duration("invalid name with spaces"), None);
+    assert!(!registry.handles().contains_key("invalid name with spaces"));
+
+    let too_long = "a".repeat(MAX_METRIC_NAME_LEN + 1);
+    registry.record_counter(&too_long, 1);
+    assert_eq!(registry.read_counter(&too_long), 0);
+    assert!(!registry.handles().contains_key(&too_long));
+}
+
+#[test]
+fn test_custom_metric_prefixed_instruments_and_duration_histogram() {
+    use wasm_transformer::host_calls::MetricHandle;
+
+    let registry = Arc::new(MetricRegistry::with_signal("my_comp", "logs"));
+    registry.record_counter("requests", 42);
+    registry.record_gauge("queue_depth", 10.0_f64.to_bits());
+    registry.record_duration("process_latency", 1_500_000_000);
+    registry.record_duration("request_duration_seconds", 2_000_000_000);
+
+    let handles = registry.handles();
+    assert!(matches!(
+        handles.get("requests").as_deref(),
+        Some(MetricHandle::Counter(_))
+    ));
+    assert!(matches!(
+        handles.get("queue_depth").as_deref(),
+        Some(MetricHandle::Gauge(_))
+    ));
+    assert!(matches!(
+        handles.get("process_latency").as_deref(),
+        Some(MetricHandle::Histogram(_))
+    ));
+    assert!(matches!(
+        handles.get("request_duration_seconds").as_deref(),
+        Some(MetricHandle::Histogram(_))
+    ));
+
+    assert_eq!(registry.read_counter("requests"), 42);
+    assert_eq!(registry.read_gauge("queue_depth"), Some(10.0_f64.to_bits()));
+    assert_eq!(
+        registry
+            .read_duration("process_latency")
+            .map(|d| d.last_nanos),
+        Some(1_500_000_000)
+    );
+    assert_eq!(
+        registry
+            .read_duration("request_duration_seconds")
+            .map(|d| d.last_nanos),
+        Some(2_000_000_000)
+    );
+}
+
+#[test]
+fn test_cardinality_ceiling_50_metrics() {
+    let registry = MetricRegistry::new("cap_50");
+    for i in 0..50 {
+        registry.record_counter(&format!("metric_{i}"), 1);
+    }
+    assert_eq!(registry.handles().len(), 50);
+
+    // 51st metric must be rejected
+    registry.record_counter("metric_50", 1);
+    assert_eq!(registry.read_counter("metric_50"), 0);
+    assert_eq!(registry.handles().len(), 50);
+}
+
+#[test]
+fn test_concurrent_metric_registration_respects_capacity_limit() {
+    let registry = Arc::new(MetricRegistry::new("concurrent_cap"));
+    let mut handles = Vec::new();
+
+    // Spawn 50 threads, each attempting to register 20 distinct metric names (1000 total unique names)
+    for thread_id in 0..50 {
+        let reg = Arc::clone(&registry);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..20 {
+                let name = format!("c_metric_{thread_id}_{i}");
+                reg.record_counter(&name, 1);
+                reg.record_gauge(&name, 100);
+                reg.record_duration(&name, 500);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Must never exceed the 50-metric cardinality limit under high concurrency
+    assert_eq!(
+        registry.handles().len(),
+        50,
+        "Concurrent metric registration must strictly cap handles at 50"
+    );
+    assert_eq!(
+        registry.metrics().len(),
+        50,
+        "Concurrent metric values must strictly cap at 50"
+    );
+}
+
+#[test]
+fn test_host_linker_defines_capability_query_with_phase_enforcement() {
+    let engine = Engine::default();
+    let linker = build_host_linker(&engine).unwrap();
+    let registry = Arc::new(MetricRegistry::new("test_comp"));
+
+    let wasm_wat = r#"
+        (module
+            (import "env" "datalake_host_has_capability" (func $has_cap (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "nonexistent_capability")
+            (func (export "check_cap") (result i32)
+                (call $has_cap (i32.const 0) (i32.const 22))
+            )
+        )
+    "#;
+    let wasm_bytes = wat::parse_str(wasm_wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+
+    // 1. In Init phase: function links and returns 0 for unrecognized capability
+    let mut store_init = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store_init, &module).unwrap();
+    let check_fn = instance
+        .get_typed_func::<(), i32>(&mut store_init, "check_cap")
+        .unwrap();
+    assert_eq!(check_fn.call(&mut store_init, ()).unwrap(), 0);
+
+    // 2. In Execution phase: function returns 0
+    let mut store_exec = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance_exec = linker.instantiate(&mut store_exec, &module).unwrap();
+    let check_fn_exec = instance_exec
+        .get_typed_func::<(), i32>(&mut store_exec, "check_cap")
+        .unwrap();
+    assert_eq!(check_fn_exec.call(&mut store_exec, ()).unwrap(), 0);
+}
+
+#[test]
+fn test_host_linker_defines_now_nanos_import() {
+    let engine = Engine::default();
+    let linker = build_host_linker(&engine).unwrap();
+    let registry = Arc::new(MetricRegistry::new("now_comp"));
+
+    let wat = r#"(module
+        (import "env" "datalake_host_now_nanos" (func $now_nanos (result i64)))
+        (func (export "get_now") (result i64)
+            (call $now_nanos)
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let get_now_fn = instance
+        .get_typed_func::<(), u64>(&mut store, "get_now")
+        .unwrap();
+    let now = get_now_fn.call(&mut store, ()).unwrap();
+    assert!(now > 0, "Expected non-zero timestamp in nanoseconds");
 }

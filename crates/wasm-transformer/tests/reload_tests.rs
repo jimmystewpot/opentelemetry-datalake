@@ -221,3 +221,62 @@ async fn test_spawn_sighup_listener_enabled() {
         assert!(handle.is_none());
     }
 }
+
+#[test]
+fn test_current_module_atomic_snapshot() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    let (mod_opt, generation) = cache.current_module();
+    assert!(mod_opt.is_none());
+    assert_eq!(generation, 0);
+
+    let bytes = wat::parse_str(valid_wat()).unwrap();
+    let new_gen = cache.reload_from_bytes(&bytes, None).unwrap();
+    assert_eq!(new_gen, 1);
+
+    let (mod_opt2, generation2) = cache.current_module();
+    assert!(mod_opt2.is_some());
+    assert_eq!(generation2, 1);
+}
+
+#[test]
+fn test_current_module_concurrent_reload_snapshot_consistency() {
+    let cache = Arc::new(EngineCache::new_pooling(4, 32 * 1024 * 1024).unwrap());
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let mut reader_handles = Vec::new();
+    for _ in 0..4 {
+        let cache_clone = Arc::clone(&cache);
+        let running_clone = Arc::clone(&running);
+        reader_handles.push(std::thread::spawn(move || {
+            let mut last_observed_gen = 0;
+            while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                let (module_opt, current_gen) = cache_clone.current_module();
+                assert!(
+                    current_gen >= last_observed_gen,
+                    "Observed generation regressed from {last_observed_gen} to {current_gen}"
+                );
+                last_observed_gen = current_gen;
+                if current_gen == 0 {
+                    assert!(module_opt.is_none(), "Gen 0 must have no module");
+                } else {
+                    assert!(
+                        module_opt.is_some(),
+                        "Gen {current_gen} must have a compiled module"
+                    );
+                }
+            }
+        }));
+    }
+
+    let bytes = wat::parse_str(valid_wat()).unwrap();
+    for expected_gen in 1..=5 {
+        let new_gen = cache.reload_from_bytes(&bytes, None).unwrap();
+        assert_eq!(new_gen, expected_gen);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    running.store(false, std::sync::atomic::Ordering::Relaxed);
+    for h in reader_handles {
+        h.join().unwrap();
+    }
+}

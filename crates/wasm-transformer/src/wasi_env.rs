@@ -24,8 +24,9 @@ pub fn filter_environment_variables(
         result.insert(key.clone(), value.clone());
     }
     let sensitive = ["SECRET", "TOKEN", "KEY", "PASSWORD", "CREDENTIAL"];
-    for (key, _) in std::env::vars() {
-        if !result.contains_key(&key) {
+    for (key_os, _) in std::env::vars_os() {
+        let key = key_os.to_string_lossy();
+        if !result.contains_key(key.as_ref()) {
             let upper = key.to_uppercase();
             if sensitive.iter().any(|p| upper.contains(*p)) {
                 warn!(

@@ -24,9 +24,12 @@ struct AppConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(clippy::struct_field_names)]
 struct ServerConfig {
     grpc_addr: SocketAddr,
     http_addr: SocketAddr,
+    #[serde(default)]
+    admin_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -71,6 +74,10 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     http_addr: Option<SocketAddr>,
 
+    /// Override admin HTTP bind address (e.g. 0.0.0.0:9090)
+    #[arg(long, value_name = "ADDR")]
+    admin_addr: Option<SocketAddr>,
+
     /// Override dry-run mode for Iceberg sink
     #[arg(long)]
     dry_run: Option<bool>,
@@ -81,6 +88,16 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    }
+
+    if config.kafka.is_none()
+        && config.iceberg.is_none()
+        && config.starrocks.is_none()
+        && config.elasticsearch.is_none()
+    {
+        anyhow::bail!(
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+        );
     }
 
     if let Some(ref iceberg_cfg) = config.iceberg {
@@ -109,213 +126,410 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         es_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    } else if config.kafka.is_none() && config.starrocks.is_none() {
+    } else if let Some(ref sr_cfg) = config.starrocks {
+        sr_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if let Some(sort_cfg) = config.kafka.as_ref().and_then(|k| k.order_by.as_ref()) {
+        pipeline_core::sort::BatchSorter::from_config(sort_cfg)
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    }
+
+    if let Some(admin_addr) = config.server.admin_addr
+        && (admin_addr == config.server.http_addr || admin_addr == config.server.grpc_addr)
+    {
         anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+            "Configuration validation failed: server.admin_addr ({admin_addr}) cannot match http_addr or grpc_addr (port isolation required)"
         );
     }
 
     Ok(())
 }
 
-/// A tuple containing signal-isolated transformers for logs, traces, and metrics, along with SIGHUP listener handles.
-type SignalTransformers = (
-    Box<dyn Transform>,
-    Box<dyn Transform>,
-    Box<dyn Transform>,
-    Vec<Option<tokio::task::JoinHandle<()>>>,
-);
-
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Creates a bounded DLQ channel and spawns a background logging task to drain diverted batches.
-fn setup_dlq_channel(
-    transformer_id: &str,
-    signal: &str,
-    role: &str,
-    capacity: usize,
-) -> (
-    pipeline_core::pipeline::PipelineSender,
-    tokio::task::JoinHandle<()>,
-) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<pipeline_core::pipeline::SignalBatch>(capacity);
-    let transformer_id = transformer_id.to_string();
-    let signal = signal.to_string();
-    let role = role.to_string();
-    let handle = tokio::spawn(async move {
-        let dlq_dir = std::path::PathBuf::from("dlq")
-            .join(&transformer_id)
-            .join(&signal)
-            .join(&role);
-        if let Err(e) = tokio::fs::create_dir_all(&dlq_dir).await {
-            tracing::error!(
-                "Failed to create DLQ directory {}: {}. Terminating DLQ task to propagate backpressure.",
-                dlq_dir.display(),
-                e
-            );
-            return;
-        }
-
-        while let Some(batch) = rx.recv().await {
-            let (batch_signal, record_batch) = match &batch {
-                pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb),
-                pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb),
-                pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb),
-            };
-
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
-
-            let mut buf = Vec::new();
-            let mut writer = match arrow::ipc::writer::StreamWriter::try_new(
-                &mut buf,
-                &record_batch.schema(),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to initialize Arrow IPC writer for DLQ batch: {e}. Terminating DLQ task to propagate backpressure."
-                    );
-                    return;
-                }
-            };
-
-            if let Err(e) = writer.write(record_batch).and_then(|()| writer.finish()) {
-                tracing::error!(
-                    "Failed to write DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
-                );
-                return;
-            }
-
-            let write_res = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&file_path)
-                .await
-            {
-                Ok(mut file) => {
-                    use tokio::io::AsyncWriteExt;
-                    file.write_all(&buf).await
-                }
-                Err(e) => Err(e),
-            };
-
-            if let Err(e) = write_res {
-                tracing::error!(
-                    "Failed to persist DLQ batch to {}: {e}. Terminating DLQ task to propagate backpressure.",
-                    file_path.display()
-                );
-                return;
-            }
-
-            tracing::warn!(
-                transformer_id = %transformer_id,
-                signal = %signal,
-                role = %role,
-                rows = record_batch.num_rows(),
-                path = %file_path.display(),
-                "DLQ: Persisted diverted batch to disk"
-            );
-        }
-    });
-    (tx, handle)
+/// Returns `true` if `val` is a safe, single relative path component without path traversal,
+/// separators, or null bytes (e.g. neither empty, `"."`, `".."`, nor containing `/` or `\`).
+fn is_safe_path_component(val: &str) -> bool {
+    if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains('\0') {
+        return false;
+    }
+    let mut components = std::path::Path::new(val).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
-/// Instantiates a signal-isolated [`wasm_transformer::WasmTransformer`], setting up DLQ reroute channels as needed.
+/// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
+#[derive(Debug)]
+pub struct FileDlqSink {
+    transformer_id: String,
+    signal: String,
+    role: String,
+    dlq_dir: std::path::PathBuf,
+}
+
+impl FileDlqSink {
+    /// Creates a new `FileDlqSink` targeting the directory `dlq/{transformer_id}/{signal}/{role}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `transformer_id`, `signal`, or `role` contain path separators
+    /// or traversal components (e.g., `..`, `/`, `\`), which would escape the intended DLQ hierarchy.
+    pub fn new(transformer_id: &str, signal: &str, role: &str) -> anyhow::Result<Self> {
+        for (label, value) in [
+            ("transformer_id", transformer_id),
+            ("signal", signal),
+            ("role", role),
+        ] {
+            if !is_safe_path_component(value) {
+                anyhow::bail!("DLQ {label} contains unsafe path components: {value:?}");
+            }
+        }
+        let dlq_dir = std::path::PathBuf::from("dlq")
+            .join(transformer_id)
+            .join(signal)
+            .join(role);
+        Ok(Self {
+            transformer_id: transformer_id.to_string(),
+            signal: signal.to_string(),
+            role: role.to_string(),
+            dlq_dir,
+        })
+    }
+
+    /// Atomically persists an Arrow IPC payload to disk via a temporary file and sync rename.
+    async fn persist_ipc_payload(
+        &self,
+        file_path: &std::path::Path,
+        temp_file_path: &std::path::Path,
+        buf: &[u8],
+    ) -> Result<(), std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_file_path)
+            .await?;
+
+        if let Err(e) = file.write_all(buf).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        if let Err(e) = file.sync_all().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        drop(file);
+
+        if let Err(e) = tokio::fs::rename(temp_file_path, file_path).await {
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        #[cfg(unix)]
+        {
+            let dir = tokio::fs::File::open(&self.dlq_dir).await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to open DLQ directory {} for sync: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
+            dir.sync_all().await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to sync DLQ directory {}: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl wasm_transformer::DlqSink for FileDlqSink {
+    async fn send(
+        &self,
+        batch: pipeline_core::pipeline::SignalBatch,
+    ) -> Result<(), pipeline_core::error::PipelineError> {
+        if let Err(e) = tokio::fs::create_dir_all(&self.dlq_dir).await {
+            tracing::error!(
+                "Failed to create DLQ directory {}: {e}. Terminating DLQ task to propagate backpressure.",
+                self.dlq_dir.display()
+            );
+            return Err(pipeline_core::error::PipelineError::Internal(format!(
+                "Failed to create DLQ directory {}: {e}",
+                self.dlq_dir.display()
+            )));
+        }
+
+        let (batch_signal, record_batch) = match &batch {
+            pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb),
+            pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb),
+            pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb),
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_path = self
+            .dlq_dir
+            .join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
+
+        let encode_res = tokio::task::spawn_blocking({
+            let rb = record_batch.clone();
+            move || -> Result<Vec<u8>, arrow::error::ArrowError> {
+                let mut buf = Vec::new();
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &rb.schema())?;
+                writer.write(&rb)?;
+                writer.finish()?;
+                Ok(buf)
+            }
+        })
+        .await;
+
+        let buf = match encode_res {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "Failed to serialize DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
+                );
+                return Err(pipeline_core::error::PipelineError::Internal(format!(
+                    "Failed to serialize DLQ batch to Arrow IPC: {e}"
+                )));
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    "DLQ serialization blocking task failed: {join_err}. Terminating DLQ task to propagate backpressure."
+                );
+                return Err(pipeline_core::error::PipelineError::Internal(format!(
+                    "DLQ serialization blocking task failed: {join_err}"
+                )));
+            }
+        };
+
+        let tmp_seq = DLQ_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_file_path = self.dlq_dir.join(format!(
+            ".tmp_{batch_signal}_{timestamp}_{seq}_{}_{tmp_seq}.arrow",
+            std::process::id()
+        ));
+
+        let write_res = self
+            .persist_ipc_payload(&file_path, &temp_file_path, &buf)
+            .await;
+
+        if let Err(e) = write_res {
+            tracing::error!(
+                "Failed to persist DLQ batch to {}: {e}. Terminating DLQ task to propagate backpressure.",
+                file_path.display()
+            );
+            return Err(pipeline_core::error::PipelineError::Internal(format!(
+                "Failed to persist DLQ batch to {}: {e}",
+                file_path.display()
+            )));
+        }
+
+        tracing::warn!(
+            transformer_id = %self.transformer_id,
+            signal = %self.signal,
+            role = %self.role,
+            rows = record_batch.num_rows(),
+            path = %file_path.display(),
+            "DLQ: Persisted diverted batch to disk"
+        );
+
+        Ok(())
+    }
+}
+
+/// Tuple containing the signal-isolated transformers for logs, traces, and metrics.
+type SignalTransformers = (Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>);
+
+/// Instantiates a signal-isolated [`wasm_transformer::WasmTransformer`], setting up durable DLQ sinks as needed.
 fn instantiate_signal_wasm_transformer(
     cfg: &pipeline_core::config::WasmTransformerConfig,
     signal: &str,
-    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<wasm_transformer::WasmTransformer> {
+    engine: &std::sync::Arc<wasm_transformer::engine::EngineCache>,
+    metric_bridges: &mut Vec<wasm_transformer::MetricBridgeHandle>,
+) -> anyhow::Result<Box<dyn Transform>> {
     let mut signal_cfg = cfg.clone();
     signal_cfg
         .env
         .insert("signal".to_string(), signal.to_string());
 
-    let capacity = signal_cfg.worker_channel_capacity.max(16);
-
     let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
-        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "error", capacity);
-        dlq_handles.push(h);
-        Some(tx)
+        Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
+            FileDlqSink::new(&signal_cfg.id, signal, "error")?,
+        )))
     } else {
         None
     };
 
     let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
-        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "reject", capacity);
-        dlq_handles.push(h);
-        Some(tx)
+        Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
+            FileDlqSink::new(&signal_cfg.id, signal, "reject")?,
+        )))
     } else {
         None
     };
 
-    let transformer =
-        wasm_transformer::WasmTransformer::new(signal_cfg, reroute_error, reroute_reject)?;
-    Ok(transformer)
+    let transformer = wasm_transformer::WasmTransformer::with_engine(
+        signal_cfg,
+        reroute_error,
+        reroute_reject,
+        std::sync::Arc::clone(engine),
+    )?;
+
+    // Bridge the guest MetricRegistry into OpenTelemetry before erasing the concrete transformer
+    let bridge =
+        wasm_transformer::bridge_metrics_to_opentelemetry(transformer.metric_registry(), signal);
+    metric_bridges.push(bridge);
+
+    Ok(Box::new(transformer))
 }
 
 /// Initializes the pipeline transformers based on the provided application configuration.
 /// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
-/// and registers optional SIGHUP listeners. Otherwise, it falls back to No-op transformers.
+/// sharing a common [`wasm_transformer::engine::EngineCache`].
+/// Otherwise, it falls back to No-op transformers.
 fn initialize_transformers(
     config: &AppConfig,
-    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<SignalTransformers> {
-    let mut sighup_handles = Vec::new();
-    let (logs_transformer, traces_transformer, metrics_transformer): (
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
+    metric_bridges: &mut Vec<wasm_transformer::MetricBridgeHandle>,
+) -> anyhow::Result<(
+    SignalTransformers,
+    Option<std::sync::Arc<wasm_transformer::engine::EngineCache>>,
+)> {
+    if let Some(ref wasm_cfg) = config.wasm_transformer {
         tracing::info!(
             transformer_id = %wasm_cfg.id,
             module_path = %wasm_cfg.module_path,
-            "Initializing 3x signal-isolated WasmTransformer instances"
+            "Initializing 3x signal-isolated WasmTransformer instances with shared EngineCache"
         );
-        let logs_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "logs", dlq_handles)?;
-        let traces_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "traces", dlq_handles)?;
-        let metrics_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "metrics", dlq_handles)?;
+        let max_memory_bytes = wasm_transformer::worker::parse_byte_size(&wasm_cfg.max_memory)
+            .unwrap_or(64 * 1024 * 1024);
+        let pool_capacity = (wasm_cfg.concurrency.max(1) * 6).saturating_add(3);
+        let shared_engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(pool_capacity, max_memory_bytes)?,
+        );
 
-        if wasm_cfg.enable_sighup {
-            let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
-            let expected_sha = wasm_cfg.sha256.clone();
-            let engines = vec![
-                std::sync::Arc::clone(logs_wasm.engine()),
-                std::sync::Arc::clone(traces_wasm.engine()),
-                std::sync::Arc::clone(metrics_wasm.engine()),
-            ];
-            sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener_multi(
-                engines,
-                module_path,
-                expected_sha,
-                true,
-            ));
-        }
-
-        (
-            Box::new(logs_wasm),
-            Box::new(traces_wasm),
-            Box::new(metrics_wasm),
-        )
+        let transformers = (
+            instantiate_signal_wasm_transformer(wasm_cfg, "logs", &shared_engine, metric_bridges)?,
+            instantiate_signal_wasm_transformer(
+                wasm_cfg,
+                "traces",
+                &shared_engine,
+                metric_bridges,
+            )?,
+            instantiate_signal_wasm_transformer(
+                wasm_cfg,
+                "metrics",
+                &shared_engine,
+                metric_bridges,
+            )?,
+        );
+        Ok((transformers, Some(shared_engine)))
     } else {
-        (
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-        )
-    };
+        Ok((
+            (
+                Box::new(noop_transformer::NoopTransformer::new()),
+                Box::new(noop_transformer::NoopTransformer::new()),
+                Box::new(noop_transformer::NoopTransformer::new()),
+            ),
+            None,
+        ))
+    }
+}
 
-    Ok((
-        logs_transformer,
-        traces_transformer,
-        metrics_transformer,
-        sighup_handles,
-    ))
+#[cfg(unix)]
+fn spawn_sighup_reload_task(
+    wasm_cfg: pipeline_core::config::WasmTransformerConfig,
+    engine: std::sync::Arc<wasm_transformer::engine::EngineCache>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut signal_stream =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to register SIGHUP handler: {e}");
+                    return;
+                }
+            };
+
+        tracing::info!(
+            transformer_id = %wasm_cfg.id,
+            module_path = %wasm_cfg.module_path,
+            "SIGHUP reload handler installed"
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        tracing::debug!("SIGHUP listener shutting down");
+                        break;
+                    }
+                }
+                Some(()) = signal_stream.recv() => {
+                    tracing::info!(
+                        transformer_id = %wasm_cfg.id,
+                        module_path = %wasm_cfg.module_path,
+                        "Received SIGHUP signal. Reloading WASM module..."
+                    );
+
+                    let wasm_cfg_clone = wasm_cfg.clone();
+                    let engine_clone = std::sync::Arc::clone(&engine);
+
+                    let reload_res = tokio::task::spawn_blocking(move || {
+                        wasm_transformer::WasmTransformer::reload_module(&wasm_cfg_clone, &engine_clone)
+                    })
+                    .await;
+
+                    match reload_res {
+                        Ok(Ok(generation)) => {
+                            tracing::info!(
+                                transformer_id = %wasm_cfg.id,
+                                generation = generation,
+                                "Successfully recompiled WASM module and advanced generation on SIGHUP"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                transformer_id = %wasm_cfg.id,
+                                "Failed to reload WASM module on SIGHUP: {e}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Blocking reload task panicked on SIGHUP: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload_task(
+    _wasm_cfg: pipeline_core::config::WasmTransformerConfig,
+    _engine: std::sync::Arc<wasm_transformer::engine::EngineCache>,
+    _shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 #[tokio::main]
@@ -363,6 +577,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(http_addr) = cli_args.http_addr {
         config.server.http_addr = http_addr;
     }
+    if let Some(admin_addr) = cli_args.admin_addr {
+        config.server.admin_addr = Some(admin_addr);
+    }
     if let (Some(dry_run), Some(iceberg)) = (cli_args.dry_run, &mut config.iceberg) {
         iceberg.dry_run = dry_run;
     }
@@ -379,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry
-    pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
+    let _telemetry = pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
 
     tracing::info!("Starting opentelemetry-datalake service");
 
@@ -403,35 +620,100 @@ async fn main() -> anyhow::Result<()> {
         logs_tx,
         traces_tx,
         metrics_tx,
-        shutdown_rx,
+        shutdown_rx.clone(),
     );
 
-    let mut dlq_handles = Vec::new();
-    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer, sighup_handles) =
-        initialize_transformers(&config, &mut dlq_handles)?;
+    // Create Transformers (WASM if configured, otherwise Noop)
+    let mut metric_bridges = Vec::new();
+    let ((mut logs_transformer, mut traces_transformer, mut metrics_transformer), shared_engine) =
+        initialize_transformers(&config, &mut metric_bridges)?;
+
+    let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
+        let expected_sha = config
+            .wasm_transformer
+            .as_ref()
+            .and_then(|w| w.sha256.clone());
+        let admin_router = if let Some(ref engine) = shared_engine {
+            wasm_transformer::reload::build_admin_router_with_sha(
+                std::sync::Arc::clone(engine),
+                expected_sha,
+            )
+        } else {
+            axum::Router::new()
+        };
+        let listener = tokio::net::TcpListener::bind(admin_addr)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to bind admin HTTP listener to {admin_addr}: {e}")
+            })?;
+        tracing::info!("Admin HTTP server listening on {admin_addr}");
+        let mut shutdown_rx_admin = shutdown_tx.subscribe();
+        let admin_shutdown = async move {
+            while !*shutdown_rx_admin.borrow_and_update() {
+                if shutdown_rx_admin.changed().await.is_err() {
+                    break;
+                }
+            }
+            tracing::info!("Admin HTTP server shutting down gracefully");
+        };
+        Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, admin_router)
+                .with_graceful_shutdown(admin_shutdown)
+                .await
+            {
+                tracing::error!("Admin HTTP server error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    let sighup_handle =
+        if let (Some(wasm_cfg), Some(engine)) = (&config.wasm_transformer, &shared_engine) {
+            if wasm_cfg.enable_sighup {
+                Some(spawn_sighup_reload_task(
+                    wasm_cfg.clone(),
+                    std::sync::Arc::clone(engine),
+                    shutdown_rx.clone(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
     // Spawn transformers
-    let logs_trans_handle = tokio::spawn(async move {
+    let mut logs_trans_handle = tokio::spawn(async move {
         if let Err(e) = logs_transformer.transform(logs_rx, logs_sink_tx).await {
             tracing::error!("Logs transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
-    let traces_trans_handle = tokio::spawn(async move {
+    let mut traces_trans_handle = tokio::spawn(async move {
         if let Err(e) = traces_transformer
             .transform(traces_rx, traces_sink_tx)
             .await
         {
             tracing::error!("Traces transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
-    let metrics_trans_handle = tokio::spawn(async move {
+    let mut metrics_trans_handle = tokio::spawn(async move {
         if let Err(e) = metrics_transformer
             .transform(metrics_rx, metrics_sink_tx)
             .await
         {
             tracing::error!("Metrics transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
@@ -622,6 +904,8 @@ async fn main() -> anyhow::Result<()> {
     // Spawn source
     let mut source_handle = tokio::spawn(async move { source.run().await });
 
+    let mut exit_err: Option<anyhow::Error> = None;
+
     // Handle shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -635,32 +919,119 @@ async fn main() -> anyhow::Result<()> {
         }
         res = &mut source_handle => {
             match res {
-                Ok(Err(e)) => tracing::error!("Source receiver stopped unexpectedly with error: {}", e),
-                Ok(Ok(())) => tracing::error!("Source receiver stopped unexpectedly."),
-                Err(e) => tracing::error!("Source receiver task panicked: {}", e),
+                Ok(Err(e)) => {
+                    tracing::error!("Source receiver stopped unexpectedly with error: {}", e);
+                    exit_err = Some(anyhow::anyhow!("Source receiver stopped unexpectedly with error: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Source receiver stopped unexpectedly.");
+                    exit_err = Some(anyhow::anyhow!("Source receiver stopped unexpectedly"));
+                }
+                Err(e) => {
+                    tracing::error!("Source receiver task panicked: {}", e);
+                    exit_err = Some(anyhow::anyhow!("Source receiver task panicked: {e}"));
+                }
             }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut logs_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Logs transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Logs transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Logs transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut traces_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Traces transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Traces transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Traces transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut metrics_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Metrics transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Metrics transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Metrics transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
         }
     }
 
     // Wait for pipeline to drain
     let _ = tokio::join!(
-        logs_trans_handle,
-        traces_trans_handle,
-        metrics_trans_handle,
+        async {
+            if !logs_trans_handle.is_finished() {
+                let _ = logs_trans_handle.await;
+            }
+        },
+        async {
+            if !traces_trans_handle.is_finished() {
+                let _ = traces_trans_handle.await;
+            }
+        },
+        async {
+            if !metrics_trans_handle.is_finished() {
+                let _ = metrics_trans_handle.await;
+            }
+        },
         logs_sink_handle,
         traces_sink_handle,
         metrics_sink_handle
     );
 
-    for h in sighup_handles.into_iter().flatten() {
-        h.abort();
+    if let Some(h) = sighup_handle {
+        let _ = h.await;
     }
 
-    // Wait for DLQ tasks to drain
-    for dlq_handle in dlq_handles {
-        if let Err(e) = dlq_handle.await {
-            tracing::error!("DLQ drain task panicked: {e}");
+    if let Some(mut h) = admin_handle {
+        tokio::select! {
+            res = &mut h => {
+                if let Err(e) = res {
+                    tracing::warn!("Admin HTTP server task exited with error: {e}");
+                }
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                tracing::warn!("Admin HTTP server did not drain within 5 seconds; aborting");
+                h.abort();
+                let _ = h.await;
+            }
         }
+    }
+
+    drop(metric_bridges);
+
+    if let Some(err) = exit_err {
+        return Err(err);
     }
 
     tracing::info!("Shutdown complete.");
@@ -1008,6 +1379,182 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[tokio::test]
+    async fn test_admin_server_runtime_listener_serves_reload_endpoint() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wasm_transformer::engine::EngineCache;
+        use wasm_transformer::reload::build_admin_router_multi;
+
+        let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let router = build_admin_router_multi(vec![engine], None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow_and_update() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        // Test sending request to runtime listener over loopback TCP
+        let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        let req = format!(
+            "POST /api/v1/transforms/wasm/reload HTTP/1.1\r\nHost: {bound_addr}\r\nContent-Type: application/json\r\nContent-Length: 19\r\n\r\n{{\"module_path\": \"\"}}"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 400 Bad Request"));
+
+        let _ = shutdown_tx.send(true);
+        server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_config_validation_fails_when_admin_addr_matches_http_addr() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        admin_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("port isolation required"));
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_insecure_starrocks_tls() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks TLS verification is disabled");
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited"),
+            "Error message should indicate disabled verification prohibited: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_missing_starrocks_ca_cert() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        ca_cert_path = "/nonexistent/ca.pem"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks CA file is missing");
+        assert!(
+            err.to_string().contains("CA certificate file not found"),
+            "Error message should indicate missing CA file: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_validates_only_selected_sink_in_priority_order() {
+        // Iceberg takes precedence over StarRocks and Elasticsearch.
+        // Even if an inactive StarRocks section has invalid TLS, validate_config should succeed
+        // because Iceberg is the selected sink.
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_name = "test_catalog"
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "db.telemetry"
+        logs_table_identifier = "db.logs"
+        traces_table_identifier = "db.traces"
+        metrics_table_identifier = "db.metrics"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        assert!(
+            validate_config(&config).is_ok(),
+            "validate_config should succeed because Iceberg is selected and valid, ignoring inactive StarRocks"
+        );
+    }
+
     #[test]
     fn test_initialize_transformers_noop() {
         let toml_str = r#"
@@ -1020,22 +1567,27 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let (_logs, _traces, _metrics, handles) =
-            initialize_transformers(&config, &mut dlq_handles).unwrap();
-        assert!(handles.is_empty());
-        assert!(dlq_handles.is_empty());
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
+        assert!(res.is_ok());
+        let ((_logs, _traces, _metrics), engine) = res.unwrap();
+        assert!(engine.is_none());
+        assert!(metric_bridges.is_empty());
     }
 
     #[tokio::test]
     async fn test_initialize_transformers_wasm() {
-        let valid_wat = r#"
-        (module
-          (func (export "transform") (param i32 i32) (result i32)
-            i32.const 0
-          )
-        )"#;
-        let wasm_bytes = wat::parse_str(valid_wat).unwrap();
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
         let path = std::env::temp_dir().join(format!("test_wasm_{}.wasm", std::process::id()));
         std::fs::write(&path, wasm_bytes).unwrap();
 
@@ -1070,16 +1622,13 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let (_logs, _traces, _metrics, handles) =
-            initialize_transformers(&config, &mut dlq_handles).unwrap();
+        let mut metric_bridges = Vec::new();
+        let ((_logs, _traces, _metrics), engine) =
+            initialize_transformers(&config, &mut metric_bridges).unwrap();
 
-        assert_eq!(handles.len(), 1);
-        assert_eq!(
-            handles.into_iter().flatten().count(),
-            usize::from(cfg!(unix))
-        );
-        assert!(dlq_handles.is_empty());
+        assert!(engine.is_some());
+        assert_eq!(engine.unwrap().module_generation(), 1);
+        assert_eq!(metric_bridges.len(), 3);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1113,8 +1662,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         assert!(res.is_err());
     }
 
@@ -1174,8 +1723,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         let _ = std::fs::remove_file(&wasm_path);
 
         assert!(
@@ -1184,9 +1733,159 @@ mod tests {
             res.err()
         );
         assert_eq!(
-            dlq_handles.len(),
-            6,
-            "Expected 6 DLQ handles (2 per signal)"
+            metric_bridges.len(),
+            3,
+            "Expected 3 metric bridge handles (1 per signal)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_file_dlq_sink_persists_batch_durably() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use pipeline_core::pipeline::SignalBatch;
+        use std::sync::Arc;
+        use wasm_transformer::DlqSink;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["hello", "world"])),
+            ],
+        )
+        .expect("batch creation");
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = format!("test_dlq_{}", std::process::id());
+        let sink = FileDlqSink {
+            transformer_id: test_id.clone(),
+            signal: "logs".to_string(),
+            role: "error".to_string(),
+            dlq_dir: temp_dir
+                .join("dlq_test")
+                .join(&test_id)
+                .join("logs")
+                .join("error"),
+        };
+
+        let res = sink.send(SignalBatch::Logs(batch.clone())).await;
+        assert!(
+            res.is_ok(),
+            "FileDlqSink::send should succeed: {:?}",
+            res.err()
+        );
+
+        // Verify the file was written and can be read back as Arrow IPC
+        let mut read_entries = tokio::fs::read_dir(&sink.dlq_dir)
+            .await
+            .expect("read dlq dir");
+        let mut found_file = None;
+        while let Some(entry) = read_entries.next_entry().await.expect("entry") {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("arrow") {
+                found_file = Some(path);
+                break;
+            }
+        }
+        let file_path = found_file.expect("arrow file should exist");
+        let file_bytes = tokio::fs::read(&file_path).await.expect("read arrow file");
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(file_bytes), None)
+                .expect("stream reader");
+        let read_batch = reader
+            .next()
+            .expect("batch in reader")
+            .expect("valid batch");
+        assert_eq!(read_batch.num_rows(), 2);
+        assert_eq!(read_batch.num_columns(), 2);
+
+        // Verify no temporary files remain in the directory
+        let mut check_entries = tokio::fs::read_dir(&sink.dlq_dir)
+            .await
+            .expect("read dlq dir for temp check");
+        while let Some(entry) = check_entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.starts_with(".tmp_"),
+                "Temporary file was not cleaned up or renamed: {name_str}"
+            );
+        }
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(temp_dir.join("dlq_test")).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_dlq_sink_returns_error_on_inaccessible_path() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use pipeline_core::pipeline::SignalBatch;
+        use std::sync::Arc;
+        use wasm_transformer::DlqSink;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
+            .expect("batch creation");
+
+        // Target an impossible path (e.g. attempting to create a directory under a non-directory file)
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("dlq_conflict_{}.tmp", std::process::id()));
+        std::fs::write(&file_path, b"not a directory").expect("write conflict file");
+
+        let sink = FileDlqSink {
+            transformer_id: "test".to_string(),
+            signal: "logs".to_string(),
+            role: "error".to_string(),
+            dlq_dir: file_path.join("impossible_subdir"),
+        };
+
+        let res = sink.send(SignalBatch::Logs(batch)).await;
+        assert!(
+            res.is_err(),
+            "Sink must return error instead of panicking on inaccessible directory"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        assert!(is_safe_path_component("wasm_transformer"));
+        assert!(is_safe_path_component("my-sink-123"));
+        assert!(is_safe_path_component("valid.name"));
+
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("../archive"));
+        assert!(!is_safe_path_component("foo/bar"));
+        assert!(!is_safe_path_component("foo\\bar"));
+        assert!(!is_safe_path_component("/absolute"));
+        assert!(!is_safe_path_component("foo\0bar"));
+    }
+
+    #[test]
+    fn test_file_dlq_sink_new_rejects_path_traversal() {
+        assert!(FileDlqSink::new("../archive", "logs", "error").is_err());
+        assert!(FileDlqSink::new("/etc", "logs", "error").is_err());
+        assert!(FileDlqSink::new("test", "../traces", "error").is_err());
+        assert!(FileDlqSink::new("test", "logs", "error/extra").is_err());
+        assert!(FileDlqSink::new("", "logs", "error").is_err());
+
+        let ok_sink = FileDlqSink::new("valid_transformer", "logs", "error");
+        assert!(ok_sink.is_ok());
+        let sink = ok_sink.unwrap();
+        assert_eq!(
+            sink.dlq_dir,
+            std::path::PathBuf::from("dlq/valid_transformer/logs/error")
         );
     }
 
@@ -1234,5 +1933,271 @@ mod tests {
             res_invalid.is_err(),
             "validate_config must fail when WASM module path does not exist"
         );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_module_missing_abi_version() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!(
+            "test_validate_missing_abi_{}.wasm",
+            std::process::id()
+        ));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [kafka]
+            brokers = "localhost:9092"
+            logs_topic = "logs"
+            traces_topic = "traces"
+            metrics_topic = "metrics"
+            logs_format = "json"
+            traces_format = "json"
+            metrics_format = "json"
+
+            [wasm_transformer]
+            id = "test_validate_no_abi"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "drop"
+            on_reject = "drop"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = false
+            "#,
+            wasm_path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = validate_config(&config);
+        let _ = std::fs::remove_file(&wasm_path);
+
+        assert!(
+            res.is_err(),
+            "validate_config must reject module missing ABI version"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("datalake_abi_version"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_transformers_rejects_module_missing_abi_version() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_init_missing_abi_{}.wasm", std::process::id()));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [wasm_transformer]
+            id = "test_init_no_abi"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "drop"
+            on_reject = "drop"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = false
+            "#,
+            wasm_path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
+        let _ = std::fs::remove_file(&wasm_path);
+
+        let err_msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("initialize_transformers must reject module missing ABI version"),
+        };
+        assert!(err_msg.contains("datalake_abi_version"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_sighup_reload_task_advances_generation_on_signal() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_sighup_reload_{}.wasm", std::process::id()));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let wasm_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "test_sighup".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: wasm_path.display().to_string(),
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "16MiB".to_string(),
+            rejuvenate_threshold: "8MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: true,
+            on_reject: pipeline_core::config::OnRejectPolicy::Drop,
+            schema_guard: pipeline_core::config::SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: true,
+        };
+
+        let engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(2, 16 * 1024 * 1024).expect("pool"),
+        );
+        assert_eq!(engine.module_generation(), 0);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_handle =
+            spawn_sighup_reload_task(wasm_cfg, std::sync::Arc::clone(&engine), shutdown_rx);
+
+        // Give the task a moment to register the SIGHUP signal listener
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send SIGHUP to the current process via kill -HUP <pid>
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &std::process::id().to_string()])
+            .status();
+
+        // Wait for generation to advance
+        let mut reloaded = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if engine.module_generation() > 0 {
+                reloaded = true;
+                break;
+            }
+        }
+
+        assert!(
+            reloaded,
+            "Engine generation must advance after receiving SIGHUP"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = task_handle.await;
+        let _ = std::fs::remove_file(&wasm_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_sighup_reload_task_terminates_on_shutdown_channel_drop() {
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_sighup_drop_{}.wasm", std::process::id()));
+        let wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
+        )"#;
+        let wasm_bytes = wat::parse_str(wat).expect("wat");
+        std::fs::write(&wasm_path, wasm_bytes).expect("write wasm");
+
+        let wasm_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "test_sighup_drop".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: wasm_path.display().to_string(),
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "16MiB".to_string(),
+            rejuvenate_threshold: "8MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: true,
+            on_reject: pipeline_core::config::OnRejectPolicy::Drop,
+            schema_guard: pipeline_core::config::SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: true,
+        };
+
+        let engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(2, 16 * 1024 * 1024).expect("pool"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_handle =
+            spawn_sighup_reload_task(wasm_cfg, std::sync::Arc::clone(&engine), shutdown_rx);
+
+        // Drop shutdown_tx immediately without setting to true
+        drop(shutdown_tx);
+
+        let timeout_res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            timeout_res.is_ok(),
+            "SIGHUP reload task must exit cleanly on shutdown channel drop without spinning"
+        );
+        let _ = std::fs::remove_file(&wasm_path);
     }
 }

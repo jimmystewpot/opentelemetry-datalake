@@ -62,31 +62,32 @@ fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Fie
             )));
             new_f.with_nullable(true)
         }
-        arrow::datatypes::DataType::Map(child, sorted) => {
+        arrow::datatypes::DataType::Map(child, keys_sorted) => {
             let mut new_f = field.clone();
             new_f = new_f.with_data_type(arrow::datatypes::DataType::Map(
                 Arc::new(make_field_nullable(child)),
-                *sorted,
+                *keys_sorted,
             ));
             new_f.with_nullable(true)
         }
-        _ => field.clone().with_nullable(true),
+        _ => {
+            let mut new_f = field.clone();
+            new_f.set_nullable(true);
+            new_f
+        }
     }
 }
 
-/// Verifies that canonical immutable columns have not been dropped, completely wiped to nulls,
-/// or had their data types mutated.
+/// Verifies that none of the canonical immutable columns were dropped or wiped.
 ///
-/// Executes an $O(1)$ metadata check on the output [`RecordBatch`] for each canonical
-/// OpenTelemetry field defined in [`IMMUTABLE_COLUMNS`]. If a column was not entirely null
-/// in the input batch, and is either completely nullified or dropped entirely in the output
-/// batch (when non-empty), an error is returned. If an immutable column is present in both
-/// input and output, its [`arrow::datatypes::DataType`] must remain identical.
+/// Executes in $O(1)$ time by verifying `col.null_count() == col.len()` against
+/// pre-computed column statistics rather than iterating row-by-row.
 ///
 /// # Errors
 ///
-/// Returns [`WasmTransformError::Pipeline`] if any immutable column present in `input` is
-/// dropped, entirely null in `output` with `!output.is_empty()`, or has its data type mutated.
+/// Returns [`WasmTransformError::Pipeline`] if any column in [`IMMUTABLE_COLUMNS`]
+/// was dropped by the guest or became entirely null (when input had non-null data),
+/// or if the column's data type was mutated.
 pub fn verify_structural_immutability(
     input: &RecordBatch,
     output: &RecordBatch,
@@ -95,7 +96,9 @@ pub fn verify_structural_immutability(
     let input_schema = input.schema();
     for &col_name in IMMUTABLE_COLUMNS {
         let input_col_info = if let Ok(idx) = input_schema.index_of(col_name) {
-            let col = input.column(idx);
+            let col = input.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in input"))
+            })?;
             Some((col.data_type().clone(), col.null_count() == col.len()))
         } else {
             None
@@ -106,7 +109,9 @@ pub fn verify_structural_immutability(
             .is_none_or(|(_, was_null)| *was_null);
 
         if let Ok(idx) = schema.index_of(col_name) {
-            let col = output.column(idx);
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
             if let Some((in_dtype, _)) = input_col_info
                 && col.data_type() != &in_dtype
             {
@@ -175,6 +180,7 @@ pub fn verify_strict_schema_equality(
 /// # Errors
 ///
 /// Returns [`WasmTransformError::Pipeline`] if reconstructing the [`RecordBatch`] fails.
+#[allow(clippy::too_many_lines)]
 pub fn backfill_missing_columns(
     input_schema: &Schema,
     output: RecordBatch,
@@ -189,10 +195,50 @@ pub fn backfill_missing_columns(
     let num_rows = output.num_rows();
     let mut added = false;
 
+    // Build an O(1) lookup map from field name → output column index to avoid O(n²) scanning.
+    let output_field_index: std::collections::HashMap<&str, usize> = output_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+
     for field in input_schema.fields() {
-        if let Ok(idx) = output_schema.index_of(field.name()) {
-            fields.push(Arc::clone(&output_schema.fields()[idx]));
-            columns.push(Arc::clone(output.column(idx)));
+        if let Some(&idx) = output_field_index.get(field.name().as_str()) {
+            let out_field = output_schema.fields().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!(
+                    "Field index {idx} out of bounds in output schema"
+                ))
+            })?;
+            if out_field.data_type() != field.data_type() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: column '{}' data type mutated from {:?} to {:?}",
+                    field.name(),
+                    field.data_type(),
+                    out_field.data_type()
+                )));
+            }
+            if field.is_nullable() != out_field.is_nullable() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: column '{}' nullability mutated from {} to {}",
+                    field.name(),
+                    if field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    },
+                    if out_field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    }
+                )));
+            }
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
+            fields.push(Arc::clone(out_field));
+            columns.push(Arc::clone(col));
         } else {
             warn!(
                 column = %field.name(),
@@ -209,16 +255,41 @@ pub fn backfill_missing_columns(
         }
     }
 
-    // Preserve any new columns added by the guest
+    // Preserve any new columns added by the guest, ensuring they are nullable for backward compatibility
     for (idx, field) in output_schema.fields().iter().enumerate() {
         if input_schema.index_of(field.name()).is_err() {
+            if !field.is_nullable() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: newly added column '{}' must be nullable to ensure backward compatibility",
+                    field.name()
+                )));
+            }
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
             fields.push(Arc::clone(field));
-            columns.push(Arc::clone(output.column(idx)));
+            columns.push(Arc::clone(col));
         }
     }
 
-    let mut merged_metadata = input_schema.metadata().clone();
-    merged_metadata.extend(output_schema.metadata().clone());
+    for (k, v) in output_schema.metadata() {
+        if k.starts_with("otel::compliance::") {
+            if let Some(upstream_val) = input_schema.metadata().get(k) {
+                if upstream_val != v {
+                    return Err(WasmTransformError::Pipeline(format!(
+                        "Defensive schema guard violation: guest attempted to mutate compliance metadata '{k}' from '{upstream_val}' to '{v}'"
+                    )));
+                }
+            } else {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: guest attempted to inject unauthorized compliance metadata '{k}'"
+                )));
+            }
+        }
+    }
+
+    let mut merged_metadata = output_schema.metadata().clone();
+    merged_metadata.extend(input_schema.metadata().clone());
 
     if !added
         && output_schema.fields().len() == fields.len()
