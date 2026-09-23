@@ -158,7 +158,7 @@ impl WasmWorker {
             Arc::clone(&registry),
             &filtered_env,
         )?;
-        Self::initialize_guest(&mut guest, &config)?;
+        Self::initialize_guest(&mut guest, &config, init_deadline_ticks)?;
         let local_generation = engine.module_generation();
 
         let duration_ms = parse_duration_ms(&config.max_execution_duration).unwrap_or(500);
@@ -290,7 +290,7 @@ impl WasmWorker {
                 registry,
                 &filtered_env,
             )?;
-            Self::initialize_guest(&mut guest, &config)?;
+            Self::initialize_guest(&mut guest, &config, init_deadline_ticks)?;
             Ok(guest)
         };
 
@@ -371,7 +371,7 @@ impl WasmWorker {
                     registry,
                     &filtered_env,
                 )?;
-                Self::initialize_guest(&mut guest, &config)?;
+                Self::initialize_guest(&mut guest, &config, init_deadline_ticks)?;
                 Ok(guest)
             };
 
@@ -491,6 +491,7 @@ impl WasmWorker {
     fn initialize_guest(
         guest: &mut GuestComponents,
         config: &WasmTransformerConfig,
+        init_deadline_ticks: u64,
     ) -> Result<(), WasmTransformError> {
         if let Ok(init_fn) = guest
             .instance
@@ -527,8 +528,6 @@ impl WasmWorker {
                 (0, 0)
             };
 
-            let init_duration_ms = parse_duration_ms(&config.init_timeout).unwrap_or(2000);
-            let init_deadline_ticks = init_duration_ms.max(10) / 10;
             guest.store.set_epoch_deadline(init_deadline_ticks);
 
             let init_res = init_fn.call(&mut guest.store, (conf_ptr, conf_len));
@@ -721,7 +720,9 @@ fn execute_batch_in_guest(
             let ptr = func
                 .call(&mut guest.store, (ipc_ptr, ipc_len))
                 .map_err(WasmTransformError::Wasmtime)?;
-            let len = u32::try_from(RESPONSE_HEADER_SIZE).unwrap_or(20);
+            // RESPONSE_HEADER_SIZE is a compile-time constant of 20, which provably fits in u32.
+            #[allow(clippy::cast_possible_truncation)]
+            let len = RESPONSE_HEADER_SIZE as u32;
             (ptr, len)
         }
     };
@@ -750,17 +751,22 @@ fn execute_batch_in_guest(
 
     // 5. Dispatch outcome and extract transformed batches while guest memory is intact
     let outcome =
-        guest.dispatch_outcome(&header, &message, batch, schema_guard, &mut allocs_to_free)?;
+        guest.dispatch_outcome(&header, &message, batch, schema_guard, &mut allocs_to_free);
 
-    // 6. Free guest allocations on the happy path to prevent memory growth
+    // 6. Free guest allocations on all paths (happy and error) to prevent memory growth.
+    // Best-effort: dealloc failures are logged but do not shadow the primary outcome error.
     for (ptr, len) in allocs_to_free {
-        guest
-            .dealloc_fn
-            .call(&mut guest.store, (ptr, len))
-            .map_err(WasmTransformError::Wasmtime)?;
+        if let Err(e) = guest.dealloc_fn.call(&mut guest.store, (ptr, len)) {
+            tracing::warn!(
+                ptr,
+                len,
+                error = %e,
+                "Guest deallocation failed; instance memory may be leaked — rejuvenation recommended"
+            );
+        }
     }
 
-    Ok(outcome)
+    outcome
 }
 
 /// Serializes an Arrow [`RecordBatch`] to an Arrow IPC stream buffer.

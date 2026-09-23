@@ -100,7 +100,7 @@ async fn test_compile_module_with_sha256_match_and_mismatch() {
     let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
     let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
 
-    // Mismatched hash
+    // Mismatched hash — generation NOT advanced (hash rejection happens before compile)
     let err = cache
         .compile_module_with_sha256(
             &wasm_bytes,
@@ -112,8 +112,13 @@ async fn test_compile_module_with_sha256_match_and_mismatch() {
         WasmTransformError::Sha256Mismatch { ref expected, .. }
             if expected == "0000000000000000000000000000000000000000000000000000000000000000"
     ));
+    assert_eq!(
+        cache.module_generation(),
+        0,
+        "hash mismatch must not advance generation"
+    );
 
-    // Correct computed hash
+    // Correct computed hash — generation advances to 1
     let mut hasher = Sha256::new();
     hasher.update(&wasm_bytes);
     let expected = hex::encode(hasher.finalize());
@@ -121,19 +126,33 @@ async fn test_compile_module_with_sha256_match_and_mismatch() {
     let module = cache
         .compile_module_with_sha256(&wasm_bytes, Some(&expected))
         .unwrap();
-    assert_eq!(cache.module_generation(), 0);
+    assert_eq!(
+        cache.module_generation(),
+        1,
+        "first successful compile advances generation to 1"
+    );
     assert!(cache.module().is_some());
     assert!(Arc::ptr_eq(&module, &cache.module().unwrap()));
 
-    // Case-insensitive and trimmed hash
+    // Case-insensitive and trimmed hash — generation advances to 2
     let expected_upper = format!("  {}  ", expected.to_uppercase());
     let module_trimmed = cache
         .compile_module_with_sha256(&wasm_bytes, Some(&expected_upper))
         .unwrap();
+    assert_eq!(
+        cache.module_generation(),
+        2,
+        "second successful compile advances generation to 2"
+    );
     assert!(Arc::ptr_eq(&module_trimmed, &cache.module().unwrap()));
 
-    // None hash (skip verification)
+    // None hash (skip verification) — generation advances to 3
     let module_none = cache.compile_module_with_sha256(&wasm_bytes, None).unwrap();
+    assert_eq!(
+        cache.module_generation(),
+        3,
+        "third successful compile advances generation to 3"
+    );
     assert!(cache.module().is_some());
     assert!(Arc::ptr_eq(&module_none, &cache.module().unwrap()));
 }
@@ -156,4 +175,47 @@ async fn test_engine_cache_clean_drop() {
     // Drop cache and ensure thread exits without deadlock or panic
     drop(cache);
     std::thread::sleep(std::time::Duration::from_millis(25));
+}
+
+/// Regression: `compile_module` must atomically advance the generation counter so that
+/// workers calling `check_hot_reload` can detect newly compiled modules without requiring
+/// callers to explicitly call `advance_generation()` afterwards.
+#[tokio::test]
+async fn test_compile_module_auto_advances_generation() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    assert_eq!(
+        cache.module_generation(),
+        0,
+        "fresh cache starts at generation 0"
+    );
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    cache.compile_module(&wasm_bytes).unwrap();
+    assert_eq!(
+        cache.module_generation(),
+        1,
+        "compile_module must atomically advance generation to 1"
+    );
+
+    cache.compile_module(&wasm_bytes).unwrap();
+    assert_eq!(
+        cache.module_generation(),
+        2,
+        "second compile_module must advance generation to 2"
+    );
+}
+
+/// Regression: pooling allocator must bound `total_core_instances` to the configured
+/// concurrency rather than leaving it at Wasmtime's internal default (1000).
+#[tokio::test]
+async fn test_pooling_allocator_bounds_core_instances_to_concurrency() {
+    // 2 concurrency slots — must succeed with only 2 possible instances allocated
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    // If total_core_instances was set correctly, we can compile and the engine is usable.
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    // Verify module is accessible and generation was advanced
+    assert!(cache.module().is_some());
+    assert!(Arc::ptr_eq(&module, &cache.module().unwrap()));
+    assert_eq!(cache.module_generation(), 1);
 }

@@ -163,8 +163,16 @@ pub fn backfill_missing_columns(
     let num_rows = output.num_rows();
     let mut added = false;
 
+    // Build an O(1) lookup map from field name → output column index to avoid O(n²) scanning.
+    let output_field_index: std::collections::HashMap<&str, usize> = output_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+
     for field in input_schema.fields() {
-        if let Ok(idx) = output_schema.index_of(field.name()) {
+        if let Some(&idx) = output_field_index.get(field.name().as_str()) {
             fields.push(Arc::clone(&output_schema.fields()[idx]));
             columns.push(Arc::clone(output.column(idx)));
         } else {
@@ -183,7 +191,7 @@ pub fn backfill_missing_columns(
         }
     }
 
-    // Preserve any new columns added by the guest
+    // Preserve any new columns added by the guest (not present in the input schema).
     for (idx, field) in output_schema.fields().iter().enumerate() {
         if input_schema.index_of(field.name()).is_err() {
             fields.push(Arc::clone(field));

@@ -110,15 +110,12 @@ impl MetricRegistry {
     /// Records a counter increment with saturating addition and bounded entry capacity.
     pub fn record_counter(&self, name: &str, delta: u64) {
         self.with_key(name, |key| {
-            if let Some(mut val) = self.metrics.get_mut(key) {
-                if let MetricValue::Counter(c) = val.value_mut() {
-                    *c = (*c).saturating_add(delta);
-                } else {
-                    *val.value_mut() = MetricValue::Counter(delta);
-                }
-                return;
-            }
-            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+            // Use DashMap's atomic entry API to fix the TOCTOU race of get_mut+insert.
+            // Capacity check must happen BEFORE entry() to avoid a recursive shard-lock
+            // deadlock: entry() holds a write lock; calling len() inside would try to
+            // acquire a read lock on the same shard, deadlocking on non-reentrant RwLock.
+            use dashmap::mapref::entry::Entry;
+            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
                 tracing::warn!(
                     component = %self.component_id,
                     max_entries = MAX_METRIC_ENTRIES,
@@ -126,19 +123,26 @@ impl MetricRegistry {
                 );
                 return;
             }
-            self.metrics
-                .insert(key.to_string(), MetricValue::Counter(delta));
+            match self.metrics.entry(key.to_string()) {
+                Entry::Occupied(mut occ) => {
+                    if let MetricValue::Counter(c) = occ.get_mut() {
+                        *c = (*c).saturating_add(delta);
+                    } else {
+                        *occ.get_mut() = MetricValue::Counter(delta);
+                    }
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(MetricValue::Counter(delta));
+                }
+            }
         });
     }
 
     /// Records an instantaneous gauge bitcast value with bounded entry capacity.
     pub fn record_gauge(&self, name: &str, bits: u64) {
         self.with_key(name, |key| {
-            if let Some(mut val) = self.metrics.get_mut(key) {
-                *val.value_mut() = MetricValue::Gauge(bits);
-                return;
-            }
-            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+            use dashmap::mapref::entry::Entry;
+            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
                 tracing::warn!(
                     component = %self.component_id,
                     max_entries = MAX_METRIC_ENTRIES,
@@ -146,33 +150,22 @@ impl MetricRegistry {
                 );
                 return;
             }
-            self.metrics
-                .insert(key.to_string(), MetricValue::Gauge(bits));
+            match self.metrics.entry(key.to_string()) {
+                Entry::Occupied(mut occ) => {
+                    *occ.get_mut() = MetricValue::Gauge(bits);
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(MetricValue::Gauge(bits));
+                }
+            }
         });
     }
 
     /// Records a duration observation in nanoseconds with bounded entry capacity.
     pub fn record_duration(&self, name: &str, nanos: u64) {
         self.with_key(name, |key| {
-            if let Some(mut val) = self.metrics.get_mut(key) {
-                if let MetricValue::Duration(d) = val.value_mut() {
-                    d.count = d.count.saturating_add(1);
-                    d.sum_nanos = d.sum_nanos.saturating_add(nanos);
-                    d.min_nanos = d.min_nanos.min(nanos);
-                    d.max_nanos = d.max_nanos.max(nanos);
-                    d.last_nanos = nanos;
-                } else {
-                    *val.value_mut() = MetricValue::Duration(DurationSummary {
-                        count: 1,
-                        sum_nanos: nanos,
-                        min_nanos: nanos,
-                        max_nanos: nanos,
-                        last_nanos: nanos,
-                    });
-                }
-                return;
-            }
-            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+            use dashmap::mapref::entry::Entry;
+            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
                 tracing::warn!(
                     component = %self.component_id,
                     max_entries = MAX_METRIC_ENTRIES,
@@ -180,16 +173,34 @@ impl MetricRegistry {
                 );
                 return;
             }
-            self.metrics.insert(
-                key.to_string(),
-                MetricValue::Duration(DurationSummary {
-                    count: 1,
-                    sum_nanos: nanos,
-                    min_nanos: nanos,
-                    max_nanos: nanos,
-                    last_nanos: nanos,
-                }),
-            );
+            match self.metrics.entry(key.to_string()) {
+                Entry::Occupied(mut occ) => {
+                    if let MetricValue::Duration(d) = occ.get_mut() {
+                        d.count = d.count.saturating_add(1);
+                        d.sum_nanos = d.sum_nanos.saturating_add(nanos);
+                        d.min_nanos = d.min_nanos.min(nanos);
+                        d.max_nanos = d.max_nanos.max(nanos);
+                        d.last_nanos = nanos;
+                    } else {
+                        *occ.get_mut() = MetricValue::Duration(DurationSummary {
+                            count: 1,
+                            sum_nanos: nanos,
+                            min_nanos: nanos,
+                            max_nanos: nanos,
+                            last_nanos: nanos,
+                        });
+                    }
+                }
+                Entry::Vacant(vac) => {
+                    vac.insert(MetricValue::Duration(DurationSummary {
+                        count: 1,
+                        sum_nanos: nanos,
+                        min_nanos: nanos,
+                        max_nanos: nanos,
+                        last_nanos: nanos,
+                    }));
+                }
+            }
         });
     }
 
@@ -340,6 +351,7 @@ fn with_guest_str<R>(
 /// # Errors
 ///
 /// Returns [`WasmTransformError`] if function definition in the linker fails.
+#[allow(clippy::too_many_lines)]
 pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTransformError> {
     let mut linker = Linker::new(engine);
 

@@ -47,6 +47,7 @@ impl EngineCache {
     ) -> Result<Self, WasmTransformError> {
         let pool_slots = u32::try_from(concurrency.max(1)).unwrap_or(4);
         let mut pool_cfg = PoolingAllocationConfig::default();
+        pool_cfg.total_core_instances(pool_slots);
         pool_cfg.total_memories(pool_slots);
         pool_cfg.total_tables(pool_slots);
         pool_cfg.max_memory_size(max_memory_bytes);
@@ -98,6 +99,7 @@ impl EngineCache {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.module = Some(Arc::clone(&module));
+        guard.generation = guard.generation.saturating_add(1);
         Ok(module)
     }
 
