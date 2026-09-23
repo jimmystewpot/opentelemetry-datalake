@@ -453,3 +453,111 @@ async fn test_admin_router_multi_engine_mismatching_expected_sha() {
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_typed_response() {
+    use wasm_transformer::reload::WasmReloadResponse;
+
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "typed_resp_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(Arc::clone(&engine));
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}"}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let typed: WasmReloadResponse = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(typed.status, "reload successful");
+    assert_eq!(typed.path, module_path.to_str().unwrap());
+    assert_eq!(typed.generation, 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_reload_endpoint_blank_module_path_rejected() {
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
+
+    // Empty string
+    let req1 = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"module_path": ""}"#))
+        .unwrap();
+    let resp1 = router.clone().oneshot(req1).await.unwrap();
+    assert_eq!(resp1.status(), StatusCode::BAD_REQUEST);
+
+    // Whitespace string
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"module_path": "   \t\n  "}"#))
+        .unwrap();
+    let resp2 = router.oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_admin_router_with_configured_sha_fallback_when_expected_sha_is_blank() {
+    use wasm_transformer::reload::compute_sha256;
+
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "blank_expected_sha_fallback_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let sha = compute_sha256(&wasm_bytes);
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router_with_sha(Arc::clone(&engine), Some(sha));
+
+    // Send whitespace expected_sha, should fall back to configured_sha and succeed
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"module_path": "{}", "expected_sha": "   "}}"#,
+            module_path.to_str().unwrap()
+        )))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(engine.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}

@@ -116,6 +116,19 @@ impl EngineCache {
         guard.clone()
     }
 
+    /// Retrieves an atomic snapshot of the currently compiled module and its generation counter.
+    ///
+    /// The module reference and generation counter are sampled under the module read lock,
+    /// ensuring that callers never observe a newer generation paired with an older module pointer.
+    #[must_use]
+    pub fn current_module(&self) -> (Option<Arc<Module>>, u64) {
+        let guard = self
+            .module
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (guard.clone(), self.module_generation())
+    }
+
     /// Returns the current module generation counter.
     #[must_use]
     pub fn module_generation(&self) -> u64 {

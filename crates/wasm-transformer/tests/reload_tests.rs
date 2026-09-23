@@ -221,3 +221,19 @@ async fn test_spawn_sighup_listener_enabled() {
         assert!(handle.is_none());
     }
 }
+
+#[test]
+fn test_current_module_atomic_snapshot() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    let (mod_opt, generation) = cache.current_module();
+    assert!(mod_opt.is_none());
+    assert_eq!(generation, 0);
+
+    let bytes = wat::parse_str(valid_wat()).unwrap();
+    let new_gen = cache.reload_from_bytes(&bytes, None).unwrap();
+    assert_eq!(new_gen, 1);
+
+    let (mod_opt2, generation2) = cache.current_module();
+    assert!(mod_opt2.is_some());
+    assert_eq!(generation2, 1);
+}
