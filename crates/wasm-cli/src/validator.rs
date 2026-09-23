@@ -201,4 +201,27 @@ mod tests {
             other => panic!("expected MissingExport, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_unsupported_import_fails_instantiation() {
+        let wat_src = r#"
+            (module
+                (import "env" "unknown_func" (func $unknown))
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err(), "expected validation to fail");
+        let err = res.unwrap_err();
+        match err {
+            ValidationError::InstantiationFailed(_) => {}
+            other => panic!("expected InstantiationFailed, got {:?}", other),
+        }
+    }
 }

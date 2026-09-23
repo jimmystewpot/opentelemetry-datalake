@@ -29,7 +29,7 @@ use wasmtime::{Caller, Engine, Linker, Module};
 /// Returns an error if registering host functions or unknown traps fails.
 pub fn create_default_linker(
     engine: &Engine,
-    module: &Module,
+    _module: &Module,
 ) -> Result<Linker<()>, wasmtime::Error> {
     let mut linker = Linker::new(engine);
     linker.func_wrap(
@@ -42,6 +42,5 @@ pub fn create_default_linker(
         "datalake_host_metric_emit",
         |_caller: Caller<'_, ()>, _type: u32, _name_ptr: u32, _name_len: u32, _val: u64| {},
     )?;
-    linker.define_unknown_imports_as_traps(module)?;
     Ok(linker)
 }

@@ -265,7 +265,7 @@ fn test_run_immutability_suite_succeeds_with_returned_batch() {
 }
 
 #[test]
-fn test_run_immutability_suite_with_unknown_imports() {
+fn test_run_immutability_suite_rejects_unknown_imports() {
     let wat_src = r#"(module
         (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
         (import "custom_ext" "external_lookup" (func $ext (result i32)))
@@ -282,11 +282,11 @@ fn test_run_immutability_suite_with_unknown_imports() {
         )
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
-    assert!(run_immutability_suite(&wasm).is_ok());
+    assert!(run_immutability_suite(&wasm).is_err());
 }
 
 #[test]
-fn test_run_benchmark_with_unknown_imports() {
+fn test_run_benchmark_rejects_unknown_imports() {
     let wat_src = r#"(module
         (import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))
         (memory (export "memory") 1)
@@ -298,7 +298,7 @@ fn test_run_benchmark_with_unknown_imports() {
         (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
-    assert!(run_benchmark_with_disclaimer(&wasm).is_ok());
+    assert!(run_benchmark_with_disclaimer(&wasm).is_err());
 }
 
 #[test]

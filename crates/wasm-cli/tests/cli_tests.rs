@@ -151,7 +151,7 @@ fn test_validate_accepts_conformant_module() {
 }
 
 #[test]
-fn test_validate_accepts_module_with_wasi_or_unknown_imports() {
+fn test_validate_rejects_module_with_wasi_or_unknown_imports() {
     let wat_src = r#"(module
         (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
         (import "env" "custom_unused_external" (func $custom_ext (param i32) (result i32)))
@@ -163,7 +163,7 @@ fn test_validate_accepts_module_with_wasi_or_unknown_imports() {
         (memory (export "memory") 1)
     )"#;
     let wasm = wat::parse_str(wat_src).unwrap();
-    assert!(validate_wasm_bytes(&wasm).is_ok());
+    assert!(validate_wasm_bytes(&wasm).is_err());
 }
 
 #[test]
