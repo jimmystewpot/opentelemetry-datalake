@@ -37,8 +37,8 @@ pub struct WasmDispatcher {
     module: Arc<Module>,
     transformer_config: WasmTransformerConfig,
     output: PipelineSender,
-    reroute_error: Option<PipelineSender>,
-    reroute_reject: Option<PipelineSender>,
+    reroute_error: Option<crate::DlqOutput>,
+    reroute_reject: Option<crate::DlqOutput>,
     registry: Arc<crate::host_calls::MetricRegistry>,
 }
 
@@ -52,8 +52,8 @@ impl WasmDispatcher {
         module: Arc<Module>,
         transformer_config: WasmTransformerConfig,
         output: PipelineSender,
-        reroute_error: Option<PipelineSender>,
-        reroute_reject: Option<PipelineSender>,
+        reroute_error: Option<crate::DlqOutput>,
+        reroute_reject: Option<crate::DlqOutput>,
         registry: Arc<crate::host_calls::MetricRegistry>,
     ) -> Self {
         Self {
@@ -252,8 +252,8 @@ impl WasmDispatcher {
         outcome: WorkerOutcome,
         tf_cfg: &WasmTransformerConfig,
         output: &PipelineSender,
-        err_tx: Option<&PipelineSender>,
-        rej_tx: Option<&PipelineSender>,
+        err_tx: Option<&crate::DlqOutput>,
+        rej_tx: Option<&crate::DlqOutput>,
     ) -> bool {
         match outcome {
             WorkerOutcome::Emitted(batches) => {
@@ -283,7 +283,7 @@ impl WasmDispatcher {
         reason: String,
         original: SignalBatch,
         policy: OnRejectPolicy,
-        rej_tx: Option<&PipelineSender>,
+        rej_tx: Option<&crate::DlqOutput>,
     ) -> bool {
         let mut healthy = true;
         if policy == OnRejectPolicy::Reroute {
@@ -312,7 +312,7 @@ impl WasmDispatcher {
         original: SignalBatch,
         tf_cfg: &WasmTransformerConfig,
         output: &PipelineSender,
-        err_tx: Option<&PipelineSender>,
+        err_tx: Option<&crate::DlqOutput>,
     ) -> bool {
         let mut healthy = true;
         match tf_cfg.on_error {

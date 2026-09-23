@@ -270,3 +270,68 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
 
     Ok(linker)
 }
+
+/// Handle maintaining active OpenTelemetry metric observation callbacks for a [`MetricRegistry`].
+#[derive(Debug)]
+pub struct MetricBridgeHandle {
+    _counter: opentelemetry::metrics::ObservableCounter<u64>,
+    _gauge: opentelemetry::metrics::ObservableGauge<u64>,
+}
+
+/// Registers OpenTelemetry observable metric instruments for the provided [`MetricRegistry`].
+///
+/// Registers observable counter (`"datalake_wasm_guest_counter"`) and observable gauge
+/// (`"datalake_wasm_guest_gauge"`) with the global OpenTelemetry meter (`"opentelemetry-datalake"`),
+/// tagging all emitted observations with `metric_name` and `signal`.
+#[must_use]
+pub fn bridge_metrics_to_opentelemetry(
+    registry: &Arc<MetricRegistry>,
+    signal: &str,
+) -> MetricBridgeHandle {
+    let meter = opentelemetry::global::meter("opentelemetry-datalake");
+
+    let reg_counter = Arc::clone(registry);
+    let sig_counter = signal.to_string();
+    let counter = meter
+        .u64_observable_counter("datalake_wasm_guest_counter")
+        .with_description("Guest emitted counters from WASM transformer")
+        .with_callback(move |observer| {
+            for entry in reg_counter.metrics() {
+                if let MetricValue::Counter(val) = entry.value() {
+                    observer.observe(
+                        *val,
+                        &[
+                            opentelemetry::KeyValue::new("metric_name", entry.key().clone()),
+                            opentelemetry::KeyValue::new("signal", sig_counter.clone()),
+                        ],
+                    );
+                }
+            }
+        })
+        .build();
+
+    let reg_gauge = Arc::clone(registry);
+    let sig_gauge = signal.to_string();
+    let gauge = meter
+        .u64_observable_gauge("datalake_wasm_guest_gauge")
+        .with_description("Guest emitted gauges from WASM transformer")
+        .with_callback(move |observer| {
+            for entry in reg_gauge.metrics() {
+                if let MetricValue::Gauge(val) = entry.value() {
+                    observer.observe(
+                        *val,
+                        &[
+                            opentelemetry::KeyValue::new("metric_name", entry.key().clone()),
+                            opentelemetry::KeyValue::new("signal", sig_gauge.clone()),
+                        ],
+                    );
+                }
+            }
+        })
+        .build();
+
+    MetricBridgeHandle {
+        _counter: counter,
+        _gauge: gauge,
+    }
+}

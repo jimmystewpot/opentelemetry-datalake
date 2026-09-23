@@ -47,6 +47,8 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 arrow.workspace = true
+opentelemetry = { workspace = true }
+async-trait = { workspace = true }
 
 [features]
 default = []

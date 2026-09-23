@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+opentelemetry = { workspace = true }
 opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
 
 [dev-dependencies]

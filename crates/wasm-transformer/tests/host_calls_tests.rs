@@ -492,3 +492,24 @@ fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
     registry.record_counter("counter_0", 5);
     assert_eq!(registry.read_counter("counter_0"), 6);
 }
+
+#[test]
+fn test_bridge_metrics_to_opentelemetry_multi_signals() {
+    let registry = Arc::new(MetricRegistry::new("test_signals"));
+    registry.record_counter("processed_count", 100);
+    registry.record_gauge("heap_size", 2048);
+
+    let handle_logs =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "logs");
+    let handle_traces =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "traces");
+    let handle_metrics =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "metrics");
+
+    assert!(format!("{handle_logs:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_traces:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_metrics:?}").contains("MetricBridgeHandle"));
+
+    assert_eq!(registry.read_counter("processed_count"), 100);
+    assert_eq!(registry.read_gauge("heap_size"), Some(2048));
+}

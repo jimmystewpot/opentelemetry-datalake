@@ -28,6 +28,71 @@ use crate::{
     engine::EngineCache,
 };
 
+pub use crate::host_calls::{
+    MetricBridgeHandle, MetricRegistry, MetricValue, bridge_metrics_to_opentelemetry,
+};
+
+/// Trait for Dead Letter Queue (DLQ) sinks that receive diverted or rejected batches.
+#[async_trait]
+pub trait DlqSink: Send + Sync + std::fmt::Debug {
+    /// Persists or forwards a diverted [`SignalBatch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PipelineError`] if the batch cannot be durably written or forwarded.
+    async fn send(&self, batch: pipeline_core::pipeline::SignalBatch) -> Result<(), PipelineError>;
+}
+
+/// Destination for Dead Letter Queue (DLQ) routing, supporting channels or direct sinks.
+#[derive(Clone)]
+pub enum DlqOutput {
+    /// Asynchronous pipeline channel.
+    Sender(PipelineSender),
+    /// Direct DLQ sink performing persistence in the routed send path.
+    Sink(Arc<dyn DlqSink>),
+}
+
+impl std::fmt::Debug for DlqOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sender(_) => write!(f, "DlqOutput::Sender"),
+            Self::Sink(sink) => write!(f, "DlqOutput::Sink({sink:?})"),
+        }
+    }
+}
+
+impl DlqOutput {
+    /// Sends a diverted batch to the DLQ destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PipelineError`] if the destination is closed or persistence fails.
+    pub async fn send(
+        &self,
+        batch: pipeline_core::pipeline::SignalBatch,
+    ) -> Result<(), PipelineError> {
+        match self {
+            Self::Sender(tx) => tx
+                .send(batch)
+                .await
+                .map_err(|_| PipelineError::DownstreamClosed),
+            Self::Sink(sink) => sink.send(batch).await,
+        }
+    }
+}
+
+impl From<PipelineSender> for DlqOutput {
+    fn from(tx: PipelineSender) -> Self {
+        Self::Sender(tx)
+    }
+}
+
+impl From<Arc<dyn DlqSink>> for DlqOutput {
+    fn from(sink: Arc<dyn DlqSink>) -> Self {
+        Self::Sink(sink)
+    }
+}
+
 /// WebAssembly whole-batch transformer executing in isolated sandbox workers.
 ///
 /// Implements the [`Transform`] pipeline trait, dispatching incoming telemetry batches
@@ -37,8 +102,8 @@ pub struct WasmTransformer {
     config: WasmTransformerConfig,
     engine: Arc<EngineCache>,
     module: Arc<Module>,
-    reroute_error: Option<PipelineSender>,
-    reroute_reject: Option<PipelineSender>,
+    reroute_error: Option<DlqOutput>,
+    reroute_reject: Option<DlqOutput>,
     registry: Arc<crate::host_calls::MetricRegistry>,
 }
 
@@ -68,7 +133,12 @@ impl WasmTransformer {
             EngineCache::new_pooling(pool_capacity, max_memory_bytes)
                 .map_err(|e| PipelineError::Internal(e.to_string()))?,
         );
-        Self::with_engine(config, reroute_error, reroute_reject, engine)
+        Self::with_engine(
+            config,
+            reroute_error.map(DlqOutput::Sender),
+            reroute_reject.map(DlqOutput::Sender),
+            engine,
+        )
     }
 
     /// Creates and initializes a new `WasmTransformer` with a provided [`EngineCache`].
@@ -82,14 +152,14 @@ impl WasmTransformer {
     /// # Errors
     ///
     /// Returns [`PipelineError::TopologicalSinkMissing`] if `on_error` or `on_reject` is set to
-    /// `Reroute` but the corresponding DLQ sender channel is not provided (`None`).
+    /// `Reroute` but the corresponding DLQ destination is not provided (`None`).
     /// Returns [`PipelineError::Internal`] if concurrency is 0, on passthrough misconfiguration,
     /// module file read errors, SHA-256 hash mismatch, compilation failure, or probe worker initialization
     /// failure.
     pub fn with_engine(
         config: WasmTransformerConfig,
-        reroute_error: Option<PipelineSender>,
-        reroute_reject: Option<PipelineSender>,
+        reroute_error: Option<DlqOutput>,
+        reroute_reject: Option<DlqOutput>,
         engine: Arc<EngineCache>,
     ) -> Result<Self, PipelineError> {
         // 1. Topological DLQ validation

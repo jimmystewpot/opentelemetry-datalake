@@ -132,13 +132,20 @@ impl WasmWorker {
             })?
         };
 
-        let guest = Self::instantiate_guest(engine.engine(), &module, &registry, &config)?;
-        let local_generation = engine.module_generation();
+        let snapshot = engine.current_snapshot();
+        let (target_module, initial_generation) = if let Some(snap) = snapshot {
+            (snap.module, snap.generation)
+        } else {
+            let current_generation = engine.module_generation();
+            (module, current_generation)
+        };
 
-        Ok(Self {
+        let guest = Self::instantiate_guest(engine.engine(), &target_module, &registry, &config)?;
+
+        let mut worker = Self {
             id,
             engine,
-            module,
+            module: target_module,
             config,
             registry,
             store: guest.store,
@@ -148,9 +155,14 @@ impl WasmWorker {
             transform_fn: guest.transform_fn,
             memory: guest.memory,
             batches_processed: 0,
-            local_generation,
+            local_generation: initial_generation,
             rejuvenate_threshold_bytes,
-        })
+        };
+
+        // If a reload occurred while instantiating the module, adopt the newly published snapshot immediately
+        worker.check_hot_reload()?;
+
+        Ok(worker)
     }
 
     /// Executes a transformation over a [`SignalBatch`].
@@ -385,7 +397,12 @@ impl WasmWorker {
     }
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.
-    fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
+    /// Checks if a newer module snapshot is available in [`EngineCache`] and rejuvenates if so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if guest re-instantiation fails.
+    pub fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
         while self.local_generation != self.engine.module_generation() {
             let Some(snapshot) = self.engine.current_snapshot() else {
                 break;
