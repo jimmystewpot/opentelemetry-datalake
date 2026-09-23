@@ -738,3 +738,130 @@ fn test_verify_batch_immutability_rejects_tampered_value_in_subset() {
             .contains("Value mismatch in immutable column trace_id")
     );
 }
+
+#[test]
+fn test_run_immutability_suite_rejects_success_with_zero_count_nonzero_batches_ptr() {
+    // 20-byte header: status = 0 (STATUS_SUCCESS), batch_count = 0, batches_ptr = 1000 (\e8\03\00\00)
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\00\00\00\00\e8\03\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("Success response header has inconsistent batch fields"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_success_with_nonzero_count_zero_batches_ptr() {
+    // 20-byte header: status = 0 (STATUS_SUCCESS), batch_count = 1, batches_ptr = 0
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\01\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("Success response header has inconsistent batch fields"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_success_with_message_payload() {
+    // 20-byte header: status = 0 (STATUS_SUCCESS), batch_count = 0, batches_ptr = 0, message_ptr = 500, message_len = 5
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\00\00\00\00\00\00\00\00\f4\01\00\00\05\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(res.is_err());
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("Success response header must have no message payload"),
+        "actual err: {err}"
+    );
+}
+
+#[test]
+fn test_verify_batch_immutability_allows_reordered_rows() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(vec!["trace_1", "trace_2"])),
+            Arc::new(StringArray::from(vec!["body_1", "body_2"])),
+        ],
+    )
+    .unwrap();
+
+    // Reordered rows: [trace_2, trace_1] with modified body values
+    let reordered_output = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_2", "trace_1"])),
+            Arc::new(StringArray::from(vec![
+                "body_2_modified",
+                "body_1_modified",
+            ])),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(reordered_output.num_rows(), 2);
+    assert!(verify_batch_immutability(&input, &reordered_output).is_ok());
+}
+
+#[test]
+fn test_verify_batch_immutability_rejects_multiplicity_violation() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["trace_1", "trace_2"]))],
+    )
+    .unwrap();
+
+    // Output duplicates trace_1 and drops trace_2 (same length = 2 rows, but violated multiplicity)
+    let duplicate_output = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec!["trace_1", "trace_1"]))],
+    )
+    .unwrap();
+
+    let res = verify_batch_immutability(&input, &duplicate_output);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Value mismatch in immutable column trace_id")
+    );
+}

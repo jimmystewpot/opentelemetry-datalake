@@ -75,23 +75,27 @@ pub fn verify_batch_immutability(
         return Ok(());
     }
 
-    // 4. If row counts are identical and 1:1 match holds, do fast direct array equality comparison.
+    // 4. Fast path: if row counts match and all common immutable columns are positionally identical, succeed immediately.
     if input.num_rows() == output.num_rows() {
-        for &(col_name, in_col, out_col) in &col_pairs {
-            if in_col != out_col {
-                return Err(TesterError::ValueMismatch(col_name));
-            }
+        let all_positionally_identical = col_pairs
+            .iter()
+            .all(|(_, in_col, out_col)| in_col == out_col);
+        if all_positionally_identical {
+            return Ok(());
         }
-        return Ok(());
     }
 
-    // 5. For filtered subsets or split batches (output.num_rows() != input.num_rows()):
-    // Every output row must match an input row across all common immutable columns.
+    // 5. Multiplicity-preserving match: every output row must correspond to a distinct input row
+    // with identical immutable column values (supports reordered, filtered subsets, and split batches).
+    let mut used_inputs = vec![false; input.num_rows()];
     for o in 0..output.num_rows() {
-        let mut matched = false;
+        let mut matched_idx = None;
         let mut candidate_mismatched_col: Option<&'static str> = None;
 
-        for i in 0..input.num_rows() {
+        for (i, &is_used) in used_inputs.iter().enumerate() {
+            if is_used {
+                continue;
+            }
             let mut all_cols_match = true;
             for &(col_name, in_col, out_col) in &col_pairs {
                 if in_col.slice(i, 1) != out_col.slice(o, 1) {
@@ -103,12 +107,14 @@ pub fn verify_batch_immutability(
                 }
             }
             if all_cols_match {
-                matched = true;
+                matched_idx = Some(i);
                 break;
             }
         }
 
-        if !matched {
+        if let Some(i) = matched_idx {
+            used_inputs[i] = true;
+        } else {
             let col = candidate_mismatched_col.unwrap_or(col_pairs[0].0);
             return Err(TesterError::ValueMismatch(col));
         }
@@ -496,24 +502,34 @@ pub fn verify_transform_status(
         return Ok(());
     }
 
-    if status != STATUS_SUCCESS {
-        let msg = if message_len > 0 {
-            let m_start = message_ptr as usize;
-            let m_end = m_start
-                .checked_add(message_len as usize)
-                .ok_or_else(|| anyhow::anyhow!("Overflow in message bounds"))?;
-            if m_end <= mem.len() {
-                String::from_utf8_lossy(&mem[m_start..m_end]).to_string()
-            } else {
-                "out-of-bounds error message".to_string()
-            }
-        } else {
-            format!("transform failed with status {status}")
-        };
-        anyhow::bail!("Guest transform failed: {msg}");
+    if status == STATUS_SUCCESS {
+        if (batch_count == 0 && batches_ptr != 0) || (batch_count > 0 && batches_ptr == 0) {
+            anyhow::bail!(
+                "Success response header has inconsistent batch fields: batch_count={batch_count}, batches_ptr={batches_ptr}"
+            );
+        }
+        if message_ptr != 0 || message_len != 0 {
+            anyhow::bail!(
+                "Success response header must have no message payload: message_ptr={message_ptr}, message_len={message_len}"
+            );
+        }
+        return Ok(());
     }
 
-    Ok(())
+    let msg = if message_len > 0 {
+        let m_start = message_ptr as usize;
+        let m_end = m_start
+            .checked_add(message_len as usize)
+            .ok_or_else(|| anyhow::anyhow!("Overflow in message bounds"))?;
+        if m_end <= mem.len() {
+            String::from_utf8_lossy(&mem[m_start..m_end]).to_string()
+        } else {
+            "out-of-bounds error message".to_string()
+        }
+    } else {
+        format!("transform failed with status {status}")
+    };
+    anyhow::bail!("Guest transform failed: {msg}");
 }
 
 fn verify_transform_response(
