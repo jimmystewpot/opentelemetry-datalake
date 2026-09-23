@@ -200,10 +200,20 @@ pub fn backfill_missing_columns(
                     out_field.data_type()
                 )));
             }
-            if !field.is_nullable() && out_field.is_nullable() {
+            if field.is_nullable() != out_field.is_nullable() {
                 return Err(WasmTransformError::Pipeline(format!(
-                    "Defensive schema guard violation: column '{}' nullability mutated from non-nullable to nullable",
-                    field.name()
+                    "Defensive schema guard violation: column '{}' nullability mutated from {} to {}",
+                    field.name(),
+                    if field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    },
+                    if out_field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    }
                 )));
             }
             fields.push(Arc::clone(out_field));
@@ -224,16 +234,38 @@ pub fn backfill_missing_columns(
         }
     }
 
-    // Preserve any new columns added by the guest
+    // Preserve any new columns added by the guest, ensuring they are nullable for backward compatibility
     for (idx, field) in output_schema.fields().iter().enumerate() {
         if input_schema.index_of(field.name()).is_err() {
+            if !field.is_nullable() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: newly added column '{}' must be nullable to ensure backward compatibility",
+                    field.name()
+                )));
+            }
             fields.push(Arc::clone(field));
             columns.push(Arc::clone(output.column(idx)));
         }
     }
 
-    let mut merged_metadata = input_schema.metadata().clone();
-    merged_metadata.extend(output_schema.metadata().clone());
+    for (k, v) in output_schema.metadata() {
+        if k.starts_with("otel::compliance::") {
+            if let Some(upstream_val) = input_schema.metadata().get(k) {
+                if upstream_val != v {
+                    return Err(WasmTransformError::Pipeline(format!(
+                        "Defensive schema guard violation: guest attempted to mutate compliance metadata '{k}' from '{upstream_val}' to '{v}'"
+                    )));
+                }
+            } else {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: guest attempted to inject unauthorized compliance metadata '{k}'"
+                )));
+            }
+        }
+    }
+
+    let mut merged_metadata = output_schema.metadata().clone();
+    merged_metadata.extend(input_schema.metadata().clone());
 
     if !added
         && output_schema.fields().len() == fields.len()

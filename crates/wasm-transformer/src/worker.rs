@@ -255,17 +255,36 @@ impl WasmWorker {
             TransformFn::V1(f) => f
                 .call(&mut self.store, (signal_type, ipc_ptr, ipc_len))
                 .map(|packed| {
-                    if packed > 0xFFFF_FFFF {
-                        u32::try_from(packed >> 32).unwrap_or(0)
-                    } else {
-                        u32::try_from(packed).unwrap_or(0)
-                    }
+                    let ptr = u32::try_from(packed >> 32).unwrap_or(0);
+                    let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
+                    (ptr, len)
                 }),
-            TransformFn::Legacy(f) => f.call(&mut self.store, (ipc_ptr, ipc_len)),
+            TransformFn::Legacy(f) => f
+                .call(&mut self.store, (ipc_ptr, ipc_len))
+                .map(|ptr| (ptr, 20)),
         };
         let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
-        let header_ptr = match transform_res {
-            Ok(ptr) => ptr,
+        let (header_ptr, _header_len) = match transform_res {
+            Ok((ptr, len)) => {
+                if len < 20 {
+                    return Err((
+                        batch,
+                        WasmTransformError::Pipeline(format!(
+                            "Invalid V1 packed response length {len}: minimum header size is 20 bytes"
+                        )),
+                    ));
+                }
+                let mem_size = self.memory.data_size(&self.store);
+                if (ptr as usize).saturating_add(len as usize) > mem_size {
+                    return Err((
+                        batch,
+                        WasmTransformError::Pipeline(format!(
+                            "Response header at offset {ptr} with length {len} exceeds guest memory bounds {mem_size}"
+                        )),
+                    ));
+                }
+                (ptr, len)
+            }
             Err(e) => {
                 let err_chain = format!("{e:#}");
                 let is_timeout = err_chain.contains("interrupt")
@@ -558,6 +577,16 @@ impl WasmWorker {
         let linker = crate::host_calls::build_host_linker(engine)?;
         let instance = linker.instantiate(&mut store, module)?;
 
+        let version_fn = instance
+            .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
+            .map_err(|_| WasmTransformError::MissingExport("datalake_abi_version".into()))?;
+        let version = version_fn.call(&mut store, ()).map_err(|e| {
+            WasmTransformError::InitFailed(format!("Failed to call datalake_abi_version: {e}"))
+        })?;
+        if version != 1 {
+            return Err(WasmTransformError::AbiVersionMismatch(version));
+        }
+
         let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
         let dealloc_fn =
             instance.get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")?;
@@ -750,7 +779,8 @@ fn extract_output_batches(
 }
 
 /// Parses a byte size string with standard unit suffixes into a byte count.
-pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
+#[must_use]
+pub fn parse_byte_size(s: &str) -> Option<usize> {
     let trimmed = s.trim();
     if let Some(num) = trimmed.strip_suffix("GiB") {
         num.trim()
@@ -775,7 +805,8 @@ pub(crate) fn parse_byte_size(s: &str) -> Option<usize> {
 }
 
 /// Parses a duration string (e.g. "500ms", "5s", "1m") into a [`std::time::Duration`].
-pub(crate) fn parse_duration(s: &str) -> Option<std::time::Duration> {
+#[must_use]
+pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
     let trimmed = s.trim();
     if let Some(num) = trimmed.strip_suffix("ms") {
         num.trim()
