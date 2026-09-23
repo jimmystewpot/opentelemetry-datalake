@@ -17,6 +17,13 @@ use wasmtime::{Caller, Engine, Linker, Module};
 /// defined as traps so that guest modules containing WASI or runtime externs
 /// can be instantiated and validated.
 ///
+/// # Concurrency Characteristics
+///
+/// The returned [`Linker`] is bound to the provided [`Engine`] and parameterized with `()`.
+/// While the underlying [`Engine`] is thread-safe (`Send + Sync`) and can be freely shared across
+/// threads, each [`Linker`] instance must be used within its own thread or store execution context
+/// and is not intended for concurrent instantiation across threads without external synchronization.
+///
 /// # Errors
 ///
 /// Returns an error if registering host functions or unknown traps fails.

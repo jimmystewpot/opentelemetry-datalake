@@ -6,8 +6,8 @@ use anyhow::Result;
 use wasmtime::{Config, Engine, Module, Store};
 
 use crate::tester::{
-    build_canonical_test_batch_for_signal, reclaim_transform_response, serialize_batch_to_ipc,
-    verify_transform_status,
+    build_canonical_test_batch_for_signal, extract_transform_payloads, reclaim_transform_response,
+    serialize_batch_to_ipc,
 };
 use crate::validator::validate_wasm_bytes;
 
@@ -17,6 +17,12 @@ fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
 
 /// Executes local latency/throughput benchmarks for a guest WASM module
 /// with an explicit signal type and optional initialization configuration payload.
+///
+/// # Concurrency Characteristics
+///
+/// This function creates an isolated Wasmtime [`Engine`] and [`Store`], executing entirely
+/// within the calling thread. Multiple threads can call this function concurrently with
+/// independent guest modules.
 ///
 /// # Errors
 ///
@@ -127,8 +133,11 @@ pub fn run_benchmark_with_options(
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        verify_transform_status(&memory, &store, header_ptr, header_len)?;
-        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
+        let extract_res = extract_transform_payloads(&memory, &store, header_ptr, header_len);
+        let reclaim_res =
+            reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len);
+        extract_res?;
+        reclaim_res?;
     }
 
     let iterations: u32 = 50;
@@ -139,8 +148,11 @@ pub fn run_benchmark_with_options(
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        verify_transform_status(&memory, &store, header_ptr, header_len)?;
-        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
+        let extract_res = extract_transform_payloads(&memory, &store, header_ptr, header_len);
+        let reclaim_res =
+            reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len);
+        extract_res?;
+        reclaim_res?;
     }
     let total_elapsed = start_time.elapsed();
 
@@ -166,6 +178,12 @@ pub fn run_benchmark_with_options(
 
 /// Executes local latency/throughput benchmarks for a guest WASM module
 /// using default signal (`Logs` / `0`) and no configuration.
+///
+/// # Concurrency Characteristics
+///
+/// This function creates an isolated Wasmtime [`Engine`] and [`Store`], executing entirely
+/// within the calling thread. Multiple threads can call this function concurrently with
+/// independent guest modules.
 ///
 /// # Errors
 ///

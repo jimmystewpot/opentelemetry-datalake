@@ -4,6 +4,10 @@ use anyhow::Result;
 use std::path::Path;
 
 /// Converts any [`std::fmt::Display`] error into an [`anyhow::Error`].
+///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`).
 pub fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
     anyhow::anyhow!("{err}")
 }
@@ -14,6 +18,10 @@ pub fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
 /// - `"logs"`, `"log"`, `"0"` -> `0` (Logs)
 /// - `"metrics"`, `"metric"`, `"1"` -> `1` (Metrics)
 /// - `"traces"`, `"trace"`, `"2"` -> `2` (Traces)
+///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`).
 ///
 /// # Errors
 ///
@@ -39,6 +47,11 @@ pub fn parse_signal(s: &str) -> Result<u32> {
 /// - If `config_arg` is `None` but `signal_code != 0`, synthesizes a minimal JSON config
 ///   `{"signal":"..."}` so that guest modules can detect the target signal type on initialization.
 /// - If `config_arg` is `None` and `signal_code == 0`, returns `None`.
+///
+/// # Concurrency Characteristics
+///
+/// This function is thread-safe (`Send + Sync`). When reading from a file path, it performs
+/// standard thread-safe read-only filesystem I/O.
 ///
 /// # Errors
 ///

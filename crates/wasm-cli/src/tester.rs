@@ -30,6 +30,11 @@ pub enum TesterError {
 /// Filtered batches (with zero or fewer rows) and split batches (`ok_multiple`) are supported
 /// by verifying that every row present in `output` matches a corresponding row in `input`.
 ///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`). It operates solely on borrowed
+/// [`RecordBatch`] references without internal or global mutable state.
+///
 /// # Errors
 ///
 /// Returns [`TesterError::MissingColumn`] if an immutable column present in `input` is missing from `output`,
@@ -38,6 +43,30 @@ pub fn verify_batch_immutability(
     input: &RecordBatch,
     output: &RecordBatch,
 ) -> std::result::Result<(), TesterError> {
+    let mut used_inputs = vec![false; input.num_rows()];
+    verify_batch_immutability_with_used(input, output, &mut used_inputs)
+}
+
+/// Verifies that immutable OpenTelemetry columns are preserved between input and output batches,
+/// tracking used input rows across multiple batches using the provided `used_inputs` mask.
+///
+/// # Concurrency Characteristics
+///
+/// This function is thread-safe (`Send + Sync`) and operates on caller-provided references.
+///
+/// # Errors
+///
+/// Returns [`TesterError::MissingColumn`] if an immutable column present in `input` is missing from `output`,
+/// or [`TesterError::ValueMismatch`] if the values in an immutable column have been altered or
+/// if an input row is consumed more than once (multiplicity violation).
+pub fn verify_batch_immutability_with_used(
+    input: &RecordBatch,
+    output: &RecordBatch,
+    used_inputs: &mut [bool],
+) -> std::result::Result<(), TesterError> {
+    if used_inputs.len() < input.num_rows() {
+        return Err(TesterError::ValueMismatch("input_row_multiplicity"));
+    }
     let in_schema = input.schema();
     let out_schema = output.schema();
 
@@ -75,24 +104,28 @@ pub fn verify_batch_immutability(
         return Ok(());
     }
 
-    // 4. Fast path: if row counts match and all common immutable columns are positionally identical, succeed immediately.
-    if input.num_rows() == output.num_rows() {
+    // 4. Fast path: if row counts match, no rows have been used yet,
+    // and all common immutable columns are positionally identical, mark all as used and succeed immediately.
+    if input.num_rows() == output.num_rows() && used_inputs[..input.num_rows()].iter().all(|&u| !u)
+    {
         let all_positionally_identical = col_pairs
             .iter()
             .all(|(_, in_col, out_col)| in_col == out_col);
         if all_positionally_identical {
+            for u in &mut used_inputs[..input.num_rows()] {
+                *u = true;
+            }
             return Ok(());
         }
     }
 
     // 5. Multiplicity-preserving match: every output row must correspond to a distinct input row
     // with identical immutable column values (supports reordered, filtered subsets, and split batches).
-    let mut used_inputs = vec![false; input.num_rows()];
     for o in 0..output.num_rows() {
         let mut matched_idx = None;
         let mut candidate_mismatched_col: Option<&'static str> = None;
 
-        for (i, &is_used) in used_inputs.iter().enumerate() {
+        for (i, &is_used) in used_inputs[..input.num_rows()].iter().enumerate() {
             if is_used {
                 continue;
             }
@@ -128,6 +161,10 @@ pub fn verify_batch_immutability(
 /// - `0` (Logs): Canonical logs schema matching `arrow-codec::logs`.
 /// - `1` (Metrics): Canonical metrics schema matching `arrow-codec::metrics`.
 /// - `2` (Traces): Canonical traces schema matching `arrow-codec::traces`.
+///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`).
 ///
 /// # Errors
 ///
@@ -282,6 +319,10 @@ pub fn build_canonical_test_batch_for_signal(signal: u32) -> Result<RecordBatch>
 
 /// Builds a canonical test Arrow [`RecordBatch`] for default logs signal.
 ///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`).
+///
 /// # Errors
 ///
 /// Returns an error if the record batch cannot be created.
@@ -290,6 +331,10 @@ pub fn build_canonical_test_batch() -> Result<RecordBatch> {
 }
 
 /// Serializes an Arrow [`RecordBatch`] to IPC stream bytes.
+///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`).
 ///
 /// # Errors
 ///
@@ -310,6 +355,12 @@ fn wasm_err<E: std::fmt::Display>(err: E) -> anyhow::Error {
 
 /// Executes the full immutability and conformance test suite against guest WASM bytecode
 /// with an explicit signal type and optional initialization configuration payload.
+///
+/// # Concurrency Characteristics
+///
+/// This function creates an isolated Wasmtime [`Engine`] and [`Store`], executing entirely
+/// within the calling thread. Multiple threads can call this function concurrently with
+/// independent guest modules.
 ///
 /// # Errors
 ///
@@ -430,6 +481,12 @@ pub fn run_immutability_suite_with_options(
 /// Executes the full immutability and conformance test suite against guest WASM bytecode
 /// using default signal (`Logs` / `0`) and no configuration.
 ///
+/// # Concurrency Characteristics
+///
+/// This function creates an isolated Wasmtime [`Engine`] and [`Store`], executing entirely
+/// within the calling thread. Multiple threads can call this function concurrently with
+/// independent guest modules.
+///
 /// # Errors
 ///
 /// Returns an error if the module fails validation, instantiation, execution, or immutability checks.
@@ -438,6 +495,10 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
 }
 
 /// Reads and verifies the response status in the [`opentelemetry_datalake_wasm_sdk::abi::TransformResponseHeader`].
+///
+/// # Concurrency Characteristics
+///
+/// This function is thread-safe (`Send + Sync`) and operates on caller-provided references.
 ///
 /// # Errors
 ///
@@ -532,13 +593,24 @@ pub fn verify_transform_status(
     anyhow::bail!("Guest transform failed: {msg}");
 }
 
-fn verify_transform_response(
+/// Extracts and deserializes all Arrow [`RecordBatch`]es from a guest transform response.
+///
+/// If the response status is [`STATUS_DISCARD`], an empty vector is returned.
+///
+/// # Concurrency Characteristics
+///
+/// This function is thread-safe (`Send + Sync`) and operates on caller-provided references.
+///
+/// # Errors
+///
+/// Returns an error if the status indicates guest failure, if descriptor or batch pointers
+/// are out of memory bounds, or if the Arrow IPC streams cannot be deserialized.
+pub fn extract_transform_payloads(
     memory: &wasmtime::Memory,
     store: &Store<()>,
     header_ptr: u32,
     header_len: u32,
-    input_batch: &RecordBatch,
-) -> Result<()> {
+) -> Result<Vec<RecordBatch>> {
     verify_transform_status(memory, store, header_ptr, header_len)?;
 
     let h_start = header_ptr as usize;
@@ -550,7 +622,7 @@ fn verify_transform_response(
             .map_err(|e| anyhow::anyhow!("Failed to read status: {e}"))?,
     );
     if status == STATUS_DISCARD {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let batch_count = u32::from_le_bytes(
@@ -564,6 +636,7 @@ fn verify_transform_response(
             .map_err(|e| anyhow::anyhow!("Failed to read batches_ptr: {e}"))?,
     );
 
+    let mut batches = Vec::new();
     for i in 0..batch_count {
         let desc_offset = (batches_ptr as usize)
             .checked_add(
@@ -600,13 +673,33 @@ fn verify_transform_response(
         let reader = StreamReader::try_new(cursor, None)?;
         for out_batch_res in reader {
             let out_batch = out_batch_res?;
-            verify_batch_immutability(input_batch, &out_batch)?;
+            batches.push(out_batch);
         }
+    }
+    Ok(batches)
+}
+
+fn verify_transform_response(
+    memory: &wasmtime::Memory,
+    store: &Store<()>,
+    header_ptr: u32,
+    header_len: u32,
+    input_batch: &RecordBatch,
+) -> Result<()> {
+    let output_batches = extract_transform_payloads(memory, store, header_ptr, header_len)?;
+    let mut used_inputs = vec![false; input_batch.num_rows()];
+    for out_batch in &output_batches {
+        verify_batch_immutability_with_used(input_batch, out_batch, &mut used_inputs)?;
     }
     Ok(())
 }
 
 /// Reclaims guest-allocated response memory (header, descriptor array, IPC output buffers, error message).
+///
+/// # Concurrency Characteristics
+///
+/// Requires exclusive mutable access to [`Store<()>`], ensuring single-threaded synchronization
+/// during memory reclamation.
 ///
 /// # Errors
 ///

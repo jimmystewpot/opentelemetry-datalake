@@ -72,6 +72,12 @@ const REQUIRED_FUNCS: &[FuncExportSpec] = &[
 
 /// Validates raw WASM bytes against the C-ABI v1 specification.
 ///
+/// # Concurrency Characteristics
+///
+/// This function creates an isolated Wasmtime [`Engine`] and executes module validation entirely
+/// within the calling thread. Multiple threads can call this function concurrently with
+/// independent guest module bytes.
+///
 /// # Errors
 ///
 /// Returns [`ValidationError`] if:

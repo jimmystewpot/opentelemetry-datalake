@@ -3,7 +3,7 @@
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use datalake_wasm_tool::bench::run_benchmark_with_disclaimer;
+use datalake_wasm_tool::bench::{run_benchmark_with_disclaimer, run_benchmark_with_options};
 use datalake_wasm_tool::tester::{run_immutability_suite, verify_batch_immutability};
 use std::sync::Arc;
 
@@ -863,5 +863,59 @@ fn test_verify_batch_immutability_rejects_multiplicity_violation() {
         res.unwrap_err()
             .to_string()
             .contains("Value mismatch in immutable column trace_id")
+    );
+}
+
+#[test]
+fn test_run_benchmark_rejects_malformed_ipc_payload() {
+    // 20-byte header at 16384: status = 0, batch_count = 1, batches_ptr = 16404
+    // 8-byte descriptor at 16404: b_ptr = 16412, b_len = 16
+    // 16 bytes of garbage at 16412: not valid Arrow IPC stream
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384)
+            "\00\00\00\00\01\00\00\00\14\40\00\00\00\00\00\00\00\00\00\00"
+            "\1c\40\00\00\10\00\00\00"
+            "\de\ad\be\ef\de\ad\be\ef\de\ad\be\ef\de\ad\be\ef"
+        )
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177684))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_benchmark_with_options(&wasm, 0, None);
+    assert!(
+        res.is_err(),
+        "benchmarking must reject malformed IPC payload"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_cross_batch_multiplicity_duplication() {
+    // 20-byte header: status = 0 (STATUS_SUCCESS), batch_count = 2, batches_ptr = 16404
+    // Descriptor 0 at 16404: $ptr, $len
+    // Descriptor 1 at 16412: $ptr, $len (duplicates the 1-row input batch)
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\02\00\00\00\14\40\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+            (i32.store (i32.const 16404) (local.get $ptr))
+            (i32.store (i32.const 16408) (local.get $len))
+            (i32.store (i32.const 16412) (local.get $ptr))
+            (i32.store (i32.const 16416) (local.get $len))
+            (i64.const 70368744177684)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(
+        res.is_err(),
+        "cross-batch duplication of input rows must be rejected"
     );
 }
