@@ -46,7 +46,7 @@ fn valid_wat() -> &'static str {
     r#"(module
         (memory (export "memory") 1)
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
-        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
         (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
@@ -636,6 +636,214 @@ async fn test_admin_router_reload_endpoint_trims_module_path_whitespace() {
     assert_eq!(json["status"], "reload successful");
     assert_eq!(json["path"], module_path.to_str().unwrap());
     assert_eq!(engine.module_generation(), 1);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_configured_sha_cannot_be_bypassed_by_request_sha() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "pinned_sha_test_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let actual_sha = wasm_transformer::reload::compute_sha256(&wasm_bytes);
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    // Pinned to an arbitrary hash that does not match this module
+    let pinned_sha = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    let router = build_admin_router_with_sha(Arc::clone(&engine), Some(pinned_sha));
+
+    // Request attempts to bypass pinned_sha by passing actual_sha in request body
+    let payload = serde_json::json!({
+        "module_path": module_path.to_str().unwrap(),
+        "expected_sha": actual_sha
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // Must be rejected with 400 Bad Request because pinned sha takes precedence!
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(engine.module_generation(), 0);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_rejects_path_traversal() {
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
+
+    let payload = serde_json::json!({
+        "module_path": "../../../../etc/passwd"
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_admin_router_rejects_directory_path() {
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
+
+    let temp_dir = std::env::temp_dir();
+    let payload = serde_json::json!({
+        "module_path": temp_dir.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_admin_router_rejects_empty_file() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "empty_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    tokio::fs::write(&module_path, b"").await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
+
+    let payload = serde_json::json!({
+        "module_path": module_path.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_enforces_allowed_directory() {
+    let temp_dir = std::env::temp_dir();
+    let allowed_dir = temp_dir.join(format!("allowed_wasm_{}", std::process::id()));
+    let disallowed_dir = temp_dir.join(format!("disallowed_wasm_{}", std::process::id()));
+    tokio::fs::create_dir_all(&allowed_dir).await.unwrap();
+    tokio::fs::create_dir_all(&disallowed_dir).await.unwrap();
+
+    let valid_wasm = wat::parse_str(valid_wat()).unwrap();
+    let allowed_module = allowed_dir.join("module.wasm");
+    let disallowed_module = disallowed_dir.join("module.wasm");
+    tokio::fs::write(&allowed_module, &valid_wasm)
+        .await
+        .unwrap();
+    tokio::fs::write(&disallowed_module, &valid_wasm)
+        .await
+        .unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let state = wasm_transformer::reload::WasmReloadState::new(Arc::clone(&engine), None)
+        .with_allowed_directory(allowed_dir.clone());
+    let router = axum::Router::new()
+        .route(
+            "/api/v1/transforms/wasm/reload",
+            axum::routing::post(wasm_transformer::reload::wasm_reload_handler),
+        )
+        .with_state(state);
+
+    // Request from disallowed directory must be rejected
+    let payload = serde_json::json!({
+        "module_path": disallowed_module.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Request from allowed directory must succeed
+    let payload = serde_json::json!({
+        "module_path": allowed_module.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = tokio::fs::remove_dir_all(&allowed_dir).await;
+    let _ = tokio::fs::remove_dir_all(&disallowed_dir).await;
+}
+
+#[tokio::test]
+async fn test_admin_router_rejects_oversized_file() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "oversized_module_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // Create a sparse file of 65 MiB (exceeding MAX_MODULE_SIZE of 64 MiB)
+    let file = std::fs::File::create(&module_path).unwrap();
+    file.set_len(65 * 1024 * 1024).unwrap();
+    drop(file);
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine);
+
+    let payload = serde_json::json!({
+        "module_path": module_path.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
