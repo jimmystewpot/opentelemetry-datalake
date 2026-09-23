@@ -249,9 +249,15 @@ impl WasmDispatcher {
                                     "Failed to rejuvenate worker after trap; terminating worker task: {rejuv_err}"
                                 );
                                 while let Ok(unprocessed) = wrx.try_recv() {
-                                    if let Some(ref dlq) = err_tx {
-                                        let _ = dlq.send(unprocessed).await;
-                                    }
+                                    Self::handle_errored(
+                                        worker_id,
+                                        format!("Worker terminated due to rejuvenation failure: {rejuv_err}"),
+                                        unprocessed,
+                                        &tf_cfg,
+                                        &output,
+                                        err_tx.as_ref(),
+                                    )
+                                    .await;
                                 }
                                 break;
                             }
@@ -262,7 +268,17 @@ impl WasmDispatcher {
                                 );
                                 while let Ok(unprocessed) = wrx.try_recv() {
                                     if let Some(ref dlq) = err_tx {
-                                        let _ = dlq.send(unprocessed).await;
+                                        if let Err(e) = dlq.send(unprocessed).await {
+                                            warn!(
+                                                worker_id,
+                                                "Failed to send buffered batch to DLQ after output channel closed: {e}"
+                                            );
+                                        }
+                                    } else {
+                                        warn!(
+                                            worker_id,
+                                            "Dropping buffered batch: downstream output closed and no DLQ configured"
+                                        );
                                     }
                                 }
                                 break;

@@ -331,7 +331,8 @@ fn test_edge_case_metric_name_allocation_capping() {
     assert!(func.call(&mut store, ()).is_ok());
 
     let capped_name = "a".repeat(MAX_METRIC_NAME_LEN);
-    assert_eq!(registry.read_counter(&capped_name), 77);
+    assert_eq!(registry.read_counter(&capped_name), 0);
+    assert!(registry.handles().is_empty());
 }
 
 #[test]
@@ -648,4 +649,43 @@ fn test_concurrent_metric_registration_respects_capacity_limit() {
         50,
         "Concurrent metric values must strictly cap at 50"
     );
+}
+
+#[test]
+fn test_metric_name_exceeding_max_len_is_rejected() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("overlength_test"));
+    let linker = build_host_linker(&engine).unwrap();
+
+    // 70-byte name in guest memory: "a" repeated 70 times
+    let wat = r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        (func (export "emit_long_metric")
+            ;; metric_type=0 (counter), ptr=0, len=70, value=42
+            (call $metric (i32.const 0) (i32.const 0) (i32.const 70) (i64.const 42))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState {
+            phase: HostPhase::Execution,
+            registry: Arc::clone(&registry),
+        },
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, "emit_long_metric")
+        .unwrap();
+
+    assert!(func.call(&mut store, ()).is_ok());
+
+    // Neither the 70-byte name nor the truncated 64-byte prefix should exist
+    let prefix_64 = "a".repeat(64);
+    assert_eq!(registry.read_counter(&prefix_64), 0);
+    assert!(registry.handles().is_empty());
+    assert!(registry.metrics().is_empty());
 }

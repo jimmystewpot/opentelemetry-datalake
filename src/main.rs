@@ -124,6 +124,17 @@ type SignalTransformers = (Box<dyn Transform>, Box<dyn Transform>, Box<dyn Trans
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Returns `true` if `val` is a safe, single relative path component without path traversal,
+/// separators, or null bytes (e.g. neither empty, `"."`, `".."`, nor containing `/` or `\`).
+fn is_safe_path_component(val: &str) -> bool {
+    if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains('\0') {
+        return false;
+    }
+    let mut components = std::path::Path::new(val).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
 #[derive(Debug)]
 pub struct FileDlqSink {
@@ -135,18 +146,31 @@ pub struct FileDlqSink {
 
 impl FileDlqSink {
     /// Creates a new `FileDlqSink` targeting the directory `dlq/{transformer_id}/{signal}/{role}`.
-    #[must_use]
-    pub fn new(transformer_id: &str, signal: &str, role: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `transformer_id`, `signal`, or `role` contain path separators
+    /// or traversal components (e.g., `..`, `/`, `\`), which would escape the intended DLQ hierarchy.
+    pub fn new(transformer_id: &str, signal: &str, role: &str) -> anyhow::Result<Self> {
+        for (label, value) in [
+            ("transformer_id", transformer_id),
+            ("signal", signal),
+            ("role", role),
+        ] {
+            if !is_safe_path_component(value) {
+                anyhow::bail!("DLQ {label} contains unsafe path components: {value:?}");
+            }
+        }
         let dlq_dir = std::path::PathBuf::from("dlq")
             .join(transformer_id)
             .join(signal)
             .join(role);
-        Self {
+        Ok(Self {
             transformer_id: transformer_id.to_string(),
             signal: signal.to_string(),
             role: role.to_string(),
             dlq_dir,
-        }
+        })
     }
 
     /// Atomically persists an Arrow IPC payload to disk via a temporary file and sync rename.
@@ -320,7 +344,7 @@ fn instantiate_signal_wasm_transformer(
 
     let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
         Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
-            FileDlqSink::new(&signal_cfg.id, signal, "error"),
+            FileDlqSink::new(&signal_cfg.id, signal, "error")?,
         )))
     } else {
         None
@@ -328,7 +352,7 @@ fn instantiate_signal_wasm_transformer(
 
     let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
         Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
-            FileDlqSink::new(&signal_cfg.id, signal, "reject"),
+            FileDlqSink::new(&signal_cfg.id, signal, "reject")?,
         )))
     } else {
         None
@@ -1481,6 +1505,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        assert!(is_safe_path_component("wasm_transformer"));
+        assert!(is_safe_path_component("my-sink-123"));
+        assert!(is_safe_path_component("valid.name"));
+
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("../archive"));
+        assert!(!is_safe_path_component("foo/bar"));
+        assert!(!is_safe_path_component("foo\\bar"));
+        assert!(!is_safe_path_component("/absolute"));
+        assert!(!is_safe_path_component("foo\0bar"));
+    }
+
+    #[test]
+    fn test_file_dlq_sink_new_rejects_path_traversal() {
+        assert!(FileDlqSink::new("../archive", "logs", "error").is_err());
+        assert!(FileDlqSink::new("/etc", "logs", "error").is_err());
+        assert!(FileDlqSink::new("test", "../traces", "error").is_err());
+        assert!(FileDlqSink::new("test", "logs", "error/extra").is_err());
+        assert!(FileDlqSink::new("", "logs", "error").is_err());
+
+        let ok_sink = FileDlqSink::new("valid_transformer", "logs", "error");
+        assert!(ok_sink.is_ok());
+        let sink = ok_sink.unwrap();
+        assert_eq!(
+            sink.dlq_dir,
+            std::path::PathBuf::from("dlq/valid_transformer/logs/error")
+        );
     }
 
     #[test]

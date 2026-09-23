@@ -424,6 +424,16 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
          name_ptr: u32,
          name_len: u32,
          value: u64| {
+            let raw_len = name_len as usize;
+            if raw_len == 0 || raw_len > MAX_METRIC_NAME_LEN {
+                tracing::warn!(
+                    raw_len,
+                    MAX_METRIC_NAME_LEN,
+                    "WASM guest emitted metric with invalid name length"
+                );
+                return;
+            }
+
             let Some(name) =
                 read_guest_string(&mut caller, name_ptr, name_len, MAX_METRIC_NAME_LEN)
             else {
