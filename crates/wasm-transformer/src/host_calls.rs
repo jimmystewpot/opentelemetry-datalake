@@ -16,13 +16,24 @@ use std::sync::Arc;
 use wasmtime::{Caller, Engine, Linker};
 
 /// Maximum allowed length in bytes for metric names read from guest memory.
-pub const MAX_METRIC_NAME_LEN: usize = 256;
+pub const MAX_METRIC_NAME_LEN: usize = 64;
 
 /// Maximum allowed length in bytes for log messages read from guest memory (64 KiB).
 pub const MAX_LOG_MESSAGE_LEN: usize = 65_536;
 
 /// Maximum distinct metric entries permitted in a [`MetricRegistry`] to prevent unbounded memory growth.
-pub const MAX_METRIC_ENTRIES: usize = 2048;
+pub const MAX_METRIC_ENTRIES: usize = 50;
+
+/// Validates whether a metric name conforms to the OpenTelemetry custom metric naming rules.
+///
+/// Metric names must be non-empty, at most [`MAX_METRIC_NAME_LEN`] characters, and consist
+/// solely of ASCII alphanumeric characters and underscores (`_`).
+#[must_use]
+pub fn is_valid_metric_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_METRIC_NAME_LEN
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// Lifecycle execution phase of the host worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +51,19 @@ pub enum MetricValue {
     Counter(u64),
     /// A gauge value represented as raw IEEE 754 64-bit binary bits.
     Gauge(u64),
+    /// A duration measurement represented in nanoseconds.
+    Duration(u64),
+}
+
+/// Concrete OpenTelemetry instrument handle cached in [`MetricRegistry`].
+#[derive(Debug, Clone)]
+pub enum MetricHandle {
+    /// Synchronous monotonic counter instrument.
+    Counter(opentelemetry::metrics::Counter<u64>),
+    /// Synchronous gauge instrument.
+    Gauge(opentelemetry::metrics::Gauge<f64>),
+    /// Synchronous duration histogram instrument.
+    Histogram(opentelemetry::metrics::Histogram<f64>),
 }
 
 /// Thread-safe concurrent registry for metrics emitted by guest WebAssembly transformers.
@@ -49,18 +73,44 @@ pub enum MetricValue {
 pub struct MetricRegistry {
     component_id: String,
     prefix: String,
+    signal: std::sync::RwLock<String>,
     metrics: DashMap<String, MetricValue>,
+    handles: DashMap<String, MetricHandle>,
 }
 
 impl MetricRegistry {
     /// Creates a new `MetricRegistry` for the specified component identifier.
     #[must_use]
     pub fn new(component_id: &str) -> Self {
+        Self::with_signal(component_id, "")
+    }
+
+    /// Creates a new `MetricRegistry` for the specified component identifier and signal context.
+    #[must_use]
+    pub fn with_signal(component_id: &str, signal: &str) -> Self {
         Self {
             component_id: component_id.to_string(),
             prefix: format!("datalake_transformers_{component_id}_"),
+            signal: std::sync::RwLock::new(signal.to_string()),
             metrics: DashMap::new(),
+            handles: DashMap::new(),
         }
+    }
+
+    /// Updates the pipeline signal context for exported metrics.
+    pub fn set_signal(&self, signal: &str) {
+        if let Ok(mut sig) = self.signal.write() {
+            *sig = signal.to_string();
+        }
+    }
+
+    /// Returns the active pipeline signal context.
+    #[must_use]
+    pub fn signal(&self) -> String {
+        self.signal
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Formats a metric name into its full scoped key with pre-allocated capacity.
@@ -71,41 +121,177 @@ impl MetricRegistry {
         key
     }
 
-    /// Records a counter increment with saturating addition and bounded entry capacity.
+    /// Records a counter increment with saturating addition, caching and calling an OpenTelemetry [`Counter`].
     pub fn record_counter(&self, name: &str, delta: u64) {
-        let key = self.format_key(name);
-        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
-            tracing::warn!(
-                component = %self.component_id,
-                max_entries = MAX_METRIC_ENTRIES,
-                "Metric registry capacity exceeded; dropping new counter metric registration"
-            );
+        if !is_valid_metric_name(name) {
+            tracing::warn!(name, "WASM guest emitted counter with invalid name");
             return;
         }
-        self.metrics
-            .entry(key)
-            .and_modify(|val| {
-                if let MetricValue::Counter(c) = val {
-                    *c = c.saturating_add(delta);
-                } else {
-                    *val = MetricValue::Counter(delta);
-                }
-            })
-            .or_insert(MetricValue::Counter(delta));
+
+        let key = self.format_key(name);
+        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
+            self.metrics
+                .entry(key)
+                .and_modify(|val| {
+                    if let MetricValue::Counter(c) = val {
+                        *c = c.saturating_add(delta);
+                    } else {
+                        *val = MetricValue::Counter(delta);
+                    }
+                })
+                .or_insert(MetricValue::Counter(delta));
+        }
+
+        let counter = if let Some(handle) = self.handles.get(name) {
+            if let MetricHandle::Counter(ref c) = *handle {
+                c.clone()
+            } else {
+                tracing::warn!(
+                    name,
+                    "Metric type mismatch in registry cache; expected counter"
+                );
+                return;
+            }
+        } else {
+            if self.handles.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new counter metric '{name}'"
+                );
+                return;
+            }
+            let meter = opentelemetry::global::meter("opentelemetry-datalake");
+            let instrument_name = format!("{}{name}", self.prefix);
+            let c = meter
+                .u64_counter(instrument_name)
+                .with_description("Guest emitted counter from WASM transformer")
+                .build();
+            self.handles
+                .insert(name.to_string(), MetricHandle::Counter(c.clone()));
+            c
+        };
+
+        let sig = self.signal();
+        counter.add(
+            delta,
+            &[
+                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
+                opentelemetry::KeyValue::new("signal", sig),
+            ],
+        );
     }
 
-    /// Records an instantaneous gauge bitcast value with bounded entry capacity.
+    /// Records an instantaneous gauge bitcast value, caching and calling an OpenTelemetry [`Gauge`].
     pub fn record_gauge(&self, name: &str, bits: u64) {
-        let key = self.format_key(name);
-        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
-            tracing::warn!(
-                component = %self.component_id,
-                max_entries = MAX_METRIC_ENTRIES,
-                "Metric registry capacity exceeded; dropping new gauge metric registration"
-            );
+        if !is_valid_metric_name(name) {
+            tracing::warn!(name, "WASM guest emitted gauge with invalid name");
             return;
         }
-        self.metrics.insert(key, MetricValue::Gauge(bits));
+
+        let key = self.format_key(name);
+        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
+            self.metrics.insert(key, MetricValue::Gauge(bits));
+        }
+
+        let gauge = if let Some(handle) = self.handles.get(name) {
+            if let MetricHandle::Gauge(ref g) = *handle {
+                g.clone()
+            } else {
+                tracing::warn!(
+                    name,
+                    "Metric type mismatch in registry cache; expected gauge"
+                );
+                return;
+            }
+        } else {
+            if self.handles.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new gauge metric '{name}'"
+                );
+                return;
+            }
+            let meter = opentelemetry::global::meter("opentelemetry-datalake");
+            let instrument_name = format!("{}{name}", self.prefix);
+            let g = meter
+                .f64_gauge(instrument_name)
+                .with_description("Guest emitted gauge from WASM transformer")
+                .build();
+            self.handles
+                .insert(name.to_string(), MetricHandle::Gauge(g.clone()));
+            g
+        };
+
+        let float_val = f64::from_bits(bits);
+        let sig = self.signal();
+        gauge.record(
+            float_val,
+            &[
+                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
+                opentelemetry::KeyValue::new("signal", sig),
+            ],
+        );
+    }
+
+    /// Records a duration observation in nanoseconds, converting to seconds and recording to an OpenTelemetry [`Histogram`].
+    pub fn record_duration(&self, name: &str, nanos: u64) {
+        if !is_valid_metric_name(name) {
+            tracing::warn!(name, "WASM guest emitted duration with invalid name");
+            return;
+        }
+
+        let key = self.format_key(name);
+        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
+            self.metrics.insert(key, MetricValue::Duration(nanos));
+        }
+
+        let histogram = if let Some(handle) = self.handles.get(name) {
+            if let MetricHandle::Histogram(ref h) = *handle {
+                h.clone()
+            } else {
+                tracing::warn!(
+                    name,
+                    "Metric type mismatch in registry cache; expected histogram"
+                );
+                return;
+            }
+        } else {
+            if self.handles.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new duration metric '{name}'"
+                );
+                return;
+            }
+            let meter = opentelemetry::global::meter("opentelemetry-datalake");
+            let instrument_name = if name.ends_with("_duration_seconds") {
+                format!("{}{name}", self.prefix)
+            } else {
+                format!("{}{name}_duration_seconds", self.prefix)
+            };
+            let h = meter
+                .f64_histogram(instrument_name)
+                .with_unit("s")
+                .with_description("Guest emitted duration from WASM transformer")
+                .build();
+            self.handles
+                .insert(name.to_string(), MetricHandle::Histogram(h.clone()));
+            h
+        };
+
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = (nanos as f64) / 1_000_000_000.0;
+        let sig = self.signal();
+        histogram.record(
+            seconds,
+            &[
+                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
+                opentelemetry::KeyValue::new("signal", sig),
+            ],
+        );
     }
 
     /// Reads the current value of a counter, returning `0` if not found.
@@ -128,6 +314,16 @@ impl MetricRegistry {
         }
     }
 
+    /// Reads the current duration in nanoseconds, returning `None` if not found.
+    #[must_use]
+    pub fn read_duration(&self, name: &str) -> Option<u64> {
+        let key = self.format_key(name);
+        match self.metrics.get(&key).as_deref() {
+            Some(MetricValue::Duration(nanos)) => Some(*nanos),
+            _ => None,
+        }
+    }
+
     /// Returns the component identifier configured for this registry.
     #[must_use]
     pub fn component_id(&self) -> &str {
@@ -138,6 +334,12 @@ impl MetricRegistry {
     #[must_use]
     pub fn metrics(&self) -> &DashMap<String, MetricValue> {
         &self.metrics
+    }
+
+    /// Returns a reference to the underlying cached OpenTelemetry metric handles.
+    #[must_use]
+    pub fn handles(&self) -> &DashMap<String, MetricHandle> {
+        &self.handles
     }
 }
 
@@ -223,11 +425,14 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
             }
 
             match metric_type {
-                METRIC_TYPE_COUNTER | METRIC_TYPE_DURATION => {
+                METRIC_TYPE_COUNTER => {
                     caller.data().registry.record_counter(&name, value);
                 }
                 METRIC_TYPE_GAUGE => {
                     caller.data().registry.record_gauge(&name, value);
+                }
+                METRIC_TYPE_DURATION => {
+                    caller.data().registry.record_duration(&name, value);
                 }
                 _ => {
                     tracing::warn!(
@@ -271,68 +476,23 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
     Ok(linker)
 }
 
-/// Handle maintaining active OpenTelemetry metric observation callbacks for a [`MetricRegistry`].
+/// Handle maintaining active OpenTelemetry metric bridge for a [`MetricRegistry`].
 #[derive(Debug)]
 pub struct MetricBridgeHandle {
-    _counter: opentelemetry::metrics::ObservableCounter<u64>,
-    _gauge: opentelemetry::metrics::ObservableGauge<f64>,
+    _registry: Arc<MetricRegistry>,
 }
 
-/// Registers OpenTelemetry observable metric instruments for the provided [`MetricRegistry`].
+/// Bridges custom guest metrics from the provided [`MetricRegistry`] to OpenTelemetry.
 ///
-/// Registers observable counter (`"datalake_wasm_guest_counter"`) and observable gauge
-/// (`"datalake_wasm_guest_gauge"`) with the global OpenTelemetry meter (`"opentelemetry-datalake"`),
-/// tagging all emitted observations with `metric_name` and `signal`.
+/// Sets the active pipeline signal context on the registry so that subsequent guest metric
+/// recordings are properly tagged with `component_id` and `signal`.
 #[must_use]
 pub fn bridge_metrics_to_opentelemetry(
     registry: &Arc<MetricRegistry>,
     signal: &str,
 ) -> MetricBridgeHandle {
-    let meter = opentelemetry::global::meter("opentelemetry-datalake");
-
-    let reg_counter = Arc::clone(registry);
-    let sig_counter = signal.to_string();
-    let counter = meter
-        .u64_observable_counter("datalake_wasm_guest_counter")
-        .with_description("Guest emitted counters from WASM transformer")
-        .with_callback(move |observer| {
-            for entry in reg_counter.metrics() {
-                if let MetricValue::Counter(val) = entry.value() {
-                    observer.observe(
-                        *val,
-                        &[
-                            opentelemetry::KeyValue::new("metric_name", entry.key().clone()),
-                            opentelemetry::KeyValue::new("signal", sig_counter.clone()),
-                        ],
-                    );
-                }
-            }
-        })
-        .build();
-
-    let reg_gauge = Arc::clone(registry);
-    let sig_gauge = signal.to_string();
-    let gauge = meter
-        .f64_observable_gauge("datalake_wasm_guest_gauge")
-        .with_description("Guest emitted gauges from WASM transformer")
-        .with_callback(move |observer| {
-            for entry in reg_gauge.metrics() {
-                if let MetricValue::Gauge(val) = entry.value() {
-                    let float_val = f64::from_bits(*val);
-                    observer.observe(
-                        float_val,
-                        &[
-                            opentelemetry::KeyValue::new("metric_name", entry.key().clone()),
-                            opentelemetry::KeyValue::new("signal", sig_gauge.clone()),
-                        ],
-                    );
-                }
-            }
-        })
-        .build();
-
+    registry.set_signal(signal);
     MetricBridgeHandle {
-        _counter: counter,
-        _gauge: gauge,
+        _registry: Arc::clone(registry),
     }
 }

@@ -29,8 +29,11 @@ use crate::{
 };
 
 pub use crate::host_calls::{
-    MetricBridgeHandle, MetricRegistry, MetricValue, bridge_metrics_to_opentelemetry,
+    MetricBridgeHandle, MetricHandle, MetricRegistry, MetricValue, bridge_metrics_to_opentelemetry,
 };
+
+/// Maximum supported worker concurrency per WASM transformer instance.
+pub const MAX_CONCURRENCY: usize = 10_000;
 
 /// Trait for Dead Letter Queue (DLQ) sinks that receive diverted or rejected batches.
 #[async_trait]
@@ -126,9 +129,25 @@ impl WasmTransformer {
         reroute_error: Option<PipelineSender>,
         reroute_reject: Option<PipelineSender>,
     ) -> Result<Self, PipelineError> {
+        if config.concurrency == 0 || config.concurrency > MAX_CONCURRENCY {
+            return Err(PipelineError::Internal(format!(
+                "wasm_transformer.concurrency must be between 1 and {MAX_CONCURRENCY}, got {}",
+                config.concurrency
+            )));
+        }
         let max_memory_bytes =
             crate::worker::parse_byte_size(&config.max_memory).unwrap_or(64 * 1024 * 1024);
-        let pool_capacity = (config.concurrency.max(1) * 2).saturating_add(1);
+        let pool_capacity = config
+            .concurrency
+            .max(1)
+            .checked_mul(2)
+            .and_then(|val| val.checked_add(1))
+            .ok_or_else(|| {
+                PipelineError::Internal(format!(
+                    "wasm_transformer.concurrency {} overflows pool capacity calculation",
+                    config.concurrency
+                ))
+            })?;
         let engine = Arc::new(
             EngineCache::new_pooling(pool_capacity, max_memory_bytes)
                 .map_err(|e| PipelineError::Internal(e.to_string()))?,
@@ -153,7 +172,7 @@ impl WasmTransformer {
     ///
     /// Returns [`PipelineError::TopologicalSinkMissing`] if `on_error` or `on_reject` is set to
     /// `Reroute` but the corresponding DLQ destination is not provided (`None`).
-    /// Returns [`PipelineError::Internal`] if concurrency is 0, on passthrough misconfiguration,
+    /// Returns [`PipelineError::Internal`] if concurrency is 0 or exceeds [`MAX_CONCURRENCY`], on passthrough misconfiguration,
     /// module file read errors, SHA-256 hash mismatch, compilation failure, or probe worker initialization
     /// failure.
     pub fn with_engine(
@@ -178,10 +197,11 @@ impl WasmTransformer {
         }
 
         // 2. Concurrency validation
-        if config.concurrency == 0 {
-            return Err(PipelineError::Internal(
-                "wasm_transformer.concurrency must be greater than 0".to_string(),
-            ));
+        if config.concurrency == 0 || config.concurrency > MAX_CONCURRENCY {
+            return Err(PipelineError::Internal(format!(
+                "wasm_transformer.concurrency must be between 1 and {MAX_CONCURRENCY}, got {}",
+                config.concurrency
+            )));
         }
 
         // 3. Security audit logging and passthrough policy validation
@@ -303,10 +323,11 @@ impl WasmTransformer {
             ));
         }
 
-        if config.concurrency == 0 {
-            return Err(PipelineError::Internal(
-                "wasm_transformer.concurrency must be greater than 0".to_string(),
-            ));
+        if config.concurrency == 0 || config.concurrency > MAX_CONCURRENCY {
+            return Err(PipelineError::Internal(format!(
+                "wasm_transformer.concurrency must be between 1 and {MAX_CONCURRENCY}, got {}",
+                config.concurrency
+            )));
         }
 
         if config.on_error == OnErrorPolicy::Passthrough && !config.allow_unmasked_passthrough {
@@ -370,7 +391,17 @@ impl WasmTransformer {
             }
         }
 
-        let pool_capacity = (config.concurrency.max(1) * 2).saturating_add(1);
+        let pool_capacity = config
+            .concurrency
+            .max(1)
+            .checked_mul(2)
+            .and_then(|val| val.checked_add(1))
+            .ok_or_else(|| {
+                PipelineError::Internal(format!(
+                    "wasm_transformer.concurrency {} overflows pool capacity calculation",
+                    config.concurrency
+                ))
+            })?;
         let engine = Arc::new(
             EngineCache::new_pooling(pool_capacity, max_memory_bytes)
                 .map_err(|e| PipelineError::Internal(e.to_string()))?,
@@ -568,7 +599,7 @@ mod tests {
         config.concurrency = 0;
         let res = WasmTransformer::new(config, None, None);
         assert!(
-            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be greater than 0"))
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be between 1 and"))
         );
     }
 
@@ -578,7 +609,27 @@ mod tests {
         config.concurrency = 0;
         let res = WasmTransformer::validate_config(&config);
         assert!(
-            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be greater than 0"))
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be between 1 and"))
+        );
+    }
+
+    #[test]
+    fn test_new_rejects_overflow_concurrency() {
+        let mut config = base_config("dummy".to_string());
+        config.concurrency = usize::MAX;
+        let res = WasmTransformer::new(config, None, None);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be between 1 and"))
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_overflow_concurrency() {
+        let mut config = base_config("dummy".to_string());
+        config.concurrency = usize::MAX;
+        let res = WasmTransformer::validate_config(&config);
+        assert!(
+            matches!(res, Err(PipelineError::Internal(msg)) if msg.contains("concurrency must be between 1 and"))
         );
     }
 
