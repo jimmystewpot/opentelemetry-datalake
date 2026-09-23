@@ -20,12 +20,19 @@ pub enum TesterError {
     ValueMismatch(&'static str),
     #[error("Immutable column '{0}' present in input but missing from output")]
     MissingColumn(&'static str),
+    #[error("Schema mismatch in immutable column '{name}': expected {expected}, got {got}")]
+    SchemaMismatch {
+        name: &'static str,
+        expected: String,
+        got: String,
+    },
 }
 
 /// Verifies that immutable OpenTelemetry columns are preserved between input and output batches.
 ///
 /// Ensures that any canonical immutable column (`trace_id`, `span_id`, `timestamp`,
 /// `observed_timestamp`, `name`, `type`) present in `input` is also present in `output.schema()`,
+/// that its schema definition (data type and nullability) is preserved,
 /// and that emitted rows preserve their immutable values without alteration.
 /// Filtered batches (with zero or fewer rows) and split batches (`ok_multiple`) are supported
 /// by verifying that every row present in `output` matches a corresponding row in `input`.
@@ -38,6 +45,7 @@ pub enum TesterError {
 /// # Errors
 ///
 /// Returns [`TesterError::MissingColumn`] if an immutable column present in `input` is missing from `output`,
+/// [`TesterError::SchemaMismatch`] if an immutable column has an altered data type or nullability,
 /// or [`TesterError::ValueMismatch`] if the values in an immutable column have been altered.
 pub fn verify_batch_immutability(
     input: &RecordBatch,
@@ -57,6 +65,7 @@ pub fn verify_batch_immutability(
 /// # Errors
 ///
 /// Returns [`TesterError::MissingColumn`] if an immutable column present in `input` is missing from `output`,
+/// [`TesterError::SchemaMismatch`] if an immutable column has an altered data type or nullability,
 /// or [`TesterError::ValueMismatch`] if the values in an immutable column have been altered or
 /// if an input row is consumed more than once (multiplicity violation).
 pub fn verify_batch_immutability_with_used(
@@ -70,10 +79,34 @@ pub fn verify_batch_immutability_with_used(
     let in_schema = input.schema();
     let out_schema = output.schema();
 
-    // 1. Verify schema preservation: every immutable column in input must be present in output schema.
+    // 1. Verify schema preservation: every immutable column in input must be present in output schema
+    // and must have identical data type and nullability.
     for &col_name in IMMUTABLE_COLUMNS {
-        if in_schema.index_of(col_name).is_ok() && out_schema.index_of(col_name).is_err() {
-            return Err(TesterError::MissingColumn(col_name));
+        if let Ok(i_idx) = in_schema.index_of(col_name) {
+            match out_schema.index_of(col_name) {
+                Err(_) => return Err(TesterError::MissingColumn(col_name)),
+                Ok(o_idx) => {
+                    let in_field = in_schema.field(i_idx);
+                    let out_field = out_schema.field(o_idx);
+                    if in_field.data_type() != out_field.data_type()
+                        || in_field.is_nullable() != out_field.is_nullable()
+                    {
+                        return Err(TesterError::SchemaMismatch {
+                            name: col_name,
+                            expected: format!(
+                                "{}(nullable={})",
+                                in_field.data_type(),
+                                in_field.is_nullable()
+                            ),
+                            got: format!(
+                                "{}(nullable={})",
+                                out_field.data_type(),
+                                out_field.is_nullable()
+                            ),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -719,8 +752,8 @@ pub fn reclaim_transform_response(
     let h_end = h_start
         .checked_add(header_len as usize)
         .ok_or_else(|| anyhow::anyhow!("Overflow in header range"))?;
-    if header_len < 20 {
-        anyhow::bail!("Header length {header_len} is less than required 20 bytes for reclamation");
+    if header_len != 20 {
+        anyhow::bail!("Header length {header_len} must be exactly 20 bytes for reclamation");
     }
 
     let (batch_count, batches_ptr, message_ptr, message_len) = {
@@ -869,5 +902,31 @@ mod tests {
 
         let err = verify_batch_immutability(&in_batch, &out_batch).expect_err("should fail");
         assert_eq!(err, TesterError::MissingColumn("trace_id"));
+    }
+
+    #[test]
+    fn test_reclaim_transform_response_rejects_non_20_byte_header() {
+        let wat_src = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_dealloc") (param i32 i32))
+        )"#;
+        let wasm = wat::parse_str(wat_src).expect("wat parse");
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm).expect("module");
+        let mut store: Store<()> = Store::new(&engine, ());
+        let instance = wasmtime::Instance::new(&mut store, &module, &[]).expect("instance");
+        let memory = instance.get_memory(&mut store, "memory").expect("memory");
+        let dealloc_fn = instance
+            .get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")
+            .expect("dealloc_fn");
+
+        let res = reclaim_transform_response(&memory, &mut store, &dealloc_fn, 1024, 24);
+        assert!(res.is_err(), "must reject non-20 byte header length");
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("must be exactly 20 bytes"),
+            "must return exact header length error"
+        );
     }
 }

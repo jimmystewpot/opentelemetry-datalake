@@ -98,6 +98,11 @@ pub enum ByteSizeParseError {
 ///
 /// Supported units (case-insensitive): `B`/`bytes`, `KiB`/`KB`, `MiB`/`MB`, `GiB`/`GB`, `TiB`/`TB`.
 ///
+/// # Concurrency Characteristics
+///
+/// This function is pure and thread-safe (`Send + Sync`). It operates solely on borrowed
+/// string slices without mutable or global state and can be safely invoked concurrently.
+///
 /// # Errors
 ///
 /// Returns an error if the string is empty, contains an invalid number, or overflows `usize`.
@@ -311,6 +316,11 @@ pub enum WasmConfigValidationError {
 
 impl WasmTransformerConfig {
     /// Validates invariant configuration constraints.
+    ///
+    /// # Concurrency Characteristics
+    ///
+    /// This method only borrows immutable configuration state (`&self`) and is thread-safe (`Send + Sync`),
+    /// allowing concurrent validation calls across threads.
     ///
     /// # Errors
     ///

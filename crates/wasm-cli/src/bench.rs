@@ -133,11 +133,8 @@ pub fn run_benchmark_with_options(
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        let extract_res = extract_transform_payloads(&memory, &store, header_ptr, header_len);
-        let reclaim_res =
-            reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len);
-        extract_res?;
-        reclaim_res?;
+        extract_transform_payloads(&memory, &store, header_ptr, header_len)?;
+        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
 
     let iterations: u32 = 50;
@@ -148,11 +145,8 @@ pub fn run_benchmark_with_options(
             .map_err(wasm_err)?;
         let header_ptr = (packed >> 32) as u32;
         let header_len = (packed & 0xffff_ffff) as u32;
-        let extract_res = extract_transform_payloads(&memory, &store, header_ptr, header_len);
-        let reclaim_res =
-            reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len);
-        extract_res?;
-        reclaim_res?;
+        extract_transform_payloads(&memory, &store, header_ptr, header_len)?;
+        reclaim_transform_response(&memory, &mut store, &dealloc_fn, header_ptr, header_len)?;
     }
     let total_elapsed = start_time.elapsed();
 

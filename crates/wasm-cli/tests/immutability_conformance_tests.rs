@@ -919,3 +919,63 @@ fn test_run_immutability_suite_rejects_cross_batch_multiplicity_duplication() {
         "cross-batch duplication of input rows must be rejected"
     );
 }
+
+#[test]
+fn test_verify_batch_immutability_rejects_empty_batch_with_mutated_field_schema() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Null,
+        true,
+    )]));
+
+    let input = RecordBatch::try_new(
+        in_schema,
+        vec![Arc::new(StringArray::from(vec![
+            "0123456789abcdef0123456789abcdef",
+        ]))],
+    )
+    .unwrap();
+    let empty_output = RecordBatch::new_empty(out_schema);
+
+    let res = verify_batch_immutability(&input, &empty_output);
+    assert!(
+        res.is_err(),
+        "zero-row batch with mutated immutable field schema must be rejected"
+    );
+}
+
+#[test]
+fn test_run_benchmark_rejects_oversized_response_header_without_deallocating_mismatched_layout() {
+    // 24-byte response header packed return: (16384 << 32) | 24
+    // Guest dealloc traps if len != 20 (testing that invalid header sizes are never passed to dealloc)
+    let wat_src = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16384) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param $ptr i32) (param $len i32)
+            (if (i32.ne (local.get $len) (i32.const 20))
+                (then (unreachable))
+            )
+        )
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 70368744177704))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = run_benchmark_with_options(&wasm, 0, None);
+    assert!(
+        res.is_err(),
+        "benchmarking must reject oversized header with a validation error rather than trapping in dealloc"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("expected exactly 20 bytes"),
+        "error message must reflect header validation failure"
+    );
+}
