@@ -242,22 +242,22 @@ pub fn parse_signal_from_config(config: &str) -> Option<SignalType> {
         return Some(signal);
     }
 
-    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed) {
-        if let Some(sig_val) = map.get("signal") {
-            match sig_val {
-                serde_json::Value::String(s) => return match_signal_token(s),
-                serde_json::Value::Number(n) => {
-                    if let Some(v) = n.as_u64() {
-                        return match v {
-                            0 => Some(SignalType::Logs),
-                            1 => Some(SignalType::Metrics),
-                            2 => Some(SignalType::Traces),
-                            _ => None,
-                        };
-                    }
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(trimmed)
+        && let Some(sig_val) = map.get("signal")
+    {
+        match sig_val {
+            serde_json::Value::String(s) => return match_signal_token(s),
+            serde_json::Value::Number(n) => {
+                if let Some(v) = n.as_u64() {
+                    return match v {
+                        0 => Some(SignalType::Logs),
+                        1 => Some(SignalType::Metrics),
+                        2 => Some(SignalType::Traces),
+                        _ => None,
+                    };
                 }
-                _ => return None,
             }
+            _ => return None,
         }
     }
 
