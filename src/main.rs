@@ -286,7 +286,7 @@ fn initialize_transformers(
         );
         let max_memory_bytes = wasm_transformer::worker::parse_byte_size(&wasm_cfg.max_memory)
             .unwrap_or(64 * 1024 * 1024);
-        let pool_capacity = (wasm_cfg.concurrency.max(1) * 3).saturating_add(3);
+        let pool_capacity = (wasm_cfg.concurrency.max(1) * 6).saturating_add(3);
         let shared_engine = std::sync::Arc::new(
             wasm_transformer::engine::EngineCache::new_pooling(pool_capacity, max_memory_bytes)?,
         );

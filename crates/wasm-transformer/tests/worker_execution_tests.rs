@@ -1078,3 +1078,104 @@ async fn test_worker_rejects_missing_abi_version() {
         other => panic!("Expected MissingExport(\"datalake_abi_version\"), got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_worker_rapid_generation_advances_adopts_latest_module() {
+    let cache = Arc::new(EngineCache::new_pooling(4, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker =
+        WasmWorker::new(27, Arc::clone(&cache), module_v1, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    // Batch 1 uses V1 (passthrough)
+    let outcome1 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .unwrap();
+    assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.local_generation(), 0);
+
+    // Rapid reload: publish intermediate module (V2), then immediately publish final module (V3 - discard)
+    let module_v2 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(passthrough_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let _ = cache.publish_module(module_v2);
+
+    let module_v3 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let gen3 = cache.publish_module(module_v3);
+    assert_eq!(gen3, 2);
+
+    // Batch 2: worker must adopt the latest generation (V3) and discard
+    let outcome2 = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Discarded));
+    assert_eq!(worker.local_generation(), 2);
+}
+
+#[tokio::test]
+async fn test_multi_worker_concurrent_rejuvenation() {
+    let concurrency = 4;
+    // Sized for all workers rejuvenating simultaneously: (concurrency * 2) + 1 = 9
+    let pool_capacity = (concurrency * 2) + 1;
+    let cache = Arc::new(EngineCache::new_pooling(pool_capacity, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 1; // Each batch triggers rejuvenation
+
+    let registry = test_registry();
+    let mut workers = Vec::new();
+    for id in 0..concurrency {
+        let worker = WasmWorker::new(
+            id,
+            Arc::clone(&cache),
+            Arc::clone(&module),
+            cfg.clone(),
+            Arc::clone(&registry),
+        )
+        .unwrap();
+        workers.push(worker);
+    }
+
+    let batch = create_test_record_batch();
+
+    // Run batch 1 to process
+    for worker in &mut workers {
+        let outcome = worker
+            .execute_batch(SignalBatch::Logs(batch.clone()))
+            .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    }
+
+    // Now all 4 workers rejuvenate simultaneously
+    let mut handles = Vec::new();
+    for mut worker in workers {
+        let batch_clone = batch.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let res = worker.execute_batch(SignalBatch::Logs(batch_clone));
+            (worker, res)
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let (worker, res) = handle.await.unwrap();
+        let outcome = res.expect("Rejuvenation must not fail with pool exhaustion");
+        assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+        assert_eq!(worker.batches_processed(), 0);
+    }
+}

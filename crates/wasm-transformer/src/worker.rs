@@ -386,12 +386,16 @@ impl WasmWorker {
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.
     fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
-        if self.local_generation != self.engine.module_generation()
-            && let Some(new_mod) = self.engine.module()
-        {
-            self.module = new_mod;
+        while self.local_generation != self.engine.module_generation() {
+            let Some(snapshot) = self.engine.current_snapshot() else {
+                break;
+            };
+            if self.local_generation == snapshot.generation {
+                break;
+            }
+            self.module = snapshot.module;
             self.rejuvenate()?;
-            self.local_generation = self.engine.module_generation();
+            self.local_generation = snapshot.generation;
         }
         Ok(())
     }
