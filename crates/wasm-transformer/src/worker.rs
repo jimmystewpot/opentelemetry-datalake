@@ -171,12 +171,6 @@ impl WasmWorker {
     /// memory, and processed by calling `datalake_transform`. The returned response header
     /// is decoded to produce the corresponding [`WorkerOutcome`].
     ///
-    /// Executes a transformation over a [`SignalBatch`].
-    ///
-    /// The incoming batch is serialized into an Arrow IPC stream, transferred into guest
-    /// memory, and processed by calling `datalake_transform`. The returned response header
-    /// is decoded to produce the corresponding [`WorkerOutcome`].
-    ///
     /// # Errors
     ///
     /// Returns `Err((batch, err))` with the preserved input batch if IPC serialization fails,
@@ -402,15 +396,27 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if guest re-instantiation fails.
     pub fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
-        while self.local_generation != self.engine.module_generation() {
+        while self.local_generation < self.engine.module_generation() {
             let Some(snapshot) = self.engine.current_snapshot() else {
                 break;
             };
-            if self.local_generation == snapshot.generation {
+            if self.local_generation >= snapshot.generation {
                 break;
             }
+            let guest = Self::instantiate_guest(
+                self.engine.engine(),
+                &snapshot.module,
+                &self.registry,
+                &self.config,
+            )?;
             self.module = snapshot.module;
-            self.rejuvenate()?;
+            self.store = guest.store;
+            self.instance = guest.instance;
+            self.alloc_fn = guest.alloc_fn;
+            self.dealloc_fn = guest.dealloc_fn;
+            self.transform_fn = guest.transform_fn;
+            self.memory = guest.memory;
+            self.batches_processed = 0;
             self.local_generation = snapshot.generation;
         }
         Ok(())

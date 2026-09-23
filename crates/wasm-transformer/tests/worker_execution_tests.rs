@@ -1326,3 +1326,55 @@ fn test_worker_probe_candidate_instantiates_supplied_module_directly() {
     assert!(WasmWorker::probe_candidate(&cache, &candidate_module, &cfg, &registry).is_ok());
     assert_eq!(cache.module_generation(), 1);
 }
+
+#[tokio::test]
+async fn test_worker_preserves_state_and_module_when_hot_reload_fails() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker =
+        WasmWorker::new(7, Arc::clone(&cache), Arc::clone(&module_v1), cfg, registry).unwrap();
+
+    let batch = create_test_record_batch();
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.local_generation(), 0);
+
+    // Publish an invalid candidate module (ABI version 99)
+    let invalid_abi_wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 99))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+    let module_invalid = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(invalid_abi_wat).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let new_gen = cache.publish_module(Arc::clone(&module_invalid));
+    assert_eq!(new_gen, 1);
+
+    // check_hot_reload should fail with AbiVersionMismatch
+    let reload_err = worker.check_hot_reload().unwrap_err();
+    assert!(matches!(
+        reload_err,
+        WasmTransformError::AbiVersionMismatch(99)
+    ));
+
+    // Crucially: worker module must remain the original module_v1, and local_generation must remain 0
+    assert!(
+        Arc::ptr_eq(worker.module(), &module_v1),
+        "Worker module must remain unchanged when hot reload fails"
+    );
+    assert_eq!(worker.local_generation(), 0);
+}

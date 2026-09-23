@@ -146,7 +146,7 @@ impl WasmReloadState {
     pub fn new(engine: Arc<EngineCache>, configured_sha: Option<String>) -> Self {
         Self {
             engines: vec![engine],
-            configured_sha,
+            configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
         }
     }
 
@@ -155,7 +155,7 @@ impl WasmReloadState {
     pub fn new_multi(engines: Vec<Arc<EngineCache>>, configured_sha: Option<String>) -> Self {
         Self {
             engines,
-            configured_sha,
+            configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -182,12 +182,13 @@ pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
 ) -> Result<axum::Json<WasmReloadResponse>, axum::http::StatusCode> {
+    let module_path = payload.module_path.trim();
     tracing::warn!(
-        path = %payload.module_path,
+        path = %module_path,
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
 
-    if payload.module_path.trim().is_empty() {
+    if module_path.is_empty() {
         tracing::warn!("Hot-reload REST: empty or blank module_path provided");
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
@@ -197,7 +198,7 @@ pub async fn wasm_reload_handler(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let bytes = tokio::fs::read(&payload.module_path).await.map_err(|e| {
+    let bytes = tokio::fs::read(module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to read module: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -236,7 +237,7 @@ pub async fn wasm_reload_handler(
 
     Ok(axum::Json(WasmReloadResponse {
         status: "reload successful".to_string(),
-        path: payload.module_path,
+        path: module_path.to_string(),
         generation,
     }))
 }

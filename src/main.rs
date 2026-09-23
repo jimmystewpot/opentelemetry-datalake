@@ -931,8 +931,19 @@ async fn main() -> anyhow::Result<()> {
         let _ = h.await;
     }
 
-    if let Some(h) = admin_handle {
-        h.abort();
+    if let Some(mut h) = admin_handle {
+        tokio::select! {
+            res = &mut h => {
+                if let Err(e) = res {
+                    tracing::warn!("Admin HTTP server task exited with error: {e}");
+                }
+            }
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                tracing::warn!("Admin HTTP server did not drain within 5 seconds; aborting");
+                h.abort();
+                let _ = h.await;
+            }
+        }
     }
 
     drop(metric_bridges);
