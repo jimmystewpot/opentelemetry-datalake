@@ -14,6 +14,36 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
     encode(Sha256::digest(bytes))
 }
 
+/// Compiles and probes the candidate WebAssembly module on every engine, and if all succeed,
+/// publishes the candidate module atomically to each engine.
+fn stage_and_publish_module(
+    engines: &[Arc<EngineCache>],
+    bytes: &[u8],
+    expected_sha: Option<&str>,
+) -> Result<u64, WasmTransformError> {
+    if let Some(expected) = expected_sha {
+        let actual = compute_sha256(bytes);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(WasmTransformError::Sha256Mismatch {
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+    }
+    // Stage 1: compile & probe candidate module across every engine
+    let mut candidates = Vec::with_capacity(engines.len());
+    for engine in engines {
+        let module = engine.compile_and_probe_candidate(bytes, None)?;
+        candidates.push(module);
+    }
+    // Stage 2: atomically publish candidate module to each engine
+    let mut last_gen = 0;
+    for (engine, module) in engines.iter().zip(candidates) {
+        last_gen = engine.publish_module(module);
+    }
+    Ok(last_gen)
+}
+
 /// Spawns an asynchronous background task listening for `SIGHUP` signals to trigger module reload
 /// across multiple [`EngineCache`] instances simultaneously.
 ///
@@ -54,31 +84,9 @@ pub fn spawn_sighup_listener_multi(
                     Ok(bytes) => {
                         let engines_clone = engines.clone();
                         let sha = expected_sha.clone();
-                        let compile_res = tokio::task::spawn_blocking(
-                            move || -> Result<u64, WasmTransformError> {
-                                if let Some(ref expected) = sha {
-                                    let actual = compute_sha256(&bytes);
-                                    if !actual.eq_ignore_ascii_case(expected) {
-                                        return Err(WasmTransformError::Sha256Mismatch {
-                                            expected: expected.clone(),
-                                            actual,
-                                        });
-                                    }
-                                }
-                                // Stage 1: compile & probe candidate on every engine
-                                let mut candidates = Vec::with_capacity(engines_clone.len());
-                                for engine in &engines_clone {
-                                    let module = engine.compile_and_probe_candidate(&bytes, None)?;
-                                    candidates.push(module);
-                                }
-                                // Stage 2: atomically publish candidate module to each engine
-                                let mut last_gen = 0;
-                                for (engine, module) in engines_clone.iter().zip(candidates) {
-                                    last_gen = engine.publish_module(module);
-                                }
-                                Ok(last_gen)
-                            },
-                        )
+                        let compile_res = tokio::task::spawn_blocking(move || {
+                            stage_and_publish_module(&engines_clone, &bytes, sha.as_deref())
+                        })
                         .await;
 
                         match compile_res {
@@ -138,6 +146,9 @@ pub struct WasmReloadResponse {
     pub generation: u64,
 }
 
+/// Maximum allowable WebAssembly module file size (64 MiB).
+pub const MAX_MODULE_SIZE: u64 = 64 * 1024 * 1024;
+
 /// State provided to the WASM hot-reload REST endpoint handler.
 #[derive(Clone)]
 pub struct WasmReloadState {
@@ -145,6 +156,8 @@ pub struct WasmReloadState {
     pub engines: Vec<Arc<EngineCache>>,
     /// Optional configured fallback SHA-256 digest pinned at initialization.
     pub configured_sha: Option<String>,
+    /// Optional boundary directory restricting which WASM files may be reloaded.
+    pub allowed_directory: Option<PathBuf>,
 }
 
 impl WasmReloadState {
@@ -154,6 +167,7 @@ impl WasmReloadState {
         Self {
             engines: vec![engine],
             configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
+            allowed_directory: None,
         }
     }
 
@@ -163,7 +177,17 @@ impl WasmReloadState {
         Self {
             engines,
             configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
+            allowed_directory: None,
         }
+    }
+
+    /// Sets an allowed directory boundary for module reloading.
+    ///
+    /// Paths requested for reload will be verified to reside within this directory.
+    #[must_use]
+    pub fn with_allowed_directory(mut self, dir: PathBuf) -> Self {
+        self.allowed_directory = Some(std::fs::canonicalize(&dir).unwrap_or(dir));
+        self
     }
 }
 
@@ -171,6 +195,72 @@ impl From<Arc<EngineCache>> for WasmReloadState {
     fn from(engine: Arc<EngineCache>) -> Self {
         Self::new(engine, None)
     }
+}
+
+/// Sanitizes, bounds, and reads the WebAssembly module file at `module_path`.
+async fn validate_and_read_module(
+    module_path: &str,
+    allowed_directory: Option<&std::path::Path>,
+) -> Result<Vec<u8>, axum::http::StatusCode> {
+    let path_obj = std::path::Path::new(module_path);
+
+    // Reject path traversal components (e.g. "../")
+    if path_obj
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        tracing::warn!(path = %module_path, "Hot-reload REST: path traversal attempted");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let metadata = tokio::fs::metadata(path_obj).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to read module metadata: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !metadata.is_file() {
+        tracing::warn!(path = %module_path, "Hot-reload REST: path is not a regular file");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    if metadata.len() == 0 {
+        tracing::warn!(path = %module_path, "Hot-reload REST: module file is empty");
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    if metadata.len() > MAX_MODULE_SIZE {
+        tracing::warn!(
+            path = %module_path,
+            size = metadata.len(),
+            max_size = MAX_MODULE_SIZE,
+            "Hot-reload REST: module file exceeds maximum allowed size"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let canonical_path = tokio::fs::canonicalize(path_obj).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to canonicalize module path: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if let Some(allowed_dir) = allowed_directory {
+        let canonical_allowed = tokio::fs::canonicalize(allowed_dir)
+            .await
+            .unwrap_or_else(|_| allowed_dir.to_path_buf());
+        if !canonical_path.starts_with(&canonical_allowed) {
+            tracing::warn!(
+                path = %canonical_path.display(),
+                allowed = %canonical_allowed.display(),
+                "Hot-reload REST: path outside allowed directory"
+            );
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+    }
+
+    tokio::fs::read(&canonical_path).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to read module: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// Handler for the WASM hot-reload REST endpoint.
@@ -183,8 +273,9 @@ impl From<Arc<EngineCache>> for WasmReloadState {
 ///
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
-/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if `module_path` is empty or whitespace, if no engines
-/// are configured, or if the module compilation or SHA-256 verification fails.
+/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if `module_path` is empty or whitespace, if path traversal
+/// is detected, if the path is a directory or empty file or exceeds [`MAX_MODULE_SIZE`], if outside the allowed directory,
+/// if no engines are configured, or if the module compilation or SHA-256 verification fails.
 pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     axum::Json(payload): axum::Json<WasmReloadRequest>,
@@ -205,10 +296,7 @@ pub async fn wasm_reload_handler(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let bytes = tokio::fs::read(module_path).await.map_err(|e| {
-        tracing::warn!("Hot-reload REST: failed to read module: {e}");
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let bytes = validate_and_read_module(module_path, state.allowed_directory.as_deref()).await?;
 
     let engines = state.engines.clone();
     let expected_sha = if let Some(ref configured) = state.configured_sha {
@@ -227,28 +315,8 @@ pub async fn wasm_reload_handler(
         payload.expected_sha.filter(|s| !s.trim().is_empty())
     };
 
-    let generation = tokio::task::spawn_blocking(move || -> Result<u64, WasmTransformError> {
-        if let Some(ref expected) = expected_sha {
-            let actual = compute_sha256(&bytes);
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(WasmTransformError::Sha256Mismatch {
-                    expected: expected.clone(),
-                    actual,
-                });
-            }
-        }
-        // Stage 1: compile & probe candidate module across every engine
-        let mut candidates = Vec::with_capacity(engines.len());
-        for engine in &engines {
-            let module = engine.compile_and_probe_candidate(&bytes, None)?;
-            candidates.push(module);
-        }
-        // Stage 2: atomically publish candidate module to each engine
-        let mut last_gen = 0;
-        for (engine, module) in engines.iter().zip(candidates) {
-            last_gen = engine.publish_module(module);
-        }
-        Ok(last_gen)
+    let generation = tokio::task::spawn_blocking(move || {
+        stage_and_publish_module(&engines, &bytes, expected_sha.as_deref())
     })
     .await
     .map_err(|e| {

@@ -74,7 +74,7 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     http_addr: Option<SocketAddr>,
 
-    /// Override admin HTTP bind address (e.g. 0.0.0.0:9090)
+    /// Override admin HTTP bind address (e.g. 127.0.0.1:9090)
     #[arg(long, value_name = "ADDR")]
     admin_addr: Option<SocketAddr>,
 
@@ -135,12 +135,22 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     }
 
-    if let Some(admin_addr) = config.server.admin_addr
-        && (admin_addr == config.server.http_addr || admin_addr == config.server.grpc_addr)
-    {
-        anyhow::bail!(
-            "Configuration validation failed: server.admin_addr ({admin_addr}) cannot match http_addr or grpc_addr (port isolation required)"
-        );
+    if let Some(admin_addr) = config.server.admin_addr {
+        if admin_addr.ip().is_unspecified() {
+            anyhow::bail!(
+                "Configuration validation failed: server.admin_addr ({admin_addr}) cannot bind to wildcard/unspecified address; loopback or private interface required to prevent public exposure"
+            );
+        }
+        if admin_addr.port() == config.server.http_addr.port()
+            || admin_addr.port() == config.server.grpc_addr.port()
+        {
+            anyhow::bail!(
+                "Configuration validation failed: server.admin_addr port ({}) conflicts with http_addr port ({}) or grpc_addr port ({}) (port isolation required)",
+                admin_addr.port(),
+                config.server.http_addr.port(),
+                config.server.grpc_addr.port()
+            );
+        }
     }
 
     Ok(())
@@ -1408,8 +1418,10 @@ mod tests {
 
         // Test sending request to runtime listener over loopback TCP
         let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        let body = r#"{"module_path": ""}"#;
         let req = format!(
-            "POST /api/v1/transforms/wasm/reload HTTP/1.1\r\nHost: {bound_addr}\r\nContent-Type: application/json\r\nContent-Length: 19\r\n\r\n{{\"module_path\": \"\"}}"
+            "POST /api/v1/transforms/wasm/reload HTTP/1.1\r\nHost: {bound_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
         );
         stream.write_all(req.as_bytes()).await.unwrap();
 
@@ -1445,6 +1457,59 @@ mod tests {
             .unwrap();
         let err = validate_config(&config).unwrap_err();
         assert!(err.to_string().contains("port isolation required"));
+    }
+
+    #[test]
+    fn test_config_validation_fails_when_admin_addr_port_conflicts_across_different_ips() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        admin_addr = "127.0.0.2:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("port isolation required"));
+    }
+
+    #[test]
+    fn test_config_validation_fails_when_admin_addr_is_wildcard() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        admin_addr = "0.0.0.0:9090"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot bind to wildcard/unspecified address")
+        );
     }
 
     #[test]
