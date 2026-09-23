@@ -470,3 +470,45 @@ fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
     registry.record_counter("counter_0", 5);
     assert_eq!(registry.read_counter("counter_0"), 6);
 }
+
+#[test]
+fn test_host_linker_defines_capability_query_with_phase_enforcement() {
+    let engine = Engine::default();
+    let linker = build_host_linker(&engine).unwrap();
+    let registry = Arc::new(MetricRegistry::new("test_comp"));
+
+    let wasm_wat = r#"
+        (module
+            (import "env" "datalake_host_has_capability" (func $has_cap (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "nonexistent_capability")
+            (func (export "check_cap") (result i32)
+                (call $has_cap (i32.const 0) (i32.const 22))
+            )
+        )
+    "#;
+    let wasm_bytes = wat::parse_str(wasm_wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+
+    // 1. In Init phase: function links and returns 0 for unrecognized capability
+    let mut store_init = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store_init, &module).unwrap();
+    let check_fn = instance
+        .get_typed_func::<(), i32>(&mut store_init, "check_cap")
+        .unwrap();
+    assert_eq!(check_fn.call(&mut store_init, ()).unwrap(), 0);
+
+    // 2. In Execution phase: function returns 0
+    let mut store_exec = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance_exec = linker.instantiate(&mut store_exec, &module).unwrap();
+    let check_fn_exec = instance_exec
+        .get_typed_func::<(), i32>(&mut store_exec, "check_cap")
+        .unwrap();
+    assert_eq!(check_fn_exec.call(&mut store_exec, ()).unwrap(), 0);
+}

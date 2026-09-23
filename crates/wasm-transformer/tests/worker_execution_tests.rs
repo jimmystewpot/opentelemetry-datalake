@@ -1594,3 +1594,112 @@ async fn test_worker_instantiates_wasi_preview1_module_and_reads_env() {
         .unwrap();
     assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
 }
+
+#[tokio::test]
+async fn test_worker_rejects_batch_exceeding_max_batch_rows() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.max_batch_rows = 5;
+    let mut worker = WasmWorker::new(71, Arc::clone(&cache), module, cfg).unwrap();
+
+    // Create a batch with 10 rows (exceeds ceiling of 5)
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("val", arrow::datatypes::DataType::Int32, false),
+    ]));
+    let array = Arc::new(arrow::array::Int32Array::from((0..10).collect::<Vec<_>>()));
+    let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+
+    match outcome {
+        WorkerOutcome::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("exceeds configured maximum 5"),
+                "Unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("Expected WorkerOutcome::Rejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenation_uses_blocking_offload() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 1;
+    let mut worker = WasmWorker::new(72, Arc::clone(&cache), module, cfg).unwrap();
+
+    let batch = create_test_record_batch();
+    let outcome1 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+
+    // Second batch triggers rejuvenation
+    let outcome2 = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Emitted(_)));
+}
+
+#[tokio::test]
+async fn test_worker_hot_reload_failure_preserves_old_module_and_continues() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let initial_module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(73, Arc::clone(&cache), initial_module, cfg).unwrap();
+
+    // Verify initial execution works
+    let batch = create_test_record_batch();
+    let outcome1 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+
+    // Advance cache with a broken module (fails datalake_init with code 1)
+    let bad_init_wat = r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 1))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )
+    "#;
+    let _broken_module = cache
+        .compile_module(&wat::parse_str(bad_init_wat).unwrap())
+        .unwrap();
+    let _ = cache.advance_generation();
+
+    // Subsequent batch should NOT fail! It should log a warning, keep the old module, and succeed
+    let outcome2 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Emitted(_)));
+
+    // Subsequent batches should also continue serving on the old module without retrying the broken reload
+    let outcome3 = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome3, WorkerOutcome::Emitted(_)));
+}

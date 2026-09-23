@@ -726,3 +726,49 @@ fn test_backfill_nested_map_and_list_views_nullability() {
         panic!("Expected LargeListView");
     }
 }
+
+#[test]
+fn test_backfill_preserves_authoritative_input_metadata_over_guest_collision() {
+    let mut in_meta = std::collections::HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    in_meta.insert("upstream.key".to_string(), "authoritative".to_string());
+    let input_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("val", DataType::Int64, false)],
+        in_meta,
+    ));
+
+    let mut out_meta = std::collections::HashMap::new();
+    out_meta.insert(
+        "otel::compliance::status".to_string(),
+        "tampered".to_string(),
+    );
+    out_meta.insert("guest.new_key".to_string(), "guest_val".to_string());
+    let output_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("val", DataType::Int64, false)],
+        out_meta,
+    ));
+
+    let array = Arc::new(Int64Array::from(vec![1]));
+    let output_batch = RecordBatch::try_new(output_schema, vec![array]).unwrap();
+
+    let backfilled = backfill_missing_columns(&input_schema, output_batch).unwrap();
+    let schema = backfilled.schema();
+    let meta = schema.metadata();
+
+    assert_eq!(
+        meta.get("otel::compliance::status").map(String::as_str),
+        Some("verified"),
+        "Input compliance metadata was overwritten by guest output"
+    );
+    assert_eq!(
+        meta.get("upstream.key").map(String::as_str),
+        Some("authoritative")
+    );
+    assert_eq!(
+        meta.get("guest.new_key").map(String::as_str),
+        Some("guest_val")
+    );
+}

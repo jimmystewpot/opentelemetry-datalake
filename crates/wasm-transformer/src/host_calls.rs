@@ -378,5 +378,33 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
         },
     )?;
 
+    linker.func_wrap(
+        "env",
+        "datalake_host_has_capability",
+        |mut caller: Caller<'_, HostState>, cap_name_ptr: u32, cap_name_len: u32| -> u32 {
+            if caller.data().phase != HostPhase::Init {
+                tracing::warn!(
+                    "Guest module queried datalake_host_has_capability outside of init phase; returning 0"
+                );
+                return 0;
+            }
+
+            let Some(cap_name) = read_guest_string(
+                &mut caller,
+                cap_name_ptr,
+                cap_name_len,
+                MAX_METRIC_NAME_LEN,
+            ) else {
+                return 0;
+            };
+
+            tracing::warn!(
+                capability = %cap_name,
+                "Guest module queried unrecognized capability in datalake_host_has_capability; returning 0"
+            );
+            0
+        },
+    )?;
+
     Ok(linker)
 }

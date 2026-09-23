@@ -101,6 +101,7 @@ pub struct WasmWorker {
     local_generation: u64,
     rejuvenate_threshold_bytes: usize,
     epoch_deadline_ticks: u64,
+    init_deadline_ticks: u64,
 }
 
 impl std::fmt::Debug for WasmWorker {
@@ -174,6 +175,7 @@ impl WasmWorker {
             local_generation,
             rejuvenate_threshold_bytes,
             epoch_deadline_ticks,
+            init_deadline_ticks,
         })
     }
 
@@ -198,7 +200,22 @@ impl WasmWorker {
         &mut self,
         batch: SignalBatch,
     ) -> Result<WorkerOutcome, WasmTransformError> {
-        self.check_hot_reload()?;
+        self.check_hot_reload().await?;
+
+        let num_rows = match &batch {
+            SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => {
+                rb.num_rows()
+            }
+        };
+        if self.config.max_batch_rows > 0 && num_rows > self.config.max_batch_rows {
+            return Ok(WorkerOutcome::Rejected {
+                reason: format!(
+                    "Batch row count {num_rows} exceeds configured maximum {}",
+                    self.config.max_batch_rows
+                ),
+                original: batch,
+            });
+        }
 
         let mut guest = self.guest.take().ok_or_else(|| {
             WasmTransformError::Pipeline("WASM worker guest components missing".into())
@@ -236,11 +253,11 @@ impl WasmWorker {
         match outcome {
             Ok(outcome) => {
                 self.batches_processed = self.batches_processed.saturating_add(1);
-                self.check_rejuvenation()?;
+                self.check_rejuvenation().await?;
                 Ok(outcome)
             }
             Err(e) => {
-                let _ = self.rejuvenate();
+                let _ = self.rejuvenate().await;
                 Err(e)
             }
         }
@@ -252,15 +269,35 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if re-instantiation fails, required exports are missing,
     /// or guest initialization fails.
-    pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        let mut guest = Self::instantiate_guest(
-            self.engine.engine(),
-            &self.module,
-            self.epoch_deadline_ticks,
-            Arc::clone(&self.registry),
-            &self.filtered_env,
-        )?;
-        Self::initialize_guest(&mut guest, &self.config)?;
+    pub async fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
+        let engine = self.engine.engine().clone();
+        let module = Arc::clone(&self.module);
+        let init_deadline_ticks = self.init_deadline_ticks;
+        let registry = Arc::clone(&self.registry);
+        let filtered_env = self.filtered_env.clone();
+        let config = self.config.clone();
+
+        let run_init = move || -> Result<GuestComponents, WasmTransformError> {
+            let mut guest = Self::instantiate_guest(
+                &engine,
+                &module,
+                init_deadline_ticks,
+                registry,
+                &filtered_env,
+            )?;
+            Self::initialize_guest(&mut guest, &config)?;
+            Ok(guest)
+        };
+
+        let guest = if tokio::runtime::Handle::try_current().is_ok() {
+            let handle = tokio::task::spawn_blocking(run_init);
+            handle.await.map_err(|e| {
+                WasmTransformError::Pipeline(format!("Blocking init join error: {e}"))
+            })??
+        } else {
+            run_init()?
+        };
+
         self.guest = Some(guest);
         self.batches_processed = 0;
         Ok(())
@@ -309,20 +346,62 @@ impl WasmWorker {
     }
 
     /// Checks if the engine cache has compiled a newer module generation and reloads.
-    fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
+    async fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
         let (current_module, current_gen) = self.engine.current_module();
         if self.local_generation != current_gen
             && let Some(new_mod) = current_module
         {
-            self.module = new_mod;
-            self.rejuvenate()?;
-            self.local_generation = current_gen;
+            let engine = self.engine.engine().clone();
+            let module = Arc::clone(&new_mod);
+            let init_deadline_ticks = self.init_deadline_ticks;
+            let registry = Arc::clone(&self.registry);
+            let filtered_env = self.filtered_env.clone();
+            let config = self.config.clone();
+
+            let run_init = move || -> Result<GuestComponents, WasmTransformError> {
+                let mut guest = Self::instantiate_guest(
+                    &engine,
+                    &module,
+                    init_deadline_ticks,
+                    registry,
+                    &filtered_env,
+                )?;
+                Self::initialize_guest(&mut guest, &config)?;
+                Ok(guest)
+            };
+
+            let res = if tokio::runtime::Handle::try_current().is_ok() {
+                let handle = tokio::task::spawn_blocking(run_init);
+                handle.await.map_err(|e| {
+                    WasmTransformError::Pipeline(format!("Blocking reload init join error: {e}"))
+                })?
+            } else {
+                run_init()
+            };
+
+            match res {
+                Ok(new_guest) => {
+                    self.guest = Some(new_guest);
+                    self.module = new_mod;
+                    self.local_generation = current_gen;
+                    self.batches_processed = 0;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        worker_id = self.id,
+                        generation = current_gen,
+                        error = %e,
+                        "Hot reload module initialization failed; continuing with current module"
+                    );
+                    self.local_generation = current_gen;
+                }
+            }
         }
         Ok(())
     }
 
     /// Rejuvenates the guest instance if batch count or memory limits are exceeded.
-    fn check_rejuvenation(&mut self) -> Result<(), WasmTransformError> {
+    async fn check_rejuvenation(&mut self) -> Result<(), WasmTransformError> {
         let memory_exceeded = if self.rejuvenate_threshold_bytes > 0 {
             if let Some(guest) = &self.guest {
                 guest.memory.data_size(&guest.store) >= self.rejuvenate_threshold_bytes
@@ -337,7 +416,7 @@ impl WasmWorker {
             && self.batches_processed >= self.config.rejuvenate_batches)
             || memory_exceeded
         {
-            self.rejuvenate()?;
+            self.rejuvenate().await?;
         }
         Ok(())
     }
@@ -583,6 +662,7 @@ fn execute_batch_in_guest(
     worker_id: usize,
 ) -> Result<WorkerOutcome, WasmTransformError> {
     guest.store.set_epoch_deadline(epoch_deadline_ticks);
+    guest.store.data_mut().phase = HostPhase::Execution;
 
     let record_batch = match &batch {
         SignalBatch::Logs(rb) | SignalBatch::Metrics(rb) | SignalBatch::Traces(rb) => rb,
