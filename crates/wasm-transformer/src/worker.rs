@@ -258,7 +258,13 @@ impl WasmWorker {
         match outcome {
             Ok(outcome) => {
                 self.batches_processed = self.batches_processed.saturating_add(1);
-                self.check_rejuvenation().await?;
+                if let Err(e) = self.check_rejuvenation().await {
+                    tracing::warn!(
+                        worker_id = self.id,
+                        error = %e,
+                        "Failed to rejuvenate guest instance after processing batch; continuing with current instance"
+                    );
+                }
                 Ok(outcome)
             }
             Err(e) => {
