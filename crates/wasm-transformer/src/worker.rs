@@ -38,13 +38,24 @@ pub enum WorkerOutcome {
     },
 }
 
+/// Typed handle to the guest `datalake_transform` export.
+///
+/// Supports both documented C-ABI v1 `(u32, u32, u32) -> u64` and backwards-compatible legacy `(u32, u32) -> u32`.
+#[derive(Clone)]
+pub enum TransformFn {
+    /// Documented C-ABI v1: `datalake_transform(signal_type, ipc_ptr, ipc_len) -> (response_ptr << 32) | response_len`.
+    V1(TypedFunc<(u32, u32, u32), u64>),
+    /// Legacy/test mock signature: `datalake_transform(ipc_ptr, ipc_len) -> response_ptr`.
+    Legacy(TypedFunc<(u32, u32), u32>),
+}
+
 /// Internal container for guest Wasmtime execution state and exported entry points.
 struct GuestComponents {
     store: Store<HostState>,
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
-    transform_fn: TypedFunc<(u32, u32), u32>,
+    transform_fn: TransformFn,
     memory: Memory,
 }
 
@@ -73,7 +84,7 @@ pub struct WasmWorker {
     instance: Instance,
     alloc_fn: TypedFunc<u32, u32>,
     dealloc_fn: TypedFunc<(u32, u32), ()>,
-    transform_fn: TypedFunc<(u32, u32), u32>,
+    transform_fn: TransformFn,
     memory: Memory,
     batches_processed: u64,
     local_generation: u64,
@@ -158,7 +169,7 @@ impl WasmWorker {
     ///
     /// Returns `Err((batch, err))` with the preserved input batch if IPC serialization fails,
     /// guest execution traps, or guest memory bounds are violated.
-    #[allow(clippy::unused_async_trait_impl)]
+    #[allow(clippy::unused_async_trait_impl, clippy::too_many_lines)]
     pub fn execute_batch(
         &mut self,
         batch: SignalBatch,
@@ -232,9 +243,26 @@ impl WasmWorker {
             return Err((batch, WasmTransformError::Pipeline(e.to_string())));
         }
 
+        let signal_type: u32 = match &batch {
+            SignalBatch::Logs(_) => 0,
+            SignalBatch::Metrics(_) => 1,
+            SignalBatch::Traces(_) => 2,
+        };
+
         // 3. Reset deadline for transform invocation, invoke datalake_transform and free input buffer
         self.store.set_epoch_deadline(ticks);
-        let transform_res = self.transform_fn.call(&mut self.store, (ipc_ptr, ipc_len));
+        let transform_res = match &self.transform_fn {
+            TransformFn::V1(f) => f
+                .call(&mut self.store, (signal_type, ipc_ptr, ipc_len))
+                .map(|packed| {
+                    if packed > 0xFFFF_FFFF {
+                        u32::try_from(packed >> 32).unwrap_or(0)
+                    } else {
+                        u32::try_from(packed).unwrap_or(0)
+                    }
+                }),
+            TransformFn::Legacy(f) => f.call(&mut self.store, (ipc_ptr, ipc_len)),
+        };
         let _ = self.dealloc_fn.call(&mut self.store, (ipc_ptr, ipc_len));
         let header_ptr = match transform_res {
             Ok(ptr) => ptr,
@@ -530,8 +558,20 @@ impl WasmWorker {
         let alloc_fn = instance.get_typed_func::<u32, u32>(&mut store, "datalake_alloc")?;
         let dealloc_fn =
             instance.get_typed_func::<(u32, u32), ()>(&mut store, "datalake_dealloc")?;
-        let transform_fn =
-            instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")?;
+        let transform_fn = if let Ok(f) =
+            instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
+        {
+            TransformFn::V1(f)
+        } else if let Ok(f) =
+            instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
+        {
+            TransformFn::Legacy(f)
+        } else {
+            return Err(WasmTransformError::MissingExport(
+                "datalake_transform with signature (u32, u32, u32) -> u64 or (u32, u32) -> u32"
+                    .into(),
+            ));
+        };
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| WasmTransformError::MissingExport("memory".into()))?;

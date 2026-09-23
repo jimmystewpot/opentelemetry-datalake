@@ -907,3 +907,35 @@ fn test_strict_schema_equality_reordered_fields_fail() {
             .contains("Strict schema guard violation")
     );
 }
+
+#[test]
+fn test_backfill_rejects_mutated_data_type() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Int64, true)]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(Int64Array::from(vec![42]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("data type mutated from Utf8 to Int64")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_nullability_mutation() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("nullability mutated from non-nullable to nullable")
+    );
+}

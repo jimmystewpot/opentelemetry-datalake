@@ -933,3 +933,42 @@ async fn test_worker_execution_deadline_interrupts_infinite_loop() {
         Ok(_) => panic!("Expected infinite loop to be interrupted with timeout"),
     }
 }
+
+#[tokio::test]
+async fn test_worker_executes_c_abi_v1_transform() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Write 20 bytes of zeros for TransformResponseHeader at offset 1024
+            (i32.store (i32.const 1024) (i32.const 0))
+            (i32.store (i32.const 1028) (i32.const 0))
+            (i32.store (i32.const 1032) (i32.const 0))
+            (i32.store (i32.const 1036) (i32.const 0))
+            (i32.store (i32.const 1040) (i32.const 0))
+            ;; (1024 << 32) | 20 = 0x0000_0400_0000_0014 = 4398046511124_i64
+            (i64.const 4398046511124)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(22, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let input_batch = SignalBatch::Logs(create_test_record_batch());
+
+    let outcome = worker.execute_batch(input_batch).unwrap();
+    match outcome {
+        WorkerOutcome::Emitted(batches) => {
+            assert_eq!(batches.len(), 1);
+            match &batches[0] {
+                SignalBatch::Logs(rb) => assert_eq!(rb.num_rows(), 1),
+                _ => panic!("Expected Logs signal"),
+            }
+        }
+        _ => panic!("Expected Emitted outcome"),
+    }
+}
