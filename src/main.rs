@@ -232,6 +232,7 @@ fn setup_dlq_channel(
 fn instantiate_signal_wasm_transformer(
     cfg: &pipeline_core::config::WasmTransformerConfig,
     signal: &str,
+    engine: &std::sync::Arc<wasm_transformer::engine::EngineCache>,
     dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<Box<dyn Transform>> {
     let mut signal_cfg = cfg.clone();
@@ -257,36 +258,134 @@ fn instantiate_signal_wasm_transformer(
         None
     };
 
-    let transformer =
-        wasm_transformer::WasmTransformer::new(signal_cfg, reroute_error, reroute_reject)?;
+    let transformer = wasm_transformer::WasmTransformer::with_engine(
+        signal_cfg,
+        reroute_error,
+        reroute_reject,
+        std::sync::Arc::clone(engine),
+    )?;
     Ok(Box::new(transformer))
 }
 
 /// Initializes the pipeline transformers based on the provided application configuration.
-/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances.
+/// If `wasm_transformer` is configured, it instantiates three signal-isolated instances
+/// sharing a common [`wasm_transformer::engine::EngineCache`].
 /// Otherwise, it falls back to No-op transformers.
 fn initialize_transformers(
     config: &AppConfig,
     dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<SignalTransformers> {
+) -> anyhow::Result<(
+    SignalTransformers,
+    Option<std::sync::Arc<wasm_transformer::engine::EngineCache>>,
+)> {
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         tracing::info!(
             transformer_id = %wasm_cfg.id,
             module_path = %wasm_cfg.module_path,
-            "Initializing 3x signal-isolated WasmTransformer instances"
+            "Initializing 3x signal-isolated WasmTransformer instances with shared EngineCache"
         );
-        Ok((
-            instantiate_signal_wasm_transformer(wasm_cfg, "logs", dlq_handles)?,
-            instantiate_signal_wasm_transformer(wasm_cfg, "traces", dlq_handles)?,
-            instantiate_signal_wasm_transformer(wasm_cfg, "metrics", dlq_handles)?,
-        ))
+        let max_memory_bytes = wasm_transformer::worker::parse_byte_size(&wasm_cfg.max_memory)
+            .unwrap_or(64 * 1024 * 1024);
+        let pool_capacity = (wasm_cfg.concurrency.max(1) * 3).saturating_add(3);
+        let shared_engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(pool_capacity, max_memory_bytes)?,
+        );
+
+        let transformers = (
+            instantiate_signal_wasm_transformer(wasm_cfg, "logs", &shared_engine, dlq_handles)?,
+            instantiate_signal_wasm_transformer(wasm_cfg, "traces", &shared_engine, dlq_handles)?,
+            instantiate_signal_wasm_transformer(wasm_cfg, "metrics", &shared_engine, dlq_handles)?,
+        );
+        Ok((transformers, Some(shared_engine)))
     } else {
         Ok((
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
+            (
+                Box::new(noop_transformer::NoopTransformer::new()),
+                Box::new(noop_transformer::NoopTransformer::new()),
+                Box::new(noop_transformer::NoopTransformer::new()),
+            ),
+            None,
         ))
     }
+}
+
+#[cfg(unix)]
+fn spawn_sighup_reload_task(
+    wasm_cfg: pipeline_core::config::WasmTransformerConfig,
+    engine: std::sync::Arc<wasm_transformer::engine::EngineCache>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut signal_stream =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Failed to register SIGHUP handler: {e}");
+                    return;
+                }
+            };
+
+        tracing::info!(
+            transformer_id = %wasm_cfg.id,
+            module_path = %wasm_cfg.module_path,
+            "SIGHUP reload handler installed"
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        tracing::debug!("SIGHUP listener shutting down");
+                        break;
+                    }
+                }
+                Some(()) = signal_stream.recv() => {
+                    tracing::info!(
+                        transformer_id = %wasm_cfg.id,
+                        module_path = %wasm_cfg.module_path,
+                        "Received SIGHUP signal. Reloading WASM module..."
+                    );
+
+                    let wasm_cfg_clone = wasm_cfg.clone();
+                    let engine_clone = std::sync::Arc::clone(&engine);
+
+                    let reload_res = tokio::task::spawn_blocking(move || {
+                        wasm_transformer::WasmTransformer::reload_module(&wasm_cfg_clone, &engine_clone)
+                    })
+                    .await;
+
+                    match reload_res {
+                        Ok(Ok(generation)) => {
+                            tracing::info!(
+                                transformer_id = %wasm_cfg.id,
+                                generation = generation,
+                                "Successfully recompiled WASM module and advanced generation on SIGHUP"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!(
+                                transformer_id = %wasm_cfg.id,
+                                "Failed to reload WASM module on SIGHUP: {e}"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("Blocking reload task panicked on SIGHUP: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload_task(
+    _wasm_cfg: pipeline_core::config::WasmTransformerConfig,
+    _engine: std::sync::Arc<wasm_transformer::engine::EngineCache>,
+    _shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {})
 }
 
 #[tokio::main]
@@ -374,36 +473,60 @@ async fn main() -> anyhow::Result<()> {
         logs_tx,
         traces_tx,
         metrics_tx,
-        shutdown_rx,
+        shutdown_rx.clone(),
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
     let mut dlq_handles = Vec::new();
-    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer) =
+    let ((mut logs_transformer, mut traces_transformer, mut metrics_transformer), shared_engine) =
         initialize_transformers(&config, &mut dlq_handles)?;
 
+    let sighup_handle =
+        if let (Some(wasm_cfg), Some(engine)) = (&config.wasm_transformer, shared_engine) {
+            if wasm_cfg.enable_sighup {
+                Some(spawn_sighup_reload_task(
+                    wasm_cfg.clone(),
+                    engine,
+                    shutdown_rx.clone(),
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     // Spawn transformers
-    let logs_trans_handle = tokio::spawn(async move {
+    let mut logs_trans_handle = tokio::spawn(async move {
         if let Err(e) = logs_transformer.transform(logs_rx, logs_sink_tx).await {
             tracing::error!("Logs transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
-    let traces_trans_handle = tokio::spawn(async move {
+    let mut traces_trans_handle = tokio::spawn(async move {
         if let Err(e) = traces_transformer
             .transform(traces_rx, traces_sink_tx)
             .await
         {
             tracing::error!("Traces transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
-    let metrics_trans_handle = tokio::spawn(async move {
+    let mut metrics_trans_handle = tokio::spawn(async move {
         if let Err(e) = metrics_transformer
             .transform(metrics_rx, metrics_sink_tx)
             .await
         {
             tracing::error!("Metrics transformer error: {}", e);
+            Err(e)
+        } else {
+            Ok(())
         }
     });
 
@@ -594,6 +717,8 @@ async fn main() -> anyhow::Result<()> {
     // Spawn source
     let mut source_handle = tokio::spawn(async move { source.run().await });
 
+    let mut exit_err: Option<anyhow::Error> = None;
+
     // Handle shutdown
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
@@ -607,28 +732,109 @@ async fn main() -> anyhow::Result<()> {
         }
         res = &mut source_handle => {
             match res {
-                Ok(Err(e)) => tracing::error!("Source receiver stopped unexpectedly with error: {}", e),
-                Ok(Ok(())) => tracing::error!("Source receiver stopped unexpectedly."),
-                Err(e) => tracing::error!("Source receiver task panicked: {}", e),
+                Ok(Err(e)) => {
+                    tracing::error!("Source receiver stopped unexpectedly with error: {}", e);
+                    exit_err = Some(anyhow::anyhow!("Source receiver stopped unexpectedly with error: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Source receiver stopped unexpectedly.");
+                    exit_err = Some(anyhow::anyhow!("Source receiver stopped unexpectedly"));
+                }
+                Err(e) => {
+                    tracing::error!("Source receiver task panicked: {}", e);
+                    exit_err = Some(anyhow::anyhow!("Source receiver task panicked: {e}"));
+                }
             }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut logs_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Logs transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Logs transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Logs transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Logs transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut traces_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Traces transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Traces transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Traces transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Traces transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut metrics_trans_handle => {
+            match res {
+                Ok(Err(e)) => {
+                    tracing::error!("Metrics transformer failed: {e}");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer failed: {e}"));
+                }
+                Ok(Ok(())) => {
+                    tracing::error!("Metrics transformer exited prematurely");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer exited prematurely"));
+                }
+                Err(e) => {
+                    tracing::error!("Metrics transformer task panicked: {e}");
+                    exit_err = Some(anyhow::anyhow!("Metrics transformer task panicked: {e}"));
+                }
+            }
+            let _ = shutdown_tx.send(true);
         }
     }
 
     // Wait for pipeline to drain
     let _ = tokio::join!(
-        logs_trans_handle,
-        traces_trans_handle,
-        metrics_trans_handle,
+        async {
+            if !logs_trans_handle.is_finished() {
+                let _ = logs_trans_handle.await;
+            }
+        },
+        async {
+            if !traces_trans_handle.is_finished() {
+                let _ = traces_trans_handle.await;
+            }
+        },
+        async {
+            if !metrics_trans_handle.is_finished() {
+                let _ = metrics_trans_handle.await;
+            }
+        },
         logs_sink_handle,
         traces_sink_handle,
         metrics_sink_handle
     );
+
+    if let Some(h) = sighup_handle {
+        let _ = h.await;
+    }
 
     // Wait for DLQ tasks to drain
     for dlq_handle in dlq_handles {
         if let Err(e) = dlq_handle.await {
             tracing::error!("DLQ drain task panicked: {e}");
         }
+    }
+
+    if let Some(err) = exit_err {
+        return Err(err);
     }
 
     tracing::info!("Shutdown complete.");
@@ -1117,5 +1323,212 @@ mod tests {
             res_invalid.is_err(),
             "validate_config must fail when WASM module path does not exist"
         );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_module_missing_abi_version() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!(
+            "test_validate_missing_abi_{}.wasm",
+            std::process::id()
+        ));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [kafka]
+            brokers = "localhost:9092"
+            logs_topic = "logs"
+            traces_topic = "traces"
+            metrics_topic = "metrics"
+            logs_format = "json"
+            traces_format = "json"
+            metrics_format = "json"
+
+            [wasm_transformer]
+            id = "test_validate_no_abi"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "drop"
+            on_reject = "drop"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = false
+            "#,
+            wasm_path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = validate_config(&config);
+        let _ = std::fs::remove_file(&wasm_path);
+
+        assert!(
+            res.is_err(),
+            "validate_config must reject module missing ABI version"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("datalake_abi_version"));
+    }
+
+    #[tokio::test]
+    async fn test_initialize_transformers_rejects_module_missing_abi_version() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_init_missing_abi_{}.wasm", std::process::id()));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let toml_str = format!(
+            r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [wasm_transformer]
+            id = "test_init_no_abi"
+            type = "wasm"
+            module_path = "{}"
+            on_error = "drop"
+            on_reject = "drop"
+            concurrency = 1
+            worker_channel_capacity = 1
+            max_memory = "16MiB"
+            rejuvenate_threshold = "8MiB"
+            rejuvenate_batches = 1000
+            init_timeout = "1s"
+            allow_unmasked_passthrough = true
+            schema_guard = "defensive"
+            env_whitelist = []
+            enable_sighup = false
+            "#,
+            wasm_path.display()
+        );
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(&toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        let mut dlq_handles = Vec::new();
+        let res = initialize_transformers(&config, &mut dlq_handles);
+        let _ = std::fs::remove_file(&wasm_path);
+
+        let err_msg = match res {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("initialize_transformers must reject module missing ABI version"),
+        };
+        assert!(err_msg.contains("datalake_abi_version"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_sighup_reload_task_advances_generation_on_signal() {
+        let wasm_bytes = wat::parse_str(
+            r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        )"#,
+        )
+        .expect("wat parse");
+
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_sighup_reload_{}.wasm", std::process::id()));
+        std::fs::write(&wasm_path, &wasm_bytes).expect("write wasm");
+
+        let wasm_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "test_sighup".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: wasm_path.display().to_string(),
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "16MiB".to_string(),
+            rejuvenate_threshold: "8MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: true,
+            on_reject: pipeline_core::config::OnRejectPolicy::Drop,
+            schema_guard: pipeline_core::config::SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: true,
+        };
+
+        let engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(2, 16 * 1024 * 1024).expect("pool"),
+        );
+        assert_eq!(engine.module_generation(), 0);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_handle =
+            spawn_sighup_reload_task(wasm_cfg, std::sync::Arc::clone(&engine), shutdown_rx);
+
+        // Give the task a moment to register the SIGHUP signal listener
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send SIGHUP to the current process via kill -HUP <pid>
+        let _ = std::process::Command::new("kill")
+            .args(["-HUP", &std::process::id().to_string()])
+            .status();
+
+        // Wait for generation to advance
+        let mut reloaded = false;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if engine.module_generation() > 0 {
+                reloaded = true;
+                break;
+            }
+        }
+
+        assert!(
+            reloaded,
+            "Engine generation must advance after receiving SIGHUP"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = task_handle.await;
+        let _ = std::fs::remove_file(&wasm_path);
     }
 }

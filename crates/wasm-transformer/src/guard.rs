@@ -200,10 +200,20 @@ pub fn backfill_missing_columns(
                     out_field.data_type()
                 )));
             }
-            if !field.is_nullable() && out_field.is_nullable() {
+            if field.is_nullable() != out_field.is_nullable() {
                 return Err(WasmTransformError::Pipeline(format!(
-                    "Defensive schema guard violation: column '{}' nullability mutated from non-nullable to nullable",
-                    field.name()
+                    "Defensive schema guard violation: column '{}' nullability mutated from {} to {}",
+                    field.name(),
+                    if field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    },
+                    if out_field.is_nullable() {
+                        "nullable"
+                    } else {
+                        "non-nullable"
+                    }
                 )));
             }
             fields.push(Arc::clone(out_field));

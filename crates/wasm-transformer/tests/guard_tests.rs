@@ -1040,3 +1040,23 @@ fn test_backfill_preserves_upstream_metadata_on_conflict() {
         Some("verified")
     );
 }
+
+#[test]
+fn test_backfill_rejects_nullable_to_non_nullable_mutation() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("col_a", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![Field::new(
+        "col_a",
+        DataType::Utf8,
+        false,
+    )]));
+    let out_batch =
+        RecordBatch::try_new(out_schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("column 'col_a' nullability mutated from nullable to non-nullable")
+    );
+}
