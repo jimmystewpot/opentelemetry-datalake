@@ -434,11 +434,15 @@ impl WasmDispatcher {
                     "Worker channel closed during backpressure send. Attempting retry across surviving workers..."
                 );
                 let mut routed = false;
-                let mut retry_batch = returned_batch;
+                let mut pending_batch: Option<SignalBatch> = Some(returned_batch);
+                let mut first_full_idx: Option<usize> = None;
                 for retry_offset in 1..concurrency {
                     let retry_idx = (full_idx.saturating_add(retry_offset)) % concurrency;
                     let Some(retry_tx) = worker_txs.get(retry_idx) else {
                         continue;
+                    };
+                    let Some(retry_batch) = pending_batch.take() else {
+                        break;
                     };
                     match retry_tx.try_send(retry_batch) {
                         Ok(()) => {
@@ -446,12 +450,27 @@ impl WasmDispatcher {
                             *next_worker = (retry_idx.saturating_add(1)) % concurrency;
                             break;
                         }
-                        Err(
-                            mpsc::error::TrySendError::Full(recovered)
-                            | mpsc::error::TrySendError::Closed(recovered),
-                        ) => {
-                            retry_batch = recovered;
+                        Err(mpsc::error::TrySendError::Full(recovered)) => {
+                            if first_full_idx.is_none() {
+                                first_full_idx = Some(retry_idx);
+                            }
+                            pending_batch = Some(recovered);
                         }
+                        Err(mpsc::error::TrySendError::Closed(recovered)) => {
+                            pending_batch = Some(recovered);
+                        }
+                    }
+                }
+                if !routed {
+                    // All try_sends failed. If any worker was full (alive but backpressured),
+                    // await capacity on it rather than dropping the batch.
+                    if let Some(survivor_idx) = first_full_idx
+                        && let Some(batch) = pending_batch.take()
+                        && let Some(survivor_tx) = worker_txs.get(survivor_idx)
+                        && survivor_tx.send(batch).await.is_ok()
+                    {
+                        *next_worker = (survivor_idx.saturating_add(1)) % concurrency;
+                        routed = true;
                     }
                 }
                 if !routed {
