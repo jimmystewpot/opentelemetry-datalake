@@ -191,7 +191,22 @@ pub fn backfill_missing_columns(
 
     for field in input_schema.fields() {
         if let Ok(idx) = output_schema.index_of(field.name()) {
-            fields.push(Arc::clone(&output_schema.fields()[idx]));
+            let out_field = &output_schema.fields()[idx];
+            if out_field.data_type() != field.data_type() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: column '{}' data type mutated from {:?} to {:?}",
+                    field.name(),
+                    field.data_type(),
+                    out_field.data_type()
+                )));
+            }
+            if !field.is_nullable() && out_field.is_nullable() {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Defensive schema guard violation: column '{}' nullability mutated from non-nullable to nullable",
+                    field.name()
+                )));
+            }
+            fields.push(Arc::clone(out_field));
             columns.push(Arc::clone(output.column(idx)));
         } else {
             warn!(

@@ -186,26 +186,34 @@ fn setup_dlq_channel(
             let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
 
-            let mut buf = Vec::new();
-            let mut writer = match arrow::ipc::writer::StreamWriter::try_new(
-                &mut buf,
-                &record_batch.schema(),
-            ) {
-                Ok(w) => w,
-                Err(e) => {
+            let encode_res = tokio::task::spawn_blocking({
+                let rb = record_batch.clone();
+                move || -> Result<Vec<u8>, arrow::error::ArrowError> {
+                    let mut buf = Vec::new();
+                    let mut writer =
+                        arrow::ipc::writer::StreamWriter::try_new(&mut buf, &rb.schema())?;
+                    writer.write(&rb)?;
+                    writer.finish()?;
+                    Ok(buf)
+                }
+            })
+            .await;
+
+            let buf = match encode_res {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
                     tracing::error!(
-                        "Failed to initialize Arrow IPC writer for DLQ batch: {e}. Terminating DLQ task to propagate backpressure."
+                        "Failed to serialize DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
+                    );
+                    return;
+                }
+                Err(join_err) => {
+                    tracing::error!(
+                        "DLQ serialization blocking task failed: {join_err}. Terminating DLQ task to propagate backpressure."
                     );
                     return;
                 }
             };
-
-            if let Err(e) = writer.write(record_batch).and_then(|()| writer.finish()) {
-                tracing::error!(
-                    "Failed to write DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
-                );
-                return;
-            }
 
             let write_res = match tokio::fs::OpenOptions::new()
                 .write(true)
