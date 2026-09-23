@@ -205,7 +205,10 @@ fn test_edge_case_duration_nanos_counter_recording() {
         .unwrap();
 
     assert!(func.call(&mut store, ()).is_ok());
-    assert_eq!(registry.read_counter("latency_nanos"), 7_500_000);
+    // Duration is exported as a histogram, not a cumulative counter
+    assert_eq!(registry.read_counter("latency_nanos"), 0);
+    assert_eq!(registry.read_duration("latency_nanos"), Some(2_500_000));
+    assert!(registry.handles().contains_key("latency_nanos"));
 }
 
 #[test]
@@ -491,4 +494,123 @@ fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
     // Updating existing entries still succeeds
     registry.record_counter("counter_0", 5);
     assert_eq!(registry.read_counter("counter_0"), 6);
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_bridge_metrics_to_opentelemetry_multi_signals() {
+    let registry = Arc::new(MetricRegistry::new("test_signals"));
+    registry.record_counter("processed_count", 100);
+    let gauge_val = 1.5_f64;
+    registry.record_gauge("heap_size", gauge_val.to_bits());
+
+    let handle_logs =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "logs");
+    let handle_traces =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "traces");
+    let handle_metrics =
+        wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "metrics");
+
+    assert!(format!("{handle_logs:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_traces:?}").contains("MetricBridgeHandle"));
+    assert!(format!("{handle_metrics:?}").contains("MetricBridgeHandle"));
+
+    assert_eq!(registry.read_counter("processed_count"), 100);
+    assert_eq!(registry.read_gauge("heap_size"), Some(gauge_val.to_bits()));
+    assert_eq!(
+        f64::from_bits(registry.read_gauge("heap_size").unwrap()),
+        gauge_val
+    );
+}
+
+#[test]
+fn test_metric_name_validation_rules() {
+    let registry = Arc::new(MetricRegistry::new("valid_test"));
+    // Valid names
+    registry.record_counter("valid_counter_1", 10);
+    assert_eq!(registry.read_counter("valid_counter_1"), 10);
+    assert!(registry.handles().contains_key("valid_counter_1"));
+
+    registry.record_gauge("valid_gauge_2", 100);
+    assert_eq!(registry.read_gauge("valid_gauge_2"), Some(100));
+    assert!(registry.handles().contains_key("valid_gauge_2"));
+
+    registry.record_duration("valid_duration_3", 500);
+    assert_eq!(registry.read_duration("valid_duration_3"), Some(500));
+    assert!(registry.handles().contains_key("valid_duration_3"));
+
+    // Invalid names: empty, special characters, too long
+    registry.record_counter("", 1);
+    assert_eq!(registry.read_counter(""), 0);
+
+    registry.record_counter("invalid-name-with-dash", 1);
+    assert_eq!(registry.read_counter("invalid-name-with-dash"), 0);
+    assert!(!registry.handles().contains_key("invalid-name-with-dash"));
+
+    registry.record_gauge("invalid.name.with.dots", 1);
+    assert_eq!(registry.read_gauge("invalid.name.with.dots"), None);
+    assert!(!registry.handles().contains_key("invalid.name.with.dots"));
+
+    registry.record_duration("invalid name with spaces", 1);
+    assert_eq!(registry.read_duration("invalid name with spaces"), None);
+    assert!(!registry.handles().contains_key("invalid name with spaces"));
+
+    let too_long = "a".repeat(65);
+    registry.record_counter(&too_long, 1);
+    assert_eq!(registry.read_counter(&too_long), 0);
+    assert!(!registry.handles().contains_key(&too_long));
+}
+
+#[test]
+fn test_custom_metric_prefixed_instruments_and_duration_histogram() {
+    use wasm_transformer::host_calls::MetricHandle;
+
+    let registry = Arc::new(MetricRegistry::with_signal("my_comp", "logs"));
+    registry.record_counter("requests", 42);
+    registry.record_gauge("queue_depth", 10.0_f64.to_bits());
+    registry.record_duration("process_latency", 1_500_000_000);
+    registry.record_duration("request_duration_seconds", 2_000_000_000);
+
+    let handles = registry.handles();
+    assert!(matches!(
+        handles.get("requests").as_deref(),
+        Some(MetricHandle::Counter(_))
+    ));
+    assert!(matches!(
+        handles.get("queue_depth").as_deref(),
+        Some(MetricHandle::Gauge(_))
+    ));
+    assert!(matches!(
+        handles.get("process_latency").as_deref(),
+        Some(MetricHandle::Histogram(_))
+    ));
+    assert!(matches!(
+        handles.get("request_duration_seconds").as_deref(),
+        Some(MetricHandle::Histogram(_))
+    ));
+
+    assert_eq!(registry.read_counter("requests"), 42);
+    assert_eq!(registry.read_gauge("queue_depth"), Some(10.0_f64.to_bits()));
+    assert_eq!(
+        registry.read_duration("process_latency"),
+        Some(1_500_000_000)
+    );
+    assert_eq!(
+        registry.read_duration("request_duration_seconds"),
+        Some(2_000_000_000)
+    );
+}
+
+#[test]
+fn test_cardinality_ceiling_50_metrics() {
+    let registry = MetricRegistry::new("cap_50");
+    for i in 0..50 {
+        registry.record_counter(&format!("metric_{i}"), 1);
+    }
+    assert_eq!(registry.handles().len(), 50);
+
+    // 51st metric must be rejected
+    registry.record_counter("metric_50", 1);
+    assert_eq!(registry.read_counter("metric_50"), 0);
+    assert_eq!(registry.handles().len(), 50);
 }

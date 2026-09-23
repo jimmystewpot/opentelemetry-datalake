@@ -132,13 +132,20 @@ impl WasmWorker {
             })?
         };
 
-        let guest = Self::instantiate_guest(engine.engine(), &module, &registry, &config)?;
-        let local_generation = engine.module_generation();
+        let snapshot = engine.current_snapshot();
+        let (target_module, initial_generation) = if let Some(snap) = snapshot {
+            (snap.module, snap.generation)
+        } else {
+            let current_generation = engine.module_generation();
+            (module, current_generation)
+        };
 
-        Ok(Self {
+        let guest = Self::instantiate_guest(engine.engine(), &target_module, &registry, &config)?;
+
+        let mut worker = Self {
             id,
             engine,
-            module,
+            module: target_module,
             config,
             registry,
             store: guest.store,
@@ -148,9 +155,14 @@ impl WasmWorker {
             transform_fn: guest.transform_fn,
             memory: guest.memory,
             batches_processed: 0,
-            local_generation,
+            local_generation: initial_generation,
             rejuvenate_threshold_bytes,
-        })
+        };
+
+        // If a reload occurred while instantiating the module, adopt the newly published snapshot immediately
+        worker.check_hot_reload()?;
+
+        Ok(worker)
     }
 
     /// Executes a transformation over a [`SignalBatch`].
@@ -384,17 +396,22 @@ impl WasmWorker {
         &self.registry
     }
 
-    /// Checks if the engine cache has compiled a newer module generation and reloads.
-    fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
-        if self.local_generation != self.engine.module_generation() {
-            let (new_mod, generation) = self.engine.current_module();
-            if generation > self.local_generation
-                && let Some(m) = new_mod
-            {
-                self.module = m;
-                self.rejuvenate()?;
-                self.local_generation = generation;
+    /// Checks if a newer module snapshot is available in [`EngineCache`] and rejuvenates if so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if guest re-instantiation fails.
+    pub fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
+        while self.local_generation != self.engine.module_generation() {
+            let Some(snapshot) = self.engine.current_snapshot() else {
+                break;
+            };
+            if self.local_generation == snapshot.generation {
+                break;
             }
+            self.module = snapshot.module;
+            self.rejuvenate()?;
+            self.local_generation = snapshot.generation;
         }
         Ok(())
     }
@@ -460,6 +477,25 @@ impl WasmWorker {
         Ok(())
     }
 
+    /// Probes a candidate WebAssembly module to ensure it can be instantiated,
+    /// exports required C-ABI v1 symbols, and initializes successfully.
+    ///
+    /// Unlike [`WasmWorker::new`], this method instantiates the supplied candidate
+    /// module directly without consulting or adopting any cached module snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if instantiation fails, required exports are
+    /// missing, or guest initialization fails.
+    pub fn probe_candidate(
+        engine: &EngineCache,
+        module: &Module,
+        config: &WasmTransformerConfig,
+        registry: &Arc<MetricRegistry>,
+    ) -> Result<(), WasmTransformError> {
+        Self::instantiate_guest(engine.engine(), module, registry, config).map(|_| ())
+    }
+
     /// Dispatches the response status code into a [`WorkerOutcome`].
     fn dispatch_outcome(
         &self,
@@ -469,8 +505,15 @@ impl WasmWorker {
     ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
         match header.status {
             0 => {
-                if header.batch_count == 0 || header.batches_ptr == 0 {
+                if header.batch_count == 0 {
                     Ok(WorkerOutcome::Emitted(vec![batch]))
+                } else if header.batches_ptr == 0 {
+                    Err((
+                        batch,
+                        WasmTransformError::Pipeline(
+                            "Protocol error: guest returned status 0 with batch_count > 0 but null batches_ptr".to_string(),
+                        ),
+                    ))
                 } else {
                     let mut out_batches = match extract_output_batches(
                         &self.memory,

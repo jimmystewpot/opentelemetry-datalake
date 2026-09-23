@@ -135,140 +135,171 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Creates a bounded DLQ channel and spawns a background logging task to drain diverted batches.
-fn setup_dlq_channel(
-    transformer_id: &str,
-    signal: &str,
-    role: &str,
-    capacity: usize,
-) -> (
-    pipeline_core::pipeline::PipelineSender,
-    tokio::task::JoinHandle<()>,
-) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<pipeline_core::pipeline::SignalBatch>(capacity);
-    let transformer_id = transformer_id.to_string();
-    let signal = signal.to_string();
-    let role = role.to_string();
-    let handle = tokio::spawn(async move {
+/// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
+#[derive(Debug)]
+pub struct FileDlqSink {
+    transformer_id: String,
+    signal: String,
+    role: String,
+    dlq_dir: std::path::PathBuf,
+}
+
+impl FileDlqSink {
+    /// Creates a new `FileDlqSink` targeting the directory `dlq/{transformer_id}/{signal}/{role}`.
+    #[must_use]
+    pub fn new(transformer_id: &str, signal: &str, role: &str) -> Self {
         let dlq_dir = std::path::PathBuf::from("dlq")
-            .join(&transformer_id)
-            .join(&signal)
-            .join(&role);
-        if let Err(e) = tokio::fs::create_dir_all(&dlq_dir).await {
+            .join(transformer_id)
+            .join(signal)
+            .join(role);
+        Self {
+            transformer_id: transformer_id.to_string(),
+            signal: signal.to_string(),
+            role: role.to_string(),
+            dlq_dir,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl wasm_transformer::DlqSink for FileDlqSink {
+    async fn send(
+        &self,
+        batch: pipeline_core::pipeline::SignalBatch,
+    ) -> Result<(), pipeline_core::error::PipelineError> {
+        if let Err(e) = tokio::fs::create_dir_all(&self.dlq_dir).await {
             tracing::error!(
-                "Failed to create DLQ directory {}: {}. Terminating DLQ task to propagate backpressure.",
-                dlq_dir.display(),
-                e
+                "Failed to create DLQ directory {}: {e}. Terminating DLQ task to propagate backpressure.",
+                self.dlq_dir.display()
             );
-            return;
+            return Err(pipeline_core::error::PipelineError::Internal(format!(
+                "Failed to create DLQ directory {}: {e}",
+                self.dlq_dir.display()
+            )));
         }
 
-        while let Some(batch) = rx.recv().await {
-            let (batch_signal, record_batch) = match &batch {
-                pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb),
-                pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb),
-                pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb),
-            };
+        let (batch_signal, record_batch) = match &batch {
+            pipeline_core::pipeline::SignalBatch::Logs(rb) => ("logs", rb),
+            pipeline_core::pipeline::SignalBatch::Metrics(rb) => ("metrics", rb),
+            pipeline_core::pipeline::SignalBatch::Traces(rb) => ("traces", rb),
+        };
 
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let file_path = dlq_dir.join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let seq = DLQ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_path = self
+            .dlq_dir
+            .join(format!("{batch_signal}_{timestamp}_{seq}.arrow"));
 
-            let encode_res = tokio::task::spawn_blocking({
-                let rb = record_batch.clone();
-                move || -> Result<Vec<u8>, arrow::error::ArrowError> {
-                    let mut buf = Vec::new();
-                    let mut writer =
-                        arrow::ipc::writer::StreamWriter::try_new(&mut buf, &rb.schema())?;
-                    writer.write(&rb)?;
-                    writer.finish()?;
-                    Ok(buf)
-                }
-            })
-            .await;
-
-            let buf = match encode_res {
-                Ok(Ok(bytes)) => bytes,
-                Ok(Err(e)) => {
-                    tracing::error!(
-                        "Failed to serialize DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
-                    );
-                    return;
-                }
-                Err(join_err) => {
-                    tracing::error!(
-                        "DLQ serialization blocking task failed: {join_err}. Terminating DLQ task to propagate backpressure."
-                    );
-                    return;
-                }
-            };
-
-            let write_res = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&file_path)
-                .await
-            {
-                Ok(mut file) => {
-                    use tokio::io::AsyncWriteExt;
-                    file.write_all(&buf).await
-                }
-                Err(e) => Err(e),
-            };
-
-            if let Err(e) = write_res {
-                tracing::error!(
-                    "Failed to persist DLQ batch to {}: {e}. Terminating DLQ task to propagate backpressure.",
-                    file_path.display()
-                );
-                return;
+        let encode_res = tokio::task::spawn_blocking({
+            let rb = record_batch.clone();
+            move || -> Result<Vec<u8>, arrow::error::ArrowError> {
+                let mut buf = Vec::new();
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &rb.schema())?;
+                writer.write(&rb)?;
+                writer.finish()?;
+                Ok(buf)
             }
+        })
+        .await;
 
-            tracing::warn!(
-                transformer_id = %transformer_id,
-                signal = %signal,
-                role = %role,
-                rows = record_batch.num_rows(),
-                path = %file_path.display(),
-                "DLQ: Persisted diverted batch to disk"
+        let buf = match encode_res {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(e)) => {
+                tracing::error!(
+                    "Failed to serialize DLQ batch to Arrow IPC: {e}. Terminating DLQ task to propagate backpressure."
+                );
+                return Err(pipeline_core::error::PipelineError::Internal(format!(
+                    "Failed to serialize DLQ batch to Arrow IPC: {e}"
+                )));
+            }
+            Err(join_err) => {
+                tracing::error!(
+                    "DLQ serialization blocking task failed: {join_err}. Terminating DLQ task to propagate backpressure."
+                );
+                return Err(pipeline_core::error::PipelineError::Internal(format!(
+                    "DLQ serialization blocking task failed: {join_err}"
+                )));
+            }
+        };
+
+        let write_res = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .await
+        {
+            Ok(mut file) => {
+                use tokio::io::AsyncWriteExt;
+                if let Err(e) = file.write_all(&buf).await {
+                    Err(e)
+                } else if let Err(e) = file.sync_all().await {
+                    Err(e)
+                } else {
+                    drop(file);
+                    #[cfg(unix)]
+                    if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
+                        let _ = dir.sync_all().await;
+                    }
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = write_res {
+            tracing::error!(
+                "Failed to persist DLQ batch to {}: {e}. Terminating DLQ task to propagate backpressure.",
+                file_path.display()
             );
+            return Err(pipeline_core::error::PipelineError::Internal(format!(
+                "Failed to persist DLQ batch to {}: {e}",
+                file_path.display()
+            )));
         }
-    });
-    (tx, handle)
+
+        tracing::warn!(
+            transformer_id = %self.transformer_id,
+            signal = %self.signal,
+            role = %self.role,
+            rows = record_batch.num_rows(),
+            path = %file_path.display(),
+            "DLQ: Persisted diverted batch to disk"
+        );
+
+        Ok(())
+    }
 }
 
 /// Tuple containing the signal-isolated transformers for logs, traces, and metrics.
 type SignalTransformers = (Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>);
 
-/// Instantiates a signal-isolated [`wasm_transformer::WasmTransformer`], setting up DLQ reroute channels as needed.
+/// Instantiates a signal-isolated [`wasm_transformer::WasmTransformer`], setting up durable DLQ sinks as needed.
 fn instantiate_signal_wasm_transformer(
     cfg: &pipeline_core::config::WasmTransformerConfig,
     signal: &str,
     engine: &std::sync::Arc<wasm_transformer::engine::EngineCache>,
-    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    metric_bridges: &mut Vec<wasm_transformer::MetricBridgeHandle>,
 ) -> anyhow::Result<Box<dyn Transform>> {
     let mut signal_cfg = cfg.clone();
     signal_cfg
         .env
         .insert("signal".to_string(), signal.to_string());
 
-    let capacity = signal_cfg.worker_channel_capacity.max(16);
-
     let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
-        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "error", capacity);
-        dlq_handles.push(h);
-        Some(tx)
+        Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
+            FileDlqSink::new(&signal_cfg.id, signal, "error"),
+        )))
     } else {
         None
     };
 
     let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
-        let (tx, h) = setup_dlq_channel(&signal_cfg.id, signal, "reject", capacity);
-        dlq_handles.push(h);
-        Some(tx)
+        Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
+            FileDlqSink::new(&signal_cfg.id, signal, "reject"),
+        )))
     } else {
         None
     };
@@ -279,6 +310,12 @@ fn instantiate_signal_wasm_transformer(
         reroute_reject,
         std::sync::Arc::clone(engine),
     )?;
+
+    // Bridge the guest MetricRegistry into OpenTelemetry before erasing the concrete transformer
+    let bridge =
+        wasm_transformer::bridge_metrics_to_opentelemetry(transformer.metric_registry(), signal);
+    metric_bridges.push(bridge);
+
     Ok(Box::new(transformer))
 }
 
@@ -288,7 +325,7 @@ fn instantiate_signal_wasm_transformer(
 /// Otherwise, it falls back to No-op transformers.
 fn initialize_transformers(
     config: &AppConfig,
-    dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    metric_bridges: &mut Vec<wasm_transformer::MetricBridgeHandle>,
 ) -> anyhow::Result<(
     SignalTransformers,
     Option<std::sync::Arc<wasm_transformer::engine::EngineCache>>,
@@ -301,15 +338,25 @@ fn initialize_transformers(
         );
         let max_memory_bytes = wasm_transformer::worker::parse_byte_size(&wasm_cfg.max_memory)
             .unwrap_or(64 * 1024 * 1024);
-        let pool_capacity = (wasm_cfg.concurrency.max(1) * 3).saturating_add(3);
+        let pool_capacity = (wasm_cfg.concurrency.max(1) * 6).saturating_add(3);
         let shared_engine = std::sync::Arc::new(
             wasm_transformer::engine::EngineCache::new_pooling(pool_capacity, max_memory_bytes)?,
         );
 
         let transformers = (
-            instantiate_signal_wasm_transformer(wasm_cfg, "logs", &shared_engine, dlq_handles)?,
-            instantiate_signal_wasm_transformer(wasm_cfg, "traces", &shared_engine, dlq_handles)?,
-            instantiate_signal_wasm_transformer(wasm_cfg, "metrics", &shared_engine, dlq_handles)?,
+            instantiate_signal_wasm_transformer(wasm_cfg, "logs", &shared_engine, metric_bridges)?,
+            instantiate_signal_wasm_transformer(
+                wasm_cfg,
+                "traces",
+                &shared_engine,
+                metric_bridges,
+            )?,
+            instantiate_signal_wasm_transformer(
+                wasm_cfg,
+                "metrics",
+                &shared_engine,
+                metric_bridges,
+            )?,
         );
         Ok((transformers, Some(shared_engine)))
     } else {
@@ -467,7 +514,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry
-    pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
+    let _telemetry = pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
 
     tracing::info!("Starting opentelemetry-datalake service");
 
@@ -494,9 +541,10 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     );
 
-    let mut dlq_handles = Vec::new();
+    // Create Transformers (WASM if configured, otherwise Noop)
+    let mut metric_bridges = Vec::new();
     let ((mut logs_transformer, mut traces_transformer, mut metrics_transformer), shared_engine) =
-        initialize_transformers(&config, &mut dlq_handles)?;
+        initialize_transformers(&config, &mut metric_bridges)?;
 
     let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
         let expected_sha = config
@@ -887,12 +935,7 @@ async fn main() -> anyhow::Result<()> {
         h.abort();
     }
 
-    // Wait for DLQ tasks to drain
-    for dlq_handle in dlq_handles {
-        if let Err(e) = dlq_handle.await {
-            tracing::error!("DLQ drain task panicked: {e}");
-        }
-    }
+    drop(metric_bridges);
 
     if let Some(err) = exit_err {
         return Err(err);
@@ -1323,12 +1366,12 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         assert!(res.is_ok());
         let ((_logs, _traces, _metrics), engine) = res.unwrap();
         assert!(engine.is_none());
-        assert!(dlq_handles.is_empty());
+        assert!(metric_bridges.is_empty());
     }
 
     #[tokio::test]
@@ -1378,13 +1421,13 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
+        let mut metric_bridges = Vec::new();
         let ((_logs, _traces, _metrics), engine) =
-            initialize_transformers(&config, &mut dlq_handles).unwrap();
+            initialize_transformers(&config, &mut metric_bridges).unwrap();
 
         assert!(engine.is_some());
         assert_eq!(engine.unwrap().module_generation(), 0);
-        assert!(dlq_handles.is_empty());
+        assert_eq!(metric_bridges.len(), 3);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1418,8 +1461,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         assert!(res.is_err());
     }
 
@@ -1479,8 +1522,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         let _ = std::fs::remove_file(&wasm_path);
 
         assert!(
@@ -1489,10 +1532,114 @@ mod tests {
             res.err()
         );
         assert_eq!(
-            dlq_handles.len(),
-            6,
-            "Expected 6 DLQ handles (2 per signal)"
+            metric_bridges.len(),
+            3,
+            "Expected 3 metric bridge handles (1 per signal)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_file_dlq_sink_persists_batch_durably() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use pipeline_core::pipeline::SignalBatch;
+        use std::sync::Arc;
+        use wasm_transformer::DlqSink;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["hello", "world"])),
+            ],
+        )
+        .expect("batch creation");
+
+        let temp_dir = std::env::temp_dir();
+        let test_id = format!("test_dlq_{}", std::process::id());
+        let sink = FileDlqSink {
+            transformer_id: test_id.clone(),
+            signal: "logs".to_string(),
+            role: "error".to_string(),
+            dlq_dir: temp_dir
+                .join("dlq_test")
+                .join(&test_id)
+                .join("logs")
+                .join("error"),
+        };
+
+        let res = sink.send(SignalBatch::Logs(batch.clone())).await;
+        assert!(
+            res.is_ok(),
+            "FileDlqSink::send should succeed: {:?}",
+            res.err()
+        );
+
+        // Verify the file was written and can be read back as Arrow IPC
+        let mut read_entries = tokio::fs::read_dir(&sink.dlq_dir)
+            .await
+            .expect("read dlq dir");
+        let mut found_file = None;
+        while let Some(entry) = read_entries.next_entry().await.expect("entry") {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("arrow") {
+                found_file = Some(path);
+                break;
+            }
+        }
+        let file_path = found_file.expect("arrow file should exist");
+        let file_bytes = tokio::fs::read(&file_path).await.expect("read arrow file");
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(file_bytes), None)
+                .expect("stream reader");
+        let read_batch = reader
+            .next()
+            .expect("batch in reader")
+            .expect("valid batch");
+        assert_eq!(read_batch.num_rows(), 2);
+        assert_eq!(read_batch.num_columns(), 2);
+
+        // Cleanup
+        let _ = tokio::fs::remove_dir_all(temp_dir.join("dlq_test")).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_dlq_sink_returns_error_on_inaccessible_path() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use pipeline_core::pipeline::SignalBatch;
+        use std::sync::Arc;
+        use wasm_transformer::DlqSink;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
+            .expect("batch creation");
+
+        // Target an impossible path (e.g. attempting to create a directory under a non-directory file)
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("dlq_conflict_{}.tmp", std::process::id()));
+        std::fs::write(&file_path, b"not a directory").expect("write conflict file");
+
+        let sink = FileDlqSink {
+            transformer_id: "test".to_string(),
+            signal: "logs".to_string(),
+            role: "error".to_string(),
+            dlq_dir: file_path.join("impossible_subdir"),
+        };
+
+        let res = sink.send(SignalBatch::Logs(batch)).await;
+        assert!(
+            res.is_err(),
+            "Sink must return error instead of panicking on inaccessible directory"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
     }
 
     #[test]
@@ -1658,8 +1805,8 @@ mod tests {
             .extract()
             .expect("Config should deserialize");
 
-        let mut dlq_handles = Vec::new();
-        let res = initialize_transformers(&config, &mut dlq_handles);
+        let mut metric_bridges = Vec::new();
+        let res = initialize_transformers(&config, &mut metric_bridges);
         let _ = std::fs::remove_file(&wasm_path);
 
         let err_msg = match res {

@@ -192,7 +192,7 @@ async fn test_dispatcher_error_reroute_policy_routes_to_reroute_error() {
         module,
         cfg,
         output_tx,
-        Some(err_tx),
+        Some(err_tx.into()),
         None,
         test_registry(),
     );
@@ -253,7 +253,7 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
         module,
         cfg,
         output_tx,
-        Some(err_tx),
+        Some(err_tx.into()),
         None,
         test_registry(),
     );
@@ -314,7 +314,7 @@ async fn test_dispatcher_error_passthrough_disabled_drops_batch() {
         module,
         cfg,
         output_tx,
-        Some(err_tx),
+        Some(err_tx.into()),
         None,
         test_registry(),
     );
@@ -375,7 +375,7 @@ async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
         cfg,
         output_tx,
         None,
-        Some(rej_tx),
+        Some(rej_tx.into()),
         test_registry(),
     );
 
@@ -435,7 +435,7 @@ async fn test_dispatcher_reject_drop_policy_drops_batch() {
         cfg,
         output_tx,
         None,
-        Some(rej_tx),
+        Some(rej_tx.into()),
         test_registry(),
     );
 
@@ -618,8 +618,8 @@ async fn test_dispatcher_worker_init_failure() {
         module,
         tf_cfg,
         out_tx,
-        Some(err_tx),
-        Some(rej_tx),
+        Some(err_tx.into()),
+        Some(rej_tx.into()),
         test_registry(),
     );
 
@@ -668,8 +668,8 @@ async fn test_dispatcher_output_channel_closed() {
         module,
         tf_cfg,
         out_tx,
-        Some(err_tx),
-        Some(rej_tx),
+        Some(err_tx.into()),
+        Some(rej_tx.into()),
         test_registry(),
     );
     let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
@@ -772,7 +772,7 @@ async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
         module,
         cfg,
         output_tx,
-        Some(err_tx),
+        Some(err_tx.into()),
         None,
         test_registry(),
     );
@@ -821,7 +821,7 @@ async fn test_dlq_error_channel_closed_terminates_worker() {
         module,
         cfg,
         output_tx,
-        Some(err_tx),
+        Some(err_tx.into()),
         None,
         test_registry(),
     );
@@ -867,7 +867,7 @@ async fn test_dlq_reject_channel_closed_terminates_worker() {
         cfg,
         output_tx,
         None,
-        Some(rej_tx),
+        Some(rej_tx.into()),
         test_registry(),
     );
 
@@ -879,6 +879,110 @@ async fn test_dlq_reject_channel_closed_terminates_worker() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Send another batch
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[derive(Debug, Default)]
+struct MockDlqSink {
+    batches: std::sync::Mutex<Vec<SignalBatch>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl wasm_transformer::DlqSink for MockDlqSink {
+    async fn send(&self, batch: SignalBatch) -> Result<(), pipeline_core::error::PipelineError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(pipeline_core::error::PipelineError::Internal(
+                "mock DLQ write failure".into(),
+            ));
+        }
+        self.batches.lock().unwrap().push(batch);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_dispatcher_custom_dlq_sink_routes_successfully() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dlq_sink = Arc::new(MockDlqSink::default());
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(wasm_transformer::DlqOutput::Sink(
+            Arc::clone(&dlq_sink) as Arc<dyn wasm_transformer::DlqSink>
+        )),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(res.is_ok());
+    assert_eq!(dlq_sink.batches.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_dispatcher_custom_dlq_sink_write_failure_terminates_worker() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dlq_sink = Arc::new(MockDlqSink::default());
+    dlq_sink
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(wasm_transformer::DlqOutput::Sink(
+            Arc::clone(&dlq_sink) as Arc<dyn wasm_transformer::DlqSink>
+        )),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
     drop(input_tx);
 

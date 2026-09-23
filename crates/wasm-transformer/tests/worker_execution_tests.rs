@@ -1078,3 +1078,251 @@ async fn test_worker_rejects_missing_abi_version() {
         other => panic!("Expected MissingExport(\"datalake_abi_version\"), got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_worker_rapid_generation_advances_adopts_latest_module() {
+    let cache = Arc::new(EngineCache::new_pooling(4, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker =
+        WasmWorker::new(27, Arc::clone(&cache), module_v1, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    // Batch 1 uses V1 (passthrough)
+    let outcome1 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .unwrap();
+    assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.local_generation(), 0);
+
+    // Rapid reload: publish intermediate module (V2), then immediately publish final module (V3 - discard)
+    let module_v2 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(passthrough_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let _ = cache.publish_module(module_v2);
+
+    let module_v3 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let gen3 = cache.publish_module(module_v3);
+    assert_eq!(gen3, 2);
+
+    // Batch 2: worker must adopt the latest generation (V3) and discard
+    let outcome2 = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome2, WorkerOutcome::Discarded));
+    assert_eq!(worker.local_generation(), 2);
+}
+
+#[tokio::test]
+async fn test_multi_worker_concurrent_rejuvenation() {
+    let concurrency = 4;
+    // Sized for all workers rejuvenating simultaneously: (concurrency * 2) + 1 = 9
+    let pool_capacity = (concurrency * 2) + 1;
+    let cache = Arc::new(EngineCache::new_pooling(pool_capacity, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 1; // Each batch triggers rejuvenation
+
+    let registry = test_registry();
+    let mut workers = Vec::new();
+    for id in 0..concurrency {
+        let worker = WasmWorker::new(
+            id,
+            Arc::clone(&cache),
+            Arc::clone(&module),
+            cfg.clone(),
+            Arc::clone(&registry),
+        )
+        .unwrap();
+        workers.push(worker);
+    }
+
+    let batch = create_test_record_batch();
+
+    // Run batch 1 to process
+    for worker in &mut workers {
+        let outcome = worker
+            .execute_batch(SignalBatch::Logs(batch.clone()))
+            .unwrap();
+        assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    }
+
+    // Now all 4 workers rejuvenate simultaneously
+    let mut handles = Vec::new();
+    for mut worker in workers {
+        let batch_clone = batch.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let res = worker.execute_batch(SignalBatch::Logs(batch_clone));
+            (worker, res)
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        let (worker, res) = handle.await.unwrap();
+        let outcome = res.expect("Rejuvenation must not fail with pool exhaustion");
+        assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+        assert_eq!(worker.batches_processed(), 0);
+    }
+}
+
+#[test]
+fn test_worker_new_fences_reload_during_initialization() {
+    let cache = Arc::new(EngineCache::new_pooling(4, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+    let gen1 = cache.publish_module(Arc::clone(&module_v1));
+    assert_eq!(gen1, 1);
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+
+    // Publish module v2 before worker is constructed, but pass module_v1 as the stale argument.
+    // WasmWorker::new must ignore the stale argument, bind initial generation to snapshot (2),
+    // and adopt module v2.
+    let module_v2 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let gen2 = cache.publish_module(module_v2);
+    assert_eq!(gen2, 2);
+
+    let mut worker = WasmWorker::new(
+        0,
+        Arc::clone(&cache),
+        Arc::clone(&module_v1),
+        cfg,
+        Arc::clone(&registry),
+    )
+    .unwrap();
+
+    assert_eq!(worker.local_generation(), 2);
+
+    // Verify it executes module v2 (discard) rather than stale module v1 (passthrough)
+    let batch = create_test_record_batch();
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Discarded));
+}
+
+#[tokio::test]
+async fn test_concurrent_worker_initialization_during_module_reload() {
+    let cache = Arc::new(EngineCache::new_pooling(16, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+    let _ = cache.publish_module(Arc::clone(&module_v1));
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+
+    let mut handles = Vec::new();
+    for id in 0..8 {
+        let cache_clone = Arc::clone(&cache);
+        let mod_clone = Arc::clone(&module_v1);
+        let cfg_clone = cfg.clone();
+        let reg_clone = Arc::clone(&registry);
+        handles.push(tokio::task::spawn_blocking(move || {
+            WasmWorker::new(id, cache_clone, mod_clone, cfg_clone, reg_clone)
+        }));
+    }
+
+    // Concurrently publish module_v2
+    let module_v2 = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+    let target_gen = cache.publish_module(module_v2);
+
+    let mut workers = Vec::new();
+    for handle in handles {
+        let worker = handle.await.unwrap().unwrap();
+        workers.push(worker);
+    }
+
+    // All workers must have safely initialized without errors or pool corruption.
+    // Each worker's generation should either be 1 or target_gen (2).
+    // If worker is at 1, calling check_hot_reload() or execute_batch() should immediately upgrade it to target_gen.
+    for mut worker in workers {
+        assert!(worker.local_generation() == 1 || worker.local_generation() == target_gen);
+        worker.check_hot_reload().unwrap();
+        assert_eq!(worker.local_generation(), target_gen);
+    }
+}
+
+#[test]
+fn test_worker_rejects_positive_batch_count_with_null_batches_ptr() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            ;; Return header with status=0, batch_count=1, but batches_ptr=0
+            (i32.store (i32.const 0) (i32.const 0))  ;; status = 0
+            (i32.store (i32.const 4) (i32.const 1))  ;; batch_count = 1
+            (i32.store (i32.const 8) (i32.const 0))  ;; batches_ptr = 0 (null)
+            (i32.const 0)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, registry).unwrap();
+
+    let batch = create_test_record_batch();
+    let res = worker.execute_batch(SignalBatch::Logs(batch));
+    assert!(res.is_err());
+    let (_returned_batch, err) = res.unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::Pipeline(ref msg) if msg.contains("null batches_ptr")),
+        "Expected null batches_ptr protocol error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_worker_probe_candidate_instantiates_supplied_module_directly() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+    let _ = cache.publish_module(Arc::clone(&module_v1));
+
+    let candidate_module = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+
+    // Probing candidate module succeeds without affecting cached generation or snapshot
+    assert!(WasmWorker::probe_candidate(&cache, &candidate_module, &cfg, &registry).is_ok());
+    assert_eq!(cache.module_generation(), 1);
+}

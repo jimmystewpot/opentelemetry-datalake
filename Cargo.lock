@@ -3828,6 +3828,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "axum",
  "clap",
  "elasticsearch-sink",
@@ -3835,6 +3836,7 @@ dependencies = [
  "hex",
  "kafka-sink",
  "noop-transformer",
+ "opentelemetry",
  "otlp-receiver",
  "pipeline-core",
  "serde",
@@ -6167,6 +6169,7 @@ dependencies = [
  "axum",
  "dashmap",
  "hex",
+ "opentelemetry",
  "opentelemetry-datalake-wasm-sdk",
  "pipeline-core",
  "serde",

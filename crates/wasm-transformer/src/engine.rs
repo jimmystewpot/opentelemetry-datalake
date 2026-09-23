@@ -7,16 +7,19 @@ use std::sync::{
 };
 use wasmtime::{Config, Engine, InstanceAllocationStrategy, Module, PoolingAllocationConfig};
 
-#[derive(Clone, Default)]
-struct CachedModule {
-    module: Option<Arc<Module>>,
-    generation: u64,
+/// A snapshot of a compiled WebAssembly module and its corresponding generation counter.
+#[derive(Clone)]
+pub struct ModuleSnapshot {
+    /// The compiled Wasmtime module.
+    pub module: Arc<Module>,
+    /// The generation counter associated with this module.
+    pub generation: u64,
 }
 
 /// Engine cache maintaining a compiled WebAssembly module and generation counter.
 pub struct EngineCache {
     engine: Engine,
-    state: RwLock<CachedModule>,
+    snapshot: RwLock<Option<ModuleSnapshot>>,
     generation: AtomicU64,
     stop_epoch_ticker: Arc<AtomicBool>,
 }
@@ -33,6 +36,7 @@ impl EngineCache {
         max_memory_bytes: usize,
     ) -> Result<Self, WasmTransformError> {
         let mut pool_cfg = PoolingAllocationConfig::default();
+        pool_cfg.total_core_instances(u32::try_from(concurrency).unwrap_or(4));
         pool_cfg.total_memories(u32::try_from(concurrency).unwrap_or(4));
         pool_cfg.total_tables(u32::try_from(concurrency).unwrap_or(4));
         pool_cfg.max_memory_size(max_memory_bytes);
@@ -59,7 +63,7 @@ impl EngineCache {
 
         Ok(Self {
             engine,
-            state: RwLock::new(CachedModule::default()),
+            snapshot: RwLock::new(None),
             generation: AtomicU64::new(0),
             stop_epoch_ticker,
         })
@@ -73,11 +77,29 @@ impl EngineCache {
     pub fn compile_module(&self, bytes: &[u8]) -> Result<Arc<Module>, WasmTransformError> {
         let module = Arc::new(Module::new(&self.engine, bytes)?);
         let mut guard = self
-            .state
+            .snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.module = Some(Arc::clone(&module));
+        let current_gen = self.generation.load(Ordering::Acquire);
+        *guard = Some(ModuleSnapshot {
+            module: Arc::clone(&module),
+            generation: current_gen,
+        });
         Ok(module)
+    }
+
+    /// Atomically publishes a new compiled module and increments the generation counter.
+    pub fn publish_module(&self, module: Arc<Module>) -> u64 {
+        let mut guard = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *guard = Some(ModuleSnapshot {
+            module,
+            generation: new_gen,
+        });
+        new_gen
     }
 
     /// Recompiles a WebAssembly module from bytes, verifies its SHA-256 hash if specified,
@@ -104,25 +126,24 @@ impl EngineCache {
         }
 
         let new_module = Arc::new(Module::new(&self.engine, new_bytes)?);
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next_gen = guard.generation.saturating_add(1);
-        guard.module = Some(Arc::clone(&new_module));
-        guard.generation = next_gen;
-        self.generation.store(next_gen, Ordering::Release);
+        let next_gen = self.publish_module(new_module);
         Ok(next_gen)
+    }
+
+    /// Returns the currently active module snapshot, if available.
+    #[must_use]
+    pub fn current_snapshot(&self) -> Option<ModuleSnapshot> {
+        let guard = self
+            .snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clone()
     }
 
     /// Retrieves the currently compiled module from the cache, if available.
     #[must_use]
     pub fn module(&self) -> Option<Arc<Module>> {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.module.clone()
+        self.current_snapshot().map(|s| s.module)
     }
 
     /// Retrieves an atomic snapshot of the currently compiled module and its generation counter.
@@ -131,11 +152,11 @@ impl EngineCache {
     /// ensuring that callers never observe a newer generation paired with an older module pointer.
     #[must_use]
     pub fn current_module(&self) -> (Option<Arc<Module>>, u64) {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (guard.module.clone(), guard.generation)
+        if let Some(snap) = self.current_snapshot() {
+            (Some(snap.module), snap.generation)
+        } else {
+            (None, self.generation.load(Ordering::Acquire))
+        }
     }
 
     /// Returns the current module generation counter.
@@ -148,13 +169,14 @@ impl EngineCache {
     #[must_use]
     pub fn advance_generation(&self) -> u64 {
         let mut guard = self
-            .state
+            .snapshot
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let next_gen = guard.generation.saturating_add(1);
-        guard.generation = next_gen;
-        self.generation.store(next_gen, Ordering::Release);
-        next_gen
+        let new_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(ref mut snap) = *guard {
+            snap.generation = new_gen;
+        }
+        new_gen
     }
 
     /// Returns a reference to the underlying Wasmtime [`Engine`].
