@@ -830,3 +830,41 @@ fn test_backfill_on_schema_missing_multiple_columns_is_correct() {
     // Total columns: 50 input + 1 trace_id + 2 guest = 53
     assert_eq!(result_schema.fields().len(), 53);
 }
+
+#[test]
+fn test_backfill_strips_guest_injected_compliance_metadata() {
+    let input_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+
+    let mut guest_metadata = std::collections::HashMap::new();
+    guest_metadata.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    guest_metadata.insert("user::custom::tag".to_string(), "custom_val".to_string());
+    let output_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        guest_metadata,
+    ));
+
+    let output_batch = RecordBatch::try_new(
+        output_schema,
+        vec![Arc::new(StringArray::from(vec!["trace_1"]))],
+    )
+    .unwrap();
+
+    let result = backfill_missing_columns(&input_schema, output_batch).unwrap();
+    let res_schema = result.schema();
+    let meta = res_schema.metadata();
+    assert!(
+        !meta.contains_key("otel::compliance::status"),
+        "Guest must not inject compliance status"
+    );
+    assert_eq!(
+        meta.get("user::custom::tag").map(String::as_str),
+        Some("custom_val")
+    );
+}

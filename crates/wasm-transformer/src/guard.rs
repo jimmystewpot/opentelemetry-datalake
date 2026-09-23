@@ -201,6 +201,9 @@ pub fn backfill_missing_columns(
 
     let mut merged_metadata = input_schema.metadata().clone();
     for (k, v) in output_schema.metadata() {
+        if k.starts_with("otel::compliance::") {
+            continue;
+        }
         merged_metadata
             .entry(k.clone())
             .or_insert_with(|| v.clone());

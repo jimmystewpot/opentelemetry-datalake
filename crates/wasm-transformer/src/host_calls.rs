@@ -12,7 +12,7 @@ use opentelemetry_datalake_wasm_sdk::abi::{
 use opentelemetry_datalake_wasm_sdk::metrics::{
     METRIC_TYPE_COUNTER, METRIC_TYPE_DURATION, METRIC_TYPE_GAUGE,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use wasmtime::{Caller, Engine, Linker};
 
 /// Maximum allowed length in bytes for metric names read from guest memory.
@@ -68,6 +68,7 @@ pub struct MetricRegistry {
     component_id: String,
     prefix: String,
     metrics: DashMap<String, MetricValue>,
+    registration_lock: Mutex<()>,
 }
 
 impl MetricRegistry {
@@ -78,6 +79,7 @@ impl MetricRegistry {
             component_id: component_id.to_string(),
             prefix: format!("datalake_transformers_{component_id}_"),
             metrics: DashMap::new(),
+            registration_lock: Mutex::new(()),
         }
     }
 
@@ -107,101 +109,102 @@ impl MetricRegistry {
         f(&key)
     }
 
-    /// Records a counter increment with saturating addition and bounded entry capacity.
-    pub fn record_counter(&self, name: &str, delta: u64) {
+    /// Updates an existing metric lock-free, or acquires [`registration_lock`] to register a new
+    /// metric entry under double-checked capacity limits to eliminate TOCTOU capacity races.
+    fn update_or_register<F>(&self, name: &str, init: MetricValue, update: F, metric_type: &str)
+    where
+        F: FnOnce(&mut MetricValue),
+    {
         self.with_key(name, |key| {
-            // Use DashMap's atomic entry API to fix the TOCTOU race of get_mut+insert.
-            // Capacity check must happen BEFORE entry() to avoid a recursive shard-lock
-            // deadlock: entry() holds a write lock; calling len() inside would try to
-            // acquire a read lock on the same shard, deadlocking on non-reentrant RwLock.
-            use dashmap::mapref::entry::Entry;
-            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
+            // Fast path: existing metric update without acquiring registration_lock.
+            if let Some(mut item) = self.metrics.get_mut(key) {
+                update(item.value_mut());
+                return;
+            }
+
+            // Slow path: new metric registration protected by mutex against TOCTOU capacity races.
+            let _guard = match self.registration_lock.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            // Double check existence under lock in case another worker registered it concurrently.
+            if let Some(mut item) = self.metrics.get_mut(key) {
+                update(item.value_mut());
+                return;
+            }
+
+            if self.metrics.len() >= MAX_METRIC_ENTRIES {
                 tracing::warn!(
                     component = %self.component_id,
                     max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new counter metric registration"
+                    "Metric registry capacity exceeded; dropping new {metric_type} metric registration"
                 );
                 return;
             }
-            match self.metrics.entry(key.to_string()) {
-                Entry::Occupied(mut occ) => {
-                    if let MetricValue::Counter(c) = occ.get_mut() {
-                        *c = (*c).saturating_add(delta);
-                    } else {
-                        *occ.get_mut() = MetricValue::Counter(delta);
-                    }
-                }
-                Entry::Vacant(vac) => {
-                    vac.insert(MetricValue::Counter(delta));
-                }
-            }
+
+            self.metrics.insert(key.to_string(), init);
         });
+    }
+
+    /// Records a counter increment with saturating addition and bounded entry capacity.
+    pub fn record_counter(&self, name: &str, delta: u64) {
+        self.update_or_register(
+            name,
+            MetricValue::Counter(delta),
+            |val| {
+                if let MetricValue::Counter(c) = val {
+                    *c = (*c).saturating_add(delta);
+                } else {
+                    *val = MetricValue::Counter(delta);
+                }
+            },
+            "counter",
+        );
     }
 
     /// Records an instantaneous gauge bitcast value with bounded entry capacity.
     pub fn record_gauge(&self, name: &str, bits: u64) {
-        self.with_key(name, |key| {
-            use dashmap::mapref::entry::Entry;
-            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
-                tracing::warn!(
-                    component = %self.component_id,
-                    max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new gauge metric registration"
-                );
-                return;
-            }
-            match self.metrics.entry(key.to_string()) {
-                Entry::Occupied(mut occ) => {
-                    *occ.get_mut() = MetricValue::Gauge(bits);
-                }
-                Entry::Vacant(vac) => {
-                    vac.insert(MetricValue::Gauge(bits));
-                }
-            }
-        });
+        self.update_or_register(
+            name,
+            MetricValue::Gauge(bits),
+            |val| {
+                *val = MetricValue::Gauge(bits);
+            },
+            "gauge",
+        );
     }
 
     /// Records a duration observation in nanoseconds with bounded entry capacity.
     pub fn record_duration(&self, name: &str, nanos: u64) {
-        self.with_key(name, |key| {
-            use dashmap::mapref::entry::Entry;
-            if !self.metrics.contains_key(key) && self.metrics.len() >= MAX_METRIC_ENTRIES {
-                tracing::warn!(
-                    component = %self.component_id,
-                    max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new duration metric registration"
-                );
-                return;
-            }
-            match self.metrics.entry(key.to_string()) {
-                Entry::Occupied(mut occ) => {
-                    if let MetricValue::Duration(d) = occ.get_mut() {
-                        d.count = d.count.saturating_add(1);
-                        d.sum_nanos = d.sum_nanos.saturating_add(nanos);
-                        d.min_nanos = d.min_nanos.min(nanos);
-                        d.max_nanos = d.max_nanos.max(nanos);
-                        d.last_nanos = nanos;
-                    } else {
-                        *occ.get_mut() = MetricValue::Duration(DurationSummary {
-                            count: 1,
-                            sum_nanos: nanos,
-                            min_nanos: nanos,
-                            max_nanos: nanos,
-                            last_nanos: nanos,
-                        });
-                    }
-                }
-                Entry::Vacant(vac) => {
-                    vac.insert(MetricValue::Duration(DurationSummary {
+        self.update_or_register(
+            name,
+            MetricValue::Duration(DurationSummary {
+                count: 1,
+                sum_nanos: nanos,
+                min_nanos: nanos,
+                max_nanos: nanos,
+                last_nanos: nanos,
+            }),
+            |val| {
+                if let MetricValue::Duration(d) = val {
+                    d.count = d.count.saturating_add(1);
+                    d.sum_nanos = d.sum_nanos.saturating_add(nanos);
+                    d.min_nanos = d.min_nanos.min(nanos);
+                    d.max_nanos = d.max_nanos.max(nanos);
+                    d.last_nanos = nanos;
+                } else {
+                    *val = MetricValue::Duration(DurationSummary {
                         count: 1,
                         sum_nanos: nanos,
                         min_nanos: nanos,
                         max_nanos: nanos,
                         last_nanos: nanos,
-                    }));
+                    });
                 }
-            }
-        });
+            },
+            "duration",
+        );
     }
 
     /// Reads the current value of a counter, returning `0` if not found.

@@ -664,6 +664,13 @@ impl GuestComponents {
     }
 }
 
+#[inline]
+fn push_in_bounds_alloc(allocs: &mut Vec<(u32, u32)>, ptr: u32, len: u32, mem_size: usize) {
+    if ptr > 0 && len > 0 && (ptr as usize).saturating_add(len as usize) <= mem_size {
+        allocs.push((ptr, len));
+    }
+}
+
 fn execute_batch_in_guest(
     guest: &mut GuestComponents,
     batch: SignalBatch,
@@ -701,7 +708,7 @@ fn execute_batch_in_guest(
         .write(&mut guest.store, ipc_ptr as usize, ipc_buf)
         .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
 
-    // 3. Invoke datalake_transform and free input buffer
+    // 3. Invoke datalake_transform
     let (header_ptr, header_len) = match &guest.transform_fn {
         TransformFunc::V1(func) => {
             let signal_type = match &batch {
@@ -734,11 +741,6 @@ fn execute_batch_in_guest(
         }
     };
 
-    guest
-        .dealloc_fn
-        .call(&mut guest.store, (ipc_ptr, ipc_len))
-        .map_err(WasmTransformError::Wasmtime)?;
-
     // 4. Read TransformResponseHeader safely without unwrap
     let header = guest.read_response_header(header_ptr)?;
     let message = read_guest_message(
@@ -748,20 +750,30 @@ fn execute_batch_in_guest(
         header.message_len,
     );
 
-    let mut allocs_to_free = vec![(header_ptr, header_len)];
-    if header.message_ptr > 0 && header.message_len > 0 {
-        allocs_to_free.push((header.message_ptr, header.message_len));
-    }
-    if header.batch_count > 0 && header.batches_ptr > 0 {
-        allocs_to_free.push((header.batches_ptr, header.batch_count.saturating_mul(8)));
-    }
+    let mem_size = guest.memory.data_size(&guest.store);
+    let mut allocs_to_free = Vec::with_capacity(4);
+    push_in_bounds_alloc(&mut allocs_to_free, ipc_ptr, ipc_len, mem_size);
+    push_in_bounds_alloc(&mut allocs_to_free, header_ptr, header_len, mem_size);
+    push_in_bounds_alloc(
+        &mut allocs_to_free,
+        header.message_ptr,
+        header.message_len,
+        mem_size,
+    );
+    push_in_bounds_alloc(
+        &mut allocs_to_free,
+        header.batches_ptr,
+        header.batch_count.saturating_mul(8),
+        mem_size,
+    );
 
     // 5. Dispatch outcome and extract transformed batches while guest memory is intact
     let outcome =
         guest.dispatch_outcome(&header, &message, batch, schema_guard, &mut allocs_to_free);
 
     // 6. Free guest allocations on all paths (happy and error) to prevent memory growth.
-    // Best-effort: dealloc failures are logged but do not shadow the primary outcome error.
+    // If guest dealloc traps on an otherwise successful outcome, propagate the error so the worker rejuvenates.
+    let mut dealloc_err = None;
     for (ptr, len) in allocs_to_free {
         if let Err(e) = guest.dealloc_fn.call(&mut guest.store, (ptr, len)) {
             tracing::warn!(
@@ -770,10 +782,22 @@ fn execute_batch_in_guest(
                 error = %e,
                 "Guest deallocation failed; instance memory may be leaked — rejuvenation recommended"
             );
+            if dealloc_err.is_none() {
+                dealloc_err = Some(e);
+            }
         }
     }
 
-    outcome
+    match outcome {
+        Ok(res) => {
+            if let Some(err) = dealloc_err {
+                Err(WasmTransformError::Wasmtime(err))
+            } else {
+                Ok(res)
+            }
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Serializes an Arrow [`RecordBatch`] to an Arrow IPC stream buffer.
@@ -867,10 +891,6 @@ fn extract_output_batches<T>(
         let b_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
 
-        if b_ptr > 0 && b_len > 0 {
-            allocs_to_free.push((b_ptr, b_len));
-        }
-
         let b_len_usize = b_len as usize;
         total_bytes = total_bytes.saturating_add(b_len_usize);
         if total_bytes > 64 * 1024 * 1024 {
@@ -884,6 +904,8 @@ fn extract_output_batches<T>(
                 "Batch IPC buffer bounds exceed guest memory size {mem_size}"
             )));
         }
+
+        push_in_bounds_alloc(allocs_to_free, b_ptr, b_len, mem_size);
 
         let mut out_ipc_bytes = vec![0u8; b_len_usize];
         memory
@@ -952,7 +974,10 @@ fn parse_duration_ms(s: &str) -> Option<u64> {
     if let Some(num) = trimmed.strip_suffix("ms") {
         num.trim().parse::<u64>().ok()
     } else if let Some(num) = trimmed.strip_suffix('s') {
-        num.trim().parse::<u64>().ok().map(|s| s * 1000)
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|s| s.checked_mul(1000))
     } else {
         trimmed.parse::<u64>().ok()
     }
@@ -972,5 +997,14 @@ mod tests {
         assert_eq!(parse_byte_size("128MiB"), Some(128 * 1024 * 1024));
         assert_eq!(parse_byte_size("1GiB"), Some(1024 * 1024 * 1024));
         assert_eq!(parse_byte_size("500"), Some(500));
+    }
+
+    #[test]
+    fn test_parse_duration_ms() {
+        assert_eq!(parse_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_duration_ms("2s"), Some(2000));
+        assert_eq!(parse_duration_ms("1000"), Some(1000));
+        assert_eq!(parse_duration_ms("18446744073709551615s"), None); // Checked mul overflow
+        assert_eq!(parse_duration_ms("invalid"), None);
     }
 }
