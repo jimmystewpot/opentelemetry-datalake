@@ -939,3 +939,104 @@ fn test_backfill_rejects_nullability_mutation() {
             .contains("nullability mutated from non-nullable to nullable")
     );
 }
+
+#[test]
+fn test_backfill_rejects_non_nullable_new_column() {
+    let in_schema = Arc::new(Schema::new(vec![Field::new("col_a", DataType::Utf8, true)]));
+    let out_schema = Arc::new(Schema::new(vec![
+        Field::new("col_a", DataType::Utf8, true),
+        Field::new("new_required_col", DataType::Int64, false),
+    ]));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["hello"])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("newly added column 'new_required_col' must be nullable")
+    );
+}
+
+#[test]
+fn test_backfill_rejects_tampered_compliance_metadata() {
+    let mut in_meta = HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    let in_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        in_meta,
+    ));
+
+    let mut out_meta = HashMap::new();
+    out_meta.insert("otel::compliance::status".to_string(), "forged".to_string());
+    let out_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        out_meta,
+    ));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let res = backfill_missing_columns(&in_schema, out_batch);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("guest attempted to mutate compliance metadata 'otel::compliance::status'")
+    );
+}
+
+#[test]
+fn test_backfill_preserves_upstream_metadata_on_conflict() {
+    let mut in_meta = HashMap::new();
+    in_meta.insert(
+        "otel::compliance::status".to_string(),
+        "verified".to_string(),
+    );
+    in_meta.insert("conflict_key".to_string(), "upstream_value".to_string());
+    let in_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        in_meta,
+    ));
+
+    let mut out_meta = HashMap::new();
+    out_meta.insert("conflict_key".to_string(), "guest_override".to_string());
+    out_meta.insert("guest_key".to_string(), "guest_value".to_string());
+    let out_schema = Arc::new(Schema::new_with_metadata(
+        vec![Field::new("trace_id", DataType::Utf8, false)],
+        out_meta,
+    ));
+    let out_batch = RecordBatch::try_new(
+        out_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&in_schema, out_batch).unwrap();
+    let backfilled_schema = backfilled.schema();
+    let meta = backfilled_schema.metadata();
+    assert_eq!(
+        meta.get("conflict_key").map(String::as_str),
+        Some("upstream_value")
+    );
+    assert_eq!(
+        meta.get("guest_key").map(String::as_str),
+        Some("guest_value")
+    );
+    assert_eq!(
+        meta.get("otel::compliance::status").map(String::as_str),
+        Some("verified")
+    );
+}

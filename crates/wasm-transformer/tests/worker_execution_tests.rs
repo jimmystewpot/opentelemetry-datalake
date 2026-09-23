@@ -972,3 +972,109 @@ async fn test_worker_executes_c_abi_v1_transform() {
         _ => panic!("Expected Emitted outcome"),
     }
 }
+
+#[tokio::test]
+async fn test_worker_rejects_truncated_v1_response_length() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; (1024 << 32) | 10 = 0x0000_0400_0000_000A = 4398046511114_i64 (len 10 < 20)
+            (i64.const 4398046511114)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(23, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let input_batch = SignalBatch::Logs(create_test_record_batch());
+
+    let res = worker.execute_batch(input_batch);
+    assert!(res.is_err());
+    let (_, err) = res.unwrap_err();
+    assert!(
+        err.to_string().contains("minimum header size is 20 bytes"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_rejects_out_of_bounds_v1_response_header() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; (65530 << 32) | 20 = offset 65530 + 20 = 65550 > 65536 memory limit
+            ;; (65530_i64 << 32) | 20 = 281449704259604_i64
+            (i64.const 281449704259604)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(24, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let input_batch = SignalBatch::Logs(create_test_record_batch());
+
+    let res = worker.execute_batch(input_batch);
+    assert!(res.is_err());
+    let (_, err) = res.unwrap_err();
+    assert!(
+        err.to_string().contains("exceeds guest memory bounds"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_rejects_unsupported_abi_version() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 2))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            (i64.const 0)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let res = WasmWorker::new(25, Arc::clone(&cache), module, cfg, test_registry());
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        WasmTransformError::AbiVersionMismatch(version) => assert_eq!(version, 2),
+        other => panic!("Expected AbiVersionMismatch(2), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_worker_rejects_missing_abi_version() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            (i64.const 0)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let res = WasmWorker::new(26, Arc::clone(&cache), module, cfg, test_registry());
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        WasmTransformError::MissingExport(name) => assert_eq!(name, "datalake_abi_version"),
+        other => panic!("Expected MissingExport(\"datalake_abi_version\"), got {other:?}"),
+    }
+}
