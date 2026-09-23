@@ -9,7 +9,7 @@ fn valid_wat() -> &'static str {
     r#"(module
         (memory (export "memory") 1)
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
-        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
         (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
@@ -19,8 +19,8 @@ fn valid_wat() -> &'static str {
 fn valid_wat_v2() -> &'static str {
     r#"(module
         (memory (export "memory") 1)
-        (func (export "datalake_abi_version") (result i32) (i32.const 2))
-        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 2048))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
         (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
@@ -279,4 +279,37 @@ fn test_current_module_concurrent_reload_snapshot_consistency() {
     for h in reader_handles {
         h.join().unwrap();
     }
+}
+
+#[test]
+fn test_current_module_reports_generation_without_snapshot() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    assert_eq!(cache.module_generation(), 0);
+    let (mod_opt, current_gen) = cache.current_module();
+    assert!(mod_opt.is_none());
+    assert_eq!(current_gen, 0);
+
+    let gen1 = cache.advance_generation();
+    assert_eq!(gen1, 1);
+    assert_eq!(cache.module_generation(), 1);
+    // When no snapshot is active, current_module must return the atomic generation, not 0
+    let (mod_opt, current_gen) = cache.current_module();
+    assert!(mod_opt.is_none());
+    assert_eq!(current_gen, 1);
+}
+
+#[test]
+fn test_reload_from_bytes_rejects_missing_abi_exports() {
+    let cache = EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap();
+    // Valid wasm syntax, but missing datalake_abi_version and other exports
+    let invalid_wat = r#"(module
+        (memory (export "memory") 1)
+    )"#;
+    let bytes = wat::parse_str(invalid_wat).unwrap();
+    let res = cache.reload_from_bytes(&bytes, None);
+    assert!(res.is_err());
+    assert_eq!(cache.module_generation(), 0);
+    let (mod_opt, current_gen) = cache.current_module();
+    assert!(mod_opt.is_none());
+    assert_eq!(current_gen, 0);
 }

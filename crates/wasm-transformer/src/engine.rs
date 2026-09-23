@@ -145,22 +145,74 @@ impl EngineCache {
     /// Returns [`WasmTransformError::Sha256Mismatch`] if `expected_sha` is provided and does
     /// not match the SHA-256 checksum of `new_bytes` (comparison is case-insensitive).
     /// Returns [`WasmTransformError::Wasmtime`] if the WebAssembly module fails compilation.
-    pub fn reload_from_bytes(
+    /// Compiles a candidate WebAssembly module from bytes, verifies its SHA-256 hash if specified,
+    /// and probes candidate guest ABI exports and initialization without modifying the active cache snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError::Sha256Mismatch`] if hash verification fails,
+    /// [`WasmTransformError::Wasmtime`] if compilation fails,
+    /// or a [`WasmTransformError`] if guest ABI verification or initialization fails.
+    pub fn compile_and_probe_candidate(
         &self,
         new_bytes: &[u8],
         expected_sha: Option<&str>,
-    ) -> Result<u64, WasmTransformError> {
+    ) -> Result<Arc<Module>, WasmTransformError> {
         if let Some(expected) = expected_sha {
-            let actual = crate::reload::compute_sha256(new_bytes);
-            if !actual.eq_ignore_ascii_case(expected) {
+            let actual = compute_sha256_hex(new_bytes);
+            if !actual.eq_ignore_ascii_case(expected.trim()) {
                 return Err(WasmTransformError::Sha256Mismatch {
-                    expected: expected.to_string(),
+                    expected: expected.trim().to_string(),
                     actual,
                 });
             }
         }
 
         let new_module = Arc::new(Module::new(&self.engine, new_bytes)?);
+        let probe_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "probe".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: String::new(),
+            sha256: None,
+            max_execution_duration: "5s".to_string(),
+            drain_timeout: "5s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 10,
+            max_memory: "64MiB".to_string(),
+            rejuvenate_threshold: "50MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "5s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::default(),
+            allow_unmasked_passthrough: false,
+            on_reject: pipeline_core::config::OnRejectPolicy::default(),
+            schema_guard: pipeline_core::config::SchemaGuardMode::default(),
+            env_whitelist: Vec::new(),
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: false,
+        };
+        let registry = Arc::new(crate::host_calls::MetricRegistry::new("probe"));
+        crate::worker::WasmWorker::probe_candidate(self, &new_module, &probe_cfg, &registry)?;
+        Ok(new_module)
+    }
+
+    /// Recompiles a WebAssembly module from bytes, verifies its SHA-256 hash if specified,
+    /// validates candidate guest ABI exports and initialization, atomically swaps the active
+    /// module in the cache, and advances the generation counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError::Sha256Mismatch`] if `expected_sha` is provided and does
+    /// not match the SHA-256 checksum of `new_bytes` (comparison is case-insensitive).
+    /// Returns [`WasmTransformError::Wasmtime`] if the WebAssembly module fails compilation.
+    /// Returns [`WasmTransformError`] if guest ABI verification or initialization fails.
+    pub fn reload_from_bytes(
+        &self,
+        new_bytes: &[u8],
+        expected_sha: Option<&str>,
+    ) -> Result<u64, WasmTransformError> {
+        let new_module = self.compile_and_probe_candidate(new_bytes, expected_sha)?;
         let next_gen = self.publish_module(new_module);
         Ok(next_gen)
     }
@@ -193,7 +245,7 @@ impl EngineCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match *guard {
             Some(ref snap) => (Some(Arc::clone(&snap.module)), snap.generation),
-            None => (None, 0),
+            None => (None, self.generation.load(Ordering::Acquire)),
         }
     }
 
