@@ -112,6 +112,13 @@ impl std::fmt::Debug for WasmWorker {
     }
 }
 
+#[inline]
+fn push_in_bounds_alloc(allocs: &mut Vec<(u32, u32)>, ptr: u32, len: u32, mem_size: usize) {
+    if ptr > 0 && len > 0 && (ptr as usize).saturating_add(len as usize) <= mem_size {
+        allocs.push((ptr, len));
+    }
+}
+
 impl WasmWorker {
     /// Creates a new `WasmWorker` with its own isolated Wasmtime store and instance.
     ///
@@ -318,10 +325,6 @@ impl WasmWorker {
                             )),
                         ));
                     }
-                    if let Err(e) = guest.dealloc_fn.call(&mut guest.store, (ipc_ptr, ipc_len)) {
-                        let _ = self.rejuvenate();
-                        return Err((batch, WasmTransformError::Wasmtime(e)));
-                    }
                     (ptr, len)
                 }
                 Err(e) => {
@@ -351,10 +354,6 @@ impl WasmWorker {
                                 "Response header at offset {ptr} with length 20 exceeds guest memory bounds {mem_size}"
                             )),
                         ));
-                    }
-                    if let Err(e) = guest.dealloc_fn.call(&mut guest.store, (ipc_ptr, ipc_len)) {
-                        let _ = self.rejuvenate();
-                        return Err((batch, WasmTransformError::Wasmtime(e)));
                     }
                     (ptr, 20)
                 }
@@ -388,15 +387,25 @@ impl WasmWorker {
             header.message_len,
         );
 
-        let mut allocs_to_free = vec![(header_ptr, header_len)];
-        if header.message_ptr > 0 && header.message_len > 0 {
-            allocs_to_free.push((header.message_ptr, header.message_len));
-        }
-        if header.batch_count > 0 && header.batches_ptr > 0 {
-            allocs_to_free.push((header.batches_ptr, header.batch_count.saturating_mul(8)));
-        }
+        let mem_size = guest.memory.data_size(&guest.store);
+        let mut allocs_to_free = Vec::with_capacity(4);
+        push_in_bounds_alloc(&mut allocs_to_free, ipc_ptr, ipc_len, mem_size);
+        push_in_bounds_alloc(&mut allocs_to_free, header_ptr, header_len, mem_size);
+        push_in_bounds_alloc(
+            &mut allocs_to_free,
+            header.message_ptr,
+            header.message_len,
+            mem_size,
+        );
+        push_in_bounds_alloc(
+            &mut allocs_to_free,
+            header.batches_ptr,
+            header.batch_count.saturating_mul(8),
+            mem_size,
+        );
 
         // 5. Dispatch outcome and extract output batches
+        let input_batch = batch.clone();
         let outcome = guest.dispatch_outcome(
             &header,
             &message,
@@ -405,7 +414,8 @@ impl WasmWorker {
             &mut allocs_to_free,
         );
 
-        // Best effort: free guest allocations on all paths
+        // Free guest allocations on all paths
+        let mut dealloc_err = None;
         for (ptr, len) in allocs_to_free {
             if let Err(e) = guest.dealloc_fn.call(&mut guest.store, (ptr, len)) {
                 tracing::warn!(
@@ -414,22 +424,33 @@ impl WasmWorker {
                     error = %e,
                     "Guest deallocation failed; instance memory may be leaked"
                 );
+                if dealloc_err.is_none() {
+                    dealloc_err = Some(e);
+                }
             }
         }
 
         match outcome {
             Ok(outcome) => {
-                self.batches_processed = self.batches_processed.saturating_add(1);
-                if let Err(e) = self.check_rejuvenation() {
-                    tracing::warn!(
-                        worker_id = self.id,
-                        error = %e,
-                        "Post-batch rejuvenation failed; continuing execution with current instance"
-                    );
+                if let Some(err) = dealloc_err {
+                    let _ = self.rejuvenate();
+                    Err((input_batch, WasmTransformError::Wasmtime(err)))
+                } else {
+                    self.batches_processed = self.batches_processed.saturating_add(1);
+                    if let Err(e) = self.check_rejuvenation() {
+                        tracing::warn!(
+                            worker_id = self.id,
+                            error = %e,
+                            "Post-batch rejuvenation failed; continuing execution with current instance"
+                        );
+                    }
+                    Ok(outcome)
                 }
-                Ok(outcome)
             }
-            Err((orig_batch, err)) => Err((orig_batch, err)),
+            Err((orig_batch, err)) => {
+                let _ = self.rejuvenate();
+                Err((orig_batch, err))
+            }
         }
     }
 
@@ -923,10 +944,6 @@ fn extract_output_batches<T>(
             ));
         }
 
-        if b_ptr > 0 && b_len > 0 {
-            allocs_to_free.push((b_ptr, b_len));
-        }
-
         let b_len_usize = b_len as usize;
         total_bytes = total_bytes.saturating_add(b_len_usize);
         if total_bytes > 64 * 1024 * 1024 {
@@ -943,6 +960,8 @@ fn extract_output_batches<T>(
                 "Batch IPC buffer bounds exceed guest memory size {mem_size}"
             )));
         }
+
+        push_in_bounds_alloc(allocs_to_free, b_ptr, b_len, mem_size);
 
         let slice = memory.data(store).get(start..end).ok_or_else(|| {
             WasmTransformError::Pipeline(format!(
@@ -1006,6 +1025,8 @@ pub fn parse_byte_size(s: &str) -> Option<usize> {
             .parse::<usize>()
             .ok()
             .and_then(|n| n.checked_mul(1000))
+    } else if let Some(num) = trimmed.strip_suffix('B') {
+        num.trim().parse::<usize>().ok()
     } else {
         trimmed.parse::<usize>().ok()
     }
@@ -1029,11 +1050,54 @@ pub fn parse_duration(s: &str) -> Option<std::time::Duration> {
         num.trim()
             .parse::<u64>()
             .ok()
-            .map(|m| std::time::Duration::from_secs(m.saturating_mul(60)))
+            .and_then(|m| m.checked_mul(60))
+            .map(std::time::Duration::from_secs)
     } else {
         trimmed
             .parse::<u64>()
             .ok()
             .map(std::time::Duration::from_secs)
+    }
+}
+
+/// Parses a duration string (e.g., "500ms", "1s") into milliseconds.
+#[must_use]
+pub fn parse_duration_ms(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if let Some(num) = trimmed.strip_suffix("ms") {
+        num.trim().parse::<u64>().ok()
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|s| s.checked_mul(1000))
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_byte_size() {
+        assert_eq!(parse_byte_size(""), None);
+        assert_eq!(parse_byte_size("   "), None);
+        assert_eq!(parse_byte_size("100XYZ"), None);
+        assert_eq!(parse_byte_size("1024B"), Some(1024));
+        assert_eq!(parse_byte_size("16KiB"), Some(16 * 1024));
+        assert_eq!(parse_byte_size("128MiB"), Some(128 * 1024 * 1024));
+        assert_eq!(parse_byte_size("1GiB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_byte_size("500"), Some(500));
+    }
+
+    #[test]
+    fn test_parse_duration_ms() {
+        assert_eq!(parse_duration_ms("500ms"), Some(500));
+        assert_eq!(parse_duration_ms("2s"), Some(2000));
+        assert_eq!(parse_duration_ms("1000"), Some(1000));
+        assert_eq!(parse_duration_ms("18446744073709551615s"), None); // Checked mul overflow
+        assert_eq!(parse_duration_ms("invalid"), None);
     }
 }

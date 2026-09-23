@@ -695,3 +695,26 @@ fn test_host_linker_defines_now_nanos_import() {
     let now = get_now_fn.call(&mut store, ()).unwrap();
     assert!(now > 0, "Expected non-zero timestamp in nanoseconds");
 }
+
+#[test]
+fn test_metric_registry_concurrent_registrations_respect_capacity() {
+    let registry = Arc::new(MetricRegistry::new("concurrency_test"));
+    let mut handles = Vec::new();
+
+    // Spawn 10 threads, each attempting to insert 300 unique metrics (3000 total attempts > MAX_METRIC_ENTRIES 2048)
+    for thread_idx in 0..10 {
+        let reg = Arc::clone(&registry);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..300 {
+                let name = format!("metric_{thread_idx}_{i}");
+                reg.record_counter(&name, 1);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    assert_eq!(registry.metrics().len(), MAX_METRIC_ENTRIES);
+}
