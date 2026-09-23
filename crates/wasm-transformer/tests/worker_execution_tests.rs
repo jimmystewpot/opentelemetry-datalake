@@ -1703,3 +1703,47 @@ async fn test_worker_hot_reload_failure_preserves_old_module_and_continues() {
         .unwrap();
     assert!(matches!(outcome3, WorkerOutcome::Emitted(_)));
 }
+
+#[tokio::test]
+async fn test_worker_deallocates_dynamic_header_length_correctly() {
+    let dynamic_header_wat = r#"
+        (module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 2048))
+            (func (export "datalake_dealloc") (param $ptr i32) (param $len i32)
+                (if (i32.eq (local.get $ptr) (i32.const 1024))
+                    (then
+                        (if (i32.ne (local.get $len) (i32.const 32))
+                            (then (unreachable))
+                        )
+                    )
+                )
+            )
+            (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            (func (export "datalake_transform") (param $sig i32) (param $ptr i32) (param $len i32) (result i64)
+                (i32.store (i32.const 1024) (i32.const 1))
+                (i32.store (i32.const 1028) (i32.const 0))
+                (i32.store (i32.const 1032) (i32.const 0))
+                (i32.store (i32.const 1036) (i32.const 0))
+                (i32.store (i32.const 1040) (i32.const 0))
+                (i64.or (i64.shl (i64.const 1024) (i64.const 32)) (i64.const 32))
+            )
+        )
+    "#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(dynamic_header_wat).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(99, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Discarded));
+}

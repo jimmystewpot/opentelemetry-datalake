@@ -102,6 +102,7 @@ pub struct WasmWorker {
     rejuvenate_threshold_bytes: usize,
     epoch_deadline_ticks: u64,
     init_deadline_ticks: u64,
+    ipc_buffer: Vec<u8>,
 }
 
 impl std::fmt::Debug for WasmWorker {
@@ -176,6 +177,7 @@ impl WasmWorker {
             rejuvenate_threshold_bytes,
             epoch_deadline_ticks,
             init_deadline_ticks,
+            ipc_buffer: Vec::with_capacity(64 * 1024),
         })
     }
 
@@ -225,21 +227,23 @@ impl WasmWorker {
         let schema_guard = self.config.schema_guard;
         let module_path = self.config.module_path.clone();
         let worker_id = self.id;
+        let mut ipc_buf = std::mem::take(&mut self.ipc_buffer);
 
         let run_transform =
-            move || -> (GuestComponents, Result<WorkerOutcome, WasmTransformError>) {
+            move || -> (GuestComponents, Vec<u8>, Result<WorkerOutcome, WasmTransformError>) {
                 let res = execute_batch_in_guest(
                     &mut guest,
                     batch,
+                    &mut ipc_buf,
                     epoch_deadline_ticks,
                     schema_guard,
                     &module_path,
                     worker_id,
                 );
-                (guest, res)
+                (guest, ipc_buf, res)
             };
 
-        let (guest, outcome) = if tokio::runtime::Handle::try_current().is_ok() {
+        let (guest, ipc_buf, outcome) = if tokio::runtime::Handle::try_current().is_ok() {
             let handle = tokio::task::spawn_blocking(run_transform);
             handle.await.map_err(|e| {
                 WasmTransformError::Pipeline(format!("Blocking task join error: {e}"))
@@ -249,6 +253,7 @@ impl WasmWorker {
         };
 
         self.guest = Some(guest);
+        self.ipc_buffer = ipc_buf;
 
         match outcome {
             Ok(outcome) => {
@@ -656,6 +661,7 @@ impl GuestComponents {
 fn execute_batch_in_guest(
     guest: &mut GuestComponents,
     batch: SignalBatch,
+    ipc_buf: &mut Vec<u8>,
     epoch_deadline_ticks: u64,
     schema_guard: pipeline_core::config::SchemaGuardMode,
     module_path: &str,
@@ -669,7 +675,7 @@ fn execute_batch_in_guest(
     };
 
     // 1. Serialize input RecordBatch to Arrow IPC Stream
-    let ipc_buf = serialize_batch_to_ipc(record_batch)?;
+    serialize_batch_to_ipc(record_batch, ipc_buf)?;
     let ipc_len = u32::try_from(ipc_buf.len())
         .map_err(|_| WasmTransformError::Pipeline("IPC payload exceeds u32::MAX".to_string()))?;
 
@@ -686,11 +692,11 @@ fn execute_batch_in_guest(
     }
     guest
         .memory
-        .write(&mut guest.store, ipc_ptr as usize, &ipc_buf)
+        .write(&mut guest.store, ipc_ptr as usize, ipc_buf)
         .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
 
     // 3. Invoke datalake_transform and free input buffer
-    let transform_res: Result<u32, WasmTransformError> = match &guest.transform_fn {
+    let (header_ptr, header_len) = match &guest.transform_fn {
         TransformFunc::V1(func) => {
             let signal_type = match &batch {
                 SignalBatch::Logs(_) => 0u32,
@@ -702,29 +708,30 @@ fn execute_batch_in_guest(
                     let ptr = (packed >> 32) as u32;
                     let len = (packed & 0xFFFF_FFFF) as u32;
                     if ptr == 0 || (len as usize) < RESPONSE_HEADER_SIZE {
-                        Err(WasmTransformError::Pipeline(format!(
+                        return Err(WasmTransformError::Pipeline(format!(
                             "Malformed C-ABI v1 response header: ptr={ptr}, len={len} (minimum required: {RESPONSE_HEADER_SIZE} bytes)"
-                        )))
-                    } else {
-                        Ok(ptr)
+                        )));
                     }
+                    (ptr, len)
                 }
-                Err(e) => Err(WasmTransformError::Wasmtime(e)),
+                Err(e) => return Err(WasmTransformError::Wasmtime(e)),
             }
         }
-        TransformFunc::V0(func) => func
-            .call(&mut guest.store, (ipc_ptr, ipc_len))
-            .map_err(WasmTransformError::Wasmtime),
+        TransformFunc::V0(func) => {
+            let ptr = func
+                .call(&mut guest.store, (ipc_ptr, ipc_len))
+                .map_err(WasmTransformError::Wasmtime)?;
+            let len = u32::try_from(RESPONSE_HEADER_SIZE).unwrap_or(20);
+            (ptr, len)
+        }
     };
-    if transform_res.is_ok() {
-        guest
-            .dealloc_fn
-            .call(&mut guest.store, (ipc_ptr, ipc_len))
-            .map_err(WasmTransformError::Wasmtime)?;
-    }
-    let header_ptr = transform_res?;
 
-    // 4. Read TransformResponseHeader (20 bytes) safely without unwrap
+    guest
+        .dealloc_fn
+        .call(&mut guest.store, (ipc_ptr, ipc_len))
+        .map_err(WasmTransformError::Wasmtime)?;
+
+    // 4. Read TransformResponseHeader safely without unwrap
     let header = guest.read_response_header(header_ptr)?;
     let message = read_guest_message(
         &guest.memory,
@@ -733,7 +740,7 @@ fn execute_batch_in_guest(
         header.message_len,
     );
 
-    let mut allocs_to_free = vec![(header_ptr, 20)];
+    let mut allocs_to_free = vec![(header_ptr, header_len)];
     if header.message_ptr > 0 && header.message_len > 0 {
         allocs_to_free.push((header.message_ptr, header.message_len));
     }
@@ -757,9 +764,12 @@ fn execute_batch_in_guest(
 }
 
 /// Serializes an Arrow [`RecordBatch`] to an Arrow IPC stream buffer.
-fn serialize_batch_to_ipc(record_batch: &RecordBatch) -> Result<Vec<u8>, WasmTransformError> {
-    let mut ipc_buf = Vec::with_capacity(64 * 1024);
-    let mut writer = StreamWriter::try_new(&mut ipc_buf, &record_batch.schema())
+fn serialize_batch_to_ipc(
+    record_batch: &RecordBatch,
+    ipc_buf: &mut Vec<u8>,
+) -> Result<(), WasmTransformError> {
+    ipc_buf.clear();
+    let mut writer = StreamWriter::try_new(ipc_buf, &record_batch.schema())
         .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
     writer
         .write(record_batch)
@@ -767,7 +777,7 @@ fn serialize_batch_to_ipc(record_batch: &RecordBatch) -> Result<Vec<u8>, WasmTra
     writer
         .finish()
         .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
-    Ok(ipc_buf)
+    Ok(())
 }
 
 const MAX_GUEST_MESSAGE_LEN: usize = 64 * 1024;

@@ -512,3 +512,29 @@ fn test_host_linker_defines_capability_query_with_phase_enforcement() {
         .unwrap();
     assert_eq!(check_fn_exec.call(&mut store_exec, ()).unwrap(), 0);
 }
+
+#[test]
+fn test_host_linker_defines_now_nanos_import() {
+    let engine = Engine::default();
+    let linker = build_host_linker(&engine).unwrap();
+    let registry = Arc::new(MetricRegistry::new("now_comp"));
+
+    let wat = r#"(module
+        (import "env" "datalake_host_now_nanos" (func $now_nanos (result i64)))
+        (func (export "get_now") (result i64)
+            (call $now_nanos)
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let get_now_fn = instance
+        .get_typed_func::<(), u64>(&mut store, "get_now")
+        .unwrap();
+    let now = get_now_fn.call(&mut store, ()).unwrap();
+    assert!(now > 0, "Expected non-zero timestamp in nanoseconds");
+}

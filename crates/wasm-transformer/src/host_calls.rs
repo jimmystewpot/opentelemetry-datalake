@@ -82,72 +82,87 @@ impl MetricRegistry {
     }
 
     /// Formats a metric name into its full scoped key with pre-allocated capacity.
-    fn format_key(&self, name: &str) -> String {
+    #[must_use]
+    pub fn format_key(&self, name: &str) -> String {
         let mut key = String::with_capacity(self.prefix.len() + name.len());
         key.push_str(&self.prefix);
         key.push_str(name);
         key
     }
 
+    /// Invokes a closure with a formatted metric key string without heap allocation when possible.
+    fn with_key<R>(&self, name: &str, f: impl FnOnce(&str) -> R) -> R {
+        let required_len = self.prefix.len() + name.len();
+        if required_len <= 512 {
+            let mut buf = [0u8; 512];
+            buf[..self.prefix.len()].copy_from_slice(self.prefix.as_bytes());
+            buf[self.prefix.len()..required_len].copy_from_slice(name.as_bytes());
+            if let Ok(s) = std::str::from_utf8(&buf[..required_len]) {
+                return f(s);
+            }
+        }
+        let mut key = String::with_capacity(required_len);
+        key.push_str(&self.prefix);
+        key.push_str(name);
+        f(&key)
+    }
+
     /// Records a counter increment with saturating addition and bounded entry capacity.
     pub fn record_counter(&self, name: &str, delta: u64) {
-        let key = self.format_key(name);
-        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
-            tracing::warn!(
-                component = %self.component_id,
-                max_entries = MAX_METRIC_ENTRIES,
-                "Metric registry capacity exceeded; dropping new counter metric registration"
-            );
-            return;
-        }
-        self.metrics
-            .entry(key)
-            .and_modify(|val| {
-                if let MetricValue::Counter(c) = val {
+        self.with_key(name, |key| {
+            if let Some(mut val) = self.metrics.get_mut(key) {
+                if let MetricValue::Counter(c) = val.value_mut() {
                     *c = (*c).saturating_add(delta);
                 } else {
-                    *val = MetricValue::Counter(delta);
+                    *val.value_mut() = MetricValue::Counter(delta);
                 }
-            })
-            .or_insert(MetricValue::Counter(delta));
+                return;
+            }
+            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new counter metric registration"
+                );
+                return;
+            }
+            self.metrics
+                .insert(key.to_string(), MetricValue::Counter(delta));
+        });
     }
 
     /// Records an instantaneous gauge bitcast value with bounded entry capacity.
     pub fn record_gauge(&self, name: &str, bits: u64) {
-        let key = self.format_key(name);
-        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
-            tracing::warn!(
-                component = %self.component_id,
-                max_entries = MAX_METRIC_ENTRIES,
-                "Metric registry capacity exceeded; dropping new gauge metric registration"
-            );
-            return;
-        }
-        self.metrics.insert(key, MetricValue::Gauge(bits));
+        self.with_key(name, |key| {
+            if let Some(mut val) = self.metrics.get_mut(key) {
+                *val.value_mut() = MetricValue::Gauge(bits);
+                return;
+            }
+            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new gauge metric registration"
+                );
+                return;
+            }
+            self.metrics
+                .insert(key.to_string(), MetricValue::Gauge(bits));
+        });
     }
 
     /// Records a duration observation in nanoseconds with bounded entry capacity.
     pub fn record_duration(&self, name: &str, nanos: u64) {
-        let key = self.format_key(name);
-        if self.metrics.len() >= MAX_METRIC_ENTRIES && !self.metrics.contains_key(&key) {
-            tracing::warn!(
-                component = %self.component_id,
-                max_entries = MAX_METRIC_ENTRIES,
-                "Metric registry capacity exceeded; dropping new duration metric registration"
-            );
-            return;
-        }
-        self.metrics
-            .entry(key)
-            .and_modify(|val| {
-                if let MetricValue::Duration(d) = val {
+        self.with_key(name, |key| {
+            if let Some(mut val) = self.metrics.get_mut(key) {
+                if let MetricValue::Duration(d) = val.value_mut() {
                     d.count = d.count.saturating_add(1);
                     d.sum_nanos = d.sum_nanos.saturating_add(nanos);
                     d.min_nanos = d.min_nanos.min(nanos);
                     d.max_nanos = d.max_nanos.max(nanos);
                     d.last_nanos = nanos;
                 } else {
-                    *val = MetricValue::Duration(DurationSummary {
+                    *val.value_mut() = MetricValue::Duration(DurationSummary {
                         count: 1,
                         sum_nanos: nanos,
                         min_nanos: nanos,
@@ -155,44 +170,54 @@ impl MetricRegistry {
                         last_nanos: nanos,
                     });
                 }
-            })
-            .or_insert(MetricValue::Duration(DurationSummary {
-                count: 1,
-                sum_nanos: nanos,
-                min_nanos: nanos,
-                max_nanos: nanos,
-                last_nanos: nanos,
-            }));
+                return;
+            }
+            if self.metrics.len() >= MAX_METRIC_ENTRIES {
+                tracing::warn!(
+                    component = %self.component_id,
+                    max_entries = MAX_METRIC_ENTRIES,
+                    "Metric registry capacity exceeded; dropping new duration metric registration"
+                );
+                return;
+            }
+            self.metrics.insert(
+                key.to_string(),
+                MetricValue::Duration(DurationSummary {
+                    count: 1,
+                    sum_nanos: nanos,
+                    min_nanos: nanos,
+                    max_nanos: nanos,
+                    last_nanos: nanos,
+                }),
+            );
+        });
     }
 
     /// Reads the current value of a counter, returning `0` if not found.
     #[must_use]
     pub fn read_counter(&self, name: &str) -> u64 {
-        let key = self.format_key(name);
-        match self.metrics.get(&key).as_deref() {
+        self.with_key(name, |key| match self.metrics.get(key).as_deref() {
             Some(&MetricValue::Counter(c)) => c,
             _ => 0,
-        }
+        })
     }
 
     /// Reads the current raw bitcast value of a gauge, returning `None` if not found.
     #[must_use]
     pub fn read_gauge(&self, name: &str) -> Option<u64> {
-        let key = self.format_key(name);
-        match self.metrics.get(&key).as_deref() {
+        self.with_key(name, |key| match self.metrics.get(key).as_deref() {
             Some(&MetricValue::Gauge(bits)) => Some(bits),
             _ => None,
-        }
+        })
     }
 
     /// Reads the current duration metric summary, returning `None` if not found.
     #[must_use]
     pub fn read_duration(&self, name: &str) -> Option<DurationSummary> {
-        let key = self.format_key(name);
-        match self.metrics.get(&key).as_deref() {
+        self.with_key(name, |key| match self.metrics.get(key).as_deref() {
             Some(&MetricValue::Duration(d)) => Some(d),
             _ => None,
-        }
+        })
     }
 
     /// Returns the component identifier configured for this registry.
@@ -254,13 +279,14 @@ impl HostState {
     }
 }
 
-/// Safely reads a string from guest linear memory, checking bounds and capping allocation size.
-fn read_guest_string(
+/// Invokes a closure with a borrowed string slice from guest linear memory, checking bounds and UTF-8.
+fn with_guest_str<R>(
     caller: &mut Caller<'_, HostState>,
     ptr: u32,
     len: u32,
     max_len: usize,
-) -> Option<String> {
+    f: impl FnOnce(&Caller<'_, HostState>, &str) -> R,
+) -> Option<R> {
     let Some(export) = caller.get_export("memory") else {
         tracing::warn!("WASM guest invoked host function without exporting 'memory'");
         return None;
@@ -275,7 +301,8 @@ fn read_guest_string(
         return None;
     };
 
-    let mem_data = memory.data(caller);
+    let caller_ref = &*caller;
+    let mem_data = memory.data(caller_ref);
     let offset = ptr as usize;
     let total_end = end_u32 as usize;
 
@@ -291,8 +318,14 @@ fn read_guest_string(
 
     let read_len = (len as usize).min(max_len);
     let end = offset.saturating_add(read_len);
+    let slice = &mem_data[offset..end];
 
-    Some(String::from_utf8_lossy(&mem_data[offset..end]).into_owned())
+    if let Ok(s) = std::str::from_utf8(slice) {
+        Some(f(caller_ref, s))
+    } else {
+        let owned = String::from_utf8_lossy(slice).into_owned();
+        Some(f(caller_ref, &owned))
+    }
 }
 
 /// Builds and configures a Wasmtime [`Linker`] with standard host functions.
@@ -301,6 +334,8 @@ fn read_guest_string(
 /// - `"wasi_snapshot_preview1"`: WASI Preview 1 host imports from [`wasmtime_wasi::p1`].
 /// - `"env:datalake_host_metric_emit"`: Safe metric emission from guest to [`MetricRegistry`].
 /// - `"env:datalake_host_log"`: Safe logging forwarding from guest to host [`tracing`].
+/// - `"env:datalake_host_has_capability"`: Host capability negotiation during initialization.
+/// - `"env:datalake_host_now_nanos"`: Fast monotonic timestamp query in nanoseconds.
 ///
 /// # Errors
 ///
@@ -318,35 +353,37 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
          name_ptr: u32,
          name_len: u32,
          value: u64| {
-            let Some(name) =
-                read_guest_string(&mut caller, name_ptr, name_len, MAX_METRIC_NAME_LEN)
-            else {
-                return;
-            };
+            let _ = with_guest_str(
+                &mut caller,
+                name_ptr,
+                name_len,
+                MAX_METRIC_NAME_LEN,
+                |caller_ref, name| {
+                    if name.is_empty() {
+                        tracing::warn!("WASM guest emitted metric with empty name");
+                        return;
+                    }
 
-            if name.is_empty() {
-                tracing::warn!("WASM guest emitted metric with empty name");
-                return;
-            }
-
-            match metric_type {
-                METRIC_TYPE_COUNTER => {
-                    caller.data().registry.record_counter(&name, value);
-                }
-                METRIC_TYPE_GAUGE => {
-                    caller.data().registry.record_gauge(&name, value);
-                }
-                METRIC_TYPE_DURATION => {
-                    caller.data().registry.record_duration(&name, value);
-                }
-                _ => {
-                    tracing::warn!(
-                        metric_type,
-                        name = %name,
-                        "Received unknown metric type from guest WebAssembly module"
-                    );
-                }
-            }
+                    match metric_type {
+                        METRIC_TYPE_COUNTER => {
+                            caller_ref.data().registry.record_counter(name, value);
+                        }
+                        METRIC_TYPE_GAUGE => {
+                            caller_ref.data().registry.record_gauge(name, value);
+                        }
+                        METRIC_TYPE_DURATION => {
+                            caller_ref.data().registry.record_duration(name, value);
+                        }
+                        _ => {
+                            tracing::warn!(
+                                metric_type,
+                                name = %name,
+                                "Received unknown metric type from guest WebAssembly module"
+                            );
+                        }
+                    }
+                },
+            );
         },
     )?;
 
@@ -354,27 +391,30 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
         "env",
         "datalake_host_log",
         |mut caller: Caller<'_, HostState>, level: u32, msg_ptr: u32, msg_len: u32| {
-            let Some(msg) = read_guest_string(&mut caller, msg_ptr, msg_len, MAX_LOG_MESSAGE_LEN)
-            else {
-                return;
-            };
-
-            let comp_id = caller.data().registry.component_id();
-            match level {
-                LOG_LEVEL_ERROR => {
-                    tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
-                }
-                LOG_LEVEL_WARN => {
-                    tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
-                }
-                LOG_LEVEL_INFO => {
-                    tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
-                }
-                LOG_LEVEL_DEBUG => {
-                    tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
-                }
-                _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
-            }
+            let _ = with_guest_str(
+                &mut caller,
+                msg_ptr,
+                msg_len,
+                MAX_LOG_MESSAGE_LEN,
+                |caller_ref, msg| {
+                    let comp_id = caller_ref.data().registry.component_id();
+                    match level {
+                        LOG_LEVEL_ERROR => {
+                            tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
+                        }
+                        LOG_LEVEL_WARN => {
+                            tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
+                        }
+                        LOG_LEVEL_INFO => {
+                            tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
+                        }
+                        LOG_LEVEL_DEBUG => {
+                            tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
+                        }
+                        _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
+                    }
+                },
+            );
         },
     )?;
 
@@ -389,22 +429,28 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
                 return 0;
             }
 
-            let Some(cap_name) = read_guest_string(
+            with_guest_str(
                 &mut caller,
                 cap_name_ptr,
                 cap_name_len,
                 MAX_METRIC_NAME_LEN,
-            ) else {
-                return 0;
-            };
-
-            tracing::warn!(
-                capability = %cap_name,
-                "Guest module queried unrecognized capability in datalake_host_has_capability; returning 0"
-            );
-            0
+                |_caller_ref, cap_name| {
+                    tracing::warn!(
+                        capability = %cap_name,
+                        "Guest module queried unrecognized capability in datalake_host_has_capability; returning 0"
+                    );
+                    0
+                },
+            )
+            .unwrap_or(0)
         },
     )?;
+
+    linker.func_wrap("env", "datalake_host_now_nanos", || -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+    })?;
 
     Ok(linker)
 }
