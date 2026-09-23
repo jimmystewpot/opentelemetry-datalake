@@ -183,8 +183,25 @@ impl FileDlqSink {
         }
 
         #[cfg(unix)]
-        if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
-            let _ = dir.sync_all().await;
+        {
+            let dir = tokio::fs::File::open(&self.dlq_dir).await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to open DLQ directory {} for sync: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
+            dir.sync_all().await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to sync DLQ directory {}: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
         }
 
         Ok(())
@@ -1727,7 +1744,7 @@ mod tests {
         let wat = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
         )"#;

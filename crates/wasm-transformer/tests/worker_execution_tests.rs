@@ -1337,7 +1337,7 @@ fn test_worker_rejects_batch_descriptor_with_null_ipc_ptr() {
     let wat = r#"(module
         (memory (export "memory") 1)
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
-        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 4096))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_transform") (param i32 i32 i32) (result i64)
             (i32.store (i32.const 1024) (i32.const 0))

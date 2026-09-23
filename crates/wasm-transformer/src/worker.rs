@@ -241,6 +241,15 @@ impl WasmWorker {
                 return Err((batch, e.into()));
             }
         };
+        if ipc_ptr == 0 {
+            return Err((
+                batch,
+                WasmTransformError::Pipeline(
+                    "Guest datalake_alloc returned null pointer (0), indicating allocation failure"
+                        .to_string(),
+                ),
+            ));
+        }
         if let Err(e) = self
             .memory
             .write(&mut self.store, ipc_ptr as usize, &ipc_buf)
@@ -663,6 +672,13 @@ impl WasmWorker {
                 .call(&mut store, len)
                 .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
 
+            if ptr == 0 {
+                return Err(WasmTransformError::InitFailed(
+                    "Guest datalake_alloc returned null pointer (0) during initialization"
+                        .to_string(),
+                ));
+            }
+
             memory
                 .write(&mut store, ptr as usize, &init_bytes)
                 .map_err(|e| WasmTransformError::InitFailed(e.to_string()))?;
@@ -771,6 +787,7 @@ fn extract_output_batches(
     }
 
     let mut out_batches = Vec::with_capacity((batch_count as usize).min(64));
+    let max_decoded = MAX_GUEST_BATCH_COUNT as usize;
 
     for i in 0..batch_count {
         let offset =
@@ -809,6 +826,11 @@ fn extract_output_batches(
         let reader = StreamReader::try_new(cursor, None)
             .map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
         for maybe_rb in reader {
+            if out_batches.len() >= max_decoded {
+                return Err(WasmTransformError::Pipeline(format!(
+                    "Aggregate decoded batch count exceeds maximum allowed limit of {MAX_GUEST_BATCH_COUNT}"
+                )));
+            }
             let rb = maybe_rb.map_err(|e| WasmTransformError::ArrowIpc(e.to_string()))?;
             let signal = match input_batch {
                 SignalBatch::Logs(_) => SignalBatch::Logs(rb),
