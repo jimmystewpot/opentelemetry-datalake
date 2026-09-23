@@ -1808,3 +1808,72 @@ async fn test_worker_deallocates_guest_memory_on_dispatch_error_path() {
     }
     // Reaching here without a panic confirms memory is properly freed on error paths.
 }
+
+#[tokio::test]
+async fn test_worker_rejuvenates_when_pool_concurrency_is_one() {
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 2;
+
+    let mut worker = WasmWorker::new(1, Arc::clone(&cache), module, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+    assert_eq!(worker.batches_processed(), 1);
+
+    // Batch 2 triggers rejuvenation.
+    // If old guest is NOT dropped before instantiating new guest, the pool (size 1) is exhausted!
+    worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert_eq!(
+        worker.batches_processed(),
+        0,
+        "batches_processed must be reset after rejuvenation in pool with concurrency 1"
+    );
+}
+
+#[tokio::test]
+async fn test_worker_hot_reload_when_pool_concurrency_is_one() {
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(1, Arc::clone(&cache), module_v1, cfg).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome1 = worker
+        .execute_batch(SignalBatch::Logs(batch.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(outcome1, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.local_generation(), 1);
+
+    // Recompile with discard module — advances generation to 2.
+    let _module_v2 = cache
+        .compile_module(&wat::parse_str(discard_wat()).unwrap())
+        .unwrap();
+    assert_eq!(cache.module_generation(), 2);
+
+    // Batch 2 must detect generation mismatch and reload module V2.
+    // If pool slots has no headroom for candidate instance, reload fails and old module persists!
+    let outcome2 = worker
+        .execute_batch(SignalBatch::Logs(batch))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome2, WorkerOutcome::Discarded),
+        "Worker must switch to discarded module on hot reload even when concurrency is 1"
+    );
+    assert_eq!(worker.local_generation(), 2);
+}

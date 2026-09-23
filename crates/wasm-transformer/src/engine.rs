@@ -45,7 +45,10 @@ impl EngineCache {
         concurrency: usize,
         max_memory_bytes: usize,
     ) -> Result<Self, WasmTransformError> {
-        let pool_slots = u32::try_from(concurrency.max(1)).unwrap_or(4);
+        let active_slots = u32::try_from(concurrency.max(1)).unwrap_or(4);
+        // Provide 2x instance/memory headroom so that active workers can instantiate candidate
+        // instances during hot-reloads and transitions without exhausting the pool.
+        let pool_slots = active_slots.saturating_mul(2);
         let mut pool_cfg = PoolingAllocationConfig::default();
         pool_cfg.total_core_instances(pool_slots);
         pool_cfg.total_memories(pool_slots);

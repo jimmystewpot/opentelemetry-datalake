@@ -281,6 +281,7 @@ impl WasmWorker {
     /// Returns [`WasmTransformError`] if re-instantiation fails, required exports are missing,
     /// or guest initialization fails.
     pub async fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
+        drop(self.guest.take());
         let engine = self.engine.engine().clone();
         let module = Arc::clone(&self.module);
         let init_deadline_ticks = self.init_deadline_ticks;
