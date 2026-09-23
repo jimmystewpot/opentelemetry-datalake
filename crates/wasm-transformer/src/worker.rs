@@ -341,7 +341,9 @@ impl WasmWorker {
     fn check_hot_reload(&mut self) -> Result<(), WasmTransformError> {
         if self.local_generation != self.engine.module_generation() {
             let (new_mod, generation) = self.engine.current_module();
-            if let Some(m) = new_mod {
+            if generation > self.local_generation
+                && let Some(m) = new_mod
+            {
                 self.module = m;
                 self.rejuvenate()?;
                 self.local_generation = generation;

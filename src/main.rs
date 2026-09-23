@@ -24,9 +24,12 @@ struct AppConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(clippy::struct_field_names)]
 struct ServerConfig {
     grpc_addr: SocketAddr,
     http_addr: SocketAddr,
+    #[serde(default)]
+    admin_addr: Option<SocketAddr>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -70,6 +73,10 @@ struct Cli {
     /// Override HTTP bind address (e.g. 0.0.0.0:4318)
     #[arg(long, value_name = "ADDR")]
     http_addr: Option<SocketAddr>,
+
+    /// Override admin HTTP bind address (e.g. 0.0.0.0:9090)
+    #[arg(long, value_name = "ADDR")]
+    admin_addr: Option<SocketAddr>,
 
     /// Override dry-run mode for Iceberg sink
     #[arg(long)]
@@ -115,16 +122,25 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         );
     }
 
+    if let Some(admin_addr) = config.server.admin_addr
+        && (admin_addr == config.server.http_addr || admin_addr == config.server.grpc_addr)
+    {
+        anyhow::bail!(
+            "Configuration validation failed: server.admin_addr ({admin_addr}) cannot match http_addr or grpc_addr (port isolation required)"
+        );
+    }
+
     Ok(())
 }
 
-/// A tuple containing signal-isolated transformers for logs, traces, and metrics, along with SIGHUP listener handles.
-type SignalTransformers = (
-    Box<dyn Transform>,
-    Box<dyn Transform>,
-    Box<dyn Transform>,
-    Vec<Option<tokio::task::JoinHandle<()>>>,
-);
+/// Container for signal-isolated transformers, SIGHUP listener handles, and engine references.
+struct InitializedTransformers {
+    logs: Box<dyn Transform>,
+    traces: Box<dyn Transform>,
+    metrics: Box<dyn Transform>,
+    sighup_handles: Vec<Option<tokio::task::JoinHandle<()>>>,
+    engines: Vec<std::sync::Arc<wasm_transformer::engine::EngineCache>>,
+}
 
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -265,13 +281,8 @@ fn instantiate_signal_wasm_transformer(
 fn initialize_transformers(
     config: &AppConfig,
     dlq_handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<SignalTransformers> {
-    let mut sighup_handles = Vec::new();
-    let (logs_transformer, traces_transformer, metrics_transformer): (
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-        Box<dyn Transform>,
-    ) = if let Some(ref wasm_cfg) = config.wasm_transformer {
+) -> anyhow::Result<InitializedTransformers> {
+    if let Some(ref wasm_cfg) = config.wasm_transformer {
         tracing::info!(
             transformer_id = %wasm_cfg.id,
             module_path = %wasm_cfg.module_path,
@@ -281,41 +292,40 @@ fn initialize_transformers(
         let traces_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "traces", dlq_handles)?;
         let metrics_wasm = instantiate_signal_wasm_transformer(wasm_cfg, "metrics", dlq_handles)?;
 
+        let engines = vec![
+            std::sync::Arc::clone(logs_wasm.engine()),
+            std::sync::Arc::clone(traces_wasm.engine()),
+            std::sync::Arc::clone(metrics_wasm.engine()),
+        ];
+
+        let mut sighup_handles = Vec::new();
         if wasm_cfg.enable_sighup {
             let module_path = std::path::PathBuf::from(&wasm_cfg.module_path);
             let expected_sha = wasm_cfg.sha256.clone();
-            let engines = vec![
-                std::sync::Arc::clone(logs_wasm.engine()),
-                std::sync::Arc::clone(traces_wasm.engine()),
-                std::sync::Arc::clone(metrics_wasm.engine()),
-            ];
             sighup_handles.push(wasm_transformer::reload::spawn_sighup_listener_multi(
-                engines,
+                engines.clone(),
                 module_path,
                 expected_sha,
                 true,
             ));
         }
 
-        (
-            Box::new(logs_wasm),
-            Box::new(traces_wasm),
-            Box::new(metrics_wasm),
-        )
+        Ok(InitializedTransformers {
+            logs: Box::new(logs_wasm),
+            traces: Box::new(traces_wasm),
+            metrics: Box::new(metrics_wasm),
+            sighup_handles,
+            engines,
+        })
     } else {
-        (
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-            Box::new(noop_transformer::NoopTransformer::new()),
-        )
-    };
-
-    Ok((
-        logs_transformer,
-        traces_transformer,
-        metrics_transformer,
-        sighup_handles,
-    ))
+        Ok(InitializedTransformers {
+            logs: Box::new(noop_transformer::NoopTransformer::new()),
+            traces: Box::new(noop_transformer::NoopTransformer::new()),
+            metrics: Box::new(noop_transformer::NoopTransformer::new()),
+            sighup_handles: Vec::new(),
+            engines: Vec::new(),
+        })
+    }
 }
 
 #[tokio::main]
@@ -363,6 +373,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(http_addr) = cli_args.http_addr {
         config.server.http_addr = http_addr;
     }
+    if let Some(admin_addr) = cli_args.admin_addr {
+        config.server.admin_addr = Some(admin_addr);
+    }
     if let (Some(dry_run), Some(iceberg)) = (cli_args.dry_run, &mut config.iceberg) {
         iceberg.dry_run = dry_run;
     }
@@ -407,18 +420,52 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut dlq_handles = Vec::new();
-    let (mut logs_transformer, mut traces_transformer, mut metrics_transformer, sighup_handles) =
-        initialize_transformers(&config, &mut dlq_handles)?;
+    let mut transformers = initialize_transformers(&config, &mut dlq_handles)?;
+
+    let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
+        let expected_sha = config
+            .wasm_transformer
+            .as_ref()
+            .and_then(|w| w.sha256.clone());
+        let admin_router =
+            wasm_transformer::reload::build_admin_router_multi(transformers.engines, expected_sha);
+        let listener = tokio::net::TcpListener::bind(admin_addr)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to bind admin HTTP listener to {admin_addr}: {e}")
+            })?;
+        tracing::info!("Admin HTTP server listening on {admin_addr}");
+        let mut shutdown_rx_admin = shutdown_tx.subscribe();
+        let admin_shutdown = async move {
+            while !*shutdown_rx_admin.borrow_and_update() {
+                if shutdown_rx_admin.changed().await.is_err() {
+                    break;
+                }
+            }
+            tracing::info!("Admin HTTP server shutting down gracefully");
+        };
+        Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, admin_router)
+                .with_graceful_shutdown(admin_shutdown)
+                .await
+            {
+                tracing::error!("Admin HTTP server error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
 
     // Spawn transformers
     let logs_trans_handle = tokio::spawn(async move {
-        if let Err(e) = logs_transformer.transform(logs_rx, logs_sink_tx).await {
+        if let Err(e) = transformers.logs.transform(logs_rx, logs_sink_tx).await {
             tracing::error!("Logs transformer error: {}", e);
         }
     });
 
     let traces_trans_handle = tokio::spawn(async move {
-        if let Err(e) = traces_transformer
+        if let Err(e) = transformers
+            .traces
             .transform(traces_rx, traces_sink_tx)
             .await
         {
@@ -427,7 +474,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let metrics_trans_handle = tokio::spawn(async move {
-        if let Err(e) = metrics_transformer
+        if let Err(e) = transformers
+            .metrics
             .transform(metrics_rx, metrics_sink_tx)
             .await
         {
@@ -652,7 +700,11 @@ async fn main() -> anyhow::Result<()> {
         metrics_sink_handle
     );
 
-    for h in sighup_handles.into_iter().flatten() {
+    for h in transformers.sighup_handles.into_iter().flatten() {
+        h.abort();
+    }
+
+    if let Some(h) = admin_handle {
         h.abort();
     }
 
@@ -1008,6 +1060,74 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    #[tokio::test]
+    async fn test_admin_server_runtime_listener_serves_reload_endpoint() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wasm_transformer::engine::EngineCache;
+        use wasm_transformer::reload::build_admin_router_multi;
+
+        let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+        let router = build_admin_router_multi(vec![engine], None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    while !*shutdown_rx.borrow_and_update() {
+                        if shutdown_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+        });
+
+        // Test sending request to runtime listener over loopback TCP
+        let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        let req = format!(
+            "POST /api/v1/transforms/wasm/reload HTTP/1.1\r\nHost: {bound_addr}\r\nContent-Type: application/json\r\nContent-Length: 19\r\n\r\n{{\"module_path\": \"\"}}"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp_str.starts_with("HTTP/1.1 400 Bad Request"));
+
+        let _ = shutdown_tx.send(true);
+        server_handle.await.unwrap();
+    }
+
+    #[test]
+    fn test_config_validation_fails_when_admin_addr_matches_http_addr() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        admin_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(err.to_string().contains("port isolation required"));
+    }
+
     #[test]
     fn test_initialize_transformers_noop() {
         let toml_str = r#"
@@ -1021,9 +1141,9 @@ mod tests {
             .expect("Config should deserialize");
 
         let mut dlq_handles = Vec::new();
-        let (_logs, _traces, _metrics, handles) =
-            initialize_transformers(&config, &mut dlq_handles).unwrap();
-        assert!(handles.is_empty());
+        let trans = initialize_transformers(&config, &mut dlq_handles).unwrap();
+        assert!(trans.sighup_handles.is_empty());
+        assert!(trans.engines.is_empty());
         assert!(dlq_handles.is_empty());
     }
 
@@ -1071,14 +1191,14 @@ mod tests {
             .expect("Config should deserialize");
 
         let mut dlq_handles = Vec::new();
-        let (_logs, _traces, _metrics, handles) =
-            initialize_transformers(&config, &mut dlq_handles).unwrap();
+        let trans = initialize_transformers(&config, &mut dlq_handles).unwrap();
 
-        assert_eq!(handles.len(), 1);
+        assert_eq!(trans.sighup_handles.len(), 1);
         assert_eq!(
-            handles.into_iter().flatten().count(),
+            trans.sighup_handles.into_iter().flatten().count(),
             usize::from(cfg!(unix))
         );
+        assert_eq!(trans.engines.len(), 3);
         assert!(dlq_handles.is_empty());
         let _ = std::fs::remove_file(&path);
     }

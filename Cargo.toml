@@ -47,6 +47,7 @@ serde = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 arrow.workspace = true
+axum = { workspace = true }
 
 [features]
 default = []
