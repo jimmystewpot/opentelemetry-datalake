@@ -74,6 +74,9 @@ pub struct MetricRegistry {
     component_id: String,
     prefix: String,
     signal: std::sync::RwLock<String>,
+    /// Pre-computed OpenTelemetry attribute set for metric emissions.
+    /// Avoids acquiring `signal` `RwLock` and cloning strings on every emission.
+    cached_attributes: std::sync::RwLock<[opentelemetry::KeyValue; 2]>,
     registration_lock: std::sync::Mutex<()>,
     metrics: DashMap<String, MetricValue>,
     handles: DashMap<String, MetricHandle>,
@@ -89,10 +92,15 @@ impl MetricRegistry {
     /// Creates a new `MetricRegistry` for the specified component identifier and signal context.
     #[must_use]
     pub fn with_signal(component_id: &str, signal: &str) -> Self {
+        let attrs = [
+            opentelemetry::KeyValue::new("component_id", component_id.to_string()),
+            opentelemetry::KeyValue::new("signal", signal.to_string()),
+        ];
         Self {
             component_id: component_id.to_string(),
             prefix: format!("datalake_transformers_{component_id}_"),
             signal: std::sync::RwLock::new(signal.to_string()),
+            cached_attributes: std::sync::RwLock::new(attrs),
             registration_lock: std::sync::Mutex::new(()),
             metrics: DashMap::new(),
             handles: DashMap::new(),
@@ -103,6 +111,12 @@ impl MetricRegistry {
     pub fn set_signal(&self, signal: &str) {
         if let Ok(mut sig) = self.signal.write() {
             *sig = signal.to_string();
+        }
+        if let Ok(mut attrs) = self.cached_attributes.write() {
+            *attrs = [
+                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
+                opentelemetry::KeyValue::new("signal", signal.to_string()),
+            ];
         }
     }
 
@@ -121,6 +135,17 @@ impl MetricRegistry {
         key.push_str(&self.prefix);
         key.push_str(name);
         key
+    }
+
+    /// Returns the pre-computed OpenTelemetry attributes for metric emissions.
+    ///
+    /// Reads from a cached `[KeyValue; 2]` to avoid acquiring the `signal` `RwLock`
+    /// and cloning `component_id` on every metric emission in the hot path.
+    fn emit_attributes(&self) -> [opentelemetry::KeyValue; 2] {
+        self.cached_attributes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Retrieves an existing cached instrument handle, or registers a new instrument under [`MetricRegistry::registration_lock`].
@@ -200,14 +225,8 @@ impl MetricRegistry {
             return;
         };
 
-        let sig = self.signal();
-        counter.add(
-            delta,
-            &[
-                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
-                opentelemetry::KeyValue::new("signal", sig),
-            ],
-        );
+        let attrs = self.emit_attributes();
+        counter.add(delta, &attrs);
     }
 
     /// Records an instantaneous gauge bitcast value, caching and calling an OpenTelemetry [`opentelemetry::metrics::Gauge`].
@@ -241,14 +260,8 @@ impl MetricRegistry {
         self.metrics.insert(key, MetricValue::Gauge(bits));
 
         let float_val = f64::from_bits(bits);
-        let sig = self.signal();
-        gauge.record(
-            float_val,
-            &[
-                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
-                opentelemetry::KeyValue::new("signal", sig),
-            ],
-        );
+        let attrs = self.emit_attributes();
+        gauge.record(float_val, &attrs);
     }
 
     /// Records a duration observation in nanoseconds, converting to seconds and recording to an OpenTelemetry [`opentelemetry::metrics::Histogram`].
@@ -288,14 +301,8 @@ impl MetricRegistry {
 
         #[allow(clippy::cast_precision_loss)]
         let seconds = (nanos as f64) / 1_000_000_000.0;
-        let sig = self.signal();
-        histogram.record(
-            seconds,
-            &[
-                opentelemetry::KeyValue::new("component_id", self.component_id.clone()),
-                opentelemetry::KeyValue::new("signal", sig),
-            ],
-        );
+        let attrs = self.emit_attributes();
+        histogram.record(seconds, &attrs);
     }
 
     /// Reads the current value of a counter, returning `0` if not found.
