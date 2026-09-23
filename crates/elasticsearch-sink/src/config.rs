@@ -256,13 +256,9 @@ impl ElasticsearchSinkConfig {
             }
         }
 
-        if let Some(ref ca_path) = self.tls.ca_cert_path
-            && !std::path::Path::new(ca_path).is_file()
-        {
-            return Err(crate::error::ElasticsearchError::StartupValidation(
-                format!("CA certificate file does not exist: {ca_path}"),
-            ));
-        }
+        self.tls
+            .validate()
+            .map_err(|e| crate::error::ElasticsearchError::StartupValidation(e.to_string()))?;
 
         Ok(())
     }
@@ -417,7 +413,26 @@ mod tests {
         "#;
         let cfg: ElasticsearchSinkConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.tls.ca_cert_path.as_deref(), Some("/path/to/ca.pem"));
-        assert!(cfg.tls.insecure_skip_verify);
+        assert!(cfg.tls.is_insecure());
+    }
+
+    #[test]
+    fn test_config_deserializes_with_tls_verification_disabled() {
+        let toml_str = r#"
+            endpoints = ["http://localhost:9200"]
+            [data_streams]
+            logs = "logs-otel-default"
+            metrics = "metrics-otel-default"
+            traces = "traces-otel-default"
+            [tls]
+            verification = "disabled"
+        "#;
+        let cfg: ElasticsearchSinkConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.tls.is_insecure());
+        assert_eq!(
+            cfg.tls.verification,
+            crate::tls::TlsVerificationMode::Disabled
+        );
     }
 
     #[test]

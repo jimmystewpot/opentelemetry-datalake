@@ -113,18 +113,22 @@ impl WasmDispatcher {
         }
 
         let mut next_worker = 0usize;
+        let mut dispatch_result: Result<(), WasmTransformError> = Ok(());
         while let Some(batch) = input.recv().await {
             if !Self::dispatch_batch(batch, &worker_txs, &mut next_worker, concurrency).await {
-                return Err(WasmTransformError::Pipeline(
+                dispatch_result = Err(WasmTransformError::Pipeline(
                     "Dispatcher worker channel closed".into(),
                 ));
+                break;
             }
         }
 
+        // Always close worker input channels and drain workers, even after dispatch failure,
+        // to prevent orphaned tokio tasks and resource leaks.
         drop(worker_txs);
         Self::drain_workers(worker_handles, &self.transformer_config.drain_timeout).await;
 
-        Ok(())
+        dispatch_result
     }
 
     /// Spawns worker tasks and returns their channel senders, task join handles, and initialization result receivers.
@@ -245,9 +249,15 @@ impl WasmDispatcher {
                                     "Failed to rejuvenate worker after trap; terminating worker task: {rejuv_err}"
                                 );
                                 while let Ok(unprocessed) = wrx.try_recv() {
-                                    if let Some(ref dlq) = err_tx {
-                                        let _ = dlq.send(unprocessed).await;
-                                    }
+                                    Self::handle_errored(
+                                        worker_id,
+                                        format!("Worker terminated due to rejuvenation failure: {rejuv_err}"),
+                                        unprocessed,
+                                        &tf_cfg,
+                                        &output,
+                                        err_tx.as_ref(),
+                                    )
+                                    .await;
                                 }
                                 break;
                             }
@@ -258,7 +268,17 @@ impl WasmDispatcher {
                                 );
                                 while let Ok(unprocessed) = wrx.try_recv() {
                                     if let Some(ref dlq) = err_tx {
-                                        let _ = dlq.send(unprocessed).await;
+                                        if let Err(e) = dlq.send(unprocessed).await {
+                                            warn!(
+                                                worker_id,
+                                                "Failed to send buffered batch to DLQ after output channel closed: {e}"
+                                            );
+                                        }
+                                    } else {
+                                        warn!(
+                                            worker_id,
+                                            "Dropping buffered batch: downstream output closed and no DLQ configured"
+                                        );
                                     }
                                 }
                                 break;
@@ -430,14 +450,43 @@ impl WasmDispatcher {
                     "Worker channel closed during backpressure send. Attempting retry across surviving workers..."
                 );
                 let mut routed = false;
+                let mut pending_batch: Option<SignalBatch> = Some(returned_batch);
+                let mut first_full_idx: Option<usize> = None;
                 for retry_offset in 1..concurrency {
                     let retry_idx = (full_idx.saturating_add(retry_offset)) % concurrency;
-                    if let Some(retry_tx) = worker_txs.get(retry_idx)
-                        && retry_tx.try_send(returned_batch.clone()).is_ok()
-                    {
-                        routed = true;
-                        *next_worker = (retry_idx.saturating_add(1)) % concurrency;
+                    let Some(retry_tx) = worker_txs.get(retry_idx) else {
+                        continue;
+                    };
+                    let Some(retry_batch) = pending_batch.take() else {
                         break;
+                    };
+                    match retry_tx.try_send(retry_batch) {
+                        Ok(()) => {
+                            routed = true;
+                            *next_worker = (retry_idx.saturating_add(1)) % concurrency;
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Full(recovered)) => {
+                            if first_full_idx.is_none() {
+                                first_full_idx = Some(retry_idx);
+                            }
+                            pending_batch = Some(recovered);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(recovered)) => {
+                            pending_batch = Some(recovered);
+                        }
+                    }
+                }
+                if !routed {
+                    // All try_sends failed. If any worker was full (alive but backpressured),
+                    // await capacity on it rather than dropping the batch.
+                    if let Some(survivor_idx) = first_full_idx
+                        && let Some(batch) = pending_batch.take()
+                        && let Some(survivor_tx) = worker_txs.get(survivor_idx)
+                        && survivor_tx.send(batch).await.is_ok()
+                    {
+                        *next_worker = (survivor_idx.saturating_add(1)) % concurrency;
+                        routed = true;
                     }
                 }
                 if !routed {

@@ -62,31 +62,32 @@ fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Fie
             )));
             new_f.with_nullable(true)
         }
-        arrow::datatypes::DataType::Map(child, sorted) => {
+        arrow::datatypes::DataType::Map(child, keys_sorted) => {
             let mut new_f = field.clone();
             new_f = new_f.with_data_type(arrow::datatypes::DataType::Map(
                 Arc::new(make_field_nullable(child)),
-                *sorted,
+                *keys_sorted,
             ));
             new_f.with_nullable(true)
         }
-        _ => field.clone().with_nullable(true),
+        _ => {
+            let mut new_f = field.clone();
+            new_f.set_nullable(true);
+            new_f
+        }
     }
 }
 
-/// Verifies that canonical immutable columns have not been dropped, completely wiped to nulls,
-/// or had their data types mutated.
+/// Verifies that none of the canonical immutable columns were dropped or wiped.
 ///
-/// Executes an $O(1)$ metadata check on the output [`RecordBatch`] for each canonical
-/// OpenTelemetry field defined in [`IMMUTABLE_COLUMNS`]. If a column was not entirely null
-/// in the input batch, and is either completely nullified or dropped entirely in the output
-/// batch (when non-empty), an error is returned. If an immutable column is present in both
-/// input and output, its [`arrow::datatypes::DataType`] must remain identical.
+/// Executes in $O(1)$ time by verifying `col.null_count() == col.len()` against
+/// pre-computed column statistics rather than iterating row-by-row.
 ///
 /// # Errors
 ///
-/// Returns [`WasmTransformError::Pipeline`] if any immutable column present in `input` is
-/// dropped, entirely null in `output` with `!output.is_empty()`, or has its data type mutated.
+/// Returns [`WasmTransformError::Pipeline`] if any column in [`IMMUTABLE_COLUMNS`]
+/// was dropped by the guest or became entirely null (when input had non-null data),
+/// or if the column's data type was mutated.
 pub fn verify_structural_immutability(
     input: &RecordBatch,
     output: &RecordBatch,
@@ -194,8 +195,16 @@ pub fn backfill_missing_columns(
     let num_rows = output.num_rows();
     let mut added = false;
 
+    // Build an O(1) lookup map from field name → output column index to avoid O(n²) scanning.
+    let output_field_index: std::collections::HashMap<&str, usize> = output_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name().as_str(), i))
+        .collect();
+
     for field in input_schema.fields() {
-        if let Ok(idx) = output_schema.index_of(field.name()) {
+        if let Some(&idx) = output_field_index.get(field.name().as_str()) {
             let out_field = output_schema.fields().get(idx).ok_or_else(|| {
                 WasmTransformError::Pipeline(format!(
                     "Field index {idx} out of bounds in output schema"

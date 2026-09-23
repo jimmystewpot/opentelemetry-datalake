@@ -240,9 +240,13 @@ impl WasmTransformer {
         }
 
         // 6. Pre-compile WebAssembly module
-        let module = engine
-            .compile_module(&wasm_bytes)
-            .map_err(|e| PipelineError::Internal(e.to_string()))?;
+        let module = if let Some(existing) = engine.module() {
+            existing
+        } else {
+            engine
+                .compile_module(&wasm_bytes)
+                .map_err(|e| PipelineError::Internal(e.to_string()))?
+        };
 
         let signal = config.env.get("signal").map_or("", String::as_str);
         let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
@@ -713,7 +717,7 @@ mod tests {
     fn test_validate_config_rejects_missing_abi_version() {
         let wat_src = r#"(module
             (memory (export "memory") 1)
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         )"#;
@@ -736,7 +740,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 2))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         )"#;
@@ -779,7 +783,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
@@ -800,7 +804,7 @@ mod tests {
     fn test_new_rejects_module_with_missing_abi_version_early() {
         let wat_src = r#"(module
             (memory (export "memory") 1)
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         )"#;
@@ -823,7 +827,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
@@ -853,7 +857,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
@@ -896,7 +900,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
@@ -940,7 +944,7 @@ mod tests {
         let wat_src = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
@@ -1010,7 +1014,7 @@ mod tests {
         let valid_wat = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
         )"#;
@@ -1048,7 +1052,7 @@ mod tests {
             (memory (export "memory") 1)
             (data (i32.const 100) "init_counter")
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
             (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)

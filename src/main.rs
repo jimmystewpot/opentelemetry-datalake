@@ -90,6 +90,16 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     }
 
+    if config.kafka.is_none()
+        && config.iceberg.is_none()
+        && config.starrocks.is_none()
+        && config.elasticsearch.is_none()
+    {
+        anyhow::bail!(
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+        );
+    }
+
     if let Some(ref iceberg_cfg) = config.iceberg {
         let logs_table = iceberg_cfg
             .logs_table_identifier
@@ -116,10 +126,13 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         es_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    } else if config.kafka.is_none() && config.starrocks.is_none() {
-        anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
-        );
+    } else if let Some(ref sr_cfg) = config.starrocks {
+        sr_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if let Some(sort_cfg) = config.kafka.as_ref().and_then(|k| k.order_by.as_ref()) {
+        pipeline_core::sort::BatchSorter::from_config(sort_cfg)
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     }
 
     if let Some(admin_addr) = config.server.admin_addr
@@ -136,6 +149,17 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Returns `true` if `val` is a safe, single relative path component without path traversal,
+/// separators, or null bytes (e.g. neither empty, `"."`, `".."`, nor containing `/` or `\`).
+fn is_safe_path_component(val: &str) -> bool {
+    if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains('\0') {
+        return false;
+    }
+    let mut components = std::path::Path::new(val).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
 #[derive(Debug)]
 pub struct FileDlqSink {
@@ -147,18 +171,31 @@ pub struct FileDlqSink {
 
 impl FileDlqSink {
     /// Creates a new `FileDlqSink` targeting the directory `dlq/{transformer_id}/{signal}/{role}`.
-    #[must_use]
-    pub fn new(transformer_id: &str, signal: &str, role: &str) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `transformer_id`, `signal`, or `role` contain path separators
+    /// or traversal components (e.g., `..`, `/`, `\`), which would escape the intended DLQ hierarchy.
+    pub fn new(transformer_id: &str, signal: &str, role: &str) -> anyhow::Result<Self> {
+        for (label, value) in [
+            ("transformer_id", transformer_id),
+            ("signal", signal),
+            ("role", role),
+        ] {
+            if !is_safe_path_component(value) {
+                anyhow::bail!("DLQ {label} contains unsafe path components: {value:?}");
+            }
+        }
         let dlq_dir = std::path::PathBuf::from("dlq")
             .join(transformer_id)
             .join(signal)
             .join(role);
-        Self {
+        Ok(Self {
             transformer_id: transformer_id.to_string(),
             signal: signal.to_string(),
             role: role.to_string(),
             dlq_dir,
-        }
+        })
     }
 
     /// Atomically persists an Arrow IPC payload to disk via a temporary file and sync rename.
@@ -195,8 +232,25 @@ impl FileDlqSink {
         }
 
         #[cfg(unix)]
-        if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
-            let _ = dir.sync_all().await;
+        {
+            let dir = tokio::fs::File::open(&self.dlq_dir).await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to open DLQ directory {} for sync: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
+            dir.sync_all().await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to sync DLQ directory {}: {e}",
+                        self.dlq_dir.display()
+                    ),
+                )
+            })?;
         }
 
         Ok(())
@@ -318,7 +372,7 @@ fn instantiate_signal_wasm_transformer(
 
     let reroute_error = if signal_cfg.on_error == pipeline_core::config::OnErrorPolicy::Reroute {
         Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
-            FileDlqSink::new(&signal_cfg.id, signal, "error"),
+            FileDlqSink::new(&signal_cfg.id, signal, "error")?,
         )))
     } else {
         None
@@ -326,7 +380,7 @@ fn instantiate_signal_wasm_transformer(
 
     let reroute_reject = if signal_cfg.on_reject == pipeline_core::config::OnRejectPolicy::Reroute {
         Some(wasm_transformer::DlqOutput::Sink(std::sync::Arc::new(
-            FileDlqSink::new(&signal_cfg.id, signal, "reject"),
+            FileDlqSink::new(&signal_cfg.id, signal, "reject")?,
         )))
     } else {
         None
@@ -1394,6 +1448,114 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_fails_with_insecure_starrocks_tls() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks TLS verification is disabled");
+        assert!(
+            err.to_string()
+                .contains("disabling TLS certificate verification is prohibited"),
+            "Error message should indicate disabled verification prohibited: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_fails_with_missing_starrocks_ca_cert() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        ca_cert_path = "/nonexistent/ca.pem"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks config should deserialize");
+
+        let err = validate_config(&config)
+            .expect_err("Validation should fail when StarRocks CA file is missing");
+        assert!(
+            err.to_string().contains("CA certificate file not found"),
+            "Error message should indicate missing CA file: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_validates_only_selected_sink_in_priority_order() {
+        // Iceberg takes precedence over StarRocks and Elasticsearch.
+        // Even if an inactive StarRocks section has invalid TLS, validate_config should succeed
+        // because Iceberg is the selected sink.
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_name = "test_catalog"
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "db.telemetry"
+        logs_table_identifier = "db.logs"
+        traces_table_identifier = "db.traces"
+        metrics_table_identifier = "db.metrics"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "unified"
+        table = "telemetry"
+        signal_type_column = "signal_type"
+        [starrocks.tls]
+        verification = "disabled"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Config should deserialize");
+
+        assert!(
+            validate_config(&config).is_ok(),
+            "validate_config should succeed because Iceberg is selected and valid, ignoring inactive StarRocks"
+        );
+    }
+
+    #[test]
     fn test_initialize_transformers_noop() {
         let toml_str = r#"
         [server]
@@ -1465,7 +1627,7 @@ mod tests {
             initialize_transformers(&config, &mut metric_bridges).unwrap();
 
         assert!(engine.is_some());
-        assert_eq!(engine.unwrap().module_generation(), 0);
+        assert_eq!(engine.unwrap().module_generation(), 1);
         assert_eq!(metric_bridges.len(), 3);
         let _ = std::fs::remove_file(&path);
     }
@@ -1692,6 +1854,39 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_is_safe_path_component() {
+        assert!(is_safe_path_component("wasm_transformer"));
+        assert!(is_safe_path_component("my-sink-123"));
+        assert!(is_safe_path_component("valid.name"));
+
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component(".."));
+        assert!(!is_safe_path_component("../archive"));
+        assert!(!is_safe_path_component("foo/bar"));
+        assert!(!is_safe_path_component("foo\\bar"));
+        assert!(!is_safe_path_component("/absolute"));
+        assert!(!is_safe_path_component("foo\0bar"));
+    }
+
+    #[test]
+    fn test_file_dlq_sink_new_rejects_path_traversal() {
+        assert!(FileDlqSink::new("../archive", "logs", "error").is_err());
+        assert!(FileDlqSink::new("/etc", "logs", "error").is_err());
+        assert!(FileDlqSink::new("test", "../traces", "error").is_err());
+        assert!(FileDlqSink::new("test", "logs", "error/extra").is_err());
+        assert!(FileDlqSink::new("", "logs", "error").is_err());
+
+        let ok_sink = FileDlqSink::new("valid_transformer", "logs", "error");
+        assert!(ok_sink.is_ok());
+        let sink = ok_sink.unwrap();
+        assert_eq!(
+            sink.dlq_dir,
+            std::path::PathBuf::from("dlq/valid_transformer/logs/error")
+        );
     }
 
     #[test]
@@ -1955,7 +2150,7 @@ mod tests {
         let wat = r#"(module
             (memory (export "memory") 1)
             (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
         )"#;
