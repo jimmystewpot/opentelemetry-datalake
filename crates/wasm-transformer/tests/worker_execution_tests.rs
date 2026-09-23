@@ -1269,3 +1269,60 @@ async fn test_concurrent_worker_initialization_during_module_reload() {
         assert_eq!(worker.local_generation(), target_gen);
     }
 }
+
+#[test]
+fn test_worker_rejects_positive_batch_count_with_null_batches_ptr() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            ;; Return header with status=0, batch_count=1, but batches_ptr=0
+            (i32.store (i32.const 0) (i32.const 0))  ;; status = 0
+            (i32.store (i32.const 4) (i32.const 1))  ;; batch_count = 1
+            (i32.store (i32.const 8) (i32.const 0))  ;; batches_ptr = 0 (null)
+            (i32.const 0)
+        )
+    )"#;
+
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, registry).unwrap();
+
+    let batch = create_test_record_batch();
+    let res = worker.execute_batch(SignalBatch::Logs(batch));
+    assert!(res.is_err());
+    let (_returned_batch, err) = res.unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::Pipeline(ref msg) if msg.contains("null batches_ptr")),
+        "Expected null batches_ptr protocol error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_worker_probe_candidate_instantiates_supplied_module_directly() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module_v1 = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+    let _ = cache.publish_module(Arc::clone(&module_v1));
+
+    let candidate_module = Arc::new(
+        wasmtime::Module::new(
+            cache.engine(),
+            wat::parse_str(discard_wat()).unwrap().as_slice(),
+        )
+        .unwrap(),
+    );
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+
+    // Probing candidate module succeeds without affecting cached generation or snapshot
+    assert!(WasmWorker::probe_candidate(&cache, &candidate_module, &cfg, &registry).is_ok());
+    assert_eq!(cache.module_generation(), 1);
+}

@@ -221,7 +221,18 @@ impl wasm_transformer::DlqSink for FileDlqSink {
         {
             Ok(mut file) => {
                 use tokio::io::AsyncWriteExt;
-                file.write_all(&buf).await
+                if let Err(e) = file.write_all(&buf).await {
+                    Err(e)
+                } else if let Err(e) = file.sync_all().await {
+                    Err(e)
+                } else {
+                    drop(file);
+                    #[cfg(unix)]
+                    if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
+                        let _ = dir.sync_all().await;
+                    }
+                    Ok(())
+                }
             }
             Err(e) => Err(e),
         };
@@ -485,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry
-    pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
+    let _telemetry = pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
 
     tracing::info!("Starting opentelemetry-datalake service");
 

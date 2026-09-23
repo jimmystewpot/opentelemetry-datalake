@@ -228,36 +228,27 @@ impl WasmTransformer {
         // 7. Surface worker initialization failures early by probing guest instantiation
         // across active runtime signal contexts.
         if config.env.contains_key("signal") {
-            let probe = crate::worker::WasmWorker::new(
-                0,
-                Arc::clone(&engine),
-                Arc::clone(&module),
-                config.clone(),
-                Arc::clone(&registry),
-            )
-            .map_err(|e| {
-                PipelineError::Internal(format!("WASM worker initialization failed: {e}"))
-            })?;
-            drop(probe);
+            crate::worker::WasmWorker::probe_candidate(&engine, &module, &config, &registry)
+                .map_err(|e| {
+                    PipelineError::Internal(format!("WASM worker initialization failed: {e}"))
+                })?;
         } else {
             for signal in ["logs", "traces", "metrics"] {
                 let mut signal_config = config.clone();
                 signal_config
                     .env
                     .insert("signal".to_string(), (*signal).to_string());
-                let probe = crate::worker::WasmWorker::new(
-                    0,
-                    Arc::clone(&engine),
-                    Arc::clone(&module),
-                    signal_config,
-                    Arc::clone(&registry),
+                crate::worker::WasmWorker::probe_candidate(
+                    &engine,
+                    &module,
+                    &signal_config,
+                    &registry,
                 )
                 .map_err(|e| {
                     PipelineError::Internal(format!(
                         "WASM worker initialization failed for signal '{signal}': {e}"
                     ))
                 })?;
-                drop(probe);
             }
         }
 
@@ -395,19 +386,12 @@ impl WasmTransformer {
             signal_config
                 .env
                 .insert("signal".to_string(), (*signal).to_string());
-            let probe = crate::worker::WasmWorker::new(
-                0,
-                Arc::clone(&engine),
-                Arc::clone(&module),
-                signal_config,
-                Arc::clone(&registry),
-            )
-            .map_err(|e| {
-                PipelineError::Internal(format!(
-                    "WASM guest validation failed for signal '{signal}': {e}"
-                ))
-            })?;
-            drop(probe);
+            crate::worker::WasmWorker::probe_candidate(&engine, &module, &signal_config, &registry)
+                .map_err(|e| {
+                    PipelineError::Internal(format!(
+                        "WASM guest validation failed for signal '{signal}': {e}"
+                    ))
+                })?;
         }
 
         Ok(())
@@ -454,19 +438,12 @@ impl WasmTransformer {
             signal_config
                 .env
                 .insert("signal".to_string(), (*signal).to_string());
-            let probe = crate::worker::WasmWorker::new(
-                0,
-                Arc::clone(engine),
-                Arc::clone(&new_mod),
-                signal_config,
-                Arc::clone(&registry),
-            )
-            .map_err(|e| {
-                PipelineError::Internal(format!(
-                    "WASM guest validation failed on reload for signal '{signal}': {e}"
-                ))
-            })?;
-            drop(probe);
+            crate::worker::WasmWorker::probe_candidate(engine, &new_mod, &signal_config, &registry)
+                .map_err(|e| {
+                    PipelineError::Internal(format!(
+                        "WASM guest validation failed on reload for signal '{signal}': {e}"
+                    ))
+                })?;
         }
 
         let new_gen = engine.publish_module(new_mod);
@@ -918,5 +895,44 @@ mod tests {
         assert_eq!(gen2, 2);
         let snap2 = engine.current_snapshot().unwrap();
         assert_eq!(snap2.generation, 2);
+    }
+
+    #[test]
+    fn test_reload_module_rejects_candidate_with_missing_exports_even_when_cached() {
+        let engine = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+
+        // Publish a valid module as generation 1
+        let valid_wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+        )"#;
+        let valid_bytes = wat::parse_str(valid_wat).unwrap();
+        let valid_mod = Arc::new(wasmtime::Module::new(engine.engine(), &valid_bytes).unwrap());
+        let gen1 = engine.publish_module(valid_mod);
+        assert_eq!(gen1, 1);
+
+        // Write an INVALID candidate module (missing datalake_alloc) to disk
+        let invalid_wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+        )"#;
+        let invalid_bytes = wat::parse_str(invalid_wat).unwrap();
+        let path = std::env::temp_dir().join("test_reload_invalid_candidate.wasm");
+        std::fs::write(&path, invalid_bytes).unwrap();
+
+        let config = base_config(path.to_str().unwrap().to_string());
+
+        // reload_module must probe the candidate module directly, detect the missing export,
+        // fail, and NOT publish the invalid module
+        let res = WasmTransformer::reload_module(&config, &engine);
+        assert!(res.is_err());
+        assert_eq!(engine.module_generation(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

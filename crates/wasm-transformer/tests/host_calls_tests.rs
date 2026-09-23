@@ -494,10 +494,12 @@ fn test_metric_registry_capacity_limit_prevents_unbounded_growth() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_bridge_metrics_to_opentelemetry_multi_signals() {
     let registry = Arc::new(MetricRegistry::new("test_signals"));
     registry.record_counter("processed_count", 100);
-    registry.record_gauge("heap_size", 2048);
+    let gauge_val = 1.5_f64;
+    registry.record_gauge("heap_size", gauge_val.to_bits());
 
     let handle_logs =
         wasm_transformer::host_calls::bridge_metrics_to_opentelemetry(&registry, "logs");
@@ -511,5 +513,9 @@ fn test_bridge_metrics_to_opentelemetry_multi_signals() {
     assert!(format!("{handle_metrics:?}").contains("MetricBridgeHandle"));
 
     assert_eq!(registry.read_counter("processed_count"), 100);
-    assert_eq!(registry.read_gauge("heap_size"), Some(2048));
+    assert_eq!(registry.read_gauge("heap_size"), Some(gauge_val.to_bits()));
+    assert_eq!(
+        f64::from_bits(registry.read_gauge("heap_size").unwrap()),
+        gauge_val
+    );
 }

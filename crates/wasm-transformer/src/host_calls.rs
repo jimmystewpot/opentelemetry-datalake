@@ -275,7 +275,7 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
 #[derive(Debug)]
 pub struct MetricBridgeHandle {
     _counter: opentelemetry::metrics::ObservableCounter<u64>,
-    _gauge: opentelemetry::metrics::ObservableGauge<u64>,
+    _gauge: opentelemetry::metrics::ObservableGauge<f64>,
 }
 
 /// Registers OpenTelemetry observable metric instruments for the provided [`MetricRegistry`].
@@ -313,13 +313,14 @@ pub fn bridge_metrics_to_opentelemetry(
     let reg_gauge = Arc::clone(registry);
     let sig_gauge = signal.to_string();
     let gauge = meter
-        .u64_observable_gauge("datalake_wasm_guest_gauge")
+        .f64_observable_gauge("datalake_wasm_guest_gauge")
         .with_description("Guest emitted gauges from WASM transformer")
         .with_callback(move |observer| {
             for entry in reg_gauge.metrics() {
                 if let MetricValue::Gauge(val) = entry.value() {
+                    let float_val = f64::from_bits(*val);
                     observer.observe(
-                        *val,
+                        float_val,
                         &[
                             opentelemetry::KeyValue::new("metric_name", entry.key().clone()),
                             opentelemetry::KeyValue::new("signal", sig_gauge.clone()),

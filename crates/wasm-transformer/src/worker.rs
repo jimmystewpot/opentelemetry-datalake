@@ -478,6 +478,25 @@ impl WasmWorker {
         Ok(())
     }
 
+    /// Probes a candidate WebAssembly module to ensure it can be instantiated,
+    /// exports required C-ABI v1 symbols, and initializes successfully.
+    ///
+    /// Unlike [`WasmWorker::new`], this method instantiates the supplied candidate
+    /// module directly without consulting or adopting any cached module snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WasmTransformError`] if instantiation fails, required exports are
+    /// missing, or guest initialization fails.
+    pub fn probe_candidate(
+        engine: &EngineCache,
+        module: &Module,
+        config: &WasmTransformerConfig,
+        registry: &Arc<MetricRegistry>,
+    ) -> Result<(), WasmTransformError> {
+        Self::instantiate_guest(engine.engine(), module, registry, config).map(|_| ())
+    }
+
     /// Dispatches the response status code into a [`WorkerOutcome`].
     fn dispatch_outcome(
         &self,
@@ -487,8 +506,15 @@ impl WasmWorker {
     ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
         match header.status {
             0 => {
-                if header.batch_count == 0 || header.batches_ptr == 0 {
+                if header.batch_count == 0 {
                     Ok(WorkerOutcome::Emitted(vec![batch]))
+                } else if header.batches_ptr == 0 {
+                    Err((
+                        batch,
+                        WasmTransformError::Pipeline(
+                            "Protocol error: guest returned status 0 with batch_count > 0 but null batches_ptr".to_string(),
+                        ),
+                    ))
                 } else {
                     let mut out_batches = match extract_output_batches(
                         &self.memory,
