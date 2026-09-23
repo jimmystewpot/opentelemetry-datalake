@@ -273,23 +273,26 @@ pub fn backfill_missing_columns(
     }
 
     for (k, v) in output_schema.metadata() {
-        if k.starts_with("otel::compliance::") {
-            if let Some(upstream_val) = input_schema.metadata().get(k) {
-                if upstream_val != v {
-                    return Err(WasmTransformError::Pipeline(format!(
-                        "Defensive schema guard violation: guest attempted to mutate compliance metadata '{k}' from '{upstream_val}' to '{v}'"
-                    )));
-                }
-            } else {
-                return Err(WasmTransformError::Pipeline(format!(
-                    "Defensive schema guard violation: guest attempted to inject unauthorized compliance metadata '{k}'"
-                )));
-            }
+        if let Some(upstream_val) = k
+            .starts_with("otel::compliance::")
+            .then(|| input_schema.metadata().get(k).filter(|&u| u != v))
+            .flatten()
+        {
+            return Err(WasmTransformError::Pipeline(format!(
+                "Defensive schema guard violation: guest attempted to mutate compliance metadata '{k}' from '{upstream_val}' to '{v}'"
+            )));
         }
     }
 
-    let mut merged_metadata = output_schema.metadata().clone();
-    merged_metadata.extend(input_schema.metadata().clone());
+    let mut merged_metadata = input_schema.metadata().clone();
+    for (k, v) in output_schema.metadata() {
+        if k.starts_with("otel::compliance::") {
+            continue;
+        }
+        merged_metadata
+            .entry(k.clone())
+            .or_insert_with(|| v.clone());
+    }
 
     if !added
         && output_schema.fields().len() == fields.len()

@@ -6,13 +6,25 @@
 /// Current ABI version supported by this SDK.
 pub const ABI_VERSION: u32 = 1;
 
+/// Status code for a successful transformation returning zero or more record batches.
+pub const STATUS_SUCCESS: u32 = 0;
+
+/// Status code indicating the input batch was discarded (e.g. filtered out).
+pub const STATUS_DISCARD: u32 = 1;
+
+/// Status code indicating the input batch was rejected (e.g. schema or domain violation).
+pub const STATUS_REJECT: u32 = 2;
+
+/// Status code indicating a processing error occurred during transformation.
+pub const STATUS_ERROR: u32 = 3;
+
 /// Response header returned by `datalake_transform` export.
 ///
 /// Total size: 20 bytes, alignment: 4 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformResponseHeader {
-    /// Status code of the transformation (e.g. Success = 0, Error = 1, Reject = 2).
+    /// Status code of the transformation (Success = 0, Discard = 1, Reject = 2, Error = 3).
     pub status: u32,
     /// Number of transformed record batches returned.
     pub batch_count: u32,
@@ -92,7 +104,10 @@ pub extern "C" fn datalake_abi_version() -> u32 {
 #[unsafe(no_mangle)]
 #[allow(clippy::cast_possible_truncation)]
 pub extern "C" fn datalake_alloc(size: u32) -> u32 {
-    let mut buf = Vec::<u8>::with_capacity(size as usize);
+    let mut buf = Vec::<u8>::new();
+    if buf.try_reserve_exact(size as usize).is_err() {
+        return 0;
+    }
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
     ptr as usize as u32

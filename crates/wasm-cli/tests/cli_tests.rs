@@ -75,6 +75,57 @@ fn test_validate_accepts_conformant_module() {
 }
 
 #[test]
+fn test_validate_accepts_module_without_optional_datalake_init() {
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    assert!(validate_wasm_bytes(&wasm).is_ok());
+}
+
+#[test]
+fn test_validate_rejects_non_memory_export_for_memory() {
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "memory"))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = validate_wasm_bytes(&wasm);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Invalid export 'memory'")
+    );
+}
+
+#[test]
+fn test_validate_rejects_invalid_function_signature() {
+    let wat_src = r#"(module
+        (func (export "datalake_abi_version") (result i64) (i64.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (memory (export "memory") 1)
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = validate_wasm_bytes(&wasm);
+    assert!(res.is_err());
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("Invalid function signature for 'datalake_abi_version'")
+    );
+}
+
+#[test]
 fn test_cli_subcommand_test_returns_not_yet_implemented() {
     let bin = env!("CARGO_BIN_EXE_datalake-wasm");
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
