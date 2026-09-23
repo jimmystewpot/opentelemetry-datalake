@@ -639,3 +639,44 @@ async fn test_admin_router_reload_endpoint_trims_module_path_whitespace() {
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
+
+#[tokio::test]
+async fn test_admin_router_configured_sha_cannot_be_bypassed_by_request_sha() {
+    let temp_dir = std::env::temp_dir();
+    let module_path = temp_dir.join(format!(
+        "pinned_sha_test_{}_{}.wasm",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let wasm_bytes = wat::parse_str(valid_wat()).unwrap();
+    let actual_sha = wasm_transformer::reload::compute_sha256(&wasm_bytes);
+    tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    // Pinned to an arbitrary hash that does not match this module
+    let pinned_sha = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+    let router = build_admin_router_with_sha(Arc::clone(&engine), Some(pinned_sha));
+
+    // Request attempts to bypass pinned_sha by passing actual_sha in request body
+    let payload = serde_json::json!({
+        "module_path": module_path.to_str().unwrap(),
+        "expected_sha": actual_sha
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    // Must be rejected with 400 Bad Request because pinned sha takes precedence!
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(engine.module_generation(), 0);
+
+    let _ = tokio::fs::remove_file(&module_path).await;
+}

@@ -65,9 +65,16 @@ pub fn spawn_sighup_listener_multi(
                                         });
                                     }
                                 }
-                                let mut last_gen = 0;
+                                // Stage 1: compile & probe candidate on every engine
+                                let mut candidates = Vec::with_capacity(engines_clone.len());
                                 for engine in &engines_clone {
-                                    last_gen = engine.reload_from_bytes(&bytes, None)?;
+                                    let module = engine.compile_and_probe_candidate(&bytes, None)?;
+                                    candidates.push(module);
+                                }
+                                // Stage 2: atomically publish candidate module to each engine
+                                let mut last_gen = 0;
+                                for (engine, module) in engines_clone.iter().zip(candidates) {
+                                    last_gen = engine.publish_module(module);
                                 }
                                 Ok(last_gen)
                             },
@@ -204,10 +211,21 @@ pub async fn wasm_reload_handler(
     })?;
 
     let engines = state.engines.clone();
-    let expected_sha = payload
-        .expected_sha
-        .filter(|s| !s.trim().is_empty())
-        .or(state.configured_sha);
+    let expected_sha = if let Some(ref configured) = state.configured_sha {
+        if let Some(ref req_sha) = payload.expected_sha.filter(|s| !s.trim().is_empty())
+            && !req_sha.eq_ignore_ascii_case(configured)
+        {
+            tracing::warn!(
+                req_sha = %req_sha,
+                configured_sha = %configured,
+                "Hot-reload REST: request-supplied digest conflicts with pinned configured SHA-256"
+            );
+            return Err(axum::http::StatusCode::BAD_REQUEST);
+        }
+        Some(configured.clone())
+    } else {
+        payload.expected_sha.filter(|s| !s.trim().is_empty())
+    };
 
     let generation = tokio::task::spawn_blocking(move || -> Result<u64, WasmTransformError> {
         if let Some(ref expected) = expected_sha {
@@ -219,9 +237,16 @@ pub async fn wasm_reload_handler(
                 });
             }
         }
-        let mut last_gen = 0;
+        // Stage 1: compile & probe candidate module across every engine
+        let mut candidates = Vec::with_capacity(engines.len());
         for engine in &engines {
-            last_gen = engine.reload_from_bytes(&bytes, None)?;
+            let module = engine.compile_and_probe_candidate(&bytes, None)?;
+            candidates.push(module);
+        }
+        // Stage 2: atomically publish candidate module to each engine
+        let mut last_gen = 0;
+        for (engine, module) in engines.iter().zip(candidates) {
+            last_gen = engine.publish_module(module);
         }
         Ok(last_gen)
     })
