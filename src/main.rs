@@ -122,6 +122,7 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 type SignalTransformers = (Box<dyn Transform>, Box<dyn Transform>, Box<dyn Transform>);
 
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
 #[derive(Debug)]
@@ -146,6 +147,47 @@ impl FileDlqSink {
             role: role.to_string(),
             dlq_dir,
         }
+    }
+
+    /// Atomically persists an Arrow IPC payload to disk via a temporary file and sync rename.
+    async fn persist_ipc_payload(
+        &self,
+        file_path: &std::path::Path,
+        temp_file_path: &std::path::Path,
+        buf: &[u8],
+    ) -> Result<(), std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_file_path)
+            .await?;
+
+        if let Err(e) = file.write_all(buf).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        if let Err(e) = file.sync_all().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        drop(file);
+
+        if let Err(e) = tokio::fs::rename(temp_file_path, file_path).await {
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        #[cfg(unix)]
+        if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
+            let _ = dir.sync_all().await;
+        }
+
+        Ok(())
     }
 }
 
@@ -213,29 +255,15 @@ impl wasm_transformer::DlqSink for FileDlqSink {
             }
         };
 
-        let write_res = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file_path)
-            .await
-        {
-            Ok(mut file) => {
-                use tokio::io::AsyncWriteExt;
-                if let Err(e) = file.write_all(&buf).await {
-                    Err(e)
-                } else if let Err(e) = file.sync_all().await {
-                    Err(e)
-                } else {
-                    drop(file);
-                    #[cfg(unix)]
-                    if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
-                        let _ = dir.sync_all().await;
-                    }
-                    Ok(())
-                }
-            }
-            Err(e) => Err(e),
-        };
+        let tmp_seq = DLQ_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_file_path = self.dlq_dir.join(format!(
+            ".tmp_{batch_signal}_{timestamp}_{seq}_{}_{tmp_seq}.arrow",
+            std::process::id()
+        ));
+
+        let write_res = self
+            .persist_ipc_payload(&file_path, &temp_file_path, &buf)
+            .await;
 
         if let Err(e) = write_res {
             tracing::error!(
@@ -1386,6 +1414,19 @@ mod tests {
             .expect("valid batch");
         assert_eq!(read_batch.num_rows(), 2);
         assert_eq!(read_batch.num_columns(), 2);
+
+        // Verify no temporary files remain in the directory
+        let mut check_entries = tokio::fs::read_dir(&sink.dlq_dir)
+            .await
+            .expect("read dlq dir for temp check");
+        while let Some(entry) = check_entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.starts_with(".tmp_"),
+                "Temporary file was not cleaned up or renamed: {name_str}"
+            );
+        }
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_dir.join("dlq_test")).await;

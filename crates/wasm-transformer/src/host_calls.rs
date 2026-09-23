@@ -74,6 +74,7 @@ pub struct MetricRegistry {
     component_id: String,
     prefix: String,
     signal: std::sync::RwLock<String>,
+    registration_lock: std::sync::Mutex<()>,
     metrics: DashMap<String, MetricValue>,
     handles: DashMap<String, MetricHandle>,
 }
@@ -92,6 +93,7 @@ impl MetricRegistry {
             component_id: component_id.to_string(),
             prefix: format!("datalake_transformers_{component_id}_"),
             signal: std::sync::RwLock::new(signal.to_string()),
+            registration_lock: std::sync::Mutex::new(()),
             metrics: DashMap::new(),
             handles: DashMap::new(),
         }
@@ -121,6 +123,44 @@ impl MetricRegistry {
         key
     }
 
+    /// Retrieves an existing cached instrument handle, or registers a new instrument under [`MetricRegistry::registration_lock`].
+    ///
+    /// Guarantees that concurrent workers cannot exceed [`MAX_METRIC_ENTRIES`] and prevents redundant instrument allocations.
+    fn get_or_register_handle<F>(&self, name: &str, create_fn: F) -> Option<MetricHandle>
+    where
+        F: FnOnce() -> MetricHandle,
+    {
+        // Fast path: lock-free lookup in DashMap for already registered instruments
+        if let Some(handle) = self.handles.get(name) {
+            return Some(handle.clone());
+        }
+
+        // Slow path: serialize new instrument registration and capacity check
+        let _guard = self
+            .registration_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Double check if another worker registered it while waiting on the lock
+        if let Some(handle) = self.handles.get(name) {
+            return Some(handle.clone());
+        }
+
+        // Strictly enforce cardinality ceiling
+        if self.handles.len() >= MAX_METRIC_ENTRIES {
+            tracing::warn!(
+                component = %self.component_id,
+                max_entries = MAX_METRIC_ENTRIES,
+                "Metric registry capacity exceeded; dropping new metric '{name}'"
+            );
+            return None;
+        }
+
+        let handle = create_fn();
+        self.handles.insert(name.to_string(), handle.clone());
+        Some(handle)
+    }
+
     /// Records a counter increment with saturating addition, caching and calling an OpenTelemetry [`opentelemetry::metrics::Counter`].
     pub fn record_counter(&self, name: &str, delta: u64) {
         if !is_valid_metric_name(name) {
@@ -128,48 +168,36 @@ impl MetricRegistry {
             return;
         }
 
-        let key = self.format_key(name);
-        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
-            self.metrics
-                .entry(key)
-                .and_modify(|val| {
-                    if let MetricValue::Counter(c) = val {
-                        *c = c.saturating_add(delta);
-                    } else {
-                        *val = MetricValue::Counter(delta);
-                    }
-                })
-                .or_insert(MetricValue::Counter(delta));
-        }
-
-        let counter = if let Some(handle) = self.handles.get(name) {
-            if let MetricHandle::Counter(ref c) = *handle {
-                c.clone()
-            } else {
-                tracing::warn!(
-                    name,
-                    "Metric type mismatch in registry cache; expected counter"
-                );
-                return;
-            }
-        } else {
-            if self.handles.len() >= MAX_METRIC_ENTRIES {
-                tracing::warn!(
-                    component = %self.component_id,
-                    max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new counter metric '{name}'"
-                );
-                return;
-            }
+        let Some(handle) = self.get_or_register_handle(name, || {
             let meter = opentelemetry::global::meter("opentelemetry-datalake");
             let instrument_name = format!("{}{name}", self.prefix);
             let c = meter
                 .u64_counter(instrument_name)
                 .with_description("Guest emitted counter from WASM transformer")
                 .build();
-            self.handles
-                .insert(name.to_string(), MetricHandle::Counter(c.clone()));
-            c
+            MetricHandle::Counter(c)
+        }) else {
+            return;
+        };
+
+        let key = self.format_key(name);
+        self.metrics
+            .entry(key)
+            .and_modify(|val| {
+                if let MetricValue::Counter(c) = val {
+                    *c = c.saturating_add(delta);
+                } else {
+                    *val = MetricValue::Counter(delta);
+                }
+            })
+            .or_insert(MetricValue::Counter(delta));
+
+        let MetricHandle::Counter(counter) = handle else {
+            tracing::warn!(
+                name,
+                "Metric type mismatch in registry cache; expected counter"
+            );
+            return;
         };
 
         let sig = self.signal();
@@ -189,40 +217,28 @@ impl MetricRegistry {
             return;
         }
 
-        let key = self.format_key(name);
-        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
-            self.metrics.insert(key, MetricValue::Gauge(bits));
-        }
-
-        let gauge = if let Some(handle) = self.handles.get(name) {
-            if let MetricHandle::Gauge(ref g) = *handle {
-                g.clone()
-            } else {
-                tracing::warn!(
-                    name,
-                    "Metric type mismatch in registry cache; expected gauge"
-                );
-                return;
-            }
-        } else {
-            if self.handles.len() >= MAX_METRIC_ENTRIES {
-                tracing::warn!(
-                    component = %self.component_id,
-                    max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new gauge metric '{name}'"
-                );
-                return;
-            }
+        let Some(handle) = self.get_or_register_handle(name, || {
             let meter = opentelemetry::global::meter("opentelemetry-datalake");
             let instrument_name = format!("{}{name}", self.prefix);
             let g = meter
                 .f64_gauge(instrument_name)
                 .with_description("Guest emitted gauge from WASM transformer")
                 .build();
-            self.handles
-                .insert(name.to_string(), MetricHandle::Gauge(g.clone()));
-            g
+            MetricHandle::Gauge(g)
+        }) else {
+            return;
         };
+
+        let MetricHandle::Gauge(gauge) = handle else {
+            tracing::warn!(
+                name,
+                "Metric type mismatch in registry cache; expected gauge"
+            );
+            return;
+        };
+
+        let key = self.format_key(name);
+        self.metrics.insert(key, MetricValue::Gauge(bits));
 
         let float_val = f64::from_bits(bits);
         let sig = self.signal();
@@ -242,30 +258,7 @@ impl MetricRegistry {
             return;
         }
 
-        let key = self.format_key(name);
-        if self.metrics.len() < MAX_METRIC_ENTRIES || self.metrics.contains_key(&key) {
-            self.metrics.insert(key, MetricValue::Duration(nanos));
-        }
-
-        let histogram = if let Some(handle) = self.handles.get(name) {
-            if let MetricHandle::Histogram(ref h) = *handle {
-                h.clone()
-            } else {
-                tracing::warn!(
-                    name,
-                    "Metric type mismatch in registry cache; expected histogram"
-                );
-                return;
-            }
-        } else {
-            if self.handles.len() >= MAX_METRIC_ENTRIES {
-                tracing::warn!(
-                    component = %self.component_id,
-                    max_entries = MAX_METRIC_ENTRIES,
-                    "Metric registry capacity exceeded; dropping new duration metric '{name}'"
-                );
-                return;
-            }
+        let Some(handle) = self.get_or_register_handle(name, || {
             let meter = opentelemetry::global::meter("opentelemetry-datalake");
             let instrument_name = if name.ends_with("_duration_seconds") {
                 format!("{}{name}", self.prefix)
@@ -277,10 +270,21 @@ impl MetricRegistry {
                 .with_unit("s")
                 .with_description("Guest emitted duration from WASM transformer")
                 .build();
-            self.handles
-                .insert(name.to_string(), MetricHandle::Histogram(h.clone()));
-            h
+            MetricHandle::Histogram(h)
+        }) else {
+            return;
         };
+
+        let MetricHandle::Histogram(histogram) = handle else {
+            tracing::warn!(
+                name,
+                "Metric type mismatch in registry cache; expected histogram"
+            );
+            return;
+        };
+
+        let key = self.format_key(name);
+        self.metrics.insert(key, MetricValue::Duration(nanos));
 
         #[allow(clippy::cast_precision_loss)]
         let seconds = (nanos as f64) / 1_000_000_000.0;

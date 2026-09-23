@@ -30,6 +30,26 @@ fn passthrough_wat() -> &'static str {
     )"#
 }
 
+fn echo_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
+            (i32.const 0)
+        )
+    )"#
+}
+
 fn discard_wat() -> &'static str {
     r#"(module
         (memory (export "memory") 1)
@@ -124,7 +144,7 @@ fn logs_batch() -> RecordBatch {
 async fn test_dispatcher_executes_batches_and_drains_on_close() {
     let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
     let module = cache
-        .compile_module(&wat::parse_str(passthrough_wat()).expect("valid wat"))
+        .compile_module(&wat::parse_str(echo_wat()).expect("valid wat"))
         .expect("compile module");
 
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
@@ -518,7 +538,7 @@ async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
     let cache =
         Arc::new(EngineCache::new_pooling(concurrency, 64 * 1024 * 1024).expect("cache init"));
     let module = cache
-        .compile_module(&wat::parse_str(passthrough_wat()).expect("valid wat"))
+        .compile_module(&wat::parse_str(echo_wat()).expect("valid wat"))
         .expect("compile module");
 
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, concurrency);
@@ -647,7 +667,7 @@ async fn test_dispatcher_worker_init_failure() {
 async fn test_dispatcher_output_channel_closed() {
     let engine = Arc::new(EngineCache::new_pooling(2, 1024 * 1024).unwrap());
     let module = engine
-        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .compile_module(&wat::parse_str(echo_wat()).unwrap())
         .unwrap();
 
     let cfg = DispatcherConfig {
@@ -989,5 +1009,57 @@ async fn test_dispatcher_custom_dlq_sink_write_failure_terminates_worker() {
     let res = handle.await.unwrap();
     assert!(
         matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_zero_batch_success_marks_consumed_without_emitting_rows() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    // Send 3 batches to guest returning status=0 with batch_count=0
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 3");
+    drop(input_tx); // Trigger drain
+
+    // Verify 0 rows are emitted downstream (input is consumed, not leaked)
+    assert!(
+        output_rx.recv().await.is_none(),
+        "zero-batch success must mark batch consumed and emit zero rows downstream"
     );
 }

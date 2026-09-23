@@ -261,11 +261,14 @@ impl WasmTransformer {
                 signal_config
                     .env
                     .insert("signal".to_string(), (*signal).to_string());
+                let probe_registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+                    &config.id, signal,
+                ));
                 crate::worker::WasmWorker::probe_candidate(
                     &engine,
                     &module,
                     &signal_config,
-                    &registry,
+                    &probe_registry,
                 )
                 .map_err(|e| {
                     PipelineError::Internal(format!(
@@ -394,6 +397,15 @@ impl WasmTransformer {
             }
         }
 
+        Self::validate_guest_module(config, &wasm_bytes, max_memory_bytes)
+    }
+
+    /// Compiles the guest WASM binary into a temporary pooling engine and validates ABI exports and initialization across signals.
+    fn validate_guest_module(
+        config: &WasmTransformerConfig,
+        wasm_bytes: &[u8],
+        max_memory_bytes: usize,
+    ) -> Result<(), PipelineError> {
         let pool_capacity = config
             .concurrency
             .max(1)
@@ -411,21 +423,40 @@ impl WasmTransformer {
         );
 
         let module = engine
-            .compile_module(&wasm_bytes)
+            .compile_module(wasm_bytes)
             .map_err(|e| PipelineError::Internal(e.to_string()))?;
 
-        let registry = Arc::new(crate::host_calls::MetricRegistry::new(&config.id));
-        for signal in ["logs", "traces", "metrics"] {
-            let mut signal_config = config.clone();
-            signal_config
-                .env
-                .insert("signal".to_string(), (*signal).to_string());
-            crate::worker::WasmWorker::probe_candidate(&engine, &module, &signal_config, &registry)
+        if let Some(signal) = config.env.get("signal") {
+            let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+                &config.id, signal,
+            ));
+            crate::worker::WasmWorker::probe_candidate(&engine, &module, config, &registry)
                 .map_err(|e| {
                     PipelineError::Internal(format!(
                         "WASM guest validation failed for signal '{signal}': {e}"
                     ))
                 })?;
+        } else {
+            for signal in ["logs", "traces", "metrics"] {
+                let mut signal_config = config.clone();
+                signal_config
+                    .env
+                    .insert("signal".to_string(), (*signal).to_string());
+                let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+                    &config.id, signal,
+                ));
+                crate::worker::WasmWorker::probe_candidate(
+                    &engine,
+                    &module,
+                    &signal_config,
+                    &registry,
+                )
+                .map_err(|e| {
+                    PipelineError::Internal(format!(
+                        "WASM guest validation failed for signal '{signal}': {e}"
+                    ))
+                })?;
+            }
         }
 
         Ok(())
@@ -466,18 +497,37 @@ impl WasmTransformer {
             |e| PipelineError::Internal(format!("Failed to compile reloaded module: {e}")),
         )?);
 
-        let registry = Arc::new(crate::host_calls::MetricRegistry::new(&config.id));
-        for signal in ["logs", "traces", "metrics"] {
-            let mut signal_config = config.clone();
-            signal_config
-                .env
-                .insert("signal".to_string(), (*signal).to_string());
-            crate::worker::WasmWorker::probe_candidate(engine, &new_mod, &signal_config, &registry)
+        if let Some(signal) = config.env.get("signal") {
+            let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+                &config.id, signal,
+            ));
+            crate::worker::WasmWorker::probe_candidate(engine, &new_mod, config, &registry)
                 .map_err(|e| {
                     PipelineError::Internal(format!(
                         "WASM guest validation failed on reload for signal '{signal}': {e}"
                     ))
                 })?;
+        } else {
+            for signal in ["logs", "traces", "metrics"] {
+                let mut signal_config = config.clone();
+                signal_config
+                    .env
+                    .insert("signal".to_string(), (*signal).to_string());
+                let registry = Arc::new(crate::host_calls::MetricRegistry::with_signal(
+                    &config.id, signal,
+                ));
+                crate::worker::WasmWorker::probe_candidate(
+                    engine,
+                    &new_mod,
+                    &signal_config,
+                    &registry,
+                )
+                .map_err(|e| {
+                    PipelineError::Internal(format!(
+                        "WASM guest validation failed on reload for signal '{signal}': {e}"
+                    ))
+                })?;
+            }
         }
 
         let new_gen = engine.publish_module(new_mod);
@@ -986,6 +1036,40 @@ mod tests {
         let res = WasmTransformer::reload_module(&config, &engine);
         assert!(res.is_err());
         assert_eq!(engine.module_generation(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_probe_sets_signal_label_before_guest_datalake_init() {
+        let wat_src = r#"(module
+            (import "env" "datalake_host_metric_emit" (func $emit (param i32 i32 i32 i64)))
+            (memory (export "memory") 1)
+            (data (i32.const 100) "init_counter")
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+                (call $emit (i32.const 0) (i32.const 100) (i32.const 12) (i64.const 1))
+                (i32.const 0)
+            )
+        )"#;
+        let wasm_bytes = wat::parse_str(wat_src).unwrap();
+        let path = std::env::temp_dir().join("test_probe_signal_metric.wasm");
+        std::fs::write(&path, wasm_bytes).unwrap();
+
+        let mut config = base_config(path.to_str().unwrap().to_string());
+        config.env.insert("signal".to_string(), "logs".to_string());
+        let engine = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+
+        let transformer = WasmTransformer::with_engine(config, None, None, engine).unwrap();
+        assert_eq!(transformer.metric_registry().signal(), "logs");
+        assert_eq!(
+            transformer.metric_registry().read_counter("init_counter"),
+            1,
+            "Guest datalake_init metric emission during probe must be recorded into the signal-labeled registry"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

@@ -501,7 +501,7 @@ impl WasmWorker {
         match header.status {
             0 => {
                 if header.batch_count == 0 {
-                    Ok(WorkerOutcome::Emitted(vec![batch]))
+                    Ok(WorkerOutcome::Emitted(vec![]))
                 } else if header.batches_ptr == 0 {
                     Err((
                         batch,

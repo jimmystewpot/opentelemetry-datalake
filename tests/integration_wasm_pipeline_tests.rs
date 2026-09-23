@@ -53,6 +53,26 @@ fn passthrough_wat() -> &'static str {
     )"#
 }
 
+fn echo_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
+            (i32.const 0)
+        )
+    )"#
+}
+
 fn sample_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("service_name", DataType::Utf8, false),
@@ -253,7 +273,7 @@ fn test_sha256_integrity_verification() {
 
 #[tokio::test]
 async fn test_wasm_transformer_transform_trait_pipeline_execution() {
-    let wasm_bytes = wat::parse_str(passthrough_wat()).expect("valid wat");
+    let wasm_bytes = wat::parse_str(echo_wat()).expect("valid wat");
     let temp_file = TempWasmFile::new(&wasm_bytes);
 
     let cfg = WasmTransformerConfig {
@@ -309,6 +329,62 @@ async fn test_wasm_transformer_transform_trait_pipeline_execution() {
         }
         _ => panic!("Expected Logs signal variant"),
     }
+
+    let transform_res = transform_handle.await.expect("task panicked");
+    assert!(transform_res.is_ok());
+}
+
+#[tokio::test]
+async fn test_wasm_transformer_transform_zero_batch_success_consumes_without_emission() {
+    let wasm_bytes = wat::parse_str(passthrough_wat()).expect("valid wat");
+    let temp_file = TempWasmFile::new(&wasm_bytes);
+
+    let cfg = WasmTransformerConfig {
+        id: "pipeline_zero_batch".into(),
+        r#type: "wasm".into(),
+        module_path: temp_file.path_str(),
+        sha256: None,
+        max_execution_duration: "500ms".into(),
+        drain_timeout: "10s".into(),
+        max_batch_rows: 5000,
+        concurrency: 2,
+        worker_channel_capacity: 2,
+        max_memory: "64MiB".into(),
+        rejuvenate_threshold: "16MiB".into(),
+        rejuvenate_batches: 10_000,
+        init_timeout: "2s".into(),
+        on_error: OnErrorPolicy::Drop,
+        allow_unmasked_passthrough: false,
+        on_reject: OnRejectPolicy::Drop,
+        schema_guard: SchemaGuardMode::Defensive,
+        env_whitelist: vec![],
+        env: std::collections::HashMap::new(),
+        config: None,
+        enable_sighup: false,
+    };
+
+    let mut transformer =
+        WasmTransformer::new(cfg, None, None).expect("transformer creation failed");
+
+    let (input_tx, input_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
+    let (output_tx, mut output_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
+
+    let transform_handle =
+        tokio::spawn(async move { transformer.transform(input_rx, output_tx).await });
+
+    let batch = sample_batch();
+    input_tx
+        .send(SignalBatch::Logs(batch))
+        .await
+        .expect("input send failed");
+
+    drop(input_tx);
+
+    // Verify 0 rows are emitted downstream: batch was consumed
+    assert!(
+        output_rx.recv().await.is_none(),
+        "Zero-batch count success must consume batch and emit no output rows"
+    );
 
     let transform_res = transform_handle.await.expect("task panicked");
     assert!(transform_res.is_ok());
