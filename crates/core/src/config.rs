@@ -5,6 +5,8 @@ use figment::{
 };
 use serde::Deserialize;
 
+pub use crate::tls::{TlsConfig, TlsVerificationMode};
+
 /// Top-level configuration object.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PipelineConfig {

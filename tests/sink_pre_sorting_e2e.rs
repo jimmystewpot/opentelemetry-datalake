@@ -289,6 +289,7 @@ fn test_e2e_starrocks_sink_presorting() {
         retry_interval_secs: 1,
         order_by: Some(sort_config),
         batching: None,
+        tls: pipeline_core::tls::TlsConfig::default(),
     };
 
     let sink = StarRocksSink::try_new(config).expect("StarRocksSink creation failed");
