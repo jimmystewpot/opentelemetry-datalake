@@ -7,17 +7,17 @@ license = { workspace = true }
 [dependencies]
 pipeline-core = { workspace = true }
 wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true }
+wasmtime-wasi = { workspace = true, features = ["p1"] }
 tokio = { workspace = true }
 arrow = { workspace = true, features = ["ipc"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-dashmap = { workspace = true }
 sha2 = { workspace = true }
-hex = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 opentelemetry = { workspace = true }
+dashmap = { workspace = true }
 opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
 
 [dev-dependencies]

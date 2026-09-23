@@ -1060,3 +1060,61 @@ fn test_backfill_rejects_nullable_to_non_nullable_mutation() {
             .contains("column 'col_a' nullability mutated from nullable to non-nullable")
     );
 }
+
+/// Regression: `backfill_missing_columns` previously used O(n²) linear scan for field lookup.
+/// This test verifies correctness of the O(n) HashMap-based implementation with a large schema.
+#[test]
+fn test_backfill_on_schema_missing_multiple_columns_is_correct() {
+    // Build a 50-column input schema
+    let mut input_fields: Vec<Field> = (0..50)
+        .map(|i| Field::new(format!("col_{i}").as_str(), DataType::Int64, true))
+        .collect();
+    input_fields.push(Field::new("trace_id", DataType::Utf8, false));
+    let input_schema = Arc::new(Schema::new(input_fields));
+
+    // Output has only 10 of the 50 columns (guest dropped 40) plus 2 new guest columns
+    let mut output_fields: Vec<Field> = (0..10)
+        .map(|i| Field::new(format!("col_{i}").as_str(), DataType::Int64, true))
+        .collect();
+    output_fields.push(Field::new("trace_id", DataType::Utf8, false));
+    output_fields.push(Field::new("guest_col_a", DataType::Utf8, true));
+    output_fields.push(Field::new("guest_col_b", DataType::Int64, true));
+    let output_schema = Arc::new(Schema::new(output_fields));
+
+    let array_len = 3usize;
+    let mut arrays: Vec<Arc<dyn arrow::array::Array>> = (0..10)
+        .map(|_| Arc::new(Int64Array::from(vec![1i64, 2, 3])) as Arc<dyn arrow::array::Array>)
+        .collect();
+    arrays.push(Arc::new(StringArray::from(vec!["a", "b", "c"])));
+    arrays.push(Arc::new(StringArray::from(vec!["x", "y", "z"])));
+    arrays.push(Arc::new(Int64Array::from(vec![10i64, 20, 30])));
+    let output_batch = RecordBatch::try_new(output_schema, arrays).unwrap();
+
+    let result = backfill_missing_columns(&input_schema, output_batch).unwrap();
+    let result_schema = result.schema();
+
+    // Verify all input columns are present (40 missing → backfilled as nulls)
+    for i in 0..50 {
+        let col_name = format!("col_{i}");
+        assert!(
+            result_schema.index_of(&col_name).is_ok(),
+            "col_{i} must be present after backfill"
+        );
+        if i >= 10 {
+            // Dropped columns must be null arrays
+            let idx = result_schema.index_of(&col_name).unwrap();
+            assert_eq!(
+                result.column(idx).null_count(),
+                array_len,
+                "col_{i} must be all-null after backfill"
+            );
+        }
+    }
+    // trace_id must be present
+    assert!(result_schema.index_of("trace_id").is_ok());
+    // New guest columns must be preserved
+    assert!(result_schema.index_of("guest_col_a").is_ok());
+    assert!(result_schema.index_of("guest_col_b").is_ok());
+    // Total columns: 50 input + 1 trace_id + 2 guest = 53
+    assert_eq!(result_schema.fields().len(), 53);
+}
