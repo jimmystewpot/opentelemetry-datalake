@@ -614,3 +614,38 @@ fn test_cardinality_ceiling_50_metrics() {
     assert_eq!(registry.read_counter("metric_50"), 0);
     assert_eq!(registry.handles().len(), 50);
 }
+
+#[test]
+fn test_concurrent_metric_registration_respects_capacity_limit() {
+    let registry = Arc::new(MetricRegistry::new("concurrent_cap"));
+    let mut handles = Vec::new();
+
+    // Spawn 50 threads, each attempting to register 20 distinct metric names (1000 total unique names)
+    for thread_id in 0..50 {
+        let reg = Arc::clone(&registry);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..20 {
+                let name = format!("c_metric_{thread_id}_{i}");
+                reg.record_counter(&name, 1);
+                reg.record_gauge(&name, 100);
+                reg.record_duration(&name, 500);
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    // Must never exceed the 50-metric cardinality limit under high concurrency
+    assert_eq!(
+        registry.handles().len(),
+        50,
+        "Concurrent metric registration must strictly cap handles at 50"
+    );
+    assert_eq!(
+        registry.metrics().len(),
+        50,
+        "Concurrent metric values must strictly cap at 50"
+    );
+}

@@ -134,6 +134,7 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
 }
 
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
 #[derive(Debug)]
@@ -158,6 +159,47 @@ impl FileDlqSink {
             role: role.to_string(),
             dlq_dir,
         }
+    }
+
+    /// Atomically persists an Arrow IPC payload to disk via a temporary file and sync rename.
+    async fn persist_ipc_payload(
+        &self,
+        file_path: &std::path::Path,
+        temp_file_path: &std::path::Path,
+        buf: &[u8],
+    ) -> Result<(), std::io::Error> {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp_file_path)
+            .await?;
+
+        if let Err(e) = file.write_all(buf).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        if let Err(e) = file.sync_all().await {
+            drop(file);
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        drop(file);
+
+        if let Err(e) = tokio::fs::rename(temp_file_path, file_path).await {
+            let _ = tokio::fs::remove_file(temp_file_path).await;
+            return Err(e);
+        }
+
+        #[cfg(unix)]
+        if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
+            let _ = dir.sync_all().await;
+        }
+
+        Ok(())
     }
 }
 
@@ -225,29 +267,15 @@ impl wasm_transformer::DlqSink for FileDlqSink {
             }
         };
 
-        let write_res = match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file_path)
-            .await
-        {
-            Ok(mut file) => {
-                use tokio::io::AsyncWriteExt;
-                if let Err(e) = file.write_all(&buf).await {
-                    Err(e)
-                } else if let Err(e) = file.sync_all().await {
-                    Err(e)
-                } else {
-                    drop(file);
-                    #[cfg(unix)]
-                    if let Ok(dir) = tokio::fs::File::open(&self.dlq_dir).await {
-                        let _ = dir.sync_all().await;
-                    }
-                    Ok(())
-                }
-            }
-            Err(e) => Err(e),
-        };
+        let tmp_seq = DLQ_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp_file_path = self.dlq_dir.join(format!(
+            ".tmp_{batch_signal}_{timestamp}_{seq}_{}_{tmp_seq}.arrow",
+            std::process::id()
+        ));
+
+        let write_res = self
+            .persist_ipc_payload(&file_path, &temp_file_path, &buf)
+            .await;
 
         if let Err(e) = write_res {
             tracing::error!(
@@ -396,8 +424,8 @@ fn spawn_sighup_reload_task(
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         tracing::debug!("SIGHUP listener shutting down");
                         break;
                     }
@@ -1615,6 +1643,19 @@ mod tests {
         assert_eq!(read_batch.num_rows(), 2);
         assert_eq!(read_batch.num_columns(), 2);
 
+        // Verify no temporary files remain in the directory
+        let mut check_entries = tokio::fs::read_dir(&sink.dlq_dir)
+            .await
+            .expect("read dlq dir for temp check");
+        while let Some(entry) = check_entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            assert!(
+                !name_str.starts_with(".tmp_"),
+                "Temporary file was not cleaned up or renamed: {name_str}"
+            );
+        }
+
         // Cleanup
         let _ = tokio::fs::remove_dir_all(temp_dir.join("dlq_test")).await;
     }
@@ -1903,6 +1944,65 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = task_handle.await;
+        let _ = std::fs::remove_file(&wasm_path);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_spawn_sighup_reload_task_terminates_on_shutdown_channel_drop() {
+        let temp_dir = std::env::temp_dir();
+        let wasm_path = temp_dir.join(format!("test_sighup_drop_{}.wasm", std::process::id()));
+        let wat = r#"(module
+            (memory (export "memory") 1)
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
+        )"#;
+        let wasm_bytes = wat::parse_str(wat).expect("wat");
+        std::fs::write(&wasm_path, wasm_bytes).expect("write wasm");
+
+        let wasm_cfg = pipeline_core::config::WasmTransformerConfig {
+            id: "test_sighup_drop".to_string(),
+            r#type: "wasm".to_string(),
+            module_path: wasm_path.display().to_string(),
+            sha256: None,
+            max_execution_duration: "1s".to_string(),
+            drain_timeout: "1s".to_string(),
+            max_batch_rows: 1000,
+            concurrency: 1,
+            worker_channel_capacity: 1,
+            max_memory: "16MiB".to_string(),
+            rejuvenate_threshold: "8MiB".to_string(),
+            rejuvenate_batches: 1000,
+            init_timeout: "1s".to_string(),
+            on_error: pipeline_core::config::OnErrorPolicy::Drop,
+            allow_unmasked_passthrough: true,
+            on_reject: pipeline_core::config::OnRejectPolicy::Drop,
+            schema_guard: pipeline_core::config::SchemaGuardMode::Defensive,
+            env_whitelist: vec![],
+            env: std::collections::HashMap::new(),
+            config: None,
+            enable_sighup: true,
+        };
+
+        let engine = std::sync::Arc::new(
+            wasm_transformer::engine::EngineCache::new_pooling(2, 16 * 1024 * 1024).expect("pool"),
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task_handle =
+            spawn_sighup_reload_task(wasm_cfg, std::sync::Arc::clone(&engine), shutdown_rx);
+
+        // Drop shutdown_tx immediately without setting to true
+        drop(shutdown_tx);
+
+        let timeout_res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), task_handle).await;
+        assert!(
+            timeout_res.is_ok(),
+            "SIGHUP reload task must exit cleanly on shutdown channel drop without spinning"
+        );
         let _ = std::fs::remove_file(&wasm_path);
     }
 }

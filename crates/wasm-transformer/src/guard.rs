@@ -95,7 +95,9 @@ pub fn verify_structural_immutability(
     let input_schema = input.schema();
     for &col_name in IMMUTABLE_COLUMNS {
         let input_col_info = if let Ok(idx) = input_schema.index_of(col_name) {
-            let col = input.column(idx);
+            let col = input.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in input"))
+            })?;
             Some((col.data_type().clone(), col.null_count() == col.len()))
         } else {
             None
@@ -106,7 +108,9 @@ pub fn verify_structural_immutability(
             .is_none_or(|(_, was_null)| *was_null);
 
         if let Ok(idx) = schema.index_of(col_name) {
-            let col = output.column(idx);
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
             if let Some((in_dtype, _)) = input_col_info
                 && col.data_type() != &in_dtype
             {
@@ -175,6 +179,7 @@ pub fn verify_strict_schema_equality(
 /// # Errors
 ///
 /// Returns [`WasmTransformError::Pipeline`] if reconstructing the [`RecordBatch`] fails.
+#[allow(clippy::too_many_lines)]
 pub fn backfill_missing_columns(
     input_schema: &Schema,
     output: RecordBatch,
@@ -191,7 +196,11 @@ pub fn backfill_missing_columns(
 
     for field in input_schema.fields() {
         if let Ok(idx) = output_schema.index_of(field.name()) {
-            let out_field = &output_schema.fields()[idx];
+            let out_field = output_schema.fields().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!(
+                    "Field index {idx} out of bounds in output schema"
+                ))
+            })?;
             if out_field.data_type() != field.data_type() {
                 return Err(WasmTransformError::Pipeline(format!(
                     "Defensive schema guard violation: column '{}' data type mutated from {:?} to {:?}",
@@ -216,8 +225,11 @@ pub fn backfill_missing_columns(
                     }
                 )));
             }
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
             fields.push(Arc::clone(out_field));
-            columns.push(Arc::clone(output.column(idx)));
+            columns.push(Arc::clone(col));
         } else {
             warn!(
                 column = %field.name(),
@@ -243,8 +255,11 @@ pub fn backfill_missing_columns(
                     field.name()
                 )));
             }
+            let col = output.columns().get(idx).ok_or_else(|| {
+                WasmTransformError::Pipeline(format!("Column index {idx} out of bounds in output"))
+            })?;
             fields.push(Arc::clone(field));
-            columns.push(Arc::clone(output.column(idx)));
+            columns.push(Arc::clone(col));
         }
     }
 

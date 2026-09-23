@@ -150,7 +150,7 @@ fn error_without_msg_wat() -> &'static str {
 async fn test_worker_executes_batch_through_real_wasmtime_instance() {
     let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
     let module = cache
-        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
         .unwrap();
 
     let cfg = default_test_config();
@@ -942,14 +942,18 @@ async fn test_worker_executes_c_abi_v1_transform() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
-            ;; Write 20 bytes of zeros for TransformResponseHeader at offset 1024
-            (i32.store (i32.const 1024) (i32.const 0))
-            (i32.store (i32.const 1028) (i32.const 0))
-            (i32.store (i32.const 1032) (i32.const 0))
-            (i32.store (i32.const 1036) (i32.const 0))
-            (i32.store (i32.const 1040) (i32.const 0))
-            ;; (1024 << 32) | 20 = 0x0000_0400_0000_0014 = 4398046511124_i64
-            (i64.const 4398046511124)
+            ;; Write 20 bytes for TransformResponseHeader at offset 0:
+            ;; status = 0, batch_count = 1, batches_ptr = 24
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            ;; BatchDescriptor at offset 24: ptr=$ptr, len=$len
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
+            ;; (0 << 32) | 20 = 20_i64
+            (i64.const 20)
         )
     )"#;
 
@@ -1325,6 +1329,82 @@ fn test_worker_probe_candidate_instantiates_supplied_module_directly() {
     // Probing candidate module succeeds without affecting cached generation or snapshot
     assert!(WasmWorker::probe_candidate(&cache, &candidate_module, &cfg, &registry).is_ok());
     assert_eq!(cache.module_generation(), 1);
+}
+
+#[test]
+fn test_worker_rejects_batch_descriptor_with_null_ipc_ptr() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            (i32.store (i32.const 1024) (i32.const 0))
+            (i32.store (i32.const 1028) (i32.const 1))
+            (i32.store (i32.const 1032) (i32.const 2048))
+            (i32.store (i32.const 1036) (i32.const 0))
+            (i32.store (i32.const 1040) (i32.const 0))
+            (i32.store (i32.const 2048) (i32.const 0))
+            (i32.store (i32.const 2052) (i32.const 10))
+            (i64.or
+                (i64.shl (i64.extend_i32_u (i32.const 1024)) (i64.const 32))
+                (i64.const 20)
+            )
+        )
+    )"#;
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, registry).unwrap();
+
+    let batch = create_test_record_batch();
+    let res = worker.execute_batch(SignalBatch::Logs(batch));
+    assert!(res.is_err());
+    let (_returned_batch, err) = res.unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::Pipeline(ref msg) if msg.contains("null IPC buffer pointer")),
+        "Expected null IPC buffer pointer error, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_worker_executes_empty_zero_row_batch() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(echo_single_batch_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, registry).unwrap();
+
+    let empty_batch = RecordBatch::new_empty(create_test_record_batch().schema());
+    let res = worker.execute_batch(SignalBatch::Logs(empty_batch));
+    assert!(res.is_ok());
+    let outcome = res.unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(ref batches) if batches.len() == 1));
+}
+
+#[test]
+fn test_worker_zero_batch_count_success_emits_empty_vector() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let registry = test_registry();
+    let mut worker = WasmWorker::new(0, Arc::clone(&cache), module, cfg, registry).unwrap();
+
+    let batch = create_test_record_batch();
+    let res = worker.execute_batch(SignalBatch::Logs(batch));
+    assert!(res.is_ok());
+    let outcome = res.unwrap();
+    assert!(
+        matches!(outcome, WorkerOutcome::Emitted(ref batches) if batches.is_empty()),
+        "Zero-batch count success must emit an empty vector marking batch consumed without leaking input rows"
+    );
 }
 
 #[tokio::test]
