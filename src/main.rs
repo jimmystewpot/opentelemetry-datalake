@@ -136,9 +136,9 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     if let Some(admin_addr) = config.server.admin_addr {
-        if admin_addr.ip().is_unspecified() {
+        if !is_non_public_ip(admin_addr.ip()) {
             anyhow::bail!(
-                "Configuration validation failed: server.admin_addr ({admin_addr}) cannot bind to wildcard/unspecified address; loopback or private interface required to prevent public exposure"
+                "Configuration validation failed: server.admin_addr ({admin_addr}) cannot bind to wildcard/unspecified address or public address; loopback or private interface required to prevent public exposure"
             );
         }
         if admin_addr.port() == config.server.http_addr.port()
@@ -154,6 +154,41 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Returns `true` if `ip` is a non-public address (loopback, RFC 1918 private, or link-local).
+///
+/// Unspecified/wildcard addresses (`0.0.0.0`, `::`) and publicly routable IP addresses return `false`.
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            !ipv4.is_unspecified()
+                && (ipv4.is_loopback() || ipv4.is_private() || ipv4.is_link_local())
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_unspecified() {
+                return false;
+            }
+            if ipv6.is_loopback() {
+                return true;
+            }
+            let octets = ipv6.octets();
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x)
+            if octets[..10].iter().all(|&b| b == 0) && octets[10] == 0xff && octets[11] == 0xff {
+                let v4 = std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            // Unique local address (fc00::/7)
+            if (octets[0] & 0xfe) == 0xfc {
+                return true;
+            }
+            // Unicast link-local address (fe80::/10)
+            if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            false
+        }
+    }
 }
 
 static DLQ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1510,6 +1545,78 @@ mod tests {
             err.to_string()
                 .contains("cannot bind to wildcard/unspecified address")
         );
+    }
+
+    #[test]
+    fn test_config_validation_fails_when_admin_addr_is_public() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        admin_addr = "8.8.8.8:9090"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot bind to wildcard/unspecified address or public address")
+        );
+    }
+
+    #[test]
+    fn test_is_non_public_ip() {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        // Loopback addresses
+        assert!(is_non_public_ip(IpAddr::from_str("127.0.0.1").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("127.0.0.2").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("::1").unwrap()));
+
+        // RFC 1918 private addresses
+        assert!(is_non_public_ip(IpAddr::from_str("10.0.0.1").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("172.16.0.1").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("192.168.1.1").unwrap()));
+
+        // Link-local addresses
+        assert!(is_non_public_ip(IpAddr::from_str("169.254.1.1").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("fe80::1").unwrap()));
+
+        // IPv6 Unique Local Addresses (fc00::/7)
+        assert!(is_non_public_ip(IpAddr::from_str("fd00::1").unwrap()));
+        assert!(is_non_public_ip(IpAddr::from_str("fc00::1").unwrap()));
+
+        // IPv4-mapped IPv6
+        assert!(is_non_public_ip(
+            IpAddr::from_str("::ffff:127.0.0.1").unwrap()
+        ));
+        assert!(is_non_public_ip(
+            IpAddr::from_str("::ffff:10.0.0.1").unwrap()
+        ));
+        assert!(!is_non_public_ip(
+            IpAddr::from_str("::ffff:8.8.8.8").unwrap()
+        ));
+
+        // Unspecified / wildcard (must be rejected)
+        assert!(!is_non_public_ip(IpAddr::from_str("0.0.0.0").unwrap()));
+        assert!(!is_non_public_ip(IpAddr::from_str("::").unwrap()));
+
+        // Public IPs (must be rejected)
+        assert!(!is_non_public_ip(IpAddr::from_str("8.8.8.8").unwrap()));
+        assert!(!is_non_public_ip(IpAddr::from_str("1.1.1.1").unwrap()));
+        assert!(!is_non_public_ip(IpAddr::from_str("2001:db8::1").unwrap()));
     }
 
     #[test]
