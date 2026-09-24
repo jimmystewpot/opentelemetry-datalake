@@ -847,3 +847,60 @@ async fn test_admin_router_rejects_oversized_file() {
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
+
+#[tokio::test]
+async fn test_build_admin_router_multi_with_dir_enforces_directory() {
+    let temp_dir = std::env::temp_dir();
+    let allowed_dir = temp_dir.join(format!("allowed_multi_dir_{}", std::process::id()));
+    let disallowed_dir = temp_dir.join(format!("disallowed_multi_dir_{}", std::process::id()));
+    tokio::fs::create_dir_all(&allowed_dir).await.unwrap();
+    tokio::fs::create_dir_all(&disallowed_dir).await.unwrap();
+
+    let valid_wasm = wat::parse_str(valid_wat()).unwrap();
+    let allowed_module = allowed_dir.join("module.wasm");
+    let disallowed_module = disallowed_dir.join("module.wasm");
+    tokio::fs::write(&allowed_module, &valid_wasm)
+        .await
+        .unwrap();
+    tokio::fs::write(&disallowed_module, &valid_wasm)
+        .await
+        .unwrap();
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = wasm_transformer::reload::build_admin_router_multi_with_dir(
+        vec![Arc::clone(&engine)],
+        None,
+        Some(allowed_dir.clone()),
+    );
+
+    // Request from disallowed directory must be rejected
+    let payload = serde_json::json!({
+        "module_path": disallowed_module.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Request from allowed directory must succeed
+    let payload = serde_json::json!({
+        "module_path": allowed_module.to_str().unwrap()
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_string(&payload).unwrap()))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _ = tokio::fs::remove_dir_all(&allowed_dir).await;
+    let _ = tokio::fs::remove_dir_all(&disallowed_dir).await;
+}

@@ -463,3 +463,90 @@ async fn test_spawn_sighup_listener_multi_with_mismatching_expected_sha() {
         let _ = tokio::fs::remove_file(&module_path).await;
     }
 }
+
+#[tokio::test]
+async fn test_spawn_sighup_listener_triggers_reload_failure_empty_file() {
+    #[cfg(unix)]
+    {
+        let _guard = SIGHUP_MUTEX.lock().await;
+        let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+
+        let temp_dir = std::env::temp_dir();
+        let module_path = temp_dir.join(format!(
+            "sighup_empty_test_module_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        tokio::fs::write(&module_path, b"").await.unwrap();
+
+        assert_eq!(engine.module_generation(), 0);
+
+        let handle =
+            spawn_sighup_listener(Arc::clone(&engine), module_path.clone(), None, true).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pid = std::process::id().to_string();
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(&pid)
+            .status()
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(engine.module_generation(), 0);
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = tokio::fs::remove_file(&module_path).await;
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_sighup_listener_triggers_reload_failure_oversized_file() {
+    #[cfg(unix)]
+    {
+        let _guard = SIGHUP_MUTEX.lock().await;
+        let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+
+        let temp_dir = std::env::temp_dir();
+        let module_path = temp_dir.join(format!(
+            "sighup_oversized_test_module_{}_{}.wasm",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Create a 65 MiB sparse file
+        let file = std::fs::File::create(&module_path).unwrap();
+        file.set_len(65 * 1024 * 1024).unwrap();
+        drop(file);
+
+        assert_eq!(engine.module_generation(), 0);
+
+        let handle =
+            spawn_sighup_listener(Arc::clone(&engine), module_path.clone(), None, true).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let pid = std::process::id().to_string();
+        std::process::Command::new("kill")
+            .arg("-HUP")
+            .arg(&pid)
+            .status()
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(engine.module_generation(), 0);
+
+        handle.abort();
+        let _ = handle.await;
+        let _ = tokio::fs::remove_file(&module_path).await;
+    }
+}

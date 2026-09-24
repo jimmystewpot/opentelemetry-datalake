@@ -350,16 +350,30 @@ pub fn build_admin_router_with_sha(
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`
-/// across multiple [`EngineCache`] instances with an optional configured fallback SHA-256 digest.
-pub fn build_admin_router_multi(
+/// across multiple [`EngineCache`] instances with an optional configured fallback SHA-256 digest
+/// and an optional boundary directory restricting which WASM files may be reloaded.
+pub fn build_admin_router_multi_with_dir(
     engines: Vec<Arc<EngineCache>>,
     configured_sha: Option<String>,
+    allowed_directory: Option<PathBuf>,
 ) -> axum::Router {
-    let state = WasmReloadState::new_multi(engines, configured_sha);
+    let mut state = WasmReloadState::new_multi(engines, configured_sha);
+    if let Some(dir) = allowed_directory {
+        state = state.with_allowed_directory(dir);
+    }
     axum::Router::new()
         .route(
             "/api/v1/transforms/wasm/reload",
             axum::routing::post(wasm_reload_handler),
         )
         .with_state(state)
+}
+
+/// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`
+/// across multiple [`EngineCache`] instances with an optional configured fallback SHA-256 digest.
+pub fn build_admin_router_multi(
+    engines: Vec<Arc<EngineCache>>,
+    configured_sha: Option<String>,
+) -> axum::Router {
+    build_admin_router_multi_with_dir(engines, configured_sha, None)
 }

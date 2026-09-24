@@ -678,10 +678,25 @@ async fn main() -> anyhow::Result<()> {
             .wasm_transformer
             .as_ref()
             .and_then(|w| w.sha256.clone());
+        let allowed_dir = config.wasm_transformer.as_ref().and_then(|w| {
+            let path = std::path::Path::new(&w.module_path);
+            if let Ok(canonical) = std::fs::canonicalize(path) {
+                canonical.parent().map(std::path::Path::to_path_buf)
+            } else {
+                path.parent().and_then(|p| {
+                    if p.as_os_str().is_empty() {
+                        None
+                    } else {
+                        Some(p.to_path_buf())
+                    }
+                })
+            }
+        });
         let admin_router = if let Some(ref engine) = shared_engine {
-            wasm_transformer::reload::build_admin_router_with_sha(
-                std::sync::Arc::clone(engine),
+            wasm_transformer::reload::build_admin_router_multi_with_dir(
+                vec![std::sync::Arc::clone(engine)],
                 expected_sha,
+                allowed_dir,
             )
         } else {
             axum::Router::new()
@@ -1405,10 +1420,12 @@ mod tests {
         use std::sync::Arc;
         use tower::ServiceExt;
         use wasm_transformer::engine::EngineCache;
-        use wasm_transformer::reload::build_admin_router;
+        use wasm_transformer::reload::{
+            build_admin_router, build_admin_router_multi, build_admin_router_multi_with_dir,
+        };
 
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-        let router = build_admin_router(engine);
+        let router = build_admin_router(Arc::clone(&engine));
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/transforms/wasm/reload")
@@ -1421,6 +1438,36 @@ mod tests {
             .await
             .expect("Router should handle request");
 
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let router_multi = build_admin_router_multi(vec![Arc::clone(&engine)], None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/transforms/wasm/reload")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"module_path": ""}"#))
+            .expect("Request should be created successfully");
+        let response = router_multi
+            .oneshot(req)
+            .await
+            .expect("Router should handle request");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let router_with_dir = build_admin_router_multi_with_dir(
+            vec![Arc::clone(&engine)],
+            None,
+            Some(std::path::PathBuf::from("/non_existent_allowed_dir")),
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/transforms/wasm/reload")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"module_path": "/tmp/non_existent.wasm"}"#))
+            .expect("Request should be created successfully");
+        let response = router_with_dir
+            .oneshot(req)
+            .await
+            .expect("Router should handle request");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
