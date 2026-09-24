@@ -1,0 +1,29 @@
+[package]
+name = "wasm-transformer"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[dependencies]
+pipeline-core = { workspace = true }
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true, features = ["p1"] }
+tokio = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true, features = ["alloc"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+opentelemetry = { workspace = true }
+dashmap = { workspace = true }
+opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
+axum = { workspace = true }
+
+[dev-dependencies]
+wat = "1.220"
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tracing-subscriber = { workspace = true }

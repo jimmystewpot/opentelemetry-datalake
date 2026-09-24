@@ -1,0 +1,12 @@
+[package]
+name = "pii-scrubber"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+opentelemetry-datalake-wasm-sdk = { path = "../../../crates/wasm-sdk" }
+arrow = { version = "59", default-features = false, features = ["ipc"] }

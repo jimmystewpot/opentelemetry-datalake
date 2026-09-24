@@ -33,6 +33,7 @@ Configures the OTLP receiver that listens for incoming telemetry data.
 | :--- | :--- | :--- | :--- |
 | `grpc_addr` | String | `"127.0.0.1:4317"` | Socket address for the gRPC OTLP receiver. |
 | `http_addr` | String | `"127.0.0.1:4318"` | Socket address for the HTTP/JSON OTLP receiver. |
+| `admin_addr` | String | `null` | Optional socket address for the admin HTTP server (e.g. `"127.0.0.1:9090"`). Must bind to loopback or a private non-wildcard interface and use a distinct port from `grpc_addr` and `http_addr` for port isolation. |
 
 ---
 

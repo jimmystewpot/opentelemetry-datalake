@@ -1,0 +1,34 @@
+[package]
+name = "datalake-wasm-tool"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = { workspace = true }
+homepage = { workspace = true }
+authors = { workspace = true }
+
+[package.metadata.wix]
+upgrade-guid = "3b19171e-a6a8-4594-a1e4-9d5d93f6f013"
+path-guid = "1a4c2c14-c7f9-4df6-8392-f180b48d93ba"
+license = false
+eula = false
+
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "datalake-wasm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+wasmtime = { workspace = true }
+arrow = { workspace = true, features = ["ipc"] }
+opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+wat = "1.220"

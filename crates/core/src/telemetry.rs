@@ -27,12 +27,19 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Telemetry handle retaining initialized OpenTelemetry tracer and meter providers.
+#[derive(Debug)]
+pub struct TelemetryGuard {
+    _meter_provider: opentelemetry_sdk::metrics::SdkMeterProvider,
+    _tracer_provider: opentelemetry_sdk::trace::SdkTracerProvider,
+}
+
 /// Initializes local tracing and OpenTelemetry emission.
 ///
 /// # Errors
 ///
-/// Returns `PipelineError::Configuration` if the tracer cannot be initialized.
-pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), PipelineError> {
+/// Returns `PipelineError::Configuration` if the tracer or meter provider cannot be initialized.
+pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, PipelineError> {
     let mut attributes = vec![KeyValue::new("service.name", config.service_name.clone())];
     if let Some(region) = &config.region {
         attributes.push(KeyValue::new("cloud.region", region.clone()));
@@ -51,6 +58,17 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), PipelineError> {
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_sampler(Sampler::AlwaysOn)
+        .with_resource(resource.clone())
+        .build();
+
+    let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(&config.otlp_endpoint)
+        .build()
+        .map_err(|e| PipelineError::Internal(e.to_string()))?;
+
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_periodic_exporter(metric_exporter)
         .with_resource(resource)
         .build();
 
@@ -58,23 +76,27 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), PipelineError> {
     let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(telemetry)
         .with(tracing_subscriber::fmt::layer())
-        .init();
+        .try_init();
 
-    // Set as global provider to ensure library traces are also captured
-    opentelemetry::global::set_tracer_provider(provider);
+    // Set as global providers to ensure library traces and metrics are captured
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
 
-    Ok(())
+    Ok(TelemetryGuard {
+        _meter_provider: meter_provider,
+        _tracer_provider: provider,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Default TelemetryConfig must use the localhost OTLP endpoint and
+    /// Default `TelemetryConfig` must use the localhost OTLP endpoint and
     /// the canonical service name without requiring any environment variables.
     #[test]
     fn test_telemetry_config_default_values() {
@@ -91,10 +113,10 @@ mod tests {
         );
     }
 
-    /// When the REGION environment variable is set, TelemetryConfig::default()
+    /// When the REGION environment variable is set, `TelemetryConfig::default()`
     /// must capture it in the `region` field. Because Rust runs tests in parallel
     /// and env var mutation is a global side-effect, we instead verify the
-    /// same behavior by directly constructing a TelemetryConfig with a known
+    /// same behavior by directly constructing a `TelemetryConfig` with a known
     /// region value — testing that the field is correctly handled downstream.
     #[test]
     fn test_telemetry_config_region_field_roundtrips() {

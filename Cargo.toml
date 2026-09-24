@@ -17,7 +17,8 @@ eula = false
 [workspace]
 resolver = "2"
 members = [
-    "crates/*"
+    "crates/*",
+    "examples/transforms/*",
 ]
 
 [workspace.package]
@@ -33,6 +34,7 @@ authors = ["James Lamb"]
 pipeline-core = { workspace = true }
 otlp-receiver = { workspace = true }
 noop-transformer = { workspace = true }
+wasm-transformer = { workspace = true }
 kafka-sink = { workspace = true }
 storage = { workspace = true, features = ["aws"] }
 starrocks-sink = { workspace = true }
@@ -44,6 +46,10 @@ figment = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+arrow.workspace = true
+axum = { workspace = true }
+opentelemetry = { workspace = true }
+async-trait = { workspace = true }
 
 [features]
 default = []
@@ -51,6 +57,16 @@ aws = ["elasticsearch-sink/aws"]
 
 [dev-dependencies]
 arrow = { workspace = true }
+wat = "1.220"
+sha2 = { workspace = true }
+hex = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+axum = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "wasm_boundary_bench"
+harness = false
 
 [workspace.dependencies]
 # Internal Workspace Crates
@@ -58,6 +74,7 @@ pipeline-core = { path = "crates/core", version = "0.1.0" }
 arrow-codec = { path = "crates/arrow-codec", version = "0.1.0" }
 otlp-receiver = { path = "crates/otlp-receiver", version = "0.1.0" }
 noop-transformer = { path = "crates/noop-transformer", version = "0.1.0" }
+wasm-transformer = { path = "crates/wasm-transformer", version = "0.1.0" }
 kafka-sink = { path = "crates/kafka-sink", version = "0.1.0" }
 storage = { path = "crates/storage", version = "0.1.0", default-features = false }
 starrocks-sink = { path = "crates/starrocks-sink", version = "0.1.0" }
@@ -89,8 +106,19 @@ toml = { version = "1.1.6", default-features = false, features = ["parse", "serd
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
-arrow = { version = "59", default-features = false, features = ["json"] }
+arrow = { version = "59", default-features = false, features = ["json", "ipc"] }
 parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2", "lz4"] }
+
+# WebAssembly Runtime (Wasmtime 48 — current stable, Rust 1.98+ required)
+wasmtime = { version = "48", default-features = false, features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "48", default-features = false }
+
+# Concurrent Collections
+dashmap = { version = "6.0", default-features = false }
+
+# Cryptography (SHA-256 module integrity)
+sha2 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Codec & OTLP Parsing
 prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }

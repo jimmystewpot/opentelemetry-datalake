@@ -122,7 +122,7 @@ mod tests {
     }
 
     /// When a downstream receiver is dropped, Fanout::send must return
-    /// DownstreamClosed so the upstream can propagate backpressure.
+    /// `DownstreamClosed` so the upstream can propagate backpressure.
     #[tokio::test]
     async fn test_fanout_downstream_closed() {
         let (tx1, rx1) = mpsc::channel(10);
@@ -159,7 +159,7 @@ mod tests {
         assert!(rx.recv().await.is_some());
     }
 
-    /// When a downstream channel is full, send() must block until the
+    /// When a downstream channel is full, `send()` must block until the
     /// consumer drains it rather than silently dropping data or panicking.
     /// This validates bounded-channel backpressure semantics.
     #[tokio::test]
@@ -202,16 +202,18 @@ mod tests {
         let fanout = Arc::new(Fanout::try_new(vec![tx1]).unwrap());
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
-        const MSG_COUNT: usize = 16;
 
+        const MSG_COUNT: usize = 16;
         let handles: Vec<_> = (0..MSG_COUNT)
             .map(|i| {
                 let f = Arc::clone(&fanout);
                 let s = schema.clone();
                 tokio::spawn(async move {
-                    let batch =
-                        RecordBatch::try_new(s, vec![Arc::new(Int32Array::from(vec![i as i32]))])
-                            .unwrap();
+                    let batch = RecordBatch::try_new(
+                        s,
+                        vec![Arc::new(Int32Array::from(vec![i32::try_from(i).unwrap()]))],
+                    )
+                    .unwrap();
                     f.send(SignalBatch::Traces(batch)).await.unwrap();
                 })
             })
@@ -231,7 +233,7 @@ mod tests {
         );
     }
 
-    /// All SignalBatch variants must be cloneable; verify that cloning
+    /// All `SignalBatch` variants must be cloneable; verify that cloning
     /// produces an independent copy with the same row count.
     #[test]
     fn test_signal_batch_variants_are_cloneable() {

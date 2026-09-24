@@ -100,7 +100,7 @@ pub fn downcast_string_array<'a>(
     col.as_any()
         .downcast_ref::<arrow::array::StringArray>()
         .ok_or_else(|| {
-            PipelineError::Internal(format!("column '{col_name}' is not a Utf8 StringArray"))
+            PipelineError::Internal(format!("column '{col_name}' is not a Utf8 `StringArray`"))
         })
 }
 
@@ -276,8 +276,8 @@ mod tests {
         );
     }
 
-    /// downcast_string_array must return PipelineError::Internal when the
-    /// column is not a Utf8 StringArray.
+    /// `downcast_string_array` must return `PipelineError::Internal` when the
+    /// column is not a Utf8 `StringArray`.
     #[test]
     fn test_downcast_string_array_error_on_wrong_type() {
         use arrow::array::Int32Array;
@@ -297,7 +297,7 @@ mod tests {
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("n"),
+            err.contains('n'),
             "Error message must reference the column name: {err}"
         );
     }

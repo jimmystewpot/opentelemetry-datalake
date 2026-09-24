@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(msg, "something failed");
     }
 
-    /// When no resource is set, service_name must fall back to "unknown".
+    /// When no resource is set, `service_name` must fall back to "unknown".
     #[test]
     fn test_decode_traces_missing_resource_uses_unknown() {
         use arrow::array::AsArray;
@@ -291,8 +291,8 @@ mod tests {
         assert_eq!(svc, "unknown");
     }
 
-    /// A ScopeSpans with no instrumentation scope must produce empty
-    /// scope_name and scope_version columns.
+    /// A `ScopeSpans` with no instrumentation scope must produce empty
+    /// `scope_name` and `scope_version` columns.
     #[test]
     fn test_decode_traces_no_scope_produces_empty_strings() {
         use arrow::array::AsArray;
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(scope_name, "");
     }
 
-    /// A span with start_time_unix_nano > i64::MAX must return an error.
+    /// A span with `start_time_unix_nano` > `i64::MAX` must return an error.
     #[test]
     fn test_decode_traces_timestamp_overflow_returns_error() {
         let r_span = ResourceSpans {

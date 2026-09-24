@@ -1,0 +1,1065 @@
+use arrow::array::StringArray;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use pipeline_core::config::{
+    OnErrorPolicy, OnRejectPolicy, SchemaGuardMode, WasmTransformerConfig,
+};
+use pipeline_core::pipeline::SignalBatch;
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use wasm_transformer::dispatcher::{DispatcherConfig, WasmDispatcher};
+use wasm_transformer::engine::EngineCache;
+use wasm_transformer::host_calls::MetricRegistry;
+
+fn test_registry() -> Arc<MetricRegistry> {
+    Arc::new(MetricRegistry::new("test"))
+}
+
+fn passthrough_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+fn echo_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param $ptr i32) (param $len i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 0))
+            (i32.store (i32.const 4) (i32.const 1))
+            (i32.store (i32.const 8) (i32.const 24))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (i32.store (i32.const 24) (local.get $ptr))
+            (i32.store (i32.const 28) (local.get $len))
+            (i32.const 0)
+        )
+    )"#
+}
+
+fn discard_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 1))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+fn reject_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 2))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+fn error_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (i32.store (i32.const 0) (i32.const 3))
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.const 0)
+        )
+    )"#
+}
+
+fn test_config(
+    on_error: OnErrorPolicy,
+    on_reject: OnRejectPolicy,
+    concurrency: usize,
+) -> WasmTransformerConfig {
+    WasmTransformerConfig {
+        id: "disp_test".into(),
+        r#type: "wasm".into(),
+        module_path: "test.wasm".into(),
+        sha256: None,
+        max_execution_duration: "500ms".into(),
+        drain_timeout: "5s".into(),
+        max_batch_rows: 5000,
+        concurrency,
+        worker_channel_capacity: 1,
+        max_memory: "64MiB".into(),
+        rejuvenate_threshold: "16MiB".into(),
+        rejuvenate_batches: 10_000,
+        init_timeout: "2s".into(),
+        on_error,
+        allow_unmasked_passthrough: false,
+        on_reject,
+        schema_guard: SchemaGuardMode::Defensive,
+        env_whitelist: vec![],
+        env: std::collections::HashMap::default(),
+        config: None,
+        enable_sighup: false,
+    }
+}
+
+fn logs_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["trace_abc"])),
+            Arc::new(StringArray::from(vec!["hello"])),
+        ],
+    )
+    .expect("valid record batch")
+}
+
+#[tokio::test]
+async fn test_dispatcher_executes_batches_and_drains_on_close() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(echo_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx); // Close input
+
+    let mut received = 0;
+    while output_rx.recv().await.is_some() {
+        received += 1;
+    }
+    assert_eq!(
+        received, 2,
+        "dispatcher must execute and forward all batches before drain completes"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_error_reroute_policy_routes_to_reroute_error() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(error_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let mut err_received = 0;
+    while err_rx.recv().await.is_some() {
+        err_received += 1;
+    }
+    assert_eq!(
+        err_received, 2,
+        "all errored batches must route to reroute_error DLQ"
+    );
+
+    let mut out_received = 0;
+    while output_rx.try_recv().is_ok() {
+        out_received += 1;
+    }
+    assert_eq!(
+        out_received, 0,
+        "no errored batches should be sent to primary output"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(error_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = true;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let mut out_received = 0;
+    while output_rx.recv().await.is_some() {
+        out_received += 1;
+    }
+    assert_eq!(
+        out_received, 2,
+        "passthrough policy must forward original batches to output"
+    );
+
+    let mut err_received = 0;
+    while err_rx.try_recv().is_ok() {
+        err_received += 1;
+    }
+    assert_eq!(
+        err_received, 0,
+        "passthrough policy must not forward to DLQ error channel"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_error_passthrough_disabled_drops_batch() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(error_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = false;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let mut out_received = 0;
+    while output_rx.recv().await.is_some() {
+        out_received += 1;
+    }
+    assert_eq!(
+        out_received, 0,
+        "errored batch must be dropped when allow_unmasked_passthrough is false"
+    );
+
+    let mut err_received = 0;
+    while err_rx.try_recv().is_ok() {
+        err_received += 1;
+    }
+    assert_eq!(
+        err_received, 0,
+        "passthrough policy must not forward to DLQ error channel"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(reject_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (rej_tx, mut rej_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(rej_tx.into()),
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let mut rej_received = 0;
+    while rej_rx.recv().await.is_some() {
+        rej_received += 1;
+    }
+    assert_eq!(
+        rej_received, 2,
+        "all rejected batches must route to reroute_reject DLQ"
+    );
+
+    let mut out_received = 0;
+    while output_rx.try_recv().is_ok() {
+        out_received += 1;
+    }
+    assert_eq!(
+        out_received, 0,
+        "no rejected batches should be sent to primary output"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_reject_drop_policy_drops_batch() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(reject_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Drop, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (rej_tx, mut rej_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(rej_tx.into()),
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    // Wait until output is closed on drain completion
+    assert!(output_rx.recv().await.is_none());
+
+    let mut rej_received = 0;
+    while rej_rx.try_recv().is_ok() {
+        rej_received += 1;
+    }
+    assert_eq!(
+        rej_received, 0,
+        "drop policy must not route to DLQ reject channel"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_discard_outcome_drops_batch() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(discard_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    assert!(
+        output_rx.recv().await.is_none(),
+        "discarded batches must be dropped without emission"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
+    let concurrency = 4;
+    let cache =
+        Arc::new(EngineCache::new_pooling(concurrency, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(echo_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, concurrency);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(16);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(64);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    let total_batches = 50;
+    for _ in 0..total_batches {
+        input_tx
+            .send(SignalBatch::Logs(logs_batch()))
+            .await
+            .expect("send batch");
+    }
+    drop(input_tx); // Trigger drain
+
+    let mut received = 0;
+    while output_rx.recv().await.is_some() {
+        received += 1;
+    }
+    assert_eq!(
+        received, total_batches,
+        "concurrent drain must complete without dropping any in-flight or buffered batches"
+    );
+}
+
+fn test_tf_cfg() -> WasmTransformerConfig {
+    WasmTransformerConfig {
+        id: "test".to_string(),
+        r#type: "wasm".to_string(),
+        module_path: "dummy".to_string(),
+        sha256: None,
+        max_execution_duration: "1s".to_string(),
+        drain_timeout: "10ms".to_string(),
+        max_batch_rows: 1000,
+        concurrency: 1,
+        worker_channel_capacity: 10,
+        max_memory: "1MB".to_string(),
+        rejuvenate_threshold: "0".to_string(),
+        rejuvenate_batches: 0,
+        init_timeout: "1s".to_string(),
+        allow_unmasked_passthrough: false,
+        on_error: OnErrorPolicy::Drop,
+        on_reject: OnRejectPolicy::Drop,
+        schema_guard: SchemaGuardMode::Defensive,
+        env: std::collections::HashMap::new(),
+        config: None,
+        enable_sighup: false,
+        env_whitelist: vec![],
+    }
+}
+
+#[tokio::test]
+async fn test_dispatcher_worker_init_failure() {
+    let engine = Arc::new(EngineCache::new_pooling(1, 1024 * 1024).unwrap());
+
+    // Provide a valid module initially, but we'll mess up the config or module to cause WasmWorker::new to fail.
+    // It calls `engine.instantiate(module)`. If the module needs imports that aren't provided by the linker.
+    let bad_wat = r#"(module (import "env" "missing" (func)))"#;
+    let module = engine
+        .compile_module(&wat::parse_str(bad_wat).unwrap())
+        .unwrap();
+
+    let cfg = DispatcherConfig {
+        concurrency: 1,
+        worker_channel_capacity: 1,
+    };
+
+    let tf_cfg = test_tf_cfg();
+
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+    let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
+    let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
+
+    let dispatcher = WasmDispatcher::new(
+        cfg,
+        engine,
+        module,
+        tf_cfg,
+        out_tx,
+        Some(err_tx.into()),
+        Some(rej_tx.into()),
+        test_registry(),
+    );
+
+    // The worker spawn task will fail initializing WasmWorker, causing it to return early.
+    // The worker channels are dropped, so sending to them will fail, causing run() to return Err.
+    let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
+
+    // Yield so the worker can die.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send a batch.
+    let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Utf8, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+    let _ = in_tx.send(SignalBatch::Logs(batch)).await;
+
+    let res = run_handle.await.unwrap();
+    assert!(
+        res.is_err(),
+        "Dispatcher should error because worker channel closed"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_output_channel_closed() {
+    let engine = Arc::new(EngineCache::new_pooling(2, 1024 * 1024).unwrap());
+    let module = engine
+        .compile_module(&wat::parse_str(echo_wat()).unwrap())
+        .unwrap();
+
+    let cfg = DispatcherConfig {
+        concurrency: 1,
+        worker_channel_capacity: 1,
+    };
+
+    let tf_cfg = test_tf_cfg();
+
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
+    let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
+    let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
+
+    let dispatcher = WasmDispatcher::new(
+        cfg,
+        engine,
+        module,
+        tf_cfg,
+        out_tx,
+        Some(err_tx.into()),
+        Some(rej_tx.into()),
+        test_registry(),
+    );
+    let run_handle = tokio::spawn(async move { dispatcher.run(in_rx).await });
+
+    // Drop out_rx BEFORE sending the batch, so that output.send(b) inside the worker fails.
+    drop(out_rx);
+
+    let schema = Arc::new(Schema::new(vec![Field::new("f", DataType::Utf8, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["test"]))]).unwrap();
+    let _ = in_tx.send(SignalBatch::Logs(batch)).await;
+
+    // Send another to trigger the worker loop if first dropped silently
+    // But since output closed, the worker will `break` out of its processing loop and terminate.
+    drop(in_tx);
+
+    let res = run_handle.await.unwrap();
+    assert!(
+        res.is_ok(),
+        "Run should finish gracefully when input closes"
+    );
+}
+
+fn trap_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (unreachable)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_dispatcher_trap_passthrough_policy_routes_to_output() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 2);
+    cfg.allow_unmasked_passthrough = true;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch");
+    drop(input_tx);
+
+    let received = output_rx.recv().await;
+    assert!(
+        received.is_some(),
+        "Trap with passthrough policy must route original batch to output"
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch");
+    drop(input_tx);
+
+    let received = err_rx.recv().await;
+    assert!(
+        received.is_some(),
+        "Trap with reroute policy must route original batch to DLQ"
+    );
+    assert!(
+        output_rx.try_recv().is_err(),
+        "Output channel must receive nothing on trap reroute"
+    );
+}
+
+#[tokio::test]
+async fn test_dlq_error_channel_closed_terminates_worker() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let wasm_bytes = wat::parse_str(trap_wat()).unwrap();
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Drop, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (err_tx, err_rx) = mpsc::channel::<SignalBatch>(8);
+
+    // Drop err_rx immediately so DLQ sends fail
+    drop(err_rx);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        Some(err_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    // Send batch that triggers error
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    // Give worker time to encounter closed DLQ and terminate
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send another batch; worker is dead so dispatch loop should exit or backpressure
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[tokio::test]
+async fn test_dlq_reject_channel_closed_terminates_worker() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (rej_tx, rej_rx) = mpsc::channel::<SignalBatch>(8);
+
+    // Drop rej_rx immediately so DLQ sends fail
+    drop(rej_rx);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(rej_tx.into()),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    // Send batch that triggers reject
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    // Give worker time to encounter closed DLQ and terminate
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send another batch
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[derive(Debug, Default)]
+struct MockDlqSink {
+    batches: std::sync::Mutex<Vec<SignalBatch>>,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl wasm_transformer::DlqSink for MockDlqSink {
+    async fn send(&self, batch: SignalBatch) -> Result<(), pipeline_core::error::PipelineError> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(pipeline_core::error::PipelineError::Internal(
+                "mock DLQ write failure".into(),
+            ));
+        }
+        self.batches.lock().unwrap().push(batch);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_dispatcher_custom_dlq_sink_routes_successfully() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dlq_sink = Arc::new(MockDlqSink::default());
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(wasm_transformer::DlqOutput::Sink(
+            Arc::clone(&dlq_sink) as Arc<dyn wasm_transformer::DlqSink>
+        )),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(res.is_ok());
+    assert_eq!(dlq_sink.batches.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_dispatcher_custom_dlq_sink_write_failure_terminates_worker() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let wasm_bytes = wat::parse_str(reject_wat()).unwrap();
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wasm_bytes).unwrap();
+    let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dlq_sink = Arc::new(MockDlqSink::default());
+    dlq_sink
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        Some(wasm_transformer::DlqOutput::Sink(
+            Arc::clone(&dlq_sink) as Arc<dyn wasm_transformer::DlqSink>
+        )),
+        test_registry(),
+    );
+
+    let handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let _ = input_tx.send(SignalBatch::Logs(logs_batch())).await;
+    drop(input_tx);
+
+    let res = handle.await.unwrap();
+    assert!(
+        matches!(res, Err(wasm_transformer::error::WasmTransformError::Pipeline(ref msg)) if msg.contains("Dispatcher worker channel closed"))
+    );
+}
+
+#[tokio::test]
+async fn test_dispatcher_zero_batch_success_marks_consumed_without_emitting_rows() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(passthrough_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 2,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        test_registry(),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    // Send 3 batches to guest returning status=0 with batch_count=0
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 3");
+    drop(input_tx); // Trigger drain
+
+    // Verify 0 rows are emitted downstream (input is consumed, not leaked)
+    assert!(
+        output_rx.recv().await.is_none(),
+        "zero-batch success must mark batch consumed and emit zero rows downstream"
+    );
+}
