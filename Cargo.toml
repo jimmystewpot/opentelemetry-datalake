@@ -111,7 +111,7 @@ parquet = { version = "59", default-features = false, features = ["async", "arro
 
 # WebAssembly Runtime (Wasmtime 48 — current stable, Rust 1.98+ required)
 wasmtime = { version = "48", default-features = false, features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "48", default-features = false }
+wasmtime-wasi = { version = "49", default-features = false }
 
 # Concurrent Collections
 dashmap = { version = "6.0", default-features = false }
