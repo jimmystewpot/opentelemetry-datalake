@@ -1,7 +1,7 @@
 # Architecture Design Specification: Parquet Streaming Sink with VARIANT Support
 
 - **Document ID**: SPEC-2026-10-09-PARQUET-VARIANT-SINK
-- **Status**: Finalized (Updated with OTLP, S3, and Variant constraints)
+- **Status**: Finalized (Consolidated on Apache OpenDAL)
 - **Author**: Principal Software Engineer
 - **Date**: 2026-10-09
 - **Target Workspace**: `crates/parquet-sink`
@@ -14,7 +14,7 @@ This specification defines the architecture, storage abstractions, data layout, 
 
 The sink streams OpenTelemetry signals (Logs, Metrics, Traces) directly from Arrow `RecordBatch` streams into modern Parquet files residing on cloud object storage (Amazon S3, Google Cloud Storage, Azure Blob Storage, or S3-compatible systems like RustFS) or local/shared POSIX filesystems.
 
-To maximize read efficiency and query performance across analytical engines (Snowflake, Databricks/Spark, DuckDB, ClickHouse, and StarRocks), the sink adopts the **Apache Parquet / Spark / Iceberg Variant binary format** (`metadata` and `value` payloads).
+Storage operations are consolidated on **Apache OpenDAL** (already standard within the workspace via `iceberg-storage-opendal`). To maximize read efficiency and query performance across analytical engines (Snowflake, Databricks/Spark, DuckDB, ClickHouse, and StarRocks), the sink adopts the **Apache Parquet / Spark / Iceberg Variant binary format** (`metadata` and `value` payloads).
 
 ---
 
@@ -32,11 +32,11 @@ Furthermore, deploying dozens or hundreds of ingestion nodes requires a distribu
 ## 3. Goals & Non-Goals
 
 ### Goals
-* **Direct Streaming I/O**: Stream Parquet data directly to object storage via multipart uploads and local filesystems without intermediate local disk spooling.
+* **Direct Streaming I/O**: Stream Parquet data directly to storage via OpenDAL multipart writers and local filesystems without intermediate local disk spooling.
 * **Modern Parquet Format**: Full support for Parquet 2.0+ features, Data Page V2, column statistics, Bloom filters on ID columns, and selectable compression codecs (`Zstd`, `Snappy`, `Lz4Raw`, `Gzip`, `Uncompressed`).
 * **Zero-Allocation VARIANT Encoding**: Fast, thread-local binary encoding for OTel attributes and dynamic payloads conforming to the Apache Parquet Variant specification.
 * **Collision-Free Multi-Node Ingestion**: Deterministic, entropy-backed naming (`{timestamp_nano}_{node_id}_{uuidv7}_{sequence:04}.parquet`) guaranteeing zero file collisions across concurrent nodes.
-* **Bounded Resource Usage**: LRU-evicted active partition pool, active global memory tracking, and backpressure propagation back to OTLP ingestion.
+* **Bounded Resource Usage**: LRU-evicted active partition pool, composite `(signal, path)` partition isolation, active lock-free memory tracking, and backpressure propagation back to OTLP ingestion.
 * **Zero-Panic Compliance**: Strict adherence to `AGENTS.md`—no `.unwrap()`, `.expect()`, or unhandled panics.
 
 ### Non-Goals
@@ -52,8 +52,8 @@ Furthermore, deploying dozens or hundreds of ingestion nodes requires a distribu
                       │                      ParquetSink                       │
                       │                                                        │
 PipelineReceiver ────►│  SignalRouter ──► VariantTransformer ──► PartitionMgr  │
- (SignalBatch)        │  (Logs/Metrics/   (Zero-alloc binary     (Vectorized   │
-                      │      Traces)          encoding)          slicing & LRU)│
+ (SignalBatch)        │  (Logs/Metrics/   (Zero-alloc binary     (Composite    │
+                      │      Traces)          encoding)          keys & LRU)   │
                       └───────────────────────────────────────────────┬────────┘
                                                                       │
                                       ┌───────────────────────────────┴────────┐
@@ -68,13 +68,13 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
                          │           │ (Channel)    │             │           │ (Channel)    │
                          │  ┌────────▼───────────┐  │             │  ┌────────▼───────────┐  │
                          │  │ Async Uploader     │  │             │  │ Async Uploader     │  │
-                         │  │ • WriteMultipart   │  │             │  │ • WriteMultipart   │  │
+                         │  │ • opendal::Writer  │  │             │  │ • opendal::Writer  │  │
                          │  └────────────────────┘  │             │  └────────────────────┘  │
                          └────────────┬─────────────┘             └────────────┬─────────────┘
                                       │                                        │
                                       ▼                                        ▼
                       ┌────────────────────────────────────────────────────────────────────────┐
-                      │                      object_store::ObjectStore                         │
+                      │                         opendal::Operator                              │
                       │          (s3://... | gcs://... | azblob://... | file://...)            │
                       └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -86,18 +86,18 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
 
 2. **`SignalRouter` & The Metrics Schema Explosion**:
    Extracts `RecordBatch` by signal type (`Logs`, `Metrics`, `Traces`). 
-   * **Metrics Handling**: Because OTLP Metrics are highly polymorphic (Gauges, Sums, Histograms), flattening them into a strict relational schema results in extreme column sparsity. The router flattens the metadata (name, description, unit) but serializes the polymorphic `DataPoint` (including exemplars and dynamic buckets) directly into the `VARIANT` binary payload, keeping the target Parquet schema clean and queryable.
+   * **Metrics Handling**: Because OTLP Metrics are polymorphic, flattening metadata (name, description, unit) into relational columns while serializing the polymorphic `DataPoint` directly into the `VARIANT` binary payload keeps the base Parquet schema clean.
 
 3. **`VariantTransformer`**:
-   Vectorized transformation pass that inspects semi-structured columns. If `variant_encoding` is enabled, transforms these into Arrow `StructArray`s (`metadata: Binary`, `value: Binary`) using pre-allocated reusable scratch buffers.
+   Vectorized transformation pass that transforms semi-structured columns into Arrow `StructArray`s (`metadata: Binary`, `value: Binary`) using pre-allocated reusable scratch buffers with null and empty object safety.
 
 4. **`PartitionManager`**:
-   Evaluates partition keys using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits heterogeneous batches across target partitions via boolean masks (`arrow::compute::filter`). Enforces the `GlobalMemoryTracker`.
+   Evaluates partition keys using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits batches across target partitions via boolean masks (`arrow::compute::filter`). 
+   * **Signal-Partition Isolation**: Binds writers to composite keys: `PartitionId { signal: &'static str, path: String }`, preventing schema mismatch panics across different signal types.
 
 5. **`PartitionWriter` (Decoupled Sync Encoder + Async Uploader)**:
-   * **Encoder**: A synchronous `parquet::arrow::ArrowWriter` runs inside a `tokio::task::spawn_blocking` pool to prevent starving the async reactor with heavy ZSTD compression. It pushes bytes via an in-memory channel.
-   * **Uploader**: An async task reads the channel and streams to `object_store::WriteMultipart`. 
-   * **S3 5MB Coalescing Requirement**: The uploader strictly uses `WriteMultipart` (which buffers into $\ge$ 5MB chunks) rather than raw `put_part()` calls. This prevents HTTP 400 `EntityTooSmall` errors from S3 when the sync writer flushes small Parquet pages.
+   * **Encoder**: Synchronous `parquet::arrow::ArrowWriter` runs inside `tokio::task::spawn_blocking` pool to prevent starving the async reactor with heavy ZSTD compression.
+   * **Uploader**: Async task reads from a bounded channel (`tokio::sync::mpsc::channel(8)`) and streams to `opendal::Writer`. OpenDAL's built-in chunk buffering (default 8MB) automatically satisfies cloud minimum multipart sizes.
 
 ---
 
@@ -109,12 +109,13 @@ Semi-structured columns are built as an Arrow `StructArray`:
 * `DataType::Struct(vec![Field::new("metadata", DataType::Binary, false), Field::new("value", DataType::Binary, false)])`
 
 **Ecosystem Constraint (Arrow v59)**:
-* **Fallback Behavior**: The sink explicitly injects Arrow Extension Metadata (`ARROW:extension:name = "variant"`). However, until upstream logic lands, the `parquet` writer will emit a standard Parquet `Struct`. Downstream engines seamlessly read this as a shredded struct, maintaining performance while awaiting full upstream logical type support.
+* **Fallback Behavior**: The sink explicitly injects Arrow Extension Metadata (`ARROW:extension:name = "variant"`). Downstream engines (Spark, Snowflake) read this as a shredded struct, maintaining performance while awaiting upstream `arrow-rs` native logical type mapping.
 
 ### 5.2 Zero-Allocation Scratch Buffer Strategy & Sorting Constraint
 To eliminate heap allocations in the hot ingestion path:
+* Fast-path empty objects `"{}"` to a static minimal header, and nulls/empty strings to `None`.
 * Worker tasks hold thread-local reusable scratch buffers (`SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`).
-* **Lexicographical Sorting**: The Apache Parquet Variant specification strictly mandates that string keys in the `metadata` dictionary must be sorted. After extracting keys (e.g. using `FxIndexSet`), the encoder performs an in-place lexicographical sort before finalizing the `metadata` binary payload. This guarantees $O(\log N)$ binary search capability for downstream query engines.
+* **Lexicographical Sorting**: Keys in the `metadata` dictionary are sorted in-place before finalizing the binary payload, guaranteeing $O(\log N)$ binary search capability for downstream query engines.
 
 ### 5.3 Selectable Compression & Writer Configuration
 ```rust
@@ -141,12 +142,9 @@ pub enum CompressionCodec {
 All files written use a collision-proof naming template:
 `{partition_prefix}/{timestamp_nano}_{node_id}_{uuidv7}_{sequence:04}.parquet`
 
-### 6.2 Atomic Visibility & Orphan Prevention (The Async `Drop` Pitfall)
-* **Cloud Object Stores (`s3://`, `gcs://`, `azblob://`)**:
-  Uploads use `object_store::WriteMultipart`. The file becomes visible if and only if `complete().await` succeeds.
-  * **Orphan Prevention**: Rust does not support asynchronous `Drop`. If a node panics or a task is cancelled, the `MultipartUpload` could leak uncommitted chunks in S3. The `PartitionWriter` uses a custom `Drop` guard that spins up a fire-and-forget `tokio::spawn` task to execute `multipart.abort().await` in the background, guaranteeing S3 hygiene.
-* **Local Filesystems (`file://`)**: 
-  The sink treats the `LocalFileSystem` instance identically to S3. Native atomic transactions (internal temp files and POSIX renames) are handled automatically by `object_store::local` when `complete().await` is called.
+### 6.2 Atomic Visibility & OpenDAL Abort Safety
+* **Cloud & Local Storage**: Uploads use `opendal::Writer`. Files become visible if and only if `writer.close().await` succeeds.
+* **Orphan Prevention**: OpenDAL handles multipart upload cleanup. A custom `Drop` guard spins up a fire-and-forget `tokio::spawn` task to abort any incomplete `opendal::Writer` on unexpected task termination, guaranteeing cloud storage hygiene.
 
 ---
 
@@ -157,16 +155,15 @@ Hive-style paths (`signal={signal}/date={YYYY-MM-DD}/hour={HH}/`) evaluated via 
 
 ### 7.2 File Rolling Triggers (Data-Driven & Idle Sweep)
 A partition writer rolls when:
-1. **Size Limit**: Uncompressed buffer size exceeds `max_file_size_bytes` (default: 64 MB).
-2. **Time Window**: Wall-clock time since the file was opened exceeds `max_file_interval_sec` (default: 60s).
+1. **Size Limit**: Buffer size exceeds `max_file_size_bytes` (default: 64 MB).
+2. **Time Window**: Wall-clock time since open exceeds `max_file_interval_sec` (default: 60s).
 3. **Record Count**: Exceeds `max_records` (default: 500,000).
 
-* **Idle Sweep Ticker**: The `PartitionManager` spawns a background `tokio::time::interval` ticker that periodically sweeps the active writer pool and forces a flush on expired idle partitions even when no new data arrives.
+* **Idle Sweep Ticker**: A background `tokio::time::interval` ticker sweeps the active writer pool and forces a flush on expired idle partitions.
 
-### 7.3 Bounded Memory & Global Memory Tracker
-* **`GlobalMemoryTracker`**: Tracks aggregate buffer sizes across all open writers. If total memory approaches `global_memory_limit_bytes` (default: 1 GB), the tracker forcefully evicts the largest/oldest partition writers.
-* **File Rolling Consequence**: Evicting a writer to reclaim memory necessitates closing and completing the Parquet file. Under heavy memory pressure, this forces the generation of smaller files (e.g., 5 MB instead of 64 MB). Downstream background compaction is highly recommended.
-* **Channel Backpressure**: If object storage writes stall, writer buffers fill and trip the global memory limit. The upstream OTLP network layer consequently returns HTTP 503 / `UNAVAILABLE`. No data is silently dropped.
+### 7.3 Lock-Free Memory Accounting
+* **`GlobalMemoryTracker`**: The `PartitionManager` increments memory atomically on ingress (`current_memory += batch.get_array_memory_size()`) and decrements when a partition writer closes. If total memory approaches `global_memory_limit_bytes` (default: 1 GB), the coldest writer is cleanly rolled and closed.
+* **Channel Backpressure**: If writes stall, writer buffers fill and trip the global memory limit, halting sink channel polling. The OTLP receiver returns HTTP 503 / `UNAVAILABLE`. No data is silently dropped.
 
 ---
 
@@ -204,13 +201,18 @@ In strict compliance with `AGENTS.md`:
 ```rust
 #[derive(thiserror::Error, Debug)]
 pub enum ParquetSinkError {
-    #[error("Object store error for path '{path}': {source}")]
-    ObjectStore { path: String, #[source] source: object_store::Error },
+    #[error("OpenDAL storage error: {0}")]
+    OpenDal(#[from] opendal::Error),
     #[error("Parquet writing failure: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("Arrow array processing error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
-    // ... VariantEncoding, Config, Internal
+    #[error("Variant encoding error: {0}")]
+    VariantEncoding(String),
+    #[error("Configuration validation error: {0}")]
+    Config(String),
+    #[error("Internal pipeline failure: {0}")]
+    Internal(String),
 }
 ```
 
@@ -230,10 +232,10 @@ Emits Prometheus/OpenTelemetry metrics adhering to `docs/instrumentation.md`:
 ## 11. Verification & Testing Plan
 
 1. **Unit Tests**:
-   * `test_variant_binary_encoding_sorted_keys`: Validates Arrow `StructArray` creation and strict lexicographical dictionary sorting.
+   * `test_variant_binary_encoding_sorted_keys`: Validates Arrow `StructArray` creation, null/empty safety, and lexicographical dictionary sorting.
    * `test_collision_free_naming`: Validates UUIDv7 uniqueness and ordering.
    * `test_global_memory_eviction`: Simulates memory pressure and asserts early forced rolling.
 2. **Integration Tests**:
-   * `test_s3_5mb_coalescing`: Asserts that small flushes are correctly buffered to $\ge$ 5MB before hitting the mock object store.
+   * `test_heterogeneous_signals_routed_to_separate_writers`: Asserts `Logs` and `Metrics` do not share partition writers.
    * `test_idle_partition_sweep`: Asserts the background ticker closes stale writers without new incoming data.
-   * `test_multipart_upload_abort`: Induces failure mid-upload and asserts `tokio::spawn` background abort runs successfully.
+   * `test_opendal_abort_on_drop`: Induces failure mid-upload and asserts background abort completes.

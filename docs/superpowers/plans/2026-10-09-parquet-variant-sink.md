@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build an ultra-high-throughput, horizontally scalable Parquet streaming sink (`crates/parquet-sink`) for `opentelemetry-datalake` that writes partitioned Parquet files with Apache Parquet/Spark/Iceberg Variant binary format support to object stores (S3, GCS, Azure, RustFS) or local filesystems.
+**Goal:** Build an ultra-high-throughput, horizontally scalable Parquet streaming sink (`crates/parquet-sink`) for `opentelemetry-datalake` that writes partitioned Parquet files with Apache Parquet/Spark/Iceberg Variant binary format support to object stores (S3, GCS, Azure, RustFS) or local filesystems using Apache OpenDAL.
 
-**Architecture:** A modular pipeline utilizing Arrow v59 native vectorized batches. A synchronous `parquet::arrow::ArrowWriter` runs in `tokio::task::spawn_blocking` to perform heavy CPU compression without starving the async reactor, piped via an in-memory channel to an async `object_store::WriteMultipart` uploader with 5MB coalescing. Dynamic attributes are encoded into Variant binary format with thread-local scratch buffers and sorted dictionaries. A vectorized `PartitionManager` with an LRU active pool and `GlobalMemoryTracker` bounds memory under heavy traffic.
+**Architecture:** A modular pipeline utilizing Arrow v59 native vectorized batches. A synchronous `parquet::arrow::ArrowWriter` runs in `tokio::task::spawn_blocking` to perform heavy CPU compression without starving the async reactor, piped via an in-memory bounded channel to an async `opendal::Writer` with built-in 8MB multipart coalescing and retry layers. Dynamic attributes are encoded into Variant binary format with thread-local scratch buffers and sorted dictionaries. A vectorized `PartitionManager` with composite `(signal, path)` keys, LRU active pool, and lock-free memory tracking bounds memory under heavy traffic.
 
-**Tech Stack:** Rust 2024 edition, Apache Arrow v59, Apache Parquet v59, `object_store` v0.14, `tokio` (full), `prost`, `thiserror`, `serde`, `uuid` (v7).
+**Tech Stack:** Rust 2024 edition, Apache Arrow v59 (`features = ["compute", "json"]`), Apache Parquet v59 (`features = ["arrow", "async", "zstd", "snappy"]`), Apache OpenDAL v0.58 (`features = ["services-fs", "services-s3"]`), `tokio` (full), `prost`, `thiserror`, `serde`, `uuid` (v7).
 
 **Spec:** `docs/superpowers/specs/2026-10-09-parquet-variant-sink-design.md`
 
@@ -15,6 +15,7 @@
 * **Zero-Panic Policy**: No `unwrap()`, `expect()`, `panic!()`, or `todo!()` in `src/` directories. All errors must use `Result` propagation via `ParquetSinkError` and `PipelineError`.
 * **Zero-Allocation Hot Path**: Use reusable thread-local scratch buffers (`SmallVec`, `FxIndexSet`) and Arrow builders with `append_value(&slice)`—no per-record `String` or `Vec` allocations.
 * **Vectorized Processing**: Partition routing and schema transformations must use Arrow compute kernels (`temporal`, `filter`, `take`) rather than row-by-row scalar loops.
+* **OpenDAL Ecosystem Standard**: Use `opendal` (already present in workspace) for all storage operations, avoiding competing `object_store` dependencies.
 * **Strict Quality Gates**: Every task must pass:
   * `cargo fmt --check`
   * `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc`
@@ -22,11 +23,11 @@
 
 ## Review Focus
 
-1. **S3 upload of a file smaller than 5MB on rolling**: The final part of an S3 multipart upload can be smaller than 5MB, but intermediate parts cannot. Verified in Task 5 (`test_upload_file_smaller_than_5mb_succeeds_on_complete`).
-2. **Empty batch or batch with null timestamps**: Incoming telemetry batches with empty records or null timestamps must be safely handled without panics. Verified in Task 7 (`test_partition_routing_handles_empty_and_null_timestamps`).
-3. **Variant attributes with duplicate or non-ASCII keys**: OTel attribute lists with duplicate keys or Unicode characters must be deduplicated and strictly sorted lexicographically in the binary `metadata` dictionary. Verified in Task 3 (`test_variant_encoder_deduplicates_and_lexicographically_sorts_keys`).
-4. **Rapid file rolling within the exact same nanosecond on the same node**: The per-partition sequence counter must guarantee distinct filenames even under tight millisecond loops. Verified in Task 2 (`test_naming_monotonic_sequence_same_nanosecond`).
-5. **Total memory exceeds `global_memory_limit_bytes` during heavy partition surge**: Global memory tracker must forcefully evict and complete the coldest/largest open writers to prevent OOM. Verified in Task 7 (`test_global_memory_tracker_evicts_oldest_writers_under_pressure`).
+1. **S3 upload of a file smaller than 5MB on rolling**: The final part of an S3 multipart upload can be smaller than 5MB, but intermediate parts must be coalesced. Verified in Task 5 (`test_upload_file_smaller_than_5mb_succeeds_on_complete`).
+2. **Signal-partition isolation (No schema mismatch)**: Batches from different signals (`Logs`, `Metrics`, `Traces`) hitting the same time window must be routed to distinct partition writers to avoid ArrowWriter schema conflicts. Verified in Task 7 (`test_heterogeneous_signals_routed_to_separate_writers_without_schema_conflict`).
+3. **Variant attributes with null, empty, or duplicate keys**: OTel attribute lists with null values, empty objects `"{}"`, duplicate keys, or Unicode characters must be handled without panics or memory leaks, with keys strictly sorted lexicographically. Verified in Task 3 (`test_variant_encoder_handles_null_empty_and_lexicographical_keys`).
+4. **Rapid file rolling within the exact same nanosecond on the same node**: The per-partition sequence counter must guarantee distinct filenames even under tight loops. Verified in Task 2 (`test_naming_monotonic_sequence_same_nanosecond`).
+5. **Total memory exceeds `global_memory_limit_bytes` during heavy partition surge**: Global memory tracker must forcefully evict and complete the coldest/largest open writers using lock-free batch size accounting. Verified in Task 7 (`test_global_memory_tracker_evicts_oldest_writers_under_pressure`).
 
 ---
 
@@ -34,17 +35,17 @@
 
 ```text
 crates/parquet-sink/
-├── Cargo.toml                 # Task 1: Crate definition, dependencies, features
+├── Cargo.toml                 # Task 1: Crate definition, dependencies, features (arrow, parquet, opendal)
 ├── src/
 │   ├── lib.rs                 # Task 8: Sink trait implementation, graceful shutdown
 │   ├── error.rs               # Task 1: Domain errors (ParquetSinkError)
-│   ├── config.rs              # Task 1: ParquetSinkConfig, CompressionCodec, storage config
+│   ├── config.rs              # Task 1: ParquetSinkConfig, CompressionCodec, OpenDAL operator builder
 │   ├── naming.rs              # Task 2: Collision-free file naming (timestamp, node_id, uuidv7)
-│   ├── variant.rs             # Task 3: Zero-alloc Variant binary encoder (metadata + value)
+│   ├── variant.rs             # Task 3: Zero-alloc Variant binary encoder with null/empty safety
 │   ├── router.rs              # Task 4: SignalRouter & OTLP Metric DataPoint serialization
-│   ├── uploader.rs            # Task 5: Object store WriteMultipart adapter & Drop abort guard
+│   ├── uploader.rs            # Task 5: OpenDAL async writer pipe, bounded channel & Drop abort guard
 │   ├── writer.rs              # Task 6: Decoupled Sync ArrowWriter with Bloom filters & stats
-│   └── partition.rs           # Task 7: Vectorized PartitionManager, LRU pool & memory tracker
+│   └── partition.rs           # Task 7: Vectorized PartitionManager with composite keys & memory tracker
 └── tests/
     └── integration_tests.rs   # Task 9: End-to-end integration tests (local FS & S3-compatible)
 ```
@@ -63,10 +64,10 @@ crates/parquet-sink/
 - Modify: `Cargo.toml` (root workspace members & workspace dependencies)
 
 **Interfaces:**
-- Consumes: `pipeline_core::error::PipelineError`
+- Consumes: `pipeline_core::error::PipelineError`, `opendal::Operator`
 - Produces: `ParquetSinkError`, `ParquetSinkConfig`, `CompressionCodec`
 
-- [ ] **Step 1: Write the failing test for configuration parsing and defaults**
+- [ ] **Step 1: Write the failing test for configuration parsing and OpenDAL builder setup**
 
 ```rust
 // crates/parquet-sink/src/config.rs
@@ -111,7 +112,22 @@ Expected: FAIL (crate not found / types not defined)
 
 - [ ] **Step 3: Implement crate scaffolding, `error.rs`, and `config.rs`**
 
-Add `crates/parquet-sink` to workspace `Cargo.toml`. Define `ParquetSinkError` using `thiserror` (handling `ObjectStore`, `Parquet`, `Arrow`, `VariantEncoding`, `Config`, `Internal`). Implement `From<ParquetSinkError> for PipelineError`. Define `CompressionCodec` enum and `ParquetSinkConfig` with `serde` defaults.
+In `crates/parquet-sink/Cargo.toml`, explicitly specify:
+```toml
+[dependencies]
+pipeline-core = { workspace = true }
+arrow = { workspace = true, features = ["compute", "json"] }
+parquet = { workspace = true, features = ["arrow", "async", "zstd", "snappy"] }
+opendal = { version = "0.58", default-features = false, features = ["services-fs", "services-s3"] }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+```
+Define `ParquetSinkError` using `thiserror` (handling `OpenDal(#[from] opendal::Error)`, `Parquet`, `Arrow`, `VariantEncoding`, `Config`, `Internal`). Implement `From<ParquetSinkError> for PipelineError`. Define `CompressionCodec` enum and `ParquetSinkConfig` with `serde` defaults.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -127,7 +143,7 @@ Expected: Zero warnings/errors
 
 ```bash
 git add Cargo.toml Cargo.lock crates/parquet-sink
-git commit -m "feat(parquet-sink): scaffold crate, errors, and configuration models"
+git commit -m "feat(parquet-sink): scaffold crate, errors, and opendal config models"
 ```
 
 ---
@@ -182,7 +198,7 @@ Expected: FAIL (FileNamer not defined)
 
 - [ ] **Step 3: Implement `FileNamer` in `crates/parquet-sink/src/naming.rs`**
 
-Use `chrono::Utc::now().timestamp_nanos_opt()` (or `SystemTime`), `uuid::Uuid::now_v7()`, and format as `{partition_prefix}/{timestamp_nano:020}_{node_id}_{uuidv7}_{sequence:04}.parquet`. Ensure zero-allocation path using formatted stack strings.
+Use `chrono::Utc::now().timestamp_nanos_opt()`, `uuid::Uuid::now_v7()`, and format as `{partition_prefix}/{timestamp_nano:020}_{node_id}_{uuidv7}_{sequence:04}.parquet`. Ensure zero-allocation path using stack strings.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -203,18 +219,18 @@ git commit -m "feat(parquet-sink): implement collision-free distributed file nam
 
 ---
 
-### Task 3: Vectorized In-Memory Variant Binary Encoder with Sorted Dictionary
+### Task 3: Vectorized In-Memory Variant Binary Encoder with Null & Empty Safety
 
 **Files:**
 - Create: `crates/parquet-sink/src/variant.rs`
 - Modify: `crates/parquet-sink/src/lib.rs` (export variant)
 
 **Interfaces:**
-- Consumes: JSON string column / Arrow `StringArray` or OTLP key-values
+- Consumes: JSON string column / Arrow `StringArray`
 - Produces: `VariantTransformer::transform_to_variant(&self, batch: &RecordBatch, column_names: &[&str]) -> Result<RecordBatch, ParquetSinkError>`
 - Produces Arrow `StructArray` with fields `"metadata"` (`DataType::Binary`) and `"value"` (`DataType::Binary`), with `ARROW:extension:name = "variant"`
 
-- [ ] **Step 1: Write the failing tests for Variant binary layout, sorted dictionary, and extension metadata**
+- [ ] **Step 1: Write failing tests for null, empty object `"{}"`, sorted dictionary, and extension metadata**
 
 ```rust
 // crates/parquet-sink/src/variant.rs
@@ -226,16 +242,21 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn test_variant_encoder_deduplicates_and_lexicographically_sorts_keys() {
-        let json_input = r#"{"z_key": 100, "a_key": "hello", "m_key": true}"#;
+    fn test_variant_encoder_handles_null_empty_and_lexicographical_keys() {
         let mut encoder = VariantEncoder::new();
-        let (metadata, value) = encoder.encode_json_str(json_input).expect("encoding failed");
 
-        // Verify metadata header (0x01 version)
-        assert_eq!(metadata[0], 0x01);
-        // Verify keys in metadata are sorted lexicographically: a_key, m_key, z_key
-        let keys = encoder.extract_dictionary_keys(&metadata);
-        assert_eq!(keys, vec!["a_key", "m_key", "z_key"]);
+        // 1. Null handling
+        assert!(encoder.encode_json_str("").unwrap().is_none());
+
+        // 2. Empty object handling
+        let (empty_meta, empty_val) = encoder.encode_json_str("{}").unwrap().unwrap();
+        assert_eq!(empty_meta[0], 0x01); // version 1
+        assert_eq!(empty_meta.len(), 5); // version + 4-byte count (0)
+
+        // 3. Lexicographical sorting
+        let (meta, _val) = encoder.encode_json_str(r#"{"z": 1, "a": 2, "m": 3}"#).unwrap().unwrap();
+        let keys = encoder.extract_dictionary_keys(&meta);
+        assert_eq!(keys, vec!["a", "m", "z"]);
     }
 
     #[test]
@@ -244,10 +265,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("attributes", DataType::Utf8, true),
         ]));
-        let id_arr = Arc::new(arrow::array::Int64Array::from(vec![1, 2]));
+        let id_arr = Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]));
         let attr_arr = Arc::new(StringArray::from(vec![
-            Some(r#"{"service.name":"api","http.status":200}"#),
-            Some(r#"{"service.name":"auth"}"#),
+            Some(r#"{"service.name":"api"}"#),
+            None,
+            Some("{}"),
         ]));
         let batch = RecordBatch::try_new(schema, vec![id_arr, attr_arr]).unwrap();
 
@@ -271,7 +293,7 @@ Expected: FAIL (VariantEncoder/VariantTransformer not defined)
 
 - [ ] **Step 3: Implement `VariantEncoder` and `VariantTransformer`**
 
-Implement zero-allocation scratch buffers using `SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`. Parse JSON into temporary key-value pairs, deduplicate, in-place sort keys lexicographically, construct the binary header and offset dictionary, and encode binary typed values. Build Arrow `StructArray` with `ARROW:extension:name = "variant"` metadata.
+Implement zero-allocation scratch buffers using `SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`. Fast-path `""` and `None` to `None`. Fast-path `"{}"` to a static minimal empty header. For non-empty objects, parse keys, deduplicate, in-place sort lexicographically, encode dictionary offsets, and encode typed values. Build Arrow `StructArray` with `ARROW:extension:name = "variant"` metadata.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -287,7 +309,7 @@ Expected: Zero warnings/errors
 
 ```bash
 git add crates/parquet-sink/src/variant.rs crates/parquet-sink/src/lib.rs
-git commit -m "feat(parquet-sink): implement zero-alloc Variant binary encoder with sorted keys"
+git commit -m "feat(parquet-sink): implement zero-alloc Variant binary encoder with null/empty safety"
 ```
 
 ---
@@ -303,7 +325,7 @@ git commit -m "feat(parquet-sink): implement zero-alloc Variant binary encoder w
 - Produces: `SignalRouter::route_and_prepare(&self, batch: SignalBatch) -> Result<PreparedBatch, ParquetSinkError>`
 - Produces `PreparedBatch { signal: &'static str, batch: RecordBatch }`
 
-- [ ] **Step 1: Write the failing tests for signal routing, schema conformance, and polymorphic metrics handling**
+- [ ] **Step 1: Write failing tests for signal routing, schema conformance, and polymorphic metrics handling**
 
 ```rust
 // crates/parquet-sink/src/router.rs
@@ -357,43 +379,42 @@ git commit -m "feat(parquet-sink): implement signal routing and telemetry schema
 
 ---
 
-### Task 5: Object Store Upload Abstraction with S3 5MB Coalescing & Drop Abort Guard
+### Task 5: OpenDAL Async Uploader with Bounded Channel & Drop Abort Safety
 
 **Files:**
 - Create: `crates/parquet-sink/src/uploader.rs`
 - Modify: `crates/parquet-sink/src/lib.rs` (export uploader)
 
 **Interfaces:**
-- Consumes: `object_store::ObjectStore`, `storage_uri: &str`
-- Produces: `AsyncUploader::start(store: Arc<dyn ObjectStore>, path: &object_store::path::Path) -> Result<(AsyncUploaderSender, AsyncUploaderHandle), ParquetSinkError>`
+- Consumes: `opendal::Operator`, `path: &str`
+- Produces: `AsyncUploader::start(op: &Operator, path: &str) -> Result<(UploaderSender, UploaderHandle), ParquetSinkError>`
+- Produces: `UploaderSender::send_chunk(Bytes)` and `UploaderSender::finish()`
 
-- [ ] **Step 1: Write the failing tests for 5MB part coalescing, file < 5MB completion, and Drop abort**
+- [ ] **Step 1: Write failing tests for OpenDAL writer pipe, < 5MB file completion, and drop safety**
 
 ```rust
 // crates/parquet-sink/src/uploader.rs
 #[cfg(test)]
 mod tests {
     use super::*;
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
-    use std::sync::Arc;
+    use opendal::services::Memory;
+    use opendal::Operator;
 
     #[tokio::test]
     async fn test_upload_file_smaller_than_5mb_succeeds_on_complete() {
-        let store = Arc::new(InMemory::new());
-        let path = Path::from("test/small.parquet");
-        let (mut sender, handle) = AsyncUploader::start(store.clone(), &path).unwrap();
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let path = "test/small.parquet";
+        let (mut sender, handle) = AsyncUploader::start(&op, path).unwrap();
 
         // Send a 1MB chunk (less than 5MB S3 limit)
         let chunk = bytes::Bytes::from(vec![0u8; 1024 * 1024]);
-        sender.send_chunk(chunk).await.unwrap();
-        sender.finish().await.unwrap();
+        sender.send_chunk(chunk).unwrap();
+        sender.finish().unwrap();
 
         handle.wait_for_completion().await.unwrap();
 
-        // Verify the file exists in store
-        let meta = store.head(&path).await.unwrap();
-        assert_eq!(meta.size, 1024 * 1024);
+        let meta = op.stat(path).await.unwrap();
+        assert_eq!(meta.content_length(), 1024 * 1024);
     }
 }
 ```
@@ -403,9 +424,9 @@ mod tests {
 Run: `cargo test -p parquet-sink --lib uploader`
 Expected: FAIL (AsyncUploader not defined)
 
-- [ ] **Step 3: Implement `AsyncUploader` using `object_store::WriteMultipart` with background abort Drop guard**
+- [ ] **Step 3: Implement `AsyncUploader` using `opendal::Writer` with bounded channel**
 
-Use `object_store.put_multipart(path).await` which gives `Box<dyn WriteMultipart>`. Forward chunks via channel. Implement a `Drop` guard on the active handle that calls `tokio::spawn(async move { multipart.abort().await; })` if dropped before `finish()` completes.
+Create a `tokio::sync::mpsc::channel::<bytes::Bytes>(8)` bounded channel. Spawn an async task that receives chunks from the channel and calls `writer.write(chunk).await`. On channel EOF, call `writer.close().await`. Provide `UploaderSender` with `blocking_send` for synchronous caller convenience. Implement a `Drop` guard on `UploaderHandle` to abort the OpenDAL writer if dropped prematurely.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -421,24 +442,24 @@ Expected: Zero warnings/errors
 
 ```bash
 git add crates/parquet-sink/src/uploader.rs crates/parquet-sink/src/lib.rs
-git commit -m "feat(parquet-sink): implement object store async uploader with 5MB coalescing and drop safety"
+git commit -m "feat(parquet-sink): implement opendal async uploader with bounded channel and drop safety"
 ```
 
 ---
 
-### Task 6: Decoupled Sync Parquet Writer with Compression & Bloom Filters
+### Task 6: Decoupled Sync Parquet Writer with Bloom Filters & Selectable Compression
 
 **Files:**
 - Create: `crates/parquet-sink/src/writer.rs`
 - Modify: `crates/parquet-sink/src/lib.rs` (export writer)
 
 **Interfaces:**
-- Consumes: `AsyncUploaderSender`, `CompressionCodec`, `RecordBatch`
+- Consumes: `UploaderSender`, `CompressionCodec`, `RecordBatch`
 - Produces: `PartitionWriter::new(schema, uploader_sender, config) -> Result<Self, ParquetSinkError>`
 - Produces: `PartitionWriter::write_batch(&mut self, batch: &RecordBatch) -> Result<(), ParquetSinkError>`
 - Produces: `PartitionWriter::close(self) -> Result<(), ParquetSinkError>`
 
-- [ ] **Step 1: Write the failing tests for sync writer, bloom filters, and compression codec**
+- [ ] **Step 1: Write failing tests for sync writer, bloom filters, and compression codec**
 
 ```rust
 // crates/parquet-sink/src/writer.rs
@@ -447,15 +468,15 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use object_store::memory::InMemory;
-    use object_store::path::Path;
+    use opendal::services::Memory;
+    use opendal::Operator;
     use std::sync::Arc;
 
     #[tokio::test]
     async fn test_writer_with_zstd_and_bloom_filter() {
-        let store = Arc::new(InMemory::new());
-        let path = Path::from("test/test.parquet");
-        let (sender, handle) = crate::uploader::AsyncUploader::start(store.clone(), &path).unwrap();
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let path = "test/test.parquet";
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
@@ -476,8 +497,8 @@ mod tests {
         writer.close().unwrap();
         handle.wait_for_completion().await.unwrap();
 
-        let meta = store.head(&path).await.unwrap();
-        assert!(meta.size > 0);
+        let meta = op.stat(path).await.unwrap();
+        assert!(meta.content_length() > 0);
     }
 }
 ```
@@ -489,7 +510,7 @@ Expected: FAIL (PartitionWriter not defined)
 
 - [ ] **Step 3: Implement `PartitionWriter` wrapping synchronous `ArrowWriter` in `spawn_blocking`**
 
-Build `WriterProperties` configuring `DataPageVersion::V2`, dictionary encoding, page statistics, and bloom filters for `"trace_id"` and `"span_id"`. Map `CompressionCodec` to Parquet compression. Implement a custom `std::io::Write` pipe that pushes byte buffers into the `AsyncUploaderSender`.
+Build `WriterProperties` configuring `DataPageVersion::V2`, dictionary encoding, page statistics, and bloom filters for `"trace_id"` and `"span_id"`. Map `CompressionCodec` to Parquet compression. Implement a custom `std::io::Write` adapter that sends byte chunks into `UploaderSender`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -510,20 +531,21 @@ git commit -m "feat(parquet-sink): implement sync parquet writer with bloom filt
 
 ---
 
-### Task 7: Vectorized Partition Manager with Idle Ticker & Global Memory Tracker
+### Task 7: Vectorized Partition Manager with Composite Keys & Lock-Free Memory Tracking
 
 **Files:**
 - Create: `crates/parquet-sink/src/partition.rs`
 - Modify: `crates/parquet-sink/src/lib.rs` (export partition)
 
 **Interfaces:**
-- Consumes: `PreparedBatch`, `FileNamer`, `ObjectStore`, `ParquetSinkConfig`
-- Produces: `PartitionManager::new(config, store)`
-- Produces: `PartitionManager::route_batch(&mut self, batch: &RecordBatch, signal: &str) -> Result<(), ParquetSinkError>`
+- Consumes: `PreparedBatch`, `FileNamer`, `opendal::Operator`, `ParquetSinkConfig`
+- Defines: `PartitionId { signal: &'static str, path: String }`
+- Produces: `PartitionManager::new(config, operator)`
+- Produces: `PartitionManager::route_batch(&mut self, batch: &RecordBatch, signal: &'static str) -> Result<(), ParquetSinkError>`
 - Produces: `PartitionManager::sweep_idle_writers(&mut self) -> Result<(), ParquetSinkError>`
 - Produces: `PartitionManager::flush_all(&mut self) -> Result<(), ParquetSinkError>`
 
-- [ ] **Step 1: Write the failing tests for vectorized time partitioning, idle sweep, and global memory eviction**
+- [ ] **Step 1: Write failing tests for signal-partition isolation, empty batches, and lock-free memory eviction**
 
 ```rust
 // crates/parquet-sink/src/partition.rs
@@ -532,41 +554,61 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use object_store::memory::InMemory;
+    use opendal::services::Memory;
+    use opendal::Operator;
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn test_partition_routing_handles_empty_and_null_timestamps() {
-        let store = Arc::new(InMemory::new());
+    async fn test_heterogeneous_signals_routed_to_separate_writers_without_schema_conflict() {
+        let op = Operator::new(Memory::default()).unwrap().finish();
         let config = crate::config::ParquetSinkConfig::default();
-        let mut manager = PartitionManager::new(config, store);
+        let mut manager = PartitionManager::new(config, op);
+
+        // Logs schema
+        let logs_schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let logs_batch = RecordBatch::try_new(logs_schema, vec![
+            Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000])),
+            Arc::new(arrow::array::StringArray::from(vec!["hello log"])),
+        ]).unwrap();
+
+        // Metrics schema (completely different fields)
+        let metrics_schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("metric_val", DataType::Float64, false),
+        ]));
+        let metrics_batch = RecordBatch::try_new(metrics_schema, vec![
+            Arc::new(TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000])),
+            Arc::new(arrow::array::Float64Array::from(vec![3.14])),
+        ]).unwrap();
+
+        // Both route into the same hour without schema conflict
+        assert!(manager.route_batch(&logs_batch, "logs").is_ok());
+        assert!(manager.route_batch(&metrics_batch, "metrics").is_ok());
+        assert_eq!(manager.active_writer_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_partition_routing_handles_empty_and_null_timestamps() {
+        let op = Operator::new(Memory::default()).unwrap().finish();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
             Field::new("val", DataType::Int64, false),
         ]));
 
-        // Empty batch
         let empty_batch = RecordBatch::new_empty(schema.clone());
         assert!(manager.route_batch(&empty_batch, "logs").is_ok());
 
-        // Batch with null timestamps
         let batch_with_null = RecordBatch::try_new(schema, vec![
             Arc::new(TimestampNanosecondArray::from(vec![None, Some(1_700_000_000_000_000_000)])),
             Arc::new(Int64Array::from(vec![1, 2])),
         ]).unwrap();
         assert!(manager.route_batch(&batch_with_null, "logs").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_global_memory_tracker_evicts_oldest_writers_under_pressure() {
-        let store = Arc::new(InMemory::new());
-        let mut config = crate::config::ParquetSinkConfig::default();
-        config.max_open_partitions = 2; // small for testing
-        let mut manager = PartitionManager::new(config, store);
-
-        // Open 3 distinct partition keys, verify oldest is closed
-        // ...
     }
 }
 ```
@@ -578,7 +620,7 @@ Expected: FAIL (PartitionManager not defined)
 
 - [ ] **Step 3: Implement `PartitionManager`**
 
-Use `arrow::compute::kernels::temporal::hour` and `date` to extract partition keys. Split batches with `arrow::compute::filter`. Maintain `HashMap<String, ActiveWriter>` with an LRU access list. Implement `GlobalMemoryTracker` summing writer buffers; if exceeding `global_memory_limit_bytes`, evict the oldest writer. Implement background idle sweep checking writer wall-clock duration against `max_file_interval_sec`.
+Extract partition paths using `arrow::compute::kernels::temporal::hour` and `date`. Group rows using `arrow::compute::filter`. Maintain `HashMap<PartitionId, ActiveWriter>` where `PartitionId` combines `signal` and path prefix. Track memory via `batch.get_array_memory_size()` without locks. Evict oldest writer if total memory approaches `global_memory_limit_bytes` or active count exceeds `max_open_partitions`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -594,7 +636,7 @@ Expected: Zero warnings/errors
 
 ```bash
 git add crates/parquet-sink/src/partition.rs crates/parquet-sink/src/lib.rs
-git commit -m "feat(parquet-sink): implement vectorized partition manager, LRU eviction, and memory tracking"
+git commit -m "feat(parquet-sink): implement vectorized partition manager with composite keys and memory tracking"
 ```
 
 ---
@@ -604,14 +646,13 @@ git commit -m "feat(parquet-sink): implement vectorized partition manager, LRU e
 **Files:**
 - Create: `crates/parquet-sink/src/sink.rs`
 - Modify: `crates/parquet-sink/src/lib.rs` (export `ParquetSink`)
-- Modify: `Cargo.toml` (integrate `parquet-sink` into root binary if needed)
 
 **Interfaces:**
 - Consumes: `pipeline_core::pipeline::{PipelineReceiver, Sink}`
 - Produces: `ParquetSink::try_new(config: ParquetSinkConfig) -> Result<Self, PipelineError>`
 - Implements: `#[async_trait] impl Sink for ParquetSink { async fn run(&mut self, input: PipelineReceiver) -> Result<(), PipelineError>; }`
 
-- [ ] **Step 1: Write the failing tests for `ParquetSink::run` lifecycle and graceful shutdown on channel close**
+- [ ] **Step 1: Write failing tests for `ParquetSink::run` lifecycle and graceful shutdown on channel close**
 
 ```rust
 // crates/parquet-sink/tests/sink_test.rs
@@ -664,7 +705,7 @@ Expected: FAIL (ParquetSink::run not implemented)
 
 - [ ] **Step 3: Implement `ParquetSink::run`**
 
-Set up `object_store::parse_url`. Spawn idle sweep ticker task using `tokio::time::interval`. Loop on `tokio::select!` pulling from `PipelineReceiver` and ticker. On channel close (EOF) or cancellation, call `manager.flush_all().await` and gracefully exit.
+Initialize OpenDAL `Operator` from URI. Spawn idle sweep ticker task using `tokio::time::interval`. Loop on `tokio::select!` pulling from `PipelineReceiver` and ticker. On channel close (EOF) or cancellation, call `manager.flush_all().await` and gracefully exit.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -754,8 +795,8 @@ git commit -m "test(parquet-sink): add end-to-end integration tests for parquet 
 
 ## Self-Review Checklist
 
-- [x] **Spec coverage**: Covers all sections of `2026-10-09-parquet-variant-sink-design.md` (Variant encoding, naming, S3 5MB coalescing, decoupled sync writer, LRU partition manager, memory tracker, and error handling).
+- [x] **Spec coverage**: Covers all sections of the design spec (Variant encoding, naming, OpenDAL 8MB coalescing, decoupled sync writer, LRU partition manager, lock-free memory tracker, error handling).
 - [x] **Step scan**: Every step specifies exact test assertions, file paths, commands, and expected results.
-- [x] **Type consistency**: Method signatures and config types match across tasks (`CompressionCodec`, `ParquetSinkError`, `AsyncUploader`, `PartitionWriter`).
+- [x] **Type consistency**: Method signatures and config types match across tasks (`CompressionCodec`, `ParquetSinkError`, `AsyncUploader`, `PartitionWriter`, `PartitionId`).
 - [x] **Review Focus**: All 5 critical failure modes are pinned with explicit unit/integration tests in their respective tasks.
 - [x] **Proportion**: Bite-sized, modular tasks suitable for parallel subagent execution.
