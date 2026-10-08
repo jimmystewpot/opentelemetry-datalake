@@ -4,19 +4,20 @@
 //! into the host logging subsystem (`datalake_host_log`) to prevent silent runtime crashes.
 
 #[cfg(target_arch = "wasm32")]
-use crate::abi::LOG_LEVEL_ERROR;
+use crate::abi::{HostLogRecord, LOG_LEVEL_ERROR};
 
 #[cfg(target_arch = "wasm32")]
 // SAFETY: Declaring host logging import provided by the wasm-transformer host environment.
-#[link(wasm_import_module = "env")]
+#[link(wasm_import_module = "datalake_host_v1")]
 unsafe extern "C" {
-    fn datalake_host_log(level: u32, msg_ptr: u32, msg_len: u32);
+    fn datalake_host_log(record_ptr: u32);
 }
 
 /// Registers a global panic hook forwarding panics to the host logger.
 ///
 /// On WebAssembly targets, panics are formatted into a message string and forwarded
-/// to the host import `datalake_host_log` at error level (`LOG_LEVEL_ERROR` / level 1).
+/// to the host import `datalake_host_log` at error level (`LOG_LEVEL_ERROR` / level 1)
+/// via a structured [`HostLogRecord`].
 /// On non-wasm32 targets (e.g. host unit tests), panics are printed to `eprintln!`.
 #[allow(clippy::print_stderr)]
 pub fn init_panic_hook() {
@@ -24,15 +25,24 @@ pub fn init_panic_hook() {
         let msg = info.to_string();
         #[cfg(target_arch = "wasm32")]
         {
-            // SAFETY: Passing valid UTF-8 formatted panic message pointer and length
-            // in wasm32 linear memory to the host logging import.
+            let target = "wasm_guest::panic";
+            let file = file!();
+            let line = line!();
+            let record = HostLogRecord {
+                level: LOG_LEVEL_ERROR,
+                msg_ptr: msg.as_ptr() as usize as u32,
+                msg_len: msg.len() as u32,
+                target_ptr: target.as_ptr() as usize as u32,
+                target_len: target.len() as u32,
+                file_ptr: file.as_ptr() as usize as u32,
+                file_len: file.len() as u32,
+                line,
+            };
+            // SAFETY: Passing valid HostLogRecord pointer in wasm32 linear memory
+            // to the datalake_host_v1 host logging import.
             unsafe {
                 #[allow(clippy::cast_possible_truncation)]
-                datalake_host_log(
-                    LOG_LEVEL_ERROR,
-                    msg.as_ptr() as usize as u32,
-                    msg.len() as u32,
-                );
+                datalake_host_log(std::ptr::addr_of!(record) as usize as u32);
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
