@@ -6,76 +6,60 @@
 
 use crate::error::WasmTransformError;
 use arrow::array::{Array, new_null_array};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 use std::sync::Arc;
 use tracing::warn;
 
 /// Recursively marks a field and any nested children as nullable.
-fn make_field_nullable(field: &arrow::datatypes::Field) -> arrow::datatypes::Field {
-    match field.data_type() {
-        arrow::datatypes::DataType::Struct(subfields) => {
-            let nullable_subfields: Vec<Arc<arrow::datatypes::Field>> = subfields
+fn make_field_recursively_nullable(field: &Field) -> FieldRef {
+    let new_field = match field.data_type() {
+        DataType::Struct(subfields) => {
+            let nullable_subfields: Vec<FieldRef> = subfields
                 .iter()
-                .map(|f| Arc::new(make_field_nullable(f)))
+                .map(|f| make_field_recursively_nullable(f))
                 .collect();
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::Struct(
-                nullable_subfields.into(),
-            ));
-            new_f.with_nullable(true)
+            field
+                .clone()
+                .with_data_type(DataType::Struct(nullable_subfields.into()))
+                .with_nullable(true)
         }
-        arrow::datatypes::DataType::List(child) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::List(Arc::new(
-                make_field_nullable(child),
-            )));
-            new_f.with_nullable(true)
-        }
-        arrow::datatypes::DataType::LargeList(child) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::LargeList(Arc::new(
-                make_field_nullable(child),
-            )));
-            new_f.with_nullable(true)
-        }
-        arrow::datatypes::DataType::FixedSizeList(child, size) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::FixedSizeList(
-                Arc::new(make_field_nullable(child)),
+        DataType::List(child) => field
+            .clone()
+            .with_data_type(DataType::List(make_field_recursively_nullable(child)))
+            .with_nullable(true),
+        DataType::LargeList(child) => field
+            .clone()
+            .with_data_type(DataType::LargeList(make_field_recursively_nullable(child)))
+            .with_nullable(true),
+        DataType::FixedSizeList(child, size) => field
+            .clone()
+            .with_data_type(DataType::FixedSizeList(
+                make_field_recursively_nullable(child),
                 *size,
-            ));
-            new_f.with_nullable(true)
-        }
-        arrow::datatypes::DataType::ListView(child) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::ListView(Arc::new(
-                make_field_nullable(child),
-            )));
-            new_f.with_nullable(true)
-        }
-        arrow::datatypes::DataType::LargeListView(child) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::LargeListView(Arc::new(
-                make_field_nullable(child),
-            )));
-            new_f.with_nullable(true)
-        }
-        arrow::datatypes::DataType::Map(child, keys_sorted) => {
-            let mut new_f = field.clone();
-            new_f = new_f.with_data_type(arrow::datatypes::DataType::Map(
-                Arc::new(make_field_nullable(child)),
+            ))
+            .with_nullable(true),
+        DataType::ListView(child) => field
+            .clone()
+            .with_data_type(DataType::ListView(make_field_recursively_nullable(child)))
+            .with_nullable(true),
+        DataType::LargeListView(child) => field
+            .clone()
+            .with_data_type(DataType::LargeListView(make_field_recursively_nullable(
+                child,
+            )))
+            .with_nullable(true),
+        DataType::Map(child, keys_sorted) => field
+            .clone()
+            .with_data_type(DataType::Map(
+                make_field_recursively_nullable(child),
                 *keys_sorted,
-            ));
-            new_f.with_nullable(true)
-        }
-        _ => {
-            let mut new_f = field.clone();
-            new_f.set_nullable(true);
-            new_f
-        }
-    }
+            ))
+            .with_nullable(true),
+        _ => field.clone().with_nullable(true),
+    };
+    Arc::new(new_field)
 }
 
 /// Verifies that none of the canonical immutable columns were dropped or wiped.
@@ -244,11 +228,7 @@ pub fn backfill_missing_columns(
                 column = %field.name(),
                 "Schema guard: backfilling missing column with typed nulls"
             );
-            let backfilled_field = if field.is_nullable() {
-                Arc::clone(field)
-            } else {
-                Arc::new(make_field_nullable(field))
-            };
+            let backfilled_field = make_field_recursively_nullable(field);
             columns.push(new_null_array(backfilled_field.data_type(), num_rows));
             fields.push(backfilled_field);
             added = true;
