@@ -48,7 +48,7 @@ wait_for_port() {
     return 1
 }
 
-echo "=== 1. Starting Iceberg & MinIO Services ==="
+echo "=== 1. Starting Iceberg & RustFS Services ==="
 $DOCKER_COMPOSE -f "$DIR/docker-compose.yml" down -v
 $DOCKER_COMPOSE -f "$DIR/docker-compose.yml" up -d
 
@@ -60,7 +60,7 @@ fi
 source "$DIR/.venv/bin/activate"
 
 # Only pip install if dependencies are not already satisfied
-if ! python3 -c "import pyiceberg, pyarrow, requests" >/dev/null 2>&1; then
+if ! python3 -c "import pyiceberg, pyarrow, requests, s3fs" >/dev/null 2>&1; then
     echo "Installing Python dependencies..."
     pip install -r "$DIR/requirements.txt"
 else

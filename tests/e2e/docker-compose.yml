@@ -1,31 +1,22 @@
 services:
-  minio:
-    image: quay.io/minio/minio:latest
-    container_name: e2e-minio
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: e2e-s3
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
-      - MINIO_ROOT_USER=admin
-      - MINIO_ROOT_PASSWORD=password
-    command: server /data --console-address ":9001"
+      - RUSTFS_ACCESS_KEY=admin
+      - RUSTFS_SECRET_KEY=password
+      - RUSTFS_ADDRESS=:9000
+      - RUSTFS_CONSOLE_ADDRESS=:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+    command: /data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 5
-
-  mc:
-    image: quay.io/minio/mc:latest
-    container_name: e2e-mc
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      until mc alias set local http://minio:9000 admin password; do sleep 1; done;
-      mc mb local/warehouse --ignore-existing;
-      exit 0;"
 
   iceberg-rest:
     image: tabulario/iceberg-rest:latest
@@ -38,8 +29,8 @@ services:
       - AWS_REGION=us-east-1
       - CATALOG_WAREHOUSE=s3://warehouse/
       - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
-      - CATALOG_S3_ENDPOINT=http://minio:9000
+      - CATALOG_S3_ENDPOINT=http://rustfs:9000
       - CATALOG_S3_PATH__STYLE__ACCESS=true
     depends_on:
-      mc:
-        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
