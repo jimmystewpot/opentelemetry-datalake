@@ -372,6 +372,59 @@ fn test_run_benchmark_calculates_latency_and_throughput() {
     assert!(bench_res.total_bytes >= bench_res.payload_bytes * 100);
     assert!(bench_res.avg_latency > std::time::Duration::ZERO);
     assert!(bench_res.throughput_mb_per_sec > 0.0);
+    assert!(bench_res.allocated_memory_bytes > 0);
+}
+
+#[test]
+fn test_run_benchmark_handles_infinite_loop_with_fuel_exhaustion() {
+    use datalake_wasm_tool::bench::run_benchmark;
+
+    let infinite_loop_wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (loop (br 0))
+            (i32.const 0)
+        )
+    )"#;
+    let wasm = wat::parse_str(infinite_loop_wat).unwrap();
+    let res = run_benchmark(&wasm, 1);
+    assert!(
+        res.is_err(),
+        "Expected infinite loop to trap via fuel exhaustion"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("fuel") || err.contains("trapped"),
+        "Unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn test_run_conformance_suite_rejects_failed_datalake_init() {
+    use datalake_wasm_tool::tester::run_immutability_suite;
+
+    let failed_init_wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 1))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+    let wasm = wat::parse_str(failed_init_wat).unwrap();
+    let res = run_immutability_suite(&wasm);
+    assert!(
+        res.is_err(),
+        "Expected non-zero datalake_init to fail conformance suite"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("datalake_init returned non-zero status code: 1"),
+        "Unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -18,6 +18,8 @@ pub struct BenchResult {
     pub avg_latency: std::time::Duration,
     /// Estimated processing throughput in megabytes per second.
     pub throughput_mb_per_sec: f64,
+    /// Guest linear memory size allocated in bytes.
+    pub allocated_memory_bytes: usize,
 }
 
 enum BenchTransform {
@@ -42,13 +44,23 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
     crate::validator::validate_wasm_bytes(bytes)
         .map_err(|e| anyhow::anyhow!("Module validation failed: {e}"))?;
 
-    let config = Config::new();
+    let mut config = Config::new();
+    config.consume_fuel(true);
     let engine = Engine::new(&config)
         .map_err(|e| anyhow::anyhow!("Failed to initialize wasmtime engine: {e}"))?;
     let module = Module::new(&engine, bytes)
         .map_err(|e| anyhow::anyhow!("Failed to compile WebAssembly module: {e}"))?;
 
     let mut store = Store::new(&engine, ());
+    // Allocate 10,000,000 fuel units per iteration (minimum 100,000,000) to bound infinite loops
+    let total_fuel = u64::try_from(iterations.max(1))
+        .unwrap_or(u64::MAX)
+        .saturating_mul(10_000_000)
+        .max(100_000_000);
+    store
+        .set_fuel(total_fuel)
+        .map_err(|e| anyhow::anyhow!("Failed to configure execution fuel: {e}"))?;
+
     let instance = Instance::new(&mut store, &module, &[])
         .map_err(|e| anyhow::anyhow!("Failed to instantiate WebAssembly module: {e}"))?;
 
@@ -63,7 +75,12 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
         .ok_or_else(|| anyhow::anyhow!("Missing 'memory' export"))?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init") {
-        let _ = init_fn.call(&mut store, (0, 0));
+        let status = init_fn
+            .call(&mut store, (0, 0))
+            .map_err(|e| anyhow::anyhow!("datalake_init trapped during initialization: {e}"))?;
+        if status != 0 {
+            anyhow::bail!("datalake_init returned non-zero status code: {status}");
+        }
     }
 
     let input_batch = crate::tester::create_synthetic_batch()?;
@@ -180,6 +197,7 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
     } else {
         std::time::Duration::ZERO
     };
+    let allocated_memory_bytes = memory.data_size(&store);
 
     Ok(BenchResult {
         iterations,
@@ -188,6 +206,7 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
         elapsed,
         avg_latency,
         throughput_mb_per_sec,
+        allocated_memory_bytes,
     })
 }
 
@@ -220,6 +239,10 @@ fn print_benchmark_table(res: &BenchResult) {
     println!(
         "| Throughput                     | {:<18} |",
         format!("{:.2} MB/s", res.throughput_mb_per_sec)
+    );
+    println!(
+        "| Guest Memory Allocated         | {:<18} |",
+        format!("{} bytes", res.allocated_memory_bytes)
     );
     println!("+--------------------------------+--------------------+");
 }

@@ -149,7 +149,12 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing 'memory' export"))?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init") {
-        let _ = init_fn.call(&mut store, (0, 0));
+        let status = init_fn
+            .call(&mut store, (0, 0))
+            .map_err(|e| anyhow::anyhow!("datalake_init trapped during initialization: {e}"))?;
+        if status != 0 {
+            anyhow::bail!("datalake_init returned non-zero status code: {status}");
+        }
     }
 
     let input_batch = create_synthetic_batch()?;
