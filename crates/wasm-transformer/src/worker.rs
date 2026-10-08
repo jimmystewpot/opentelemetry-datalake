@@ -467,7 +467,6 @@ impl WasmWorker {
     ///
     /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
-        drop(self.guest.take());
         let guest = match Self::instantiate_guest(
             self.engine.engine(),
             &self.module,
@@ -974,9 +973,11 @@ fn extract_output_batches<T>(
             .checked_add(output_len_usize)
             .is_some_and(|end| end <= mem_size);
         if !in_bounds {
-            return Err(WasmTransformError::Pipeline(format!(
-                "Batch IPC buffer bounds exceed guest memory size {mem_size}"
-            )));
+            return Err(WasmTransformError::InvalidMemoryBounds {
+                ptr: output_ptr,
+                len: output_len,
+                mem_size,
+            });
         }
         let end = start + output_len_usize;
 
@@ -985,9 +986,11 @@ fn extract_output_batches<T>(
         }
 
         let slice = memory.data(store).get(start..end).ok_or_else(|| {
-            WasmTransformError::Pipeline(format!(
-                "Batch IPC slice bounds exceed guest memory size {mem_size}"
-            ))
+            WasmTransformError::InvalidMemoryBounds {
+                ptr: output_ptr,
+                len: output_len,
+                mem_size,
+            }
         })?;
 
         let cursor = std::io::Cursor::new(slice);

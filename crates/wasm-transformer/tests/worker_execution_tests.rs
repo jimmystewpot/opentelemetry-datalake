@@ -453,8 +453,14 @@ async fn test_worker_guards_out_of_bounds_batch_buffer() {
 
     let (_batch, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("Batch IPC buffer bounds exceed guest memory size"),
+        matches!(
+            err,
+            WasmTransformError::InvalidMemoryBounds {
+                ptr: 60000,
+                len: 10000,
+                mem_size: 65536
+            }
+        ),
         "Unexpected error: {err}"
     );
 }
@@ -2318,57 +2324,49 @@ async fn test_worker_distinct_pointer_deallocates_both() {
     assert_eq!(worker.registry().read_counter("dealloc_out"), 1);
 }
 
-fn conditional_init_wat(fail_after_nanos: u64) -> String {
-    format!(
-        r#"(module
-            (import "env" "datalake_host_now_nanos" (func $now (result i64)))
-            (memory (export "memory") 1)
-            (func (export "datalake_abi_version") (result i32) (i32.const 1))
-            (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
-            (func (export "datalake_dealloc") (param i32 i32))
-            (func (export "datalake_init") (param i32 i32) (result i32)
-                (if (result i32) (i64.ge_u (call $now) (i64.const {fail_after_nanos}))
-                    (then (i32.const 1))
-                    (else (i32.const 0))
-                )
-            )
-            (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
-        )"#
-    )
-}
-
 #[tokio::test]
 async fn test_worker_rejuvenate_instantiate_failure_returns_unrecoverable() {
-    let now_nanos = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-    )
-    .unwrap();
-    // Set deadline 300ms in the future so initial instantiation succeeds comfortably
-    let fail_after = now_nanos + 300_000_000;
-    let wat = conditional_init_wat(fail_after);
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
 
-    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
-    let module = cache
-        .compile_module(&wat::parse_str(&wat).unwrap())
-        .unwrap();
+    // With concurrency = 1, pooling headroom allocates 1 * 2 = 2 total instance slots
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
 
     let cfg = default_test_config();
-    let mut worker = WasmWorker::new(84, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let mut worker = WasmWorker::new(
+        84,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        cfg,
+        test_registry(),
+    )
+    .unwrap();
     assert!(worker.instance().is_some());
 
-    // Sleep past threshold so subsequent datalake_init fails
-    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    // Allocate the second (and final) pool slot with a second worker so the pool is 100% full
+    let _occupant = WasmWorker::new(
+        85,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        default_test_config(),
+        test_registry(),
+    )
+    .unwrap();
 
-    // Rejuvenate now invokes datalake_init after the threshold, which fails
+    // Rejuvenate now attempts candidate instantiation prior to swapping, which exhausts the pool deterministically
     let err = worker.rejuvenate().unwrap_err();
     assert!(
-        matches!(err, WasmTransformError::Unrecoverable(ref msg) if msg.contains("datalake_init returned non-zero status: 1")),
+        matches!(err, WasmTransformError::Unrecoverable(ref msg) if msg.contains("failed rejuvenation replacement")),
         "Expected Unrecoverable error, got: {err}"
     );
 
-    // Verify guest slot was released (instance is None)
-    assert!(worker.instance().is_none());
+    // Verify candidate failure did not drop the existing active instance
+    assert!(worker.instance().is_some());
 }
