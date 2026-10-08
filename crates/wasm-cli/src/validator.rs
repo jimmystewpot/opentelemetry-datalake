@@ -53,6 +53,117 @@ const REQUIRED_EXPORTS: &[&str] = &[
 /// - The module cannot be instantiated ([`ValidationError::InstantiationFailed`]).
 /// - Calling `datalake_abi_version` fails ([`ValidationError::AbiFunctionMissing`] or [`ValidationError::AbiTrap`]).
 /// - The module's ABI version does not match the expected version ([`ValidationError::AbiMismatch`]).
+#[allow(clippy::collapsible_match)]
+fn validate_function_signature(
+    name: &str,
+    func: &wasmtime::FuncType,
+) -> std::result::Result<(), ValidationError> {
+    let params: Vec<ValType> = func.params().collect();
+    let results: Vec<ValType> = func.results().collect();
+    match name {
+        "datalake_abi_version" => {
+            if !params.is_empty() || results.len() != 1 || !matches!(results[0], ValType::I32) {
+                return Err(ValidationError::InvalidSignature {
+                    name: name.to_string(),
+                    expected: "() -> i32".to_string(),
+                });
+            }
+        }
+        "datalake_alloc" => {
+            if params.len() != 1
+                || !matches!(params[0], ValType::I32)
+                || results.len() != 1
+                || !matches!(results[0], ValType::I32)
+            {
+                return Err(ValidationError::InvalidSignature {
+                    name: name.to_string(),
+                    expected: "(i32) -> i32".to_string(),
+                });
+            }
+        }
+        "datalake_dealloc" => {
+            if params.len() != 2
+                || !matches!(params[0], ValType::I32)
+                || !matches!(params[1], ValType::I32)
+                || !results.is_empty()
+            {
+                return Err(ValidationError::InvalidSignature {
+                    name: name.to_string(),
+                    expected: "(i32, i32) -> ()".to_string(),
+                });
+            }
+        }
+        "datalake_transform" => {
+            let is_v1 = params.len() == 3
+                && matches!(params[0], ValType::I32)
+                && matches!(params[1], ValType::I32)
+                && matches!(params[2], ValType::I32)
+                && results.len() == 1
+                && matches!(results[0], ValType::I64);
+            let is_v0 = params.len() == 2
+                && matches!(params[0], ValType::I32)
+                && matches!(params[1], ValType::I32)
+                && results.len() == 1
+                && (matches!(results[0], ValType::I32) || matches!(results[0], ValType::I64));
+            if !is_v1 && !is_v0 {
+                return Err(ValidationError::InvalidSignature {
+                    name: name.to_string(),
+                    expected: "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64".to_string(),
+                });
+            }
+        }
+        "datalake_init" => {
+            if params.len() != 2
+                || !matches!(params[0], ValType::I32)
+                || !matches!(params[1], ValType::I32)
+                || results.len() != 1
+                || !matches!(results[0], ValType::I32)
+            {
+                return Err(ValidationError::InvalidSignature {
+                    name: name.to_string(),
+                    expected: "(i32, i32) -> i32".to_string(),
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_export(export: &wasmtime::ExportType) -> std::result::Result<(), ValidationError> {
+    let name = export.name();
+    let export_ty = export.ty();
+    if name == "memory" {
+        if export_ty.memory().is_none() {
+            return Err(ValidationError::InvalidExportKind {
+                name: "memory".to_string(),
+                expected: "memory".to_string(),
+                found: "non-memory".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    if matches!(
+        name,
+        "datalake_abi_version"
+            | "datalake_alloc"
+            | "datalake_dealloc"
+            | "datalake_transform"
+            | "datalake_init"
+    ) {
+        let Some(func) = export_ty.func() else {
+            return Err(ValidationError::InvalidExportKind {
+                name: name.to_string(),
+                expected: "function".to_string(),
+                found: "non-function".to_string(),
+            });
+        };
+        validate_function_signature(name, func)?;
+    }
+    Ok(())
+}
+
 pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationError> {
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -66,129 +177,7 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
     }
 
     for export in module.exports() {
-        let name = export.name();
-        let export_ty = export.ty();
-        match name {
-            "memory" => {
-                if export_ty.memory().is_none() {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: "memory".to_string(),
-                        expected: "memory".to_string(),
-                        found: "non-memory".to_string(),
-                    });
-                }
-            }
-            "datalake_abi_version" => {
-                let Some(func) = export_ty.func() else {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: name.to_string(),
-                        expected: "function".to_string(),
-                        found: "non-function".to_string(),
-                    });
-                };
-                let params: Vec<ValType> = func.params().collect();
-                let results: Vec<ValType> = func.results().collect();
-                if !params.is_empty() || results.len() != 1 || !matches!(results[0], ValType::I32) {
-                    return Err(ValidationError::InvalidSignature {
-                        name: name.to_string(),
-                        expected: "() -> i32".to_string(),
-                    });
-                }
-            }
-            "datalake_alloc" => {
-                let Some(func) = export_ty.func() else {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: name.to_string(),
-                        expected: "function".to_string(),
-                        found: "non-function".to_string(),
-                    });
-                };
-                let params: Vec<ValType> = func.params().collect();
-                let results: Vec<ValType> = func.results().collect();
-                if params.len() != 1
-                    || !matches!(params[0], ValType::I32)
-                    || results.len() != 1
-                    || !matches!(results[0], ValType::I32)
-                {
-                    return Err(ValidationError::InvalidSignature {
-                        name: name.to_string(),
-                        expected: "(i32) -> i32".to_string(),
-                    });
-                }
-            }
-            "datalake_dealloc" => {
-                let Some(func) = export_ty.func() else {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: name.to_string(),
-                        expected: "function".to_string(),
-                        found: "non-function".to_string(),
-                    });
-                };
-                let params: Vec<ValType> = func.params().collect();
-                let results: Vec<ValType> = func.results().collect();
-                if params.len() != 2
-                    || !matches!(params[0], ValType::I32)
-                    || !matches!(params[1], ValType::I32)
-                    || !results.is_empty()
-                {
-                    return Err(ValidationError::InvalidSignature {
-                        name: name.to_string(),
-                        expected: "(i32, i32) -> ()".to_string(),
-                    });
-                }
-            }
-            "datalake_transform" => {
-                let Some(func) = export_ty.func() else {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: name.to_string(),
-                        expected: "function".to_string(),
-                        found: "non-function".to_string(),
-                    });
-                };
-                let params: Vec<ValType> = func.params().collect();
-                let results: Vec<ValType> = func.results().collect();
-                let is_v1 = params.len() == 3
-                    && matches!(params[0], ValType::I32)
-                    && matches!(params[1], ValType::I32)
-                    && matches!(params[2], ValType::I32)
-                    && results.len() == 1
-                    && matches!(results[0], ValType::I64);
-                let is_v0 = params.len() == 2
-                    && matches!(params[0], ValType::I32)
-                    && matches!(params[1], ValType::I32)
-                    && results.len() == 1
-                    && (matches!(results[0], ValType::I32) || matches!(results[0], ValType::I64));
-                if !is_v1 && !is_v0 {
-                    return Err(ValidationError::InvalidSignature {
-                        name: name.to_string(),
-                        expected: "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64".to_string(),
-                    });
-                }
-            }
-            "datalake_init" => {
-                let Some(func) = export_ty.func() else {
-                    return Err(ValidationError::InvalidExportKind {
-                        name: name.to_string(),
-                        expected: "function".to_string(),
-                        found: "non-function".to_string(),
-                    });
-                };
-                let params: Vec<ValType> = func.params().collect();
-                let results: Vec<ValType> = func.results().collect();
-                if params.len() != 2
-                    || !matches!(params[0], ValType::I32)
-                    || !matches!(params[1], ValType::I32)
-                    || results.len() != 1
-                    || !matches!(results[0], ValType::I32)
-                {
-                    return Err(ValidationError::InvalidSignature {
-                        name: name.to_string(),
-                        expected: "(i32, i32) -> i32".to_string(),
-                    });
-                }
-            }
-            _ => {}
-        }
+        validate_export(&export)?;
     }
     let mut store: Store<()> = Store::new(&engine, ());
     store

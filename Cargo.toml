@@ -138,11 +138,11 @@ criterion = { version = "0.8.2", default-features = false, features = ["async_to
 
 # Storage & Iceberg Catalogs
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde", "std"] }
-iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }  
-iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
+iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "ab047b5e2f6e2ba6b999731653a3f7722b84e6f7" }
+iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "ab047b5e2f6e2ba6b999731653a3f7722b84e6f7" }
+iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "ab047b5e2f6e2ba6b999731653a3f7722b84e6f7" }  
+iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "ab047b5e2f6e2ba6b999731653a3f7722b84e6f7" }
+iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "ab047b5e2f6e2ba6b999731653a3f7722b84e6f7" }
 
 [profile.release]
 lto = "thin"
