@@ -1,7 +1,7 @@
 # Architecture Design Specification: Parquet Streaming Sink with VARIANT Support
 
 - **Document ID**: SPEC-2026-10-09-PARQUET-VARIANT-SINK
-- **Status**: Draft (Updated post-Principal Review)
+- **Status**: Final Draft (Updated with rigorous Rust/Tokio async constraints)
 - **Author**: Principal Software Engineer
 - **Date**: 2026-10-09
 - **Target Workspace**: `crates/parquet-sink`
@@ -14,7 +14,7 @@ This specification defines the architecture, storage abstractions, data layout, 
 
 The sink streams OpenTelemetry signals (Logs, Metrics, Traces) directly from Arrow `RecordBatch` streams into modern Parquet files residing on cloud object storage (Amazon S3, Google Cloud Storage, Azure Blob Storage, or S3-compatible systems like RustFS) or local/shared POSIX filesystems.
 
-To maximize read efficiency and query performance across analytical engines (Snowflake, Databricks/Spark, DuckDB, ClickHouse, and StarRocks), the sink implements the **Apache Parquet / Spark / Iceberg Variant binary format** (`group (VARIANT)` with binary `metadata` and `value`), enabling sub-field pruning without runtime JSON string parsing overhead.
+To maximize read efficiency and query performance across analytical engines (Snowflake, Databricks/Spark, DuckDB, ClickHouse, and StarRocks), the sink adopts the **Apache Parquet / Spark / Iceberg Variant binary format** (`metadata` and `value` payloads).
 
 ---
 
@@ -22,7 +22,7 @@ To maximize read efficiency and query performance across analytical engines (Sno
 
 Currently, semi-structured telemetry data (OTel `attributes`, `resource.attributes`, and log `body`) is converted to JSON-encoded strings. While simple, stringified JSON in columnar storage has severe drawbacks:
 1. **Query Scan Degradation**: Downstream query engines must scan and parse full JSON text strings row-by-row using CPU-expensive scalar functions (`get_json_object`), preventing vectorized evaluation.
-2. **Storage Inefficiency**: JSON keys and delimiters are repeatedly stored as uncompressed or redundantly compressed strings, inflating data volume.
+2. **Storage Inefficiency**: JSON keys and delimiters are repeatedly stored as uncompressed strings, inflating data volume.
 3. **No Direct Sub-field Pruning**: Analytic engines cannot skip non-matching records based on nested attribute predicates without parsing the entire payload.
 
 Furthermore, deploying dozens or hundreds of ingestion nodes requires a distributed, lock-free file writing strategy to prevent naming collisions and avoid uncommitted partial-read corruptions.
@@ -40,8 +40,8 @@ Furthermore, deploying dozens or hundreds of ingestion nodes requires a distribu
 * **Zero-Panic Compliance**: Strict adherence to `AGENTS.md`—no `.unwrap()`, `.expect()`, or unhandled panics.
 
 ### Non-Goals
-* **ACID Table Catalog Commit**: This sink writes raw partitioned Parquet files for direct engine scanning or external tables. Catalog management (e.g. Iceberg catalog commits) is handled by `crates/storage`.
-* **In-Sink Compaction**: Small-file compaction is delegated to asynchronous background compactor jobs.
+* **ACID Table Catalog Commit**: This sink writes raw partitioned Parquet files for direct engine scanning or external tables. Catalog management is handled by `crates/storage`.
+* **In-Sink Compaction**: Small-file compaction is delegated to asynchronous background compactor jobs (especially critical when memory pressure forces early file rolls).
 
 ---
 
@@ -61,9 +61,15 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
                          ┌──────────────────────────┐             ┌──────────────────────────┐
                          │ Active Partition Writer  │             │ Active Partition Writer  │
                          │ (Partition A)            │             │ (Partition B)            │
-                         │  • AsyncArrowWriter      │             │  • AsyncArrowWriter      │
-                         │  • tokio::spawn_blocking │             │  • tokio::spawn_blocking │
-                         │  • MultipartUploadPipe   │             │  • MultipartUploadPipe   │
+                         │  ┌────────────────────┐  │             │  ┌────────────────────┐  │
+                         │  │ tokio::spawn_block │  │             │  │ tokio::spawn_block │  │
+                         │  │ • Sync ArrowWriter │  │             │  │ • Sync ArrowWriter │  │
+                         │  └────────┬───────────┘  │             │  └────────┬───────────┘  │
+                         │           │ (Channel)    │             │           │ (Channel)    │
+                         │  ┌────────▼───────────┐  │             │  ┌────────▼───────────┐  │
+                         │  │ Async Uploader     │  │             │  │ Async Uploader     │  │
+                         │  │ • MultipartUpload  │  │             │  │ • MultipartUpload  │  │
+                         │  └────────────────────┘  │             │  └────────────────────┘  │
                          └────────────┬─────────────┘             └────────────┬─────────────┘
                                       │                                        │
                                       ▼                                        ▼
@@ -76,39 +82,38 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
 ### Component Breakdown
 
 1. **`ParquetSink` (`pipeline_core::pipeline::Sink`)**:
-   Main entry point consuming `SignalBatch`es from the async Tokio mpsc channel. Manages rolling timers, cancellation tokens, and graceful draining upon `SIGTERM`.
+   Main entry point consuming `SignalBatch`es from the async Tokio channel.
 
 2. **`SignalRouter`**:
    Extracts `RecordBatch` by signal type (`Logs`, `Metrics`, `Traces`), matching incoming schemas against the pre-compiled Parquet target schemas.
 
 3. **`VariantTransformer`**:
-   Vectorized transformation pass that inspects semi-structured columns (`attributes`, `resource_attributes`, `body`). If `variant_encoding` is enabled, transforms these columns into Arrow `StructArray`s (`metadata: Binary`, `value: Binary`) using pre-allocated reusable scratch buffers.
+   Vectorized transformation pass that inspects semi-structured columns. If `variant_encoding` is enabled, transforms these into Arrow `StructArray`s (`metadata: Binary`, `value: Binary`) using pre-allocated reusable scratch buffers.
 
 4. **`PartitionManager`**:
-   Evaluates partition keys from the record timestamp column using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits heterogeneous batches across target partitions via boolean masks (`arrow::compute::filter`). Manages an LRU pool of active `AsyncPartitionWriter`s and enforces the `GlobalMemoryTracker`.
+   Evaluates partition keys from the record timestamp column using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits heterogeneous batches across target partitions via boolean masks (`arrow::compute::filter`). Enforces the `GlobalMemoryTracker`.
 
-5. **`AsyncPartitionWriter`**:
-   Wraps an active `parquet::arrow::async_writer::AsyncArrowWriter` streaming bytes into a cloud `MultipartUpload` stream or a hidden atomic local staging file (`.{name}.tmp`). 
-   * **Crucial Detail**: Parquet compression and row-group encoding are CPU-intensive. Calls to `writer.write()` and `writer.close()` MUST be wrapped in `tokio::task::spawn_blocking` to avoid stalling the async Tokio reactor thread.
+5. **`PartitionWriter` (Decoupled Sync Encoder + Async Uploader)**:
+   **Crucial Detail**: `AsyncArrowWriter` cannot be used inside `tokio::task::spawn_blocking` because `write()` is an async method. To avoid blocking the Tokio reactor with heavy ZSTD compression, the architecture utilizes a synchronous `parquet::arrow::ArrowWriter` executing entirely inside a `spawn_blocking` thread pool. The compressed bytes are pushed to a bounded channel, which an async task reads from and streams to `object_store::MultipartUpload`.
 
 ---
 
 ## 5. Parquet Physical Layout & VARIANT Specification
 
-### 5.1 Parquet VARIANT Binary Layout & Arrow v59 Compatibility
+### 5.1 Arrow v59 Compatibility & Parquet Schema
 
-Semi-structured columns are written as a Parquet Group. In Apache Arrow, this is constructed as a `StructArray`:
+Semi-structured columns are built as an Arrow `StructArray`:
 * `DataType::Struct(vec![Field::new("metadata", DataType::Binary, false), Field::new("value", DataType::Binary, false)])`
 
-**Ecosystem Constraint (Arrow v59)**: Native, automatic `VARIANT` logical typing is experimental. To ensure Parquet readers (Spark, Snowflake) recognize the group as a `VARIANT`, the `VariantTransformer` explicitly injects Arrow Extension Metadata into the struct's `Field`:
-* `ARROW:extension:name = "variant"` (or the appropriate Iceberg/Spark variant tag).
-This forces the Arrow-to-Parquet writer to map it to the requested logical schema.
+**Ecosystem Constraint (Arrow v59)**:
+Native, automatic translation of Arrow extension metadata to the Parquet `VARIANT` logical type is experimental and incomplete in the Rust `parquet` crate.
+* **Fallback Behavior**: The sink explicitly injects Arrow Extension Metadata (`ARROW:extension:name = "variant"`). However, until upstream logic lands, the `parquet` writer will emit a standard Parquet `Struct` (without the logical type annotation).
+* **Impact**: Downstream engines (Spark, Snowflake) will read this as a shredded `Struct` containing `metadata` and `value`. This still provides massive performance gains over JSON parsing, and seamlessly upgrades to native `VARIANT` once the upstream `arrow-rs` crate adds support.
 
 ### 5.2 Zero-Allocation Scratch Buffer Strategy
 To eliminate heap allocations in the hot ingestion path:
 * Each worker task holds thread-local reusable scratch buffers (`SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`).
-* Keys and offsets are indexed using a task-local fast hash set (`FxIndexSet<String>`).
-* Serialized bytes are appended directly to Arrow's native `BinaryBuilder::append_value(&slice)`.
+* Serialized bytes are appended directly to Arrow's native `BinaryBuilder`.
 
 ### 5.3 Selectable Compression & Writer Configuration
 ```rust
@@ -124,8 +129,7 @@ pub enum CompressionCodec {
 ```
 * **Data Page Version**: `DataPageVersion::V2`.
 * **Dictionary Encoding**: Enabled for string columns with cardinality $< 100,000$.
-* **Bloom Filters**: Enabled on `trace_id` and `span_id` with target false positive probability $p = 0.01$.
-* **Statistics**: `Statistics::Page`.
+* **Bloom Filters**: Enabled on `trace_id` and `span_id`.
 * **Row Group Size**: Configurable default `64 MB`.
 
 ---
@@ -133,13 +137,13 @@ pub enum CompressionCodec {
 ## 6. Multi-Node Collision Avoidance & Atomic Visibility
 
 ### 6.1 Collision-Free Distributed Naming
-All files written to a partition prefix use a collision-proof naming template:
+All files written use a collision-proof naming template:
 `{partition_prefix}/{timestamp_nano}_{node_id}_{uuidv7}_{sequence:04}.parquet`
 
-### 6.2 Atomic Visibility & Orphan Prevention
+### 6.2 Atomic Visibility & Orphan Prevention (The Async `Drop` Pitfall)
 * **Cloud Object Stores (`s3://`, `gcs://`, `azblob://`)**:
   Uploads use `object_store::MultipartUpload`. The file becomes visible if and only if `complete().await` succeeds.
-  * **Orphan Prevention**: If a node crashes, the `AsyncPartitionWriter` is dropped, or an unrecoverable upload error occurs, the implementation MUST explicitly call `multipart.abort().await`. A `Drop` guard or safe error-handling block ensures hidden, uncommitted chunks do not accumulate in S3 and cause billing leaks.
+  * **Orphan Prevention**: Rust does not support asynchronous `Drop`. If a node panics or a task is cancelled, the `MultipartUpload` could leak uncommitted chunks in S3. To prevent this, the `PartitionWriter` uses a custom `Drop` guard that spins up a fire-and-forget `tokio::spawn` task to execute `multipart.abort().await` in the background, guaranteeing S3 hygiene.
 * **Local Filesystems (`file://`)**: Streams into `.{filename}.tmp` and executes an atomic POSIX `rename()` upon rolling.
 
 ---
@@ -150,18 +154,17 @@ All files written to a partition prefix use a collision-proof naming template:
 Hive-style paths (`signal={signal}/date={YYYY-MM-DD}/hour={HH}/`) evaluated via zero-copy temporal date/hour extraction kernels.
 
 ### 7.2 File Rolling Triggers (Data-Driven & Idle Sweep)
-An active partition writer rolls when:
+A partition writer rolls when:
 1. **Size Limit**: Uncompressed buffer size exceeds `max_file_size_bytes` (default: 64 MB).
 2. **Time Window**: Wall-clock time since the file was opened exceeds `max_file_interval_sec` (default: 60s).
 3. **Record Count**: Exceeds `max_records` (default: 500,000).
 
-* **Idle Sweep Ticker**: Because stream-processing systems only evaluate triggers when new data arrives, idle partitions (e.g., an expired hour) can hang indefinitely. The `PartitionManager` spawns a background `tokio::time::interval` ticker that periodically sweeps the active writer pool and forces a flush on expired idle partitions.
+* **Idle Sweep Ticker**: The `PartitionManager` spawns a background `tokio::time::interval` ticker that periodically sweeps the active writer pool and forces a flush on expired idle partitions even when no new data arrives.
 
 ### 7.3 Bounded Memory & Global Memory Tracker
-To resolve mathematical OOM risks (e.g., $N$ open partitions $\times$ 128 MB row groups $\gg$ system RAM):
-* **`GlobalMemoryTracker`**: Tracks aggregate buffer sizes across all open writers. If total memory exceeds `global_memory_limit_bytes` (default: 1 GB), the tracker forcefully flushes the largest/oldest row groups across the pool, overriding per-writer limits.
-* **`max_open_partitions`** (default: 16): If the cardinality of time windows exceeds 16, the coldest writer is cleanly evicted and finalized.
-* **Channel Backpressure**: If object storage writes stall, writer buffers fill and trip the global memory limit. The sink stops polling `PipelineReceiver`. The OTLP network layer consequently returns HTTP 503 / `UNAVAILABLE`. No data is silently dropped.
+* **`GlobalMemoryTracker`**: Tracks aggregate buffer sizes across all open writers. If total memory approaches `global_memory_limit_bytes` (default: 1 GB), the tracker forcefully evicts the largest/oldest partition writers.
+* **File Rolling Consequence**: Evicting a writer to reclaim memory necessitates closing and completing the Parquet file. Under heavy memory pressure, this forces the generation of smaller files (e.g., 5 MB instead of 64 MB). Downstream background compaction is highly recommended to offset this crash-resilience trade-off.
+* **Channel Backpressure**: If object storage writes stall, writer buffers fill and trip the global memory limit. The upstream OTLP network layer consequently returns HTTP 503 / `UNAVAILABLE`. No data is silently dropped.
 
 ---
 
@@ -208,7 +211,6 @@ pub enum ParquetSinkError {
     // ... VariantEncoding, Config, Internal
 }
 ```
-* **Drop Safety**: The sink guarantees `abort().await` is invoked on any failed `MultipartUpload` to satisfy cloud hygiene requirements.
 
 ---
 
@@ -226,10 +228,10 @@ Emits Prometheus/OpenTelemetry metrics adhering to `docs/instrumentation.md`:
 ## 11. Verification & Testing Plan
 
 1. **Unit Tests**:
-   * `test_variant_binary_encoding`: Validates Arrow `StructArray` with Extension Metadata maps correctly to Variant.
+   * `test_variant_binary_encoding`: Validates Arrow `StructArray` with Extension Metadata maps correctly.
    * `test_collision_free_naming`: Validates UUIDv7 uniqueness and ordering.
-   * `test_global_memory_eviction`: Simulates memory pressure and asserts early forced flushing.
+   * `test_global_memory_eviction`: Simulates memory pressure and asserts early forced rolling.
 2. **Integration Tests**:
    * `test_idle_partition_sweep`: Asserts the background ticker closes stale writers without new incoming data.
-   * `test_multipart_upload_abort`: Induces failure mid-upload and asserts `abort` API was called.
-   * `test_spawn_blocking_offload`: Validates Tokio executor remains responsive during heavy ZSTD compression.
+   * `test_multipart_upload_abort`: Induces failure mid-upload and asserts `tokio::spawn` background abort runs successfully.
+   * `test_sync_writer_async_uploader`: Validates that the synchronous ArrowWriter correctly pipes data to the Async Uploader task without blocking the Tokio reactor.
