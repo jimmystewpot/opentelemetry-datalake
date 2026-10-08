@@ -233,8 +233,304 @@ mod tests {
         match &err {
             ValidationError::MissingExport(name) => {
                 assert_eq!(name, "datalake_abi_version");
+                assert_eq!(err.to_string(), "Missing export 'datalake_abi_version'");
             }
             other => panic!("expected MissingExport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_valid_module_v1_and_init() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+                (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        assert!(validate_wasm_bytes(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_valid_module_v0_signatures() {
+        let wat_v0_i32 = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_v0_i32).expect("valid wat");
+        assert!(validate_wasm_bytes(&wasm).is_ok());
+
+        let wat_v0_i64 = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_v0_i64).expect("valid wat");
+        assert!(validate_wasm_bytes(&wasm).is_ok());
+    }
+
+    #[test]
+    fn test_invalid_export_kind_memory() {
+        let wat_src = r#"
+            (module
+                (func (export "memory"))
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::InvalidExportKind {
+                name,
+                expected,
+                found,
+            } => {
+                assert_eq!(name, "memory");
+                assert_eq!(expected, "memory");
+                assert_eq!(found, "non-memory");
+                assert!(err.to_string().contains("Invalid export 'memory'"));
+            }
+            other => panic!("expected InvalidExportKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_export_kind_function() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (global (export "datalake_alloc") i32 (i32.const 0))
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::InvalidExportKind {
+                name,
+                expected,
+                found,
+            } => {
+                assert_eq!(name, "datalake_alloc");
+                assert_eq!(expected, "function");
+                assert_eq!(found, "non-function");
+            }
+            other => panic!("expected InvalidExportKind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_abi_version() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i64) (i64.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::InvalidSignature { name, expected } => {
+                assert_eq!(name, "datalake_abi_version");
+                assert_eq!(expected, "() -> i32");
+                assert!(
+                    err.to_string()
+                        .contains("Invalid function signature for 'datalake_abi_version'")
+                );
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_alloc() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            ValidationError::InvalidSignature { name, expected } => {
+                assert_eq!(name, "datalake_alloc");
+                assert_eq!(expected, "(i32) -> i32");
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_dealloc() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32) (result i32) (i32.const 0))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            ValidationError::InvalidSignature { name, expected } => {
+                assert_eq!(name, "datalake_dealloc");
+                assert_eq!(expected, "(i32, i32) -> ()");
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_transform() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            ValidationError::InvalidSignature { name, expected } => {
+                assert_eq!(name, "datalake_transform");
+                assert_eq!(expected, "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64");
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_signature_init() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+                (func (export "datalake_init") (param i32))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        match res.unwrap_err() {
+            ValidationError::InvalidSignature { name, expected } => {
+                assert_eq!(name, "datalake_init");
+                assert_eq!(expected, "(i32, i32) -> i32");
+            }
+            other => panic!("expected InvalidSignature, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_abi_mismatch() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 99))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::AbiMismatch { expected, got } => {
+                assert_eq!(*expected, 1);
+                assert_eq!(*got, 99);
+                assert_eq!(err.to_string(), "ABI version mismatch: expected 1, got 99");
+            }
+            other => panic!("expected AbiMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_abi_trap() {
+        let wat_src = r#"
+            (module
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (unreachable))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::AbiTrap(_) => {
+                assert!(err.to_string().contains("datalake_abi_version trap:"));
+            }
+            other => panic!("expected AbiTrap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_instantiation_failed() {
+        let wat_src = r#"
+            (module
+                (import "env" "missing_host_fn" (func))
+                (memory (export "memory") 1)
+                (func (export "datalake_abi_version") (result i32) (i32.const 1))
+                (func (export "datalake_alloc") (param i32) (result i32) (i32.const 0))
+                (func (export "datalake_dealloc") (param i32 i32))
+                (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+            )
+        "#;
+        let wasm = wat::parse_str(wat_src).expect("valid wat");
+        let res = validate_wasm_bytes(&wasm);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        match &err {
+            ValidationError::InstantiationFailed(_) => {
+                assert!(err.to_string().contains("Instantiation failed:"));
+            }
+            other => panic!("expected InstantiationFailed, got {other:?}"),
         }
     }
 }
