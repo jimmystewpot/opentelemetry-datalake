@@ -9,7 +9,7 @@ This document provides instructions for developers setting up, building, running
 Before starting, ensure you have the following installed on your local machine:
 
 - **Rust & Cargo**: Latest stable release (installed via [rustup](https://rustup.rs/)).
-- **Docker & Docker Compose**: Needed for spinning up containerized local dependencies (MinIO, Apache Iceberg REST Catalog) during end-to-end (E2E) testing.
+- **Docker & Docker Compose**: Needed for spinning up containerized local dependencies (RustFS, Apache Iceberg REST Catalog) during end-to-end (E2E) testing.
 - **Python 3.8+**: Required for bootstrap and verification scripts in the integration test harness.
 - **Make**: For automating development and quality gate tasks.
 - **cargo-deny**: Optional but recommended to check dependency licenses and vulnerabilities.
@@ -89,7 +89,7 @@ cargo deny check
 ## 4. End-to-End (E2E) Testing
 
 We provide a fully containerized end-to-end integration test harness in the `tests/e2e/` directory. This harness tests:
-1. Spinning up local MinIO (acting as S3 storage) and an Apache Iceberg REST Catalog.
+1. Spinning up local RustFS (acting as S3 storage) and an Apache Iceberg REST Catalog.
 2. Creating Apache Iceberg tables in the catalog.
 3. Starting the `opentelemetry-datalake` receiver.
 4. Simulating live telemetry injection via the OpenTelemetry `telemetrygen` contributor utility.
@@ -106,11 +106,11 @@ This script automates building the binary, spinning up Docker containers, table 
 If you are debugging a feature or want to inspect tables manually, you can execute the steps of the E2E harness incrementally:
 
 #### 1. Spin up the Background Services
-Start MinIO and the REST Catalog in the background:
+Start RustFS and the REST Catalog in the background:
 ```bash
 docker compose -f tests/e2e/docker-compose.yml up -d
 ```
-You can access the MinIO console at `http://localhost:9001` (Username: `admin`, Password: `password`).
+You can access the RustFS console at `http://localhost:9001` (Username: `admin`, Password: `password`).
 
 #### 2. Bootstrap the Tables
 Set up the Python virtual environment and run the bootstrap script to create namespaces and Iceberg tables:
@@ -123,7 +123,7 @@ python tests/e2e/bootstrap.py
 This creates the namespace `default` and three distinct destination tables: `default.logs`, `default.metrics`, and `default.traces`.
 
 #### 3. Run the Receiver Local Instance
-Run the compiled receiver binary pointing to the test configuration. You must export target storage environment variables so the Iceberg sink can write to MinIO:
+Run the compiled receiver binary pointing to the test configuration. You must export target storage environment variables so the Iceberg sink can write to RustFS:
 ```bash
 export AWS_ACCESS_KEY_ID=admin
 export AWS_SECRET_ACCESS_KEY=password
@@ -157,7 +157,7 @@ docker run --rm --add-host=host.docker.internal:host-gateway \
 ```
 
 #### 5. Verify Committed Data
-Run the verification script to query the tables via the REST catalog and inspect the committed Parquet metadata in MinIO:
+Run the verification script to query the tables via the REST catalog and inspect the committed Parquet metadata in RustFS:
 ```bash
 source tests/e2e/.venv/bin/activate
 python tests/e2e/verify.py
