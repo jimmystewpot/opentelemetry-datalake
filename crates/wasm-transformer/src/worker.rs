@@ -316,13 +316,14 @@ impl WasmWorker {
                         ));
                     }
                     let mem_size = guest.memory.data_size(&guest.store);
-                    if (ptr as usize).saturating_add(len as usize) > mem_size {
+                    let in_bounds = (ptr as usize)
+                        .checked_add(len as usize)
+                        .is_some_and(|end| end <= mem_size);
+                    if !in_bounds {
                         let _ = guest.dealloc_fn.call(&mut guest.store, (ipc_ptr, ipc_len));
                         return Err((
                             batch,
-                            WasmTransformError::Pipeline(format!(
-                                "Response header at offset {ptr} with length {len} exceeds guest memory bounds {mem_size}"
-                            )),
+                            WasmTransformError::InvalidMemoryBounds { ptr, len, mem_size },
                         ));
                     }
                     (ptr, len)
@@ -346,13 +347,18 @@ impl WasmWorker {
             TransformFn::Legacy(f) => match f.call(&mut guest.store, (ipc_ptr, ipc_len)) {
                 Ok(ptr) => {
                     let mem_size = guest.memory.data_size(&guest.store);
-                    if (ptr as usize).saturating_add(20) > mem_size {
+                    let in_bounds = (ptr as usize)
+                        .checked_add(20)
+                        .is_some_and(|end| end <= mem_size);
+                    if !in_bounds {
                         let _ = guest.dealloc_fn.call(&mut guest.store, (ipc_ptr, ipc_len));
                         return Err((
                             batch,
-                            WasmTransformError::Pipeline(format!(
-                                "Response header at offset {ptr} with length 20 exceeds guest memory bounds {mem_size}"
-                            )),
+                            WasmTransformError::InvalidMemoryBounds {
+                                ptr,
+                                len: 20,
+                                mem_size,
+                            },
                         ));
                     }
                     (ptr, 20)
@@ -412,6 +418,7 @@ impl WasmWorker {
             batch,
             self.config.schema_guard,
             &mut allocs_to_free,
+            ipc_ptr,
         );
 
         // Free guest allocations on all paths
@@ -461,12 +468,20 @@ impl WasmWorker {
     /// Returns [`WasmTransformError`] if re-instantiation fails or required exports are missing.
     pub fn rejuvenate(&mut self) -> Result<(), WasmTransformError> {
         drop(self.guest.take());
-        let guest = Self::instantiate_guest(
+        let guest = match Self::instantiate_guest(
             self.engine.engine(),
             &self.module,
             &self.registry,
             &self.config,
-        )?;
+        ) {
+            Ok(g) => g,
+            Err(e) => {
+                return Err(WasmTransformError::Unrecoverable(format!(
+                    "Worker {} failed rejuvenation replacement: {e}",
+                    self.id
+                )));
+            }
+        };
         self.guest = Some(guest);
         self.batches_processed = 0;
         Ok(())
@@ -749,6 +764,7 @@ impl GuestComponents {
         batch: SignalBatch,
         schema_guard: pipeline_core::config::SchemaGuardMode,
         allocs_to_free: &mut Vec<(u32, u32)>,
+        ipc_ptr: u32,
     ) -> Result<WorkerOutcome, (SignalBatch, WasmTransformError)> {
         match header.status {
             0 => {
@@ -769,6 +785,7 @@ impl GuestComponents {
                         header.batch_count,
                         &batch,
                         allocs_to_free,
+                        ipc_ptr,
                     ) {
                         Ok(b) => b,
                         Err(e) => return Err((batch, e)),
@@ -899,6 +916,7 @@ fn extract_output_batches<T>(
     batch_count: u32,
     input_batch: &SignalBatch,
     allocs_to_free: &mut Vec<(u32, u32)>,
+    ipc_ptr: u32,
 ) -> Result<Vec<SignalBatch>, WasmTransformError> {
     if batch_count > MAX_GUEST_BATCH_COUNT {
         return Err(WasmTransformError::Pipeline(format!(
@@ -932,35 +950,39 @@ fn extract_output_batches<T>(
             .read(store, offset, &mut desc_bytes)
             .map_err(|e| WasmTransformError::Pipeline(e.to_string()))?;
 
-        let b_ptr =
+        let output_ptr =
             u32::from_le_bytes([desc_bytes[0], desc_bytes[1], desc_bytes[2], desc_bytes[3]]);
-        let b_len =
+        let output_len =
             u32::from_le_bytes([desc_bytes[4], desc_bytes[5], desc_bytes[6], desc_bytes[7]]);
 
-        if b_ptr == 0 {
+        if output_ptr == 0 {
             return Err(WasmTransformError::Pipeline(
                 "Protocol error: batch descriptor contained null IPC buffer pointer".to_string(),
             ));
         }
 
-        let b_len_usize = b_len as usize;
-        total_bytes = total_bytes.saturating_add(b_len_usize);
+        let output_len_usize = output_len as usize;
+        total_bytes = total_bytes.saturating_add(output_len_usize);
         if total_bytes > 64 * 1024 * 1024 {
             return Err(WasmTransformError::Pipeline(
                 "Cumulative batch output size exceeds maximum allowed 64MiB limit".into(),
             ));
         }
 
-        let start = b_ptr as usize;
-        let end = start.saturating_add(b_len_usize);
-
-        if end > mem_size {
+        let start = output_ptr as usize;
+        let in_bounds = (output_ptr as usize)
+            .checked_add(output_len_usize)
+            .is_some_and(|end| end <= mem_size);
+        if !in_bounds {
             return Err(WasmTransformError::Pipeline(format!(
                 "Batch IPC buffer bounds exceed guest memory size {mem_size}"
             )));
         }
+        let end = start + output_len_usize;
 
-        push_in_bounds_alloc(allocs_to_free, b_ptr, b_len, mem_size);
+        if output_ptr != ipc_ptr {
+            push_in_bounds_alloc(allocs_to_free, output_ptr, output_len, mem_size);
+        }
 
         let slice = memory.data(store).get(start..end).ok_or_else(|| {
             WasmTransformError::Pipeline(format!(

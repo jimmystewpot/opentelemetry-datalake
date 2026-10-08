@@ -54,4 +54,21 @@ pub enum WasmTransformError {
     /// An Arrow IPC serialization or deserialization error occurred.
     #[error("Arrow IPC error: {0}")]
     ArrowIpc(String),
+
+    /// A memory bounds validation error occurred for guest memory.
+    #[error(
+        "Invalid guest memory bounds: ptr={ptr}, len={len} exceeds guest memory bounds {mem_size}"
+    )]
+    InvalidMemoryBounds {
+        /// Start offset in guest memory.
+        ptr: u32,
+        /// Buffer length.
+        len: u32,
+        /// Total size of guest linear memory.
+        mem_size: usize,
+    },
+
+    /// An unrecoverable worker failure occurred requiring worker recreation.
+    #[error("Unrecoverable worker error: {0}")]
+    Unrecoverable(String),
 }
