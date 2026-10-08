@@ -1,0 +1,443 @@
+//! Configuration definitions and `OpenDAL` operator builder for the Parquet sink.
+
+use std::collections::HashMap;
+
+use parquet::basic::{Compression, GzipLevel, ZstdLevel};
+use serde::{Deserialize, Deserializer, Serialize, de};
+
+use crate::error::ParquetSinkError;
+
+/// Supported compression codecs for Parquet data pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionCodec {
+    /// Zstandard compression with optional compression level (1-22).
+    Zstd {
+        /// Compression level. Defaults to 3 if not specified.
+        level: Option<i32>,
+    },
+    /// Snappy compression.
+    Snappy,
+    /// LZ4 raw compression format.
+    Lz4Raw,
+    /// Gzip compression.
+    Gzip,
+    /// Uncompressed data pages.
+    Uncompressed,
+}
+
+impl CompressionCodec {
+    /// Converts this codec into the underlying Parquet [`Compression`] setting.
+    #[must_use]
+    pub fn to_parquet_compression(&self) -> Compression {
+        match *self {
+            Self::Zstd { level } => {
+                let zstd_level = level
+                    .and_then(|lvl| ZstdLevel::try_new(lvl).ok())
+                    .unwrap_or_default();
+                Compression::ZSTD(zstd_level)
+            }
+            Self::Snappy => Compression::SNAPPY,
+            Self::Lz4Raw => Compression::LZ4_RAW,
+            Self::Gzip => Compression::GZIP(GzipLevel::default()),
+            Self::Uncompressed => Compression::UNCOMPRESSED,
+        }
+    }
+}
+
+impl Default for CompressionCodec {
+    fn default() -> Self {
+        Self::Zstd { level: Some(3) }
+    }
+}
+
+impl<'de> Deserialize<'de> for CompressionCodec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Structured {
+            Zstd {
+                level: Option<i32>,
+            },
+            Snappy,
+            #[serde(alias = "lz4_raw", alias = "lz4")]
+            Lz4Raw,
+            Gzip,
+            #[serde(alias = "none")]
+            Uncompressed,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Helper {
+            Str(String),
+            Structured(Structured),
+        }
+
+        match Helper::deserialize(deserializer)? {
+            Helper::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "zstd" => Ok(Self::Zstd { level: Some(3) }),
+                "snappy" | "snap" => Ok(Self::Snappy),
+                "lz4" | "lz4raw" | "lz4_raw" => Ok(Self::Lz4Raw),
+                "gzip" | "gz" => Ok(Self::Gzip),
+                "uncompressed" | "none" => Ok(Self::Uncompressed),
+                other => Err(de::Error::custom(format!(
+                    "unknown compression codec: '{other}', expected one of: 'zstd', 'snappy', 'lz4_raw', 'gzip', 'uncompressed'"
+                ))),
+            },
+            Helper::Structured(s) => match s {
+                Structured::Zstd { level } => Ok(Self::Zstd { level }),
+                Structured::Snappy => Ok(Self::Snappy),
+                Structured::Lz4Raw => Ok(Self::Lz4Raw),
+                Structured::Gzip => Ok(Self::Gzip),
+                Structured::Uncompressed => Ok(Self::Uncompressed),
+            },
+        }
+    }
+}
+
+/// Configuration parameters for the Parquet streaming sink.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParquetSinkConfig {
+    /// Target storage URI (e.g. `file:///var/data`, `s3://bucket/prefix`).
+    #[serde(default = "default_storage_uri")]
+    pub storage_uri: String,
+
+    /// Unique ingestion node identifier used to prevent file name collisions.
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+
+    /// Compression codec applied to Parquet columns and data pages.
+    #[serde(default = "default_compression")]
+    pub compression: CompressionCodec,
+
+    /// Maximum file size in bytes before rolling a partition file (default: 64 MB).
+    #[serde(default = "default_max_file_size_bytes")]
+    pub max_file_size_bytes: usize,
+
+    /// Maximum interval in seconds before rolling an idle partition file (default: 60s).
+    #[serde(default = "default_max_file_interval_sec")]
+    pub max_file_interval_sec: u64,
+
+    /// Maximum active concurrently open partition writers (default: 16).
+    #[serde(default = "default_max_open_partitions")]
+    pub max_open_partitions: usize,
+
+    /// Global memory ceiling for active partition buffers in bytes (default: 1 GB).
+    #[serde(default = "default_global_memory_limit_bytes")]
+    pub global_memory_limit_bytes: usize,
+
+    /// Whether to encode semi-structured attributes using the Variant binary format.
+    #[serde(default = "default_variant_encoding")]
+    pub variant_encoding: bool,
+
+    /// Maximum records per file before rolling (default: 500,000).
+    #[serde(default = "default_max_records")]
+    pub max_records: usize,
+
+    /// Hive-style partition pattern template (default: `signal={signal}/date={date}/hour={hour}`).
+    #[serde(default = "default_partition_pattern")]
+    pub partition_pattern: String,
+
+    /// Additional backend storage options (e.g., `aws_region`, `endpoint`).
+    #[serde(default)]
+    pub storage_options: HashMap<String, String>,
+}
+
+fn default_storage_uri() -> String {
+    "file://./data".to_string()
+}
+
+fn default_node_id() -> String {
+    "default-node".to_string()
+}
+
+fn default_compression() -> CompressionCodec {
+    CompressionCodec::Zstd { level: Some(3) }
+}
+
+const fn default_max_file_size_bytes() -> usize {
+    67_108_864
+}
+
+const fn default_max_file_interval_sec() -> u64 {
+    60
+}
+
+const fn default_max_open_partitions() -> usize {
+    16
+}
+
+const fn default_global_memory_limit_bytes() -> usize {
+    1_073_741_824
+}
+
+const fn default_variant_encoding() -> bool {
+    true
+}
+
+const fn default_max_records() -> usize {
+    500_000
+}
+
+fn default_partition_pattern() -> String {
+    "signal={signal}/date={date}/hour={hour}".to_string()
+}
+
+impl Default for ParquetSinkConfig {
+    fn default() -> Self {
+        Self {
+            storage_uri: default_storage_uri(),
+            node_id: default_node_id(),
+            compression: default_compression(),
+            max_file_size_bytes: default_max_file_size_bytes(),
+            max_file_interval_sec: default_max_file_interval_sec(),
+            max_open_partitions: default_max_open_partitions(),
+            global_memory_limit_bytes: default_global_memory_limit_bytes(),
+            variant_encoding: default_variant_encoding(),
+            max_records: default_max_records(),
+            partition_pattern: default_partition_pattern(),
+            storage_options: HashMap::new(),
+        }
+    }
+}
+
+impl ParquetSinkConfig {
+    /// Builds an `OpenDAL` [`Operator`] configured according to `storage_uri` and `storage_options`.
+    pub fn build_operator(&self) -> Result<opendal::Operator, ParquetSinkError> {
+        let uri = self.storage_uri.trim();
+        if uri.is_empty() {
+            return Err(ParquetSinkError::Config(
+                "storage_uri cannot be empty".to_string(),
+            ));
+        }
+
+        if let Some(path) = uri.strip_prefix("file://") {
+            let builder = opendal::services::Fs::default().root(path);
+            let op = opendal::Operator::new(builder)?;
+            return Ok(op);
+        }
+
+        if let Some(s3_path) = uri.strip_prefix("s3://") {
+            let (bucket, root) = match s3_path.find('/') {
+                Some(idx) => (&s3_path[..idx], &s3_path[idx..]),
+                None => (s3_path, "/"),
+            };
+            if bucket.is_empty() {
+                return Err(ParquetSinkError::Config(
+                    "S3 storage URI missing bucket name".to_string(),
+                ));
+            }
+            let mut builder = opendal::services::S3::default().bucket(bucket);
+            if !root.is_empty() {
+                builder = builder.root(root);
+            }
+            for (k, v) in &self.storage_options {
+                match k.as_str() {
+                    "region" | "aws_region" => {
+                        builder = builder.region(v);
+                    }
+                    "endpoint" | "aws_endpoint" => {
+                        builder = builder.endpoint(v);
+                    }
+                    "access_key_id" | "aws_access_key_id" => {
+                        builder = builder.access_key_id(v);
+                    }
+                    "secret_access_key" | "aws_secret_access_key" => {
+                        builder = builder.secret_access_key(v);
+                    }
+                    _ => {}
+                }
+            }
+            let op = opendal::Operator::new(builder)?;
+            return Ok(op);
+        }
+
+        if uri.starts_with("memory://") {
+            #[cfg(any(test, feature = "services-memory"))]
+            {
+                let builder = opendal::services::Memory::default();
+                let op = opendal::Operator::new(builder)?;
+                return Ok(op);
+            }
+            #[cfg(not(any(test, feature = "services-memory")))]
+            {
+                return Err(ParquetSinkError::Config(
+                    "memory storage service is not enabled".to_string(),
+                ));
+            }
+        }
+
+        if !uri.contains("://") {
+            let builder = opendal::services::Fs::default().root(uri);
+            let op = opendal::Operator::new(builder)?;
+            return Ok(op);
+        }
+
+        Err(ParquetSinkError::Config(format!(
+            "unsupported storage URI scheme: '{uri}'"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ParquetSinkConfig::default();
+        assert_eq!(
+            config.compression,
+            CompressionCodec::Zstd { level: Some(3) }
+        );
+        assert_eq!(config.max_file_size_bytes, 67_108_864);
+        assert_eq!(config.max_file_interval_sec, 60);
+        assert_eq!(config.max_open_partitions, 16);
+        assert_eq!(config.global_memory_limit_bytes, 1_073_741_824);
+        assert!(config.variant_encoding);
+    }
+
+    #[test]
+    fn test_deserialize_toml() {
+        let toml_str = r#"
+            storage_uri = "s3://my-bucket/telemetry"
+            node_id = "test-node"
+            compression = "snappy"
+            max_file_size_bytes = 10485760
+            max_open_partitions = 32
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.storage_uri, "s3://my-bucket/telemetry");
+        assert_eq!(config.node_id, "test-node");
+        assert_eq!(config.compression, CompressionCodec::Snappy);
+        assert_eq!(config.max_file_size_bytes, 10_485_760);
+        assert_eq!(config.max_open_partitions, 32);
+    }
+
+    #[test]
+    fn test_deserialize_compression_variants() {
+        let toml_zstd = r#"
+            compression = "zstd"
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_zstd).unwrap();
+        assert_eq!(
+            config.compression,
+            CompressionCodec::Zstd { level: Some(3) }
+        );
+
+        let toml_snappy = r#"
+            compression = "snappy"
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_snappy).unwrap();
+        assert_eq!(config.compression, CompressionCodec::Snappy);
+
+        let toml_lz4 = r#"
+            compression = "lz4_raw"
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_lz4).unwrap();
+        assert_eq!(config.compression, CompressionCodec::Lz4Raw);
+
+        let toml_gzip = r#"
+            compression = "gzip"
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_gzip).unwrap();
+        assert_eq!(config.compression, CompressionCodec::Gzip);
+
+        let toml_uncompressed = r#"
+            compression = "uncompressed"
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_uncompressed).unwrap();
+        assert_eq!(config.compression, CompressionCodec::Uncompressed);
+    }
+
+    #[test]
+    fn test_to_parquet_compression() {
+        assert_eq!(
+            CompressionCodec::Snappy.to_parquet_compression(),
+            Compression::SNAPPY
+        );
+        assert_eq!(
+            CompressionCodec::Lz4Raw.to_parquet_compression(),
+            Compression::LZ4_RAW
+        );
+        assert_eq!(
+            CompressionCodec::Uncompressed.to_parquet_compression(),
+            Compression::UNCOMPRESSED
+        );
+        assert!(matches!(
+            CompressionCodec::Zstd { level: Some(5) }.to_parquet_compression(),
+            Compression::ZSTD(_)
+        ));
+        assert!(matches!(
+            CompressionCodec::Gzip.to_parquet_compression(),
+            Compression::GZIP(_)
+        ));
+    }
+
+    #[test]
+    fn test_build_operator_fs() {
+        let config = ParquetSinkConfig {
+            storage_uri: "file:///tmp/telemetry".to_string(),
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_raw_fs_path() {
+        let config = ParquetSinkConfig {
+            storage_uri: "/tmp/telemetry".to_string(),
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_s3() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert("aws_region".to_string(), "us-east-1".to_string());
+        let config = ParquetSinkConfig {
+            storage_uri: "s3://my-bucket/telemetry".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_memory() {
+        let config = ParquetSinkConfig {
+            storage_uri: "memory://test".to_string(),
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_empty_uri_fails() {
+        let config = ParquetSinkConfig {
+            storage_uri: "   ".to_string(),
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(matches!(op, Err(ParquetSinkError::Config(_))));
+    }
+
+    #[test]
+    fn test_build_operator_unsupported_scheme() {
+        let config = ParquetSinkConfig {
+            storage_uri: "ftp://my-server/telemetry".to_string(),
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(matches!(op, Err(ParquetSinkError::Config(_))));
+    }
+}

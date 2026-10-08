@@ -1,0 +1,28 @@
+[package]
+name = "parquet-sink"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Parquet streaming sink with Variant binary encoding for OpenTelemetry Data Lake"
+
+[features]
+default = []
+services-memory = ["opendal/services-memory"]
+
+[dependencies]
+pipeline-core = { workspace = true }
+arrow = { workspace = true, features = ["json"] }
+parquet = { workspace = true, features = ["arrow", "async", "zstd", "snap"] }
+opendal = { version = "0.58", default-features = false, features = ["services-fs", "services-s3"] }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }
+opendal = { version = "0.58", default-features = false, features = ["services-memory"] }

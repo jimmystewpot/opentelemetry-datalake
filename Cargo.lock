@@ -4042,6 +4042,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "parquet-sink"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "bytes",
+ "chrono",
+ "opendal",
+ "parquet",
+ "pipeline-core",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.1.6+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "pear"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
