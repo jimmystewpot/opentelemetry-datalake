@@ -1,11 +1,34 @@
 import time
 import requests
 import pyarrow as pa
+import s3fs
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NamespaceAlreadyExistsError, TableAlreadyExistsError
 
 CATALOG_URI = "http://localhost:8181"
 S3_ENDPOINT = "http://localhost:9000"
+
+def ensure_bucket(endpoint, access_key, secret_key, bucket_name="warehouse", retries=15, delay=1.0):
+    print(f"Ensuring S3 bucket '{bucket_name}' exists at {endpoint}...")
+    for attempt in range(1, retries + 1):
+        try:
+            fs = s3fs.S3FileSystem(
+                key=access_key,
+                secret=secret_key,
+                client_kwargs={"endpoint_url": endpoint},
+                config_kwargs={"s3": {"addressing_style": "path"}},
+            )
+            if not fs.exists(bucket_name):
+                fs.mkdir(bucket_name)
+                print(f"Created S3 bucket '{bucket_name}'")
+            else:
+                print(f"S3 bucket '{bucket_name}' already exists")
+            return
+        except Exception as e:
+            if attempt == retries:
+                raise
+            print(f"Waiting for S3 endpoint ({e}), retry {attempt}/{retries}...")
+            time.sleep(delay)
 
 def wait_for_catalog(url, timeout=60):
     start = time.time()
@@ -22,6 +45,7 @@ def wait_for_catalog(url, timeout=60):
     raise TimeoutError(f"REST catalog did not become ready at {url} within {timeout} seconds.")
 
 def main():
+    ensure_bucket(S3_ENDPOINT, "admin", "password", "warehouse")
     wait_for_catalog(CATALOG_URI)
 
     # Initialize PyIceberg catalog
@@ -34,6 +58,7 @@ def main():
             "s3.access-key-id": "admin",
             "s3.secret-access-key": "password",
             "s3.region": "us-east-1",
+            "s3.path-style-access": "true",
         }
     )
 
