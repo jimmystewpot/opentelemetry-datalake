@@ -53,6 +53,7 @@ const REQUIRED_EXPORTS: &[&str] = &[
 /// - The module cannot be instantiated ([`ValidationError::InstantiationFailed`]).
 /// - Calling `datalake_abi_version` fails ([`ValidationError::AbiFunctionMissing`] or [`ValidationError::AbiTrap`]).
 /// - The module's ABI version does not match the expected version ([`ValidationError::AbiMismatch`]).
+#[allow(clippy::too_many_lines)]
 pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationError> {
     let mut config = Config::new();
     config.consume_fuel(true);
