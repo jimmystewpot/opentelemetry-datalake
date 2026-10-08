@@ -568,6 +568,213 @@ fn test_backfill_nested_struct_marks_child_fields_nullable() {
 }
 
 #[test]
+fn test_backfill_missing_nullable_struct_with_non_nullable_child_marks_child_nullable() {
+    let child_field = Arc::new(Field::new("service_name", DataType::Utf8, false));
+    let struct_field = Field::new(
+        "resource",
+        DataType::Struct(vec![child_field].into()),
+        true, // Top-level struct is ALREADY nullable!
+    );
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        struct_field,
+    ]));
+
+    let partial_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    assert_eq!(backfilled.num_columns(), 2);
+    let backfilled_schema = backfilled.schema();
+    let res_field = backfilled_schema.field(1);
+    assert!(res_field.is_nullable(), "Outer struct must be nullable");
+
+    if let DataType::Struct(children) = res_field.data_type() {
+        assert!(
+            children[0].is_nullable(),
+            "Nested child field inside backfilled null struct must be recursively marked nullable even if parent was already nullable"
+        );
+    } else {
+        panic!("Expected struct data type");
+    }
+
+    let struct_col = backfilled.column(1);
+    let struct_arr = struct_col
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert!(
+        struct_arr.fields()[0].is_nullable(),
+        "Underlying StructArray child field must be marked nullable"
+    );
+}
+
+#[test]
+fn test_backfill_deeply_nested_struct_recursively_marks_all_levels_nullable() {
+    // 4 levels: Struct(level_1) -> Struct(level_2) -> Struct(level_3) -> Primitive(leaf)
+    let leaf_field = Arc::new(Field::new("leaf_id", DataType::Int64, false));
+    let level_3 = Arc::new(Field::new(
+        "level_3",
+        DataType::Struct(vec![leaf_field].into()),
+        false,
+    ));
+    let level_2 = Arc::new(Field::new(
+        "level_2",
+        DataType::Struct(vec![level_3].into()),
+        false,
+    ));
+    let level_1 = Field::new(
+        "level_1",
+        DataType::Struct(vec![level_2].into()),
+        true, // test outer nullable = true
+    );
+
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        level_1,
+    ]));
+
+    let partial_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    let backfilled_schema = backfilled.schema();
+    let f1 = backfilled_schema.field(1);
+    assert!(f1.is_nullable(), "Level 1 must be nullable");
+
+    if let DataType::Struct(l2_fields) = f1.data_type() {
+        let l2 = &l2_fields[0];
+        assert!(l2.is_nullable(), "Level 2 must be nullable");
+        if let DataType::Struct(l3_fields) = l2.data_type() {
+            let l3 = &l3_fields[0];
+            assert!(l3.is_nullable(), "Level 3 must be nullable");
+            if let DataType::Struct(l4_fields) = l3.data_type() {
+                let leaf = &l4_fields[0];
+                assert!(leaf.is_nullable(), "Level 4 (leaf) must be nullable");
+            } else {
+                panic!("Expected Level 3 to contain a Struct");
+            }
+        } else {
+            panic!("Expected Level 2 to contain a Struct");
+        }
+    } else {
+        panic!("Expected Level 1 to be a Struct");
+    }
+
+    let struct_arr = backfilled
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    assert!(struct_arr.fields()[0].is_nullable());
+}
+
+#[test]
+fn test_backfill_nested_struct_apache_arrow_and_iceberg_nullability_validation() {
+    fn validate_schema_and_array_nullability(field: &Field, array: &Arc<dyn arrow::array::Array>) {
+        if array.null_count() > 0 {
+            assert!(
+                field.is_nullable(),
+                "Iceberg/Arrow conformance violation: field '{}' contains {} nulls but is marked non-nullable",
+                field.name(),
+                array.null_count()
+            );
+        }
+        array
+            .to_data()
+            .validate_full()
+            .expect("Arrow ArrayData::validate_full() must succeed");
+
+        match (field.data_type(), array.data_type()) {
+            (DataType::Struct(schema_fields), DataType::Struct(array_fields)) => {
+                let struct_arr = array
+                    .as_any()
+                    .downcast_ref::<arrow::array::StructArray>()
+                    .expect("Must downcast to StructArray");
+                assert_eq!(schema_fields.len(), array_fields.len());
+                for (sf, af) in schema_fields.iter().zip(array_fields.iter()) {
+                    assert!(
+                        sf.is_nullable(),
+                        "Schema field '{}' must be nullable",
+                        sf.name()
+                    );
+                    assert!(
+                        af.is_nullable(),
+                        "Array field '{}' must be nullable",
+                        af.name()
+                    );
+                    let child_arr = struct_arr
+                        .column_by_name(sf.name())
+                        .expect("Child array must exist");
+                    validate_schema_and_array_nullability(sf, child_arr);
+                }
+            }
+            (DataType::List(sf), DataType::List(af)) => {
+                assert!(sf.is_nullable());
+                assert!(af.is_nullable());
+            }
+            _ => {}
+        }
+    }
+
+    let inner_child = Arc::new(Field::new("inner_leaf", DataType::Utf8, false));
+    let mid_struct = Arc::new(Field::new(
+        "mid_level",
+        DataType::Struct(vec![inner_child].into()),
+        false,
+    ));
+    let outer_struct = Field::new(
+        "nested_meta",
+        DataType::Struct(vec![mid_struct].into()),
+        true, // Already nullable parent with non-nullable nested children
+    );
+    let full_schema = Arc::new(Schema::new(vec![
+        Field::new("trace_id", DataType::Utf8, false),
+        outer_struct,
+    ]));
+
+    let partial_schema = Arc::new(Schema::new(vec![Field::new(
+        "trace_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let output = RecordBatch::try_new(
+        partial_schema,
+        vec![Arc::new(StringArray::from(vec!["trace-1", "trace-2"]))],
+    )
+    .unwrap();
+
+    let backfilled = backfill_missing_columns(&full_schema, output).unwrap();
+    assert_eq!(backfilled.num_rows(), 2);
+    assert_eq!(backfilled.num_columns(), 2);
+
+    for (field, col) in backfilled
+        .schema()
+        .fields()
+        .iter()
+        .zip(backfilled.columns())
+    {
+        validate_schema_and_array_nullability(field, col);
+    }
+}
+
+#[test]
 fn test_backfill_nested_list_marks_child_field_nullable() {
     let child_field = Arc::new(Field::new("item", DataType::Int32, false));
     let list_field = Field::new("metrics_list", DataType::List(child_field), false);
