@@ -1,7 +1,7 @@
 # Architecture Design Specification: Parquet Streaming Sink with VARIANT Support
 
 - **Document ID**: SPEC-2026-10-09-PARQUET-VARIANT-SINK
-- **Status**: Final Draft (Updated with rigorous Rust/Tokio async constraints)
+- **Status**: Finalized (Updated with OTLP, S3, and Variant constraints)
 - **Author**: Principal Software Engineer
 - **Date**: 2026-10-09
 - **Target Workspace**: `crates/parquet-sink`
@@ -68,7 +68,7 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
                          │           │ (Channel)    │             │           │ (Channel)    │
                          │  ┌────────▼───────────┐  │             │  ┌────────▼───────────┐  │
                          │  │ Async Uploader     │  │             │  │ Async Uploader     │  │
-                         │  │ • MultipartUpload  │  │             │  │ • MultipartUpload  │  │
+                         │  │ • WriteMultipart   │  │             │  │ • WriteMultipart   │  │
                          │  └────────────────────┘  │             │  └────────────────────┘  │
                          └────────────┬─────────────┘             └────────────┬─────────────┘
                                       │                                        │
@@ -84,17 +84,20 @@ PipelineReceiver ────►│  SignalRouter ──► VariantTransformer �
 1. **`ParquetSink` (`pipeline_core::pipeline::Sink`)**:
    Main entry point consuming `SignalBatch`es from the async Tokio channel.
 
-2. **`SignalRouter`**:
-   Extracts `RecordBatch` by signal type (`Logs`, `Metrics`, `Traces`), matching incoming schemas against the pre-compiled Parquet target schemas.
+2. **`SignalRouter` & The Metrics Schema Explosion**:
+   Extracts `RecordBatch` by signal type (`Logs`, `Metrics`, `Traces`). 
+   * **Metrics Handling**: Because OTLP Metrics are highly polymorphic (Gauges, Sums, Histograms), flattening them into a strict relational schema results in extreme column sparsity. The router flattens the metadata (name, description, unit) but serializes the polymorphic `DataPoint` (including exemplars and dynamic buckets) directly into the `VARIANT` binary payload, keeping the target Parquet schema clean and queryable.
 
 3. **`VariantTransformer`**:
    Vectorized transformation pass that inspects semi-structured columns. If `variant_encoding` is enabled, transforms these into Arrow `StructArray`s (`metadata: Binary`, `value: Binary`) using pre-allocated reusable scratch buffers.
 
 4. **`PartitionManager`**:
-   Evaluates partition keys from the record timestamp column using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits heterogeneous batches across target partitions via boolean masks (`arrow::compute::filter`). Enforces the `GlobalMemoryTracker`.
+   Evaluates partition keys using Arrow compute temporal kernels (`arrow::compute::kernels::temporal`). Splits heterogeneous batches across target partitions via boolean masks (`arrow::compute::filter`). Enforces the `GlobalMemoryTracker`.
 
 5. **`PartitionWriter` (Decoupled Sync Encoder + Async Uploader)**:
-   **Crucial Detail**: `AsyncArrowWriter` cannot be used inside `tokio::task::spawn_blocking` because `write()` is an async method. To avoid blocking the Tokio reactor with heavy ZSTD compression, the architecture utilizes a synchronous `parquet::arrow::ArrowWriter` executing entirely inside a `spawn_blocking` thread pool. The compressed bytes are pushed to a bounded channel, which an async task reads from and streams to `object_store::MultipartUpload`.
+   * **Encoder**: A synchronous `parquet::arrow::ArrowWriter` runs inside a `tokio::task::spawn_blocking` pool to prevent starving the async reactor with heavy ZSTD compression. It pushes bytes via an in-memory channel.
+   * **Uploader**: An async task reads the channel and streams to `object_store::WriteMultipart`. 
+   * **S3 5MB Coalescing Requirement**: The uploader strictly uses `WriteMultipart` (which buffers into $\ge$ 5MB chunks) rather than raw `put_part()` calls. This prevents HTTP 400 `EntityTooSmall` errors from S3 when the sync writer flushes small Parquet pages.
 
 ---
 
@@ -106,14 +109,12 @@ Semi-structured columns are built as an Arrow `StructArray`:
 * `DataType::Struct(vec![Field::new("metadata", DataType::Binary, false), Field::new("value", DataType::Binary, false)])`
 
 **Ecosystem Constraint (Arrow v59)**:
-Native, automatic translation of Arrow extension metadata to the Parquet `VARIANT` logical type is experimental and incomplete in the Rust `parquet` crate.
-* **Fallback Behavior**: The sink explicitly injects Arrow Extension Metadata (`ARROW:extension:name = "variant"`). However, until upstream logic lands, the `parquet` writer will emit a standard Parquet `Struct` (without the logical type annotation).
-* **Impact**: Downstream engines (Spark, Snowflake) will read this as a shredded `Struct` containing `metadata` and `value`. This still provides massive performance gains over JSON parsing, and seamlessly upgrades to native `VARIANT` once the upstream `arrow-rs` crate adds support.
+* **Fallback Behavior**: The sink explicitly injects Arrow Extension Metadata (`ARROW:extension:name = "variant"`). However, until upstream logic lands, the `parquet` writer will emit a standard Parquet `Struct`. Downstream engines seamlessly read this as a shredded struct, maintaining performance while awaiting full upstream logical type support.
 
-### 5.2 Zero-Allocation Scratch Buffer Strategy
+### 5.2 Zero-Allocation Scratch Buffer Strategy & Sorting Constraint
 To eliminate heap allocations in the hot ingestion path:
-* Each worker task holds thread-local reusable scratch buffers (`SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`).
-* Serialized bytes are appended directly to Arrow's native `BinaryBuilder`.
+* Worker tasks hold thread-local reusable scratch buffers (`SmallVec<u8, 512>` for `metadata` and `SmallVec<u8, 2048>` for `value`).
+* **Lexicographical Sorting**: The Apache Parquet Variant specification strictly mandates that string keys in the `metadata` dictionary must be sorted. After extracting keys (e.g. using `FxIndexSet`), the encoder performs an in-place lexicographical sort before finalizing the `metadata` binary payload. This guarantees $O(\log N)$ binary search capability for downstream query engines.
 
 ### 5.3 Selectable Compression & Writer Configuration
 ```rust
@@ -142,9 +143,10 @@ All files written use a collision-proof naming template:
 
 ### 6.2 Atomic Visibility & Orphan Prevention (The Async `Drop` Pitfall)
 * **Cloud Object Stores (`s3://`, `gcs://`, `azblob://`)**:
-  Uploads use `object_store::MultipartUpload`. The file becomes visible if and only if `complete().await` succeeds.
-  * **Orphan Prevention**: Rust does not support asynchronous `Drop`. If a node panics or a task is cancelled, the `MultipartUpload` could leak uncommitted chunks in S3. To prevent this, the `PartitionWriter` uses a custom `Drop` guard that spins up a fire-and-forget `tokio::spawn` task to execute `multipart.abort().await` in the background, guaranteeing S3 hygiene.
-* **Local Filesystems (`file://`)**: Streams into `.{filename}.tmp` and executes an atomic POSIX `rename()` upon rolling.
+  Uploads use `object_store::WriteMultipart`. The file becomes visible if and only if `complete().await` succeeds.
+  * **Orphan Prevention**: Rust does not support asynchronous `Drop`. If a node panics or a task is cancelled, the `MultipartUpload` could leak uncommitted chunks in S3. The `PartitionWriter` uses a custom `Drop` guard that spins up a fire-and-forget `tokio::spawn` task to execute `multipart.abort().await` in the background, guaranteeing S3 hygiene.
+* **Local Filesystems (`file://`)**: 
+  The sink treats the `LocalFileSystem` instance identically to S3. Native atomic transactions (internal temp files and POSIX renames) are handled automatically by `object_store::local` when `complete().await` is called.
 
 ---
 
@@ -163,7 +165,7 @@ A partition writer rolls when:
 
 ### 7.3 Bounded Memory & Global Memory Tracker
 * **`GlobalMemoryTracker`**: Tracks aggregate buffer sizes across all open writers. If total memory approaches `global_memory_limit_bytes` (default: 1 GB), the tracker forcefully evicts the largest/oldest partition writers.
-* **File Rolling Consequence**: Evicting a writer to reclaim memory necessitates closing and completing the Parquet file. Under heavy memory pressure, this forces the generation of smaller files (e.g., 5 MB instead of 64 MB). Downstream background compaction is highly recommended to offset this crash-resilience trade-off.
+* **File Rolling Consequence**: Evicting a writer to reclaim memory necessitates closing and completing the Parquet file. Under heavy memory pressure, this forces the generation of smaller files (e.g., 5 MB instead of 64 MB). Downstream background compaction is highly recommended.
 * **Channel Backpressure**: If object storage writes stall, writer buffers fill and trip the global memory limit. The upstream OTLP network layer consequently returns HTTP 503 / `UNAVAILABLE`. No data is silently dropped.
 
 ---
@@ -228,10 +230,10 @@ Emits Prometheus/OpenTelemetry metrics adhering to `docs/instrumentation.md`:
 ## 11. Verification & Testing Plan
 
 1. **Unit Tests**:
-   * `test_variant_binary_encoding`: Validates Arrow `StructArray` with Extension Metadata maps correctly.
+   * `test_variant_binary_encoding_sorted_keys`: Validates Arrow `StructArray` creation and strict lexicographical dictionary sorting.
    * `test_collision_free_naming`: Validates UUIDv7 uniqueness and ordering.
    * `test_global_memory_eviction`: Simulates memory pressure and asserts early forced rolling.
 2. **Integration Tests**:
+   * `test_s3_5mb_coalescing`: Asserts that small flushes are correctly buffered to $\ge$ 5MB before hitting the mock object store.
    * `test_idle_partition_sweep`: Asserts the background ticker closes stale writers without new incoming data.
    * `test_multipart_upload_abort`: Induces failure mid-upload and asserts `tokio::spawn` background abort runs successfully.
-   * `test_sync_writer_async_uploader`: Validates that the synchronous ArrowWriter correctly pipes data to the Async Uploader task without blocking the Tokio reactor.
