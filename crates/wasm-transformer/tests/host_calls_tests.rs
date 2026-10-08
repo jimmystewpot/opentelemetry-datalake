@@ -851,8 +851,86 @@ fn test_legacy_3arg_vs_new_1arg_log_signature_mismatch_prevention() {
     assert!(test_fn.call(&mut store, ()).is_ok());
 }
 
+#[derive(Clone)]
+struct CapturedLog {
+    level: tracing::Level,
+    target: String,
+    file: String,
+    line: u32,
+    component: String,
+    message: String,
+}
+
+impl Default for CapturedLog {
+    fn default() -> Self {
+        Self {
+            level: tracing::Level::TRACE,
+            target: String::new(),
+            file: String::new(),
+            line: 0,
+            component: String::new(),
+            message: String::new(),
+        }
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut CapturedLog);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let formatted = format!("{value:?}");
+        match field.name() {
+            "message" => self.0.message = formatted,
+            "component" => self.0.component = formatted,
+            "target" => self.0.target = formatted,
+            "file" => self.0.file = formatted,
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "component" => self.0.component = value.to_string(),
+            "target" => self.0.target = value.to_string(),
+            "file" => self.0.file = value.to_string(),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "line"
+            && let Ok(val) = u32::try_from(value)
+        {
+            self.0.line = val;
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct LogCollector(Arc<std::sync::Mutex<Vec<CapturedLog>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCollector {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut log = CapturedLog {
+            level: *event.metadata().level(),
+            ..Default::default()
+        };
+
+        event.record(&mut FieldVisitor(&mut log));
+        if let Ok(mut lock) = self.0.lock() {
+            lock.push(log);
+        }
+    }
+}
+
 #[test]
 fn test_host_log_record_decoding_all_5_log_levels() {
+    use tracing_subscriber::layer::SubscriberExt;
+
     let engine = Engine::default();
     let registry = Arc::new(MetricRegistry::new("levels_comp"));
     let linker = build_host_linker(&engine).unwrap();
@@ -892,9 +970,44 @@ fn test_host_log_record_decoding_all_5_log_levels() {
         .get_typed_func::<(i32, i32), ()>(&mut store, "emit_level")
         .unwrap();
 
-    for (level, line) in [(1, 42), (2, 84), (3, 126), (4, 168), (5, 210), (99, 252)] {
-        assert!(emit_fn.call(&mut store, (level, line)).is_ok());
-    }
+    let collector = LogCollector::default();
+    let subscriber = tracing_subscriber::registry().with(collector.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for (level, line) in [(1, 42), (2, 84), (3, 126), (4, 168), (5, 210), (99, 252)] {
+            assert!(emit_fn.call(&mut store, (level, line)).is_ok());
+        }
+    });
+
+    let events = collector.0.lock().unwrap().clone();
+    assert_eq!(events.len(), 6);
+
+    // Verify first event (level 1 = ERROR, line = 42)
+    assert_eq!(events[0].level, tracing::Level::ERROR);
+    assert_eq!(events[0].line, 42);
+    assert_eq!(events[0].component, "levels_comp");
+    assert_eq!(events[0].target, "wasm_module::plugin");
+    assert_eq!(events[0].file, "src/lib.rs");
+    assert!(events[0].message.contains("structured log message"));
+
+    // Verify second event (level 2 = WARN, line = 84)
+    assert_eq!(events[1].level, tracing::Level::WARN);
+    assert_eq!(events[1].line, 84);
+
+    // Verify third event (level 3 = INFO, line = 126)
+    assert_eq!(events[2].level, tracing::Level::INFO);
+    assert_eq!(events[2].line, 126);
+
+    // Verify fourth event (level 4 = DEBUG, line = 168)
+    assert_eq!(events[3].level, tracing::Level::DEBUG);
+    assert_eq!(events[3].line, 168);
+
+    // Verify fifth event (level 5 = TRACE, line = 210)
+    assert_eq!(events[4].level, tracing::Level::TRACE);
+    assert_eq!(events[4].line, 210);
+
+    // Verify unknown level 99 falls back to TRACE, line = 252
+    assert_eq!(events[5].level, tracing::Level::TRACE);
+    assert_eq!(events[5].line, 252);
 }
 
 #[test]

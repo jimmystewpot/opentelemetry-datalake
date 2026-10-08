@@ -26,8 +26,11 @@ pub fn init_panic_hook() {
         #[cfg(target_arch = "wasm32")]
         {
             let target = "wasm_guest::panic";
-            let file = file!();
-            let line = line!();
+            let (file, line) = if let Some(loc) = info.location() {
+                (loc.file(), loc.line())
+            } else {
+                ("unknown", 0)
+            };
             let record = HostLogRecord {
                 level: LOG_LEVEL_ERROR,
                 msg_ptr: msg.as_ptr() as usize as u32,
