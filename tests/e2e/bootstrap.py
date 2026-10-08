@@ -16,6 +16,7 @@ def ensure_bucket(endpoint, access_key, secret_key, bucket_name="warehouse", ret
                 key=access_key,
                 secret=secret_key,
                 client_kwargs={"endpoint_url": endpoint},
+                config_kwargs={"s3": {"addressing_style": "path"}},
             )
             if not fs.exists(bucket_name):
                 fs.mkdir(bucket_name)
@@ -57,6 +58,7 @@ def main():
             "s3.access-key-id": "admin",
             "s3.secret-access-key": "password",
             "s3.region": "us-east-1",
+            "s3.path-style-access": "true",
         }
     )
 
