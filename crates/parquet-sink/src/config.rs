@@ -525,13 +525,14 @@ mod tests {
     fn test_build_operator_azblob() {
         let mut storage_options = HashMap::new();
         storage_options.insert("azure_account_name".to_string(), "myaccount".to_string());
+        storage_options.insert("azure_endpoint".to_string(), "https://myaccount.blob.core.windows.net".to_string());
         let config = ParquetSinkConfig {
             storage_uri: "azblob://my-container/telemetry".to_string(),
             storage_options,
             ..Default::default()
         };
         let op = config.build_operator();
-        assert!(op.is_ok());
+        assert!(op.is_ok(), "op is err: {:?}", op.err());
     }
 
     #[test]
