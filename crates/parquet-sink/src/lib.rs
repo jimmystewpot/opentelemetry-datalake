@@ -6,6 +6,7 @@ pub mod naming;
 pub mod router;
 pub mod uploader;
 pub mod variant;
+pub mod writer;
 
 pub use config::{CompressionCodec, ParquetSinkConfig};
 pub use error::ParquetSinkError;
@@ -13,3 +14,4 @@ pub use naming::FileNamer;
 pub use router::{PreparedBatch, SignalRouter};
 pub use uploader::{AsyncUploader, UploaderHandle, UploaderSender};
 pub use variant::{VariantEncoder, VariantTransformer};
+pub use writer::{ChannelWriter, PartitionWriter};
