@@ -305,6 +305,7 @@ impl PartitionManager {
     }
 
     /// Routes a homogeneous sub-batch directly to the active writer for `partition_id`.
+    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
     fn route_sub_batch(
         &mut self,
         partition_id: PartitionId,
@@ -314,22 +315,25 @@ impl PartitionManager {
             return Ok(());
         }
 
-        let batch_memory = batch.get_array_memory_size();
+        let total_rows = batch.num_rows();
+        let total_batch_memory = batch.get_array_memory_size();
+
         if self.config.global_memory_limit_bytes > 0
-            && batch_memory > self.config.global_memory_limit_bytes
+            && total_batch_memory > self.config.global_memory_limit_bytes
         {
             return Err(ParquetSinkError::Config(format!(
-                "RecordBatch size ({batch_memory} bytes) exceeds global memory limit ({} bytes)",
+                "RecordBatch size ({total_batch_memory} bytes) exceeds global memory limit ({} bytes)",
                 self.config.global_memory_limit_bytes
             )));
         }
 
         self.global_memory_bytes
-            .fetch_add(batch_memory, Ordering::Relaxed);
+            .fetch_add(total_batch_memory, Ordering::Relaxed);
 
         // Evict oldest partition if memory limit exceeded
-        while self.global_memory_bytes.load(Ordering::Relaxed)
-            > self.config.global_memory_limit_bytes
+        while self.config.global_memory_limit_bytes > 0
+            && self.global_memory_bytes.load(Ordering::Relaxed)
+                > self.config.global_memory_limit_bytes
             && !self.writers.is_empty()
         {
             if let Some(oldest_key) = self.lru_order.front().cloned() {
@@ -339,27 +343,55 @@ impl PartitionManager {
             }
         }
 
-        // If writer already exists, check rolling triggers
-        if let Some(active_writer) = self.writers.get_mut(&partition_id) {
-            let should_roll = (self.config.max_records > 0
-                && active_writer.writer.records_written() >= self.config.max_records)
-                || (self.config.max_file_size_bytes > 0
-                    && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
-                || (self.config.max_file_interval_sec > 0
-                    && active_writer.opened_at.elapsed().as_secs()
-                        >= self.config.max_file_interval_sec);
+        let mut current_batch = batch.clone();
 
-            if should_roll {
-                self.close_writer(&partition_id)?;
+        while current_batch.num_rows() > 0 {
+            let num_rows = current_batch.num_rows();
+            let mut write_len = num_rows;
+
+            if self.config.max_records > 0 {
+                if let Some(active_writer) = self.writers.get(&partition_id) {
+                    let written = active_writer.writer.records_written();
+                    let remaining = self.config.max_records.saturating_sub(written);
+                    if remaining == 0 {
+                        self.close_writer(&partition_id)?;
+                        continue;
+                    }
+                    if write_len > remaining {
+                        write_len = remaining;
+                    }
+                } else if write_len > self.config.max_records {
+                    write_len = self.config.max_records;
+                }
+            }
+
+            let slice = if write_len == num_rows {
+                current_batch.clone()
             } else {
-                // Update LRU order
+                current_batch.slice(0, write_len)
+            };
+
+            let slice_memory = (total_batch_memory * write_len) / total_rows;
+
+            if let Some(active_writer) = self.writers.get_mut(&partition_id) {
+                let should_roll = (self.config.max_file_size_bytes > 0
+                    && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
+                    || (self.config.max_file_interval_sec > 0
+                        && active_writer.opened_at.elapsed().as_secs()
+                            >= self.config.max_file_interval_sec);
+
+                if should_roll {
+                    self.close_writer(&partition_id)?;
+                    continue;
+                }
+
                 if let Some(pos) = self.lru_order.iter().position(|k| k == &partition_id) {
                     self.lru_order.remove(pos);
                 }
                 self.lru_order.push_back(partition_id.clone());
 
-                active_writer.buffered_memory += batch_memory;
-                active_writer.writer.write_batch(batch)?;
+                active_writer.buffered_memory += slice_memory;
+                active_writer.writer.write_batch(&slice)?;
 
                 if (self.config.max_records > 0
                     && active_writer.writer.records_written() >= self.config.max_records)
@@ -368,53 +400,55 @@ impl PartitionManager {
                 {
                     self.close_writer(&partition_id)?;
                 }
-                return Ok(());
-            }
-        }
-
-        // Evict LRU writer if pool reached max_open_partitions
-        while self.writers.len() >= self.config.max_open_partitions && !self.writers.is_empty() {
-            if let Some(oldest_key) = self.lru_order.front().cloned() {
-                self.close_writer(&oldest_key)?;
             } else {
+                while self.writers.len() >= self.config.max_open_partitions
+                    && !self.writers.is_empty()
+                {
+                    if let Some(oldest_key) = self.lru_order.front().cloned() {
+                        self.close_writer(&oldest_key)?;
+                    } else {
+                        break;
+                    }
+                }
+
+                let seq = self.next_sequence();
+                let filename = self.namer.generate_filename(&partition_id.path, seq);
+                let (uploader_sender, uploader_handle) =
+                    AsyncUploader::start(&self.operator, &filename)?;
+                let mut partition_writer =
+                    PartitionWriter::try_new(slice.schema(), uploader_sender, &self.config)?;
+
+                partition_writer.write_batch(&slice)?;
+
+                let active = ActiveWriter {
+                    writer: partition_writer,
+                    uploader_handle,
+                    opened_at: Instant::now(),
+                    buffered_memory: slice_memory,
+                };
+
+                if (self.config.max_records > 0
+                    && active.writer.records_written() >= self.config.max_records)
+                    || (self.config.max_file_size_bytes > 0
+                        && active.writer.bytes_written() >= self.config.max_file_size_bytes)
+                {
+                    self.retire_active_writer(active)?;
+                    self.in_flight_uploads.retain(|jh| !jh.is_finished());
+                    self.check_background_errors()?;
+                } else {
+                    self.writers.insert(partition_id.clone(), active);
+                    self.lru_order.push_back(partition_id.clone());
+                }
+            }
+
+            if write_len == num_rows {
                 break;
             }
-        }
-
-        // Open new writer
-        let seq = self.next_sequence();
-        let filename = self.namer.generate_filename(&partition_id.path, seq);
-        let (uploader_sender, uploader_handle) = AsyncUploader::start(&self.operator, &filename)?;
-        let mut partition_writer =
-            PartitionWriter::try_new(batch.schema(), uploader_sender, &self.config)?;
-
-        partition_writer.write_batch(batch)?;
-
-        let active = ActiveWriter {
-            writer: partition_writer,
-            uploader_handle,
-            opened_at: Instant::now(),
-            buffered_memory: batch_memory,
-        };
-
-        if (self.config.max_records > 0
-            && active.writer.records_written() >= self.config.max_records)
-            || (self.config.max_file_size_bytes > 0
-                && active.writer.bytes_written() >= self.config.max_file_size_bytes)
-        {
-            self.retire_active_writer(active)?;
-            self.in_flight_uploads.retain(|jh| !jh.is_finished());
-            self.check_background_errors()?;
-        } else {
-            self.writers.insert(partition_id.clone(), active);
-            self.lru_order.push_back(partition_id);
+            current_batch = current_batch.slice(write_len, num_rows - write_len);
         }
 
         Ok(())
     }
-
-    /// Retires an active partition writer, finalizes the Parquet file, and spawns
-    /// a tracked background task to commit the upload with error reporting.
     fn retire_active_writer(&mut self, active: ActiveWriter) -> Result<(), ParquetSinkError> {
         self.global_memory_bytes
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -486,6 +520,9 @@ impl PartitionManager {
     /// Returns [`ParquetSinkError`] if closing or committing any expired writer fails.
     pub fn sweep_idle_writers(&mut self) -> Result<(), ParquetSinkError> {
         self.check_background_errors()?;
+        if self.config.max_file_interval_sec == 0 {
+            return Ok(());
+        }
         let max_interval = Duration::from_secs(self.config.max_file_interval_sec);
         let idle_keys: Vec<PartitionId> = self
             .writers
@@ -990,5 +1027,136 @@ mod tests {
 
         // Assert queue is empty (drained)
         assert!(manager.in_flight_uploads.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_zero_memory_limit_does_not_evict_all_writers() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            global_memory_limit_bytes: 0, // 0 means disabled
+            max_open_partitions: 10,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        // Write a large batch
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&b1, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+
+        let b2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000 + 3600_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![2])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b2, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 2); // Still 2, no eviction happened due to memory
+    }
+
+    #[tokio::test]
+    async fn test_zero_file_interval_disables_sweep() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_file_interval_sec: 0,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        let b1 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b1, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        manager.sweep_idle_writers().unwrap();
+        assert_eq!(manager.active_writer_count(), 1); // 0 means sweep disabled
+    }
+
+    #[tokio::test]
+    async fn test_large_batch_is_sliced_across_multiple_files_on_max_records() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_records: 2,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        // Batch of 5 rows
+        let b1 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                    1_700_000_000_000_000_000,
+                    1_700_000_000_000_000_000,
+                    1_700_000_000_000_000_000,
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&b1, "logs").unwrap();
+
+        // 5 rows with max_records=2 means:
+        // writer1 gets 2 rows (then closes)
+        // writer2 gets 2 rows (then closes)
+        // writer3 gets 1 row (stays open)
+        assert_eq!(manager.active_writer_count(), 1);
+
+        // The background tasks should be spawned for the 2 closed writers
+        assert_eq!(manager.in_flight_uploads.len(), 2);
     }
 }
