@@ -18,6 +18,8 @@ opendal = { version = "0.58", default-features = false, features = ["services-fs
 tokio = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+smallvec = { version = "1.16" }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }

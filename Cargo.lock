@@ -4052,6 +4052,8 @@ dependencies = [
  "parquet",
  "pipeline-core",
  "serde",
+ "serde_json",
+ "smallvec",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
