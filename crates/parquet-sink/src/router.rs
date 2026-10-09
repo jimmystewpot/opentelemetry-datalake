@@ -12,9 +12,9 @@ use smallvec::SmallVec;
 use crate::error::ParquetSinkError;
 use crate::variant::VariantTransformer;
 
-static LOG_CANDIDATE_COLUMNS: [&str; 3] = ["attributes", "resource_attributes", "body"];
+static LOG_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
 static TRACE_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
-static METRIC_CANDIDATE_COLUMNS: [&str; 3] = ["attributes", "resource_attributes", "datapoints"];
+static METRIC_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
 
 /// A record batch prepared and annotated with its signal type for partitioning and storage.
 #[derive(Debug, Clone)]
@@ -211,13 +211,13 @@ mod tests {
                 .data_type(),
             DataType::Struct(_)
         ));
-        assert!(matches!(
+        assert_eq!(
             out_schema
                 .field_with_name("body")
                 .expect("body exists")
                 .data_type(),
-            DataType::Struct(_)
-        ));
+            &DataType::Utf8
+        );
         // Untouched column remains Utf8
         assert_eq!(
             out_schema
@@ -376,90 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn test_route_metrics_polymorphic_datapoints() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("attributes", DataType::Utf8, true),
-            Field::new("resource_attributes", DataType::Utf8, true),
-            Field::new("datapoints", DataType::Utf8, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(vec![
-                    "cpu_usage",
-                    "request_count",
-                    "latency_hist",
-                ])),
-                Arc::new(StringArray::from(vec![
-                    Some(r#"{"host":"node-1"}"#),
-                    Some(r#"{"endpoint":"/health"}"#),
-                    Some(r#"{"method":"GET"}"#),
-                ])),
-                Arc::new(StringArray::from(vec![
-                    Some(r#"{"cluster":"us-east"}"#),
-                    Some(r#"{"cluster":"us-east"}"#),
-                    Some(r#"{"cluster":"us-east"}"#),
-                ])),
-                // Polymorphic datapoints across 3 different metric types:
-                Arc::new(StringArray::from(vec![
-                    Some(r#"{"type":"gauge","as_double":42.5}"#),
-                    Some(r#"{"type":"sum","as_int":1000}"#),
-                    Some(r#"{"type":"histogram","bucket_counts":[10,20,5],"explicit_bounds":[0.1,0.5]}"#),
-                ])),
-            ],
-        )
-        .expect("batch creation succeeds");
-
-        let router = SignalRouter::new(true);
-        let prepared = router
-            .route_and_prepare(SignalBatch::Metrics(batch))
-            .expect("route metrics succeeds");
-        assert_eq!(prepared.signal, "metrics");
-
-        let out_schema = prepared.batch.schema();
-        assert_eq!(
-            out_schema
-                .field_with_name("name")
-                .expect("name exists")
-                .data_type(),
-            &DataType::Utf8
-        );
-        assert!(matches!(
-            out_schema
-                .field_with_name("attributes")
-                .expect("attributes exists")
-                .data_type(),
-            DataType::Struct(_)
-        ));
-        assert!(matches!(
-            out_schema
-                .field_with_name("resource_attributes")
-                .expect("resource_attributes exists")
-                .data_type(),
-            DataType::Struct(_)
-        ));
-        assert!(matches!(
-            out_schema
-                .field_with_name("datapoints")
-                .expect("datapoints exists")
-                .data_type(),
-            DataType::Struct(_)
-        ));
-
-        // Verify that the datapoints column has 3 rows and valid Variant struct fields
-        let dp_col = prepared
-            .batch
-            .column_by_name("datapoints")
-            .expect("datapoints column exists");
-        assert_eq!(dp_col.len(), 3);
-        let struct_col = dp_col
-            .as_any()
-            .downcast_ref::<arrow::array::StructArray>()
-            .expect("downcasts to StructArray");
-        assert_eq!(struct_col.num_columns(), 2);
-    }
-
     #[test]
     fn test_route_metrics_without_datapoints() {
         let schema = Arc::new(Schema::new(vec![

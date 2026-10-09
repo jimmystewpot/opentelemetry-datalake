@@ -21,8 +21,8 @@ pub type OwnedVariantBytes = (Vec<u8>, Vec<u8>);
 /// Type alias for borrowed `(metadata, value)` Variant binary slices.
 pub type EncodedVariantBytes<'a> = (&'a [u8], &'a [u8]);
 
-/// Static minimal metadata for an empty object: version 1 (0x01) followed by 4-byte 0 count.
-pub static STATIC_EMPTY_METADATA: [u8; 5] = [0x01, 0x00, 0x00, 0x00, 0x00];
+/// Static minimal metadata for an empty object: version 1 (0x01) followed by 1-byte 0 count, 1-byte 0 offset.
+pub static STATIC_EMPTY_METADATA: [u8; 3] = [0x01, 0x00, 0x00];
 
 /// Static minimal value for an empty object: Object basic type (0x02) with 0 count (0x00) and 0 offset (0x00).
 pub static STATIC_EMPTY_VALUE: [u8; 3] = [0x02, 0x00, 0x00];
@@ -116,64 +116,55 @@ impl VariantEncoder {
     /// Parses dictionary keys from a Variant metadata binary payload.
     #[must_use]
     pub fn parse_dictionary_keys(metadata: &[u8]) -> Vec<String> {
-        if metadata.len() < 5 {
+        if metadata.is_empty() {
             return Vec::new();
         }
+        let header = metadata[0];
         // Header byte check: version 1 in lowest 4 bits
-        if metadata[0] & 0x0F != 1 {
+        if header & 0x0F != 1 {
             return Vec::new();
         }
 
-        let Ok(count_bytes) = metadata[1..5].try_into() else {
+        let offset_size = (((header >> 4) & 0x03) + 1) as usize;
+        let mut pos = 1;
+
+        if metadata.len() < pos + offset_size {
             return Vec::new();
-        };
-        let count = usize::try_from(u32::from_le_bytes(count_bytes)).unwrap_or(0);
+        }
+        let count = Self::read_int_le(metadata, pos, offset_size);
+        pos += offset_size;
+
         if count == 0 {
             return Vec::new();
         }
 
-        let Some(offsets_len) = (count.checked_add(1)).and_then(|c| c.checked_mul(4)) else {
-            return Vec::new();
-        };
-        let Some(offsets_end) = 5usize.checked_add(offsets_len) else {
-            return Vec::new();
-        };
-        if metadata.len() < offsets_end {
-            return Vec::new();
-        }
-
-        let str_data = &metadata[offsets_end..];
-        let mut keys = Vec::with_capacity(count);
-
-        for i in 0..count {
-            let s_idx = 5 + i * 4;
-            let e_idx = s_idx + 4;
-            let next_e_idx = e_idx + 4;
-
-            let Ok(s_bytes) = metadata[s_idx..e_idx].try_into() else {
-                return Vec::new();
-            };
-            let Ok(e_bytes) = metadata[e_idx..next_e_idx].try_into() else {
-                return Vec::new();
-            };
-
-            let start = usize::try_from(u32::from_le_bytes(s_bytes)).unwrap_or(0);
-            let end = usize::try_from(u32::from_le_bytes(e_bytes)).unwrap_or(0);
-
-            if start > end || end > str_data.len() {
+        let mut offsets = Vec::with_capacity(count + 1);
+        for _ in 0..=count {
+            if metadata.len() < pos + offset_size {
                 return Vec::new();
             }
-
-            let Some(slice) = str_data.get(start..end) else {
-                return Vec::new();
-            };
-            let Ok(key_str) = std::str::from_utf8(slice) else {
-                return Vec::new();
-            };
-            keys.push(key_str.to_string());
+            offsets.push(Self::read_int_le(metadata, pos, offset_size));
+            pos += offset_size;
         }
 
+        let mut keys = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = pos + offsets[i];
+            let end = pos + offsets[i + 1];
+            if metadata.len() < end {
+                return Vec::new();
+            }
+            if let Ok(s) = std::str::from_utf8(&metadata[start..end]) {
+                keys.push(s.to_string());
+            }
+        }
         keys
+    }
+
+    fn read_int_le(bytes: &[u8], pos: usize, size: usize) -> usize {
+        let mut buf = [0u8; 8];
+        buf[..size].copy_from_slice(&bytes[pos..pos + size]);
+        usize::try_from(u64::from_le_bytes(buf)).unwrap_or(0)
     }
 
     fn encode_json_internal(&mut self, trimmed: &str) -> Result<(), ParquetSinkError> {
@@ -264,31 +255,39 @@ impl VariantEncoder {
 
     fn encode_dictionary_metadata(&mut self, keys: &[&str]) -> Result<(), ParquetSinkError> {
         self.meta_buf.clear();
-        self.meta_buf.push(0x01); // Version 1
 
-        let count = u32::try_from(keys.len()).map_err(|_| {
-            ParquetSinkError::VariantEncoding("dictionary key count exceeds u32::MAX".to_string())
-        })?;
-        self.meta_buf.extend_from_slice(&count.to_le_bytes());
-
-        let mut current_offset: u32 = 0;
-        let mut offsets: SmallVec<[u32; 32]> = SmallVec::with_capacity(keys.len() + 1);
-        offsets.push(0);
-
+        let count = keys.len();
+        let mut total_len: usize = 0;
         for k in keys {
-            let k_len = u32::try_from(k.len()).map_err(|_| {
-                ParquetSinkError::VariantEncoding(
-                    "dictionary key length exceeds u32::MAX".to_string(),
-                )
-            })?;
-            current_offset = current_offset.checked_add(k_len).ok_or_else(|| {
+            total_len = total_len.checked_add(k.len()).ok_or_else(|| {
                 ParquetSinkError::VariantEncoding("dictionary key offset overflow".to_string())
             })?;
-            offsets.push(current_offset);
         }
 
-        for off in offsets {
-            self.meta_buf.extend_from_slice(&off.to_le_bytes());
+        let max_val = std::cmp::max(total_len, count);
+        let offset_size = if max_val <= u8::MAX as usize {
+            1
+        } else if max_val <= u16::MAX as usize {
+            2
+        } else if max_val <= 0xFF_FFFF as usize {
+            3
+        } else {
+            4
+        };
+
+        // version 1 (bits 0-3), offset_size_minus_1 (bits 4-5), is_sorted = 1 (bit 6)
+        #[allow(clippy::cast_possible_truncation)]
+        let offset_size_minus_1 = (offset_size - 1) as u8;
+        let header_byte = 1 | (offset_size_minus_1 << 4) | (1 << 6);
+        self.meta_buf.push(header_byte);
+
+        Self::write_int_le(&mut self.meta_buf, count, offset_size);
+
+        let mut current_offset: usize = 0;
+        Self::write_int_le(&mut self.meta_buf, current_offset, offset_size);
+        for k in keys {
+            current_offset += k.len();
+            Self::write_int_le(&mut self.meta_buf, current_offset, offset_size);
         }
 
         for k in keys {
@@ -296,6 +295,11 @@ impl VariantEncoder {
         }
 
         Ok(())
+    }
+
+    fn write_int_le(buf: &mut SmallVec<[u8; 512]>, val: usize, size: usize) {
+        let bytes = val.to_le_bytes();
+        buf.extend_from_slice(&bytes[..size]);
     }
 }
 

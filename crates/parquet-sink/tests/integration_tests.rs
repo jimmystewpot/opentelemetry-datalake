@@ -188,33 +188,8 @@ fn verify_logs_file(schema: &Schema, batches: &[RecordBatch]) {
     assert!(schema.field_with_name("attributes").is_ok());
     assert!(schema.field_with_name("resource_attributes").is_ok());
 
-    assert_variant_struct_field(schema.field_with_name("body").unwrap());
     assert_variant_struct_field(schema.field_with_name("attributes").unwrap());
     assert_variant_struct_field(schema.field_with_name("resource_attributes").unwrap());
-
-    for batch in batches {
-        let body_col = batch
-            .column_by_name("body")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .expect("body is StructArray");
-        let meta_col = body_col
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("metadata is BinaryArray");
-        let val_col = body_col
-            .column(1)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .expect("value is BinaryArray");
-
-        for i in 0..batch.num_rows() {
-            assert!(!meta_col.value(i).is_empty(), "metadata bytes non-empty");
-            assert!(!val_col.value(i).is_empty(), "value bytes non-empty");
-        }
-    }
 }
 
 fn verify_traces_file(schema: &Schema, batches: &[RecordBatch]) {
@@ -265,7 +240,6 @@ fn verify_metrics_file(schema: &Schema, batches: &[RecordBatch]) {
 
     assert_variant_struct_field(schema.field_with_name("attributes").unwrap());
     assert_variant_struct_field(schema.field_with_name("resource_attributes").unwrap());
-    assert_variant_struct_field(schema.field_with_name("datapoints").unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
