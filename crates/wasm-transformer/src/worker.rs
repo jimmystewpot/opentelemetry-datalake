@@ -461,7 +461,7 @@ impl WasmWorker {
         }
     }
 
-    /// Rejuvenates the guest instance, dropping the old instance before re-instantiating.
+    /// Rejuvenates the guest instance by pre-instantiating a candidate replacement and swapping it on success, preserving the active instance if candidate instantiation fails.
     ///
     /// # Errors
     ///
@@ -475,6 +475,7 @@ impl WasmWorker {
         ) {
             Ok(g) => g,
             Err(e) => {
+                self.batches_processed = 0;
                 return Err(WasmTransformError::Unrecoverable(format!(
                     "Worker {} failed rejuvenation replacement: {e}",
                     self.id

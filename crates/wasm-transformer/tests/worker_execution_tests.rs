@@ -2370,3 +2370,48 @@ async fn test_worker_rejuvenate_instantiate_failure_returns_unrecoverable() {
     // Verify candidate failure did not drop the existing active instance
     assert!(worker.instance().is_some());
 }
+
+#[tokio::test]
+async fn test_worker_rejuvenate_instantiate_failure_resets_counter_and_avoids_retry_storm() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+
+    // With concurrency = 1, pooling headroom allocates 1 * 2 = 2 total instance slots
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 1; // Trigger rejuvenation on every batch
+    let mut worker = WasmWorker::new(
+        99,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        cfg,
+        test_registry(),
+    )
+    .unwrap();
+
+    // Fill pool slot by creating another worker so rejuvenation candidate instantiation fails
+    let _other_worker = WasmWorker::new(
+        100,
+        Arc::clone(&cache),
+        module,
+        default_test_config(),
+        test_registry(),
+    )
+    .unwrap();
+
+    let batch = create_test_record_batch();
+    // First batch succeeds, but post-batch rejuvenation fails due to pool exhaustion
+    let res = worker.execute_batch(SignalBatch::Logs(batch.clone()));
+    assert!(res.is_ok());
+
+    // Counter must be reset or backed off, so subsequent batch does not immediately re-attempt candidate instantiation
+    assert_eq!(worker.batches_processed(), 0);
+}
