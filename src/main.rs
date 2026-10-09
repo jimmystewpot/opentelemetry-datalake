@@ -2317,3 +2317,7 @@ mod tests {
         let _ = std::fs::remove_file(&wasm_path);
     }
 }
+pub fn check() {
+    let b = parquet::file::properties::WriterProperties::builder();
+    // b.set_data_page_version
+}

@@ -92,11 +92,11 @@ impl<'de> Deserialize<'de> for CompressionCodec {
             },
             Helper::Structured(s) => match s {
                 Structured::Zstd { level } => {
+                    #[allow(clippy::collapsible_if)]
                     if let Some(lvl) = level {
                         if let Err(e) = ZstdLevel::try_new(lvl) {
                             return Err(de::Error::custom(format!(
-                                "invalid zstd compression level: {}",
-                                e
+                                "invalid zstd compression level: {e}"
                             )));
                         }
                     }
@@ -228,6 +228,7 @@ impl Default for ParquetSinkConfig {
 
 impl ParquetSinkConfig {
     /// Builds an `OpenDAL` [`Operator`] configured according to `storage_uri` and `storage_options`.
+    #[allow(clippy::too_many_lines)]
     pub fn build_operator(&self) -> Result<opendal::Operator, ParquetSinkError> {
         let uri = self.storage_uri.trim();
         if uri.is_empty() {
@@ -465,9 +466,9 @@ mod tests {
             Err(ParquetSinkError::Config(_))
         ));
 
-        let toml_invalid = r#"
+        let toml_invalid = r"
             compression = { zstd = { level = 999 } }
-        "#;
+        ";
         let res: Result<ParquetSinkConfig, _> = toml::from_str(toml_invalid);
         assert!(res.is_err());
     }
@@ -535,7 +536,10 @@ mod tests {
     fn test_build_operator_azblob() {
         let mut storage_options = HashMap::new();
         storage_options.insert("azure_account_name".to_string(), "myaccount".to_string());
-        storage_options.insert("azure_endpoint".to_string(), "https://myaccount.blob.core.windows.net".to_string());
+        storage_options.insert(
+            "azure_endpoint".to_string(),
+            "https://myaccount.blob.core.windows.net".to_string(),
+        );
         let config = ParquetSinkConfig {
             storage_uri: "azblob://my-container/telemetry".to_string(),
             storage_options,

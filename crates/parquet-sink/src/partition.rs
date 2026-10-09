@@ -458,6 +458,12 @@ impl PartitionManager {
 
         active.writer.close()?;
 
+        if self.in_flight_uploads.len() >= self.config.max_concurrent_uploads {
+            return Err(crate::error::ParquetSinkError::Internal(
+                "Max concurrent uploads reached".into(),
+            ));
+        }
+
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             ParquetSinkError::Internal(
                 "No active Tokio runtime available to spawn background upload completion"
@@ -500,6 +506,7 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if any background upload task failed.
     pub fn check_background_errors(&mut self) -> Result<(), ParquetSinkError> {
+        self.in_flight_uploads.retain(|jh| !jh.is_finished());
         if let Ok(err) = self.error_receiver.try_recv() {
             return Err(err);
         }
@@ -1067,7 +1074,7 @@ mod tests {
             schema,
             vec![
                 Arc::new(TimestampNanosecondArray::from(vec![
-                    1_700_000_000_000_000_000 + 3600_000_000_000,
+                    1_700_000_000_000_000_000 + 3_600_000_000_000,
                 ])),
                 Arc::new(Int64Array::from(vec![2])),
             ],
@@ -1159,31 +1166,7 @@ mod tests {
         // The background tasks should be spawned for the 2 closed writers
         assert_eq!(manager.in_flight_uploads.len(), 2);
     }
-}
 
-    #[tokio::test]
-    async fn test_in_flight_uploads_applies_backpressure_at_limit() {
-        let op = Operator::new(Memory::default()).unwrap();
-        let config = crate::config::ParquetSinkConfig {
-            max_concurrent_uploads: 1, // Only 1 background upload allowed
-            ..Default::default()
-        };
-        let mut manager = PartitionManager::new(config, op);
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Nanosecond, None),
-                false,
-            ),
-            Field::new("val", DataType::Int64, false),
-        ]));
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        manager.in_flight_uploads.push(tokio::spawn(async move {
-            let _ = rx.await;
-            Ok(())
-        
     #[tokio::test]
     async fn test_in_flight_uploads_applies_backpressure_at_limit() {
         let op = Operator::new(Memory::default()).unwrap();
