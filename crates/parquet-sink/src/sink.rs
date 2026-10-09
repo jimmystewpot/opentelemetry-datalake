@@ -78,20 +78,24 @@ impl Sink for ParquetSink {
             tokio::select! {
                 maybe_batch = input.recv() => {
                     if let Some(batch) = maybe_batch {
-                        let prepared = self.router.route_and_prepare(batch)?;
-                        self.manager.route_prepared_batch(&prepared)?;
+                        tokio::task::block_in_place(|| {
+                            let prepared = self.router.route_and_prepare(batch)?;
+                            self.manager.route_prepared_batch(&prepared)
+                        })?;
                     } else {
                         tracing::debug!("ParquetSink input channel closed; draining all partition writers");
                         break;
                     }
                 }
                 _ = ticker.tick() => {
-                    self.manager.sweep_idle_writers()?;
+                    tokio::task::block_in_place(|| {
+                        self.manager.sweep_idle_writers()
+                    })?;
                 }
             }
         }
 
-        self.manager.flush_all()?;
+        tokio::task::block_in_place(|| self.manager.flush_all())?;
         self.manager.wait_for_all_uploads().await?;
         tracing::info!("ParquetSink successfully drained and committed all pending uploads");
 

@@ -28,24 +28,10 @@ impl UploaderSender {
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(
                 ParquetSinkError::Internal("Uploader channel closed".to_string()),
             ),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
-                let is_multithread = match tokio::runtime::Handle::try_current() {
-                    Ok(handle) => {
-                        handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-                    }
-                    Err(_) => false,
-                };
-                if is_multithread {
-                    return tokio::task::block_in_place(|| {
-                        self.tx.blocking_send(chunk).map_err(|e| {
-                            ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))
-                        })
-                    });
-                }
-                self.tx.blocking_send(chunk).map_err(|e| {
-                    ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))
-                })
-            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => self
+                .tx
+                .blocking_send(chunk)
+                .map_err(|e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))),
         }
     }
 

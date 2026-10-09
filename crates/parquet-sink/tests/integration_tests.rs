@@ -268,7 +268,7 @@ fn verify_metrics_file(schema: &Schema, batches: &[RecordBatch]) {
     assert_variant_struct_field(schema.field_with_name("datapoints").unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_e2e_write_and_read_back_variant_parquet() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = ParquetSinkConfig {
@@ -331,7 +331,7 @@ async fn test_e2e_write_and_read_back_variant_parquet() {
     assert!(verified_metrics, "Metrics parquet file verified");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_compression_codecs_roundtrip() {
     let codecs = [
         CompressionCodec::Zstd { level: Some(3) },
@@ -382,7 +382,7 @@ async fn test_compression_codecs_roundtrip() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_path_partitioning_hierarchy() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let config = ParquetSinkConfig {

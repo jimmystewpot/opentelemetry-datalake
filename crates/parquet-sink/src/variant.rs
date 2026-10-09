@@ -191,9 +191,9 @@ impl VariantEncoder {
                 }
 
                 // Recursively collect all keys across the JSON structure
-                let mut all_keys = Vec::new();
+                let mut all_keys: Vec<&str> = Vec::new();
                 for (k, v) in &map {
-                    all_keys.push(k.clone());
+                    all_keys.push(k.as_str());
                     collect_all_keys(v, &mut all_keys);
                 }
                 all_keys.sort_unstable();
@@ -216,7 +216,7 @@ impl VariantEncoder {
         }
     }
 
-    fn encode_dictionary_metadata(&mut self, keys: &[String]) -> Result<(), ParquetSinkError> {
+    fn encode_dictionary_metadata(&mut self, keys: &[&str]) -> Result<(), ParquetSinkError> {
         self.meta_buf.clear();
         self.meta_buf.push(0x01); // Version 1
 
@@ -253,11 +253,11 @@ impl VariantEncoder {
     }
 }
 
-fn collect_all_keys(val: &serde_json::Value, keys: &mut Vec<String>) {
+fn collect_all_keys<'a>(val: &'a serde_json::Value, keys: &mut Vec<&'a str>) {
     match val {
         serde_json::Value::Object(map) => {
             for (k, v) in map {
-                keys.push(k.clone());
+                keys.push(k.as_str());
                 collect_all_keys(v, keys);
             }
         }
@@ -272,7 +272,7 @@ fn collect_all_keys(val: &serde_json::Value, keys: &mut Vec<String>) {
 
 fn encode_object_to_buf(
     map: &serde_json::Map<String, serde_json::Value>,
-    dictionary: &[String],
+    dictionary: &[&str],
     buf: &mut SmallVec<[u8; 2048]>,
 ) -> Result<(), ParquetSinkError> {
     let mut entries: Vec<(&str, &serde_json::Value)> =
@@ -350,7 +350,7 @@ fn encode_object_to_buf(
     // Field IDs referencing the dictionary
     for (k, _) in &entries {
         let id = dictionary
-            .binary_search_by(|entry| entry.as_str().cmp(k))
+            .binary_search_by(|entry| entry.cmp(k))
             .map_err(|_| {
                 ParquetSinkError::VariantEncoding(format!(
                     "dictionary key '{k}' missing during value encoding"
@@ -402,7 +402,7 @@ fn write_int_to_buf(
 
 fn encode_json_value(
     val: &serde_json::Value,
-    dictionary: &[String],
+    dictionary: &[&str],
     buf: &mut SmallVec<[u8; 256]>,
 ) -> Result<(), ParquetSinkError> {
     match val {
@@ -478,7 +478,7 @@ fn encode_json_value(
 
 fn encode_array_value(
     arr: &[serde_json::Value],
-    dictionary: &[String],
+    dictionary: &[&str],
     buf: &mut SmallVec<[u8; 256]>,
 ) -> Result<(), ParquetSinkError> {
     let num_elements = arr.len();

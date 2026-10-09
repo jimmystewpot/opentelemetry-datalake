@@ -24,7 +24,7 @@ fn find_parquet_files(dir: &Path) -> Vec<std::path::PathBuf> {
     parquet_files
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_parquet_sink_drains_on_channel_close() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ParquetSinkConfig {
@@ -73,7 +73,7 @@ async fn test_parquet_sink_drains_on_channel_close() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_parquet_sink_idle_sweeper_triggers_flush() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ParquetSinkConfig {
@@ -128,7 +128,7 @@ async fn test_parquet_sink_idle_sweeper_triggers_flush() {
         .expect("Sink run should finish Ok");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_parquet_sink_heterogeneous_signals() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ParquetSinkConfig {
