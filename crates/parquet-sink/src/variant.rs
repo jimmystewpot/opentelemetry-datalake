@@ -186,7 +186,27 @@ impl VariantEncoder {
                         "invalid JSON payload: {e}"
                     )));
                 }
-                serde_json::Value::String(trimmed.to_string())
+                // FAST PATH: Zero-allocation primitive string encoding
+                self.meta_buf.clear();
+                self.meta_buf.extend_from_slice(&STATIC_EMPTY_METADATA);
+                self.val_buf.clear();
+
+                let bytes = trimmed.as_bytes();
+                if bytes.len() < 64 {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let len_u8 = bytes.len() as u8;
+                    self.val_buf.push((len_u8 << 2) | 0x01);
+                } else {
+                    self.val_buf.push(0x40);
+                    let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
+                        ParquetSinkError::VariantEncoding(
+                            "string length exceeds u32::MAX".to_string(),
+                        )
+                    })?;
+                    self.val_buf.extend_from_slice(&len_u32.to_le_bytes());
+                }
+                self.val_buf.extend_from_slice(bytes);
+                return Ok(());
             }
         };
 

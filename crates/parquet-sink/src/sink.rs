@@ -81,19 +81,19 @@ impl Sink for ParquetSink {
                         run_blocking(|| {
                             let prepared = self.router.route_and_prepare(batch)?;
                             self.manager.route_prepared_batch(&prepared)
-                        })?;
+                        })??;
                     } else {
                         tracing::debug!("ParquetSink input channel closed; draining all partition writers");
                         break;
                     }
                 }
                 _ = ticker.tick() => {
-                    run_blocking(|| self.manager.sweep_idle_writers())?;
+                    run_blocking(|| self.manager.sweep_idle_writers())??;
                 }
             }
         }
 
-        run_blocking(|| self.manager.flush_all())?;
+        run_blocking(|| self.manager.flush_all())??;
         self.manager.wait_for_all_uploads().await?;
         tracing::info!("ParquetSink successfully drained and committed all pending uploads");
 
@@ -101,18 +101,43 @@ impl Sink for ParquetSink {
     }
 }
 
-/// Executes a closure, leveraging `block_in_place` on multi-threaded runtimes to prevent
-/// executor starvation while safely falling back to direct execution on current-thread runtimes.
-fn run_blocking<F, R>(f: F) -> R
+/// Executes a closure using `block_in_place` to prevent executor starvation.
+/// Rejects execution on single-threaded runtimes to prevent deadlocks and panics.
+fn run_blocking<F, R>(f: F) -> Result<R, PipelineError>
 where
     F: FnOnce() -> R,
 {
     let is_multithread = tokio::runtime::Handle::try_current()
         .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
 
-    if is_multithread {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
+    if !is_multithread {
+        return Err(PipelineError::Internal(
+            "ParquetSink requires a multi-threaded Tokio runtime to safely execute synchronous file uploads. \
+             Current-thread runtimes will deadlock and panic.".to_string(),
+        ));
+    }
+
+    Ok(tokio::task::block_in_place(f))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_run_blocking_rejects_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let res = run_blocking(|| 42);
+            assert!(res.is_err());
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("Current-thread runtimes will deadlock")
+            );
+        });
     }
 }

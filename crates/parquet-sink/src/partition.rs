@@ -522,11 +522,23 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if any background upload task failed.
     pub async fn wait_for_all_uploads(&mut self) -> Result<(), ParquetSinkError> {
+        let mut first_error = None;
         for jh in self.in_flight_uploads.drain(..) {
-            jh.await
-                .map_err(|e| ParquetSinkError::Internal(e.to_string()))??;
+            if let Err(e) = jh
+                .await
+                .map_err(|e| ParquetSinkError::Internal(e.to_string()))
+                .and_then(|r| r)
+            {
+                tracing::error!("Background upload failed during shutdown: {e}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
         self.check_background_errors()?;
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 }
@@ -945,5 +957,38 @@ mod tests {
                 .to_string()
                 .contains("Simulated S3 failure")
         );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_all_uploads_does_not_short_circuit() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        // First task fails
+        manager.in_flight_uploads.push(tokio::spawn(async {
+            Err(ParquetSinkError::Internal("First failed".to_string()))
+        }));
+
+        // Second task simulates long-running and succeeds
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        manager.in_flight_uploads.push(tokio::spawn(async move {
+            rx.await.unwrap();
+            Ok(())
+        }));
+
+        // Send completion to second task after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tx.send(()).unwrap();
+        });
+
+        // wait_for_all_uploads should wait for the second task and return the first error
+        let err = manager.wait_for_all_uploads().await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("First failed"));
+
+        // Assert queue is empty (drained)
+        assert!(manager.in_flight_uploads.is_empty());
     }
 }
