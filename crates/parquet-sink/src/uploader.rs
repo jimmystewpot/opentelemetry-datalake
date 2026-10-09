@@ -54,7 +54,9 @@ impl UploaderSender {
     /// Explicitly completes the sender, closing the channel and notifying the
     /// background task that all chunks have been emitted.
     pub fn finish(self) -> Result<(), ParquetSinkError> {
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) = self.tx.try_send(UploaderMessage::Finish) {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) =
+            self.tx.try_send(UploaderMessage::Finish)
+        {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let tx = self.tx.clone();
                 handle.spawn(async move {
