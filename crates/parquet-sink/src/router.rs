@@ -12,7 +12,7 @@ use smallvec::SmallVec;
 use crate::error::ParquetSinkError;
 use crate::variant::VariantTransformer;
 
-static LOG_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
+static LOG_CANDIDATE_COLUMNS: [&str; 3] = ["attributes", "resource_attributes", "body"];
 static TRACE_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
 static METRIC_CANDIDATE_COLUMNS: [&str; 3] = ["attributes", "resource_attributes", "datapoints"];
 
@@ -63,13 +63,13 @@ impl SignalRouter {
     pub fn route_and_prepare(&self, batch: SignalBatch) -> Result<PreparedBatch, ParquetSinkError> {
         match batch {
             SignalBatch::Logs(record_batch) => {
-                self.prepare_batch("logs", record_batch, &LOG_CANDIDATE_COLUMNS, true)
+                self.prepare_batch("logs", record_batch, &LOG_CANDIDATE_COLUMNS)
             }
             SignalBatch::Traces(record_batch) => {
-                self.prepare_batch("traces", record_batch, &TRACE_CANDIDATE_COLUMNS, false)
+                self.prepare_batch("traces", record_batch, &TRACE_CANDIDATE_COLUMNS)
             }
             SignalBatch::Metrics(record_batch) => {
-                self.prepare_batch("metrics", record_batch, &METRIC_CANDIDATE_COLUMNS, false)
+                self.prepare_batch("metrics", record_batch, &METRIC_CANDIDATE_COLUMNS)
             }
         }
     }
@@ -79,7 +79,6 @@ impl SignalRouter {
         signal: &'static str,
         batch: RecordBatch,
         candidate_columns: &[&'static str],
-        allow_body: bool,
     ) -> Result<PreparedBatch, ParquetSinkError> {
         if !self.variant_enabled {
             return Ok(PreparedBatch { signal, batch });
@@ -89,17 +88,11 @@ impl SignalRouter {
         let mut columns: SmallVec<[&str; 4]> = SmallVec::new();
 
         for &col in candidate_columns {
-            if schema.field_with_name(col).is_ok() {
+            if schema.field_with_name(col).is_ok_and(|field| {
+                matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
+            }) {
                 columns.push(col);
             }
-        }
-
-        if allow_body
-            && schema.field_with_name("body").is_ok_and(|field| {
-                matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8)
-            })
-        {
-            columns.push("body");
         }
 
         let transformed_batch = if columns.is_empty() {
@@ -510,6 +503,125 @@ mod tests {
                 .expect("datapoints exists")
                 .data_type(),
             &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn test_route_logs_non_string_attributes_skipped() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes", DataType::Int64, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(StringArray::from(vec![Some(r#"{"cluster":"us-west"}"#)])),
+            ],
+        )
+        .expect("batch creation succeeds");
+
+        let router = SignalRouter::new(true);
+        let prepared = router
+            .route_and_prepare(SignalBatch::Logs(batch))
+            .expect("route logs succeeds");
+        assert_eq!(prepared.signal, "logs");
+
+        let out_schema = prepared.batch.schema();
+        // Non-string attributes column is gracefully skipped and left unchanged
+        assert_eq!(
+            out_schema
+                .field_with_name("attributes")
+                .expect("attributes exists")
+                .data_type(),
+            &DataType::Int64
+        );
+        // Utf8 resource_attributes is converted to Variant Struct
+        assert!(matches!(
+            out_schema
+                .field_with_name("resource_attributes")
+                .expect("resource_attributes exists")
+                .data_type(),
+            DataType::Struct(_)
+        ));
+    }
+
+    #[test]
+    fn test_route_traces_non_string_candidate_columns_skipped() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attributes", DataType::Binary, true),
+            Field::new("resource_attributes", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(b"binary-attrs".as_slice())])),
+                Arc::new(StringArray::from(vec![Some(r#"{"service":"billing"}"#)])),
+            ],
+        )
+        .expect("batch creation succeeds");
+
+        let router = SignalRouter::new(true);
+        let prepared = router
+            .route_and_prepare(SignalBatch::Traces(batch))
+            .expect("route traces succeeds");
+        assert_eq!(prepared.signal, "traces");
+
+        let out_schema = prepared.batch.schema();
+        assert_eq!(
+            out_schema
+                .field_with_name("attributes")
+                .expect("attributes exists")
+                .data_type(),
+            &DataType::Binary
+        );
+        assert!(matches!(
+            out_schema
+                .field_with_name("resource_attributes")
+                .expect("resource_attributes exists")
+                .data_type(),
+            DataType::Struct(_)
+        ));
+    }
+
+    #[test]
+    fn test_route_metrics_non_string_datapoints_skipped() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("attributes", DataType::Utf8, true),
+            Field::new("datapoints", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["cpu"])),
+                Arc::new(StringArray::from(vec![Some(r#"{"host":"node-1"}"#)])),
+                Arc::new(Int64Array::from(vec![100])),
+            ],
+        )
+        .expect("batch creation succeeds");
+
+        let router = SignalRouter::new(true);
+        let prepared = router
+            .route_and_prepare(SignalBatch::Metrics(batch))
+            .expect("route metrics succeeds");
+        assert_eq!(prepared.signal, "metrics");
+
+        let out_schema = prepared.batch.schema();
+        assert!(matches!(
+            out_schema
+                .field_with_name("attributes")
+                .expect("attributes exists")
+                .data_type(),
+            DataType::Struct(_)
+        ));
+        // Non-string datapoints column is gracefully skipped and left unchanged
+        assert_eq!(
+            out_schema
+                .field_with_name("datapoints")
+                .expect("datapoints exists")
+                .data_type(),
+            &DataType::Int64
         );
     }
 
