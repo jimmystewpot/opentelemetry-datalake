@@ -134,10 +134,12 @@ impl Drop for ChannelWriter {
 }
 
 /// Builds Parquet [`WriterProperties`] based on the sink configuration.
-fn build_writer_properties(config: &ParquetSinkConfig) -> WriterProperties {
+fn build_writer_properties(
+    config: &ParquetSinkConfig,
+) -> Result<WriterProperties, ParquetSinkError> {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(config.compression.to_parquet_compression())
+        .set_compression(config.compression.to_parquet_compression()?)
         .set_dictionary_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Page);
 
@@ -156,7 +158,7 @@ fn build_writer_properties(config: &ParquetSinkConfig) -> WriterProperties {
         .set_column_bloom_filter_fpp(ColumnPath::from("span_id"), BLOOM_FILTER_FPP)
         .set_column_bloom_filter_max_ndv(ColumnPath::from("span_id"), BLOOM_FILTER_NDV);
 
-    builder.build()
+    Ok(builder.build())
 }
 
 /// Decoupled synchronous Parquet writer with Bloom filter support and selectable compression.
@@ -177,7 +179,7 @@ impl PartitionWriter {
         uploader: UploaderSender,
         config: &ParquetSinkConfig,
     ) -> Result<Self, ParquetSinkError> {
-        let props = build_writer_properties(config);
+        let props = build_writer_properties(config)?;
         let channel_writer = ChannelWriter::new(uploader, DEFAULT_CHUNK_BUFFER_SIZE);
         let arrow_writer = ArrowWriter::try_new(channel_writer, schema, Some(props))?;
         Ok(Self {
