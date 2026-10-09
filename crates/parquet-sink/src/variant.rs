@@ -24,8 +24,8 @@ pub type EncodedVariantBytes<'a> = (&'a [u8], &'a [u8]);
 /// Static minimal metadata for an empty object: version 1 (0x01) followed by 4-byte 0 count.
 pub static STATIC_EMPTY_METADATA: [u8; 5] = [0x01, 0x00, 0x00, 0x00, 0x00];
 
-/// Static minimal value for an empty object: Object basic type (0x02) with 0 count (0x00).
-pub static STATIC_EMPTY_VALUE: [u8; 2] = [0x02, 0x00];
+/// Static minimal value for an empty object: Object basic type (0x02) with 0 count (0x00) and 0 offset (0x00).
+pub static STATIC_EMPTY_VALUE: [u8; 3] = [0x02, 0x00, 0x00];
 
 thread_local! {
     static LOCAL_ENCODER: RefCell<VariantEncoder> = RefCell::new(VariantEncoder::new());
@@ -192,7 +192,10 @@ impl VariantEncoder {
 
                 // Recursively collect all keys across the JSON structure
                 let mut all_keys = Vec::new();
-                collect_all_keys(&serde_json::Value::Object(map.clone()), &mut all_keys);
+                for (k, v) in &map {
+                    all_keys.push(k.clone());
+                    collect_all_keys(v, &mut all_keys);
+                }
                 all_keys.sort_unstable();
                 all_keys.dedup();
 
@@ -327,10 +330,10 @@ fn encode_object_to_buf(
         _ => 3,
     };
 
-    let value_header = (is_large_bit & 0x01)
-        | ((field_id_size_minus_one & 0x03) << 1)
-        | ((field_offset_size_minus_one & 0x03) << 3);
-    let value_metadata = (value_header << 2) | 0x02; // basic_type = 2 (Object)
+    let object_header = (field_offset_size_minus_one & 0x03)
+        | ((field_id_size_minus_one & 0x03) << 2)
+        | ((is_large_bit & 0x01) << 4);
+    let value_metadata = (object_header << 2) | 0x02; // basic_type = 2 (Object)
 
     buf.push(value_metadata);
 
@@ -453,8 +456,8 @@ fn encode_json_value(
                 buf.extend_from_slice(bytes);
                 return Ok(());
             }
-            // Long string: primitive_header = 8 -> (8 << 2) | 0 = 0x20
-            buf.push(0x20);
+            // Long string: primitive_header = 16 -> (16 << 2) | 0 = 0x40
+            buf.push(0x40);
             let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
                 ParquetSinkError::VariantEncoding("string length exceeds u32::MAX".to_string())
             })?;
@@ -515,8 +518,8 @@ fn encode_array_value(
         _ => 3,
     };
 
-    let value_header = (is_large_bit & 0x01) | ((field_offset_size_minus_one & 0x03) << 1);
-    let value_metadata = (value_header << 2) | 0x03; // basic_type = 3 (Array)
+    let array_header = (field_offset_size_minus_one & 0x03) | ((is_large_bit & 0x01) << 2);
+    let value_metadata = (array_header << 2) | 0x03; // basic_type = 3 (Array)
 
     buf.push(value_metadata);
     if is_large {
@@ -874,5 +877,49 @@ mod tests {
         let schema = transformed.schema();
         let field = schema.field_with_name("attributes").unwrap();
         assert!(matches!(field.data_type(), DataType::Struct(_)));
+    }
+
+    #[test]
+    fn test_long_string_emits_header_0x40() {
+        let mut encoder = VariantEncoder::new();
+        let long_str = "x".repeat(70);
+        let json = format!("\"{long_str}\"");
+        let (_meta, val) = encoder.encode_json_str(&json).unwrap().unwrap();
+        // Long string primitive type ID 16 -> (16 << 2) | 0 = 0x40
+        assert_eq!(val[0], 0x40);
+        let len_bytes: [u8; 4] = val[1..5].try_into().unwrap();
+        assert_eq!(u32::from_le_bytes(len_bytes), 70);
+        assert_eq!(&val[5..], long_str.as_bytes());
+    }
+
+    #[test]
+    fn test_object_payload_greater_than_255_bytes_sets_offset_size_2() {
+        let mut encoder = VariantEncoder::new();
+        let s1 = "a".repeat(60);
+        let s2 = "b".repeat(60);
+        let s3 = "c".repeat(60);
+        let s4 = "d".repeat(60);
+        let s5 = "e".repeat(60);
+        let json =
+            format!(r#"{{"k1": "{s1}", "k2": "{s2}", "k3": "{s3}", "k4": "{s4}", "k5": "{s5}"}}"#);
+        let (_meta, val) = encoder.encode_json_str(&json).unwrap().unwrap();
+        let value_metadata = val[0];
+        assert_eq!(value_metadata & 0x03, 0x02); // Object basic type
+        let object_header = value_metadata >> 2;
+        // field_offset_size_minus_one is in bits 1-0 of object_header
+        // total payload is ~300 bytes (>255, <=65535) -> field_offset_size = 2 -> field_offset_size_minus_one = 1
+        assert_eq!(
+            object_header & 0x03,
+            1,
+            "bit 0 of object_header should be set for 2-byte offsets"
+        );
+    }
+
+    #[test]
+    fn test_static_empty_value_is_three_bytes() {
+        assert_eq!(STATIC_EMPTY_VALUE, [0x02, 0x00, 0x00]);
+        let mut encoder = VariantEncoder::new();
+        let (_meta, val) = encoder.encode_json_str("{}").unwrap().unwrap();
+        assert_eq!(val, vec![0x02, 0x00, 0x00]);
     }
 }
