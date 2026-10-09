@@ -28,19 +28,21 @@ pub enum CompressionCodec {
 
 impl CompressionCodec {
     /// Converts this codec into the underlying Parquet [`Compression`] setting.
-    #[must_use]
-    pub fn to_parquet_compression(&self) -> Compression {
+    pub fn to_parquet_compression(&self) -> Result<Compression, ParquetSinkError> {
         match *self {
             Self::Zstd { level } => {
-                let zstd_level = level
-                    .and_then(|lvl| ZstdLevel::try_new(lvl).ok())
-                    .unwrap_or_default();
-                Compression::ZSTD(zstd_level)
+                let zstd_level = match level {
+                    Some(lvl) => ZstdLevel::try_new(lvl).map_err(|e| {
+                        ParquetSinkError::Config(format!("Invalid Zstd level: {e}"))
+                    })?,
+                    None => ZstdLevel::default(),
+                };
+                Ok(Compression::ZSTD(zstd_level))
             }
-            Self::Snappy => Compression::SNAPPY,
-            Self::Lz4Raw => Compression::LZ4_RAW,
-            Self::Gzip => Compression::GZIP(GzipLevel::default()),
-            Self::Uncompressed => Compression::UNCOMPRESSED,
+            Self::Snappy => Ok(Compression::SNAPPY),
+            Self::Lz4Raw => Ok(Compression::LZ4_RAW),
+            Self::Gzip => Ok(Compression::GZIP(GzipLevel::default())),
+            Self::Uncompressed => Ok(Compression::UNCOMPRESSED),
         }
     }
 }
@@ -89,7 +91,17 @@ impl<'de> Deserialize<'de> for CompressionCodec {
                 ))),
             },
             Helper::Structured(s) => match s {
-                Structured::Zstd { level } => Ok(Self::Zstd { level }),
+                Structured::Zstd { level } => {
+                    if let Some(lvl) = level {
+                        if let Err(e) = ZstdLevel::try_new(lvl) {
+                            return Err(de::Error::custom(format!(
+                                "invalid zstd compression level: {}",
+                                e
+                            )));
+                        }
+                    }
+                    Ok(Self::Zstd { level })
+                }
                 Structured::Snappy => Ok(Self::Snappy),
                 Structured::Lz4Raw => Ok(Self::Lz4Raw),
                 Structured::Gzip => Ok(Self::Gzip),
@@ -250,6 +262,67 @@ impl ParquetSinkConfig {
                 }
             }
             opendal::Operator::new(builder)?
+        } else if let Some(gcs_path) = uri
+            .strip_prefix("gs://")
+            .or_else(|| uri.strip_prefix("gcs://"))
+        {
+            let (bucket, root) = match gcs_path.find('/') {
+                Some(idx) => (&gcs_path[..idx], &gcs_path[idx..]),
+                None => (gcs_path, "/"),
+            };
+            if bucket.is_empty() {
+                return Err(ParquetSinkError::Config(
+                    "GCS storage URI missing bucket name".to_string(),
+                ));
+            }
+            let mut builder = opendal::services::Gcs::default().bucket(bucket);
+            if !root.is_empty() {
+                builder = builder.root(root);
+            }
+            for (k, v) in &self.storage_options {
+                match k.as_str() {
+                    "endpoint" | "gcs_endpoint" => {
+                        builder = builder.endpoint(v);
+                    }
+                    "credential" | "gcs_credential" | "credentials" => {
+                        builder = builder.credential(v);
+                    }
+                    _ => {}
+                }
+            }
+            opendal::Operator::new(builder)?
+        } else if let Some(abfs_path) = uri
+            .strip_prefix("azblob://")
+            .or_else(|| uri.strip_prefix("abfs://"))
+        {
+            let (container, root) = match abfs_path.find('/') {
+                Some(idx) => (&abfs_path[..idx], &abfs_path[idx..]),
+                None => (abfs_path, "/"),
+            };
+            if container.is_empty() {
+                return Err(ParquetSinkError::Config(
+                    "Azblob storage URI missing container name".to_string(),
+                ));
+            }
+            let mut builder = opendal::services::Azblob::default().container(container);
+            if !root.is_empty() {
+                builder = builder.root(root);
+            }
+            for (k, v) in &self.storage_options {
+                match k.as_str() {
+                    "endpoint" | "azure_endpoint" => {
+                        builder = builder.endpoint(v);
+                    }
+                    "account_name" | "azure_account_name" => {
+                        builder = builder.account_name(v);
+                    }
+                    "account_key" | "azure_account_key" => {
+                        builder = builder.account_key(v);
+                    }
+                    _ => {}
+                }
+            }
+            opendal::Operator::new(builder)?
         } else if uri.starts_with("memory://") {
             #[cfg(any(test, feature = "services-memory"))]
             {
@@ -349,25 +422,44 @@ mod tests {
     #[test]
     fn test_to_parquet_compression() {
         assert_eq!(
-            CompressionCodec::Snappy.to_parquet_compression(),
+            CompressionCodec::Snappy.to_parquet_compression().unwrap(),
             Compression::SNAPPY
         );
         assert_eq!(
-            CompressionCodec::Lz4Raw.to_parquet_compression(),
+            CompressionCodec::Lz4Raw.to_parquet_compression().unwrap(),
             Compression::LZ4_RAW
         );
         assert_eq!(
-            CompressionCodec::Uncompressed.to_parquet_compression(),
+            CompressionCodec::Uncompressed
+                .to_parquet_compression()
+                .unwrap(),
             Compression::UNCOMPRESSED
         );
         assert!(matches!(
-            CompressionCodec::Zstd { level: Some(5) }.to_parquet_compression(),
+            CompressionCodec::Zstd { level: Some(5) }
+                .to_parquet_compression()
+                .unwrap(),
             Compression::ZSTD(_)
         ));
         assert!(matches!(
-            CompressionCodec::Gzip.to_parquet_compression(),
+            CompressionCodec::Gzip.to_parquet_compression().unwrap(),
             Compression::GZIP(_)
         ));
+    }
+
+    #[test]
+    fn test_invalid_zstd_level_returns_error() {
+        let codec = CompressionCodec::Zstd { level: Some(999) };
+        assert!(matches!(
+            codec.to_parquet_compression(),
+            Err(ParquetSinkError::Config(_))
+        ));
+
+        let toml_invalid = r#"
+            compression = { zstd = { level = 999 } }
+        "#;
+        let res: Result<ParquetSinkConfig, _> = toml::from_str(toml_invalid);
+        assert!(res.is_err());
     }
 
     #[test]
@@ -411,6 +503,36 @@ mod tests {
         };
         let op = config.build_operator();
         assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_gcs() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert(
+            "gcs_credential".to_string(),
+            "my-credential-json".to_string(),
+        );
+        let config = ParquetSinkConfig {
+            storage_uri: "gs://my-bucket/telemetry".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok());
+    }
+
+    #[test]
+    fn test_build_operator_azblob() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert("azure_account_name".to_string(), "myaccount".to_string());
+        storage_options.insert("azure_endpoint".to_string(), "https://myaccount.blob.core.windows.net".to_string());
+        let config = ParquetSinkConfig {
+            storage_uri: "azblob://my-container/telemetry".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok(), "op is err: {:?}", op.err());
     }
 
     #[test]
