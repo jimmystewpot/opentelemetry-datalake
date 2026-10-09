@@ -453,8 +453,14 @@ async fn test_worker_guards_out_of_bounds_batch_buffer() {
 
     let (_batch, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
     assert!(
-        err.to_string()
-            .contains("Batch IPC buffer bounds exceed guest memory size"),
+        matches!(
+            err,
+            WasmTransformError::InvalidMemoryBounds {
+                ptr: 60000,
+                len: 10000,
+                mem_size: 65536
+            }
+        ),
         "Unexpected error: {err}"
     );
 }
@@ -2123,4 +2129,289 @@ async fn test_worker_rejuvenates_and_recovers_after_guest_trap() {
     // Batch 2: Should reload and execute cleanly without failing from poisoned instance
     let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
     assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+}
+
+fn oob_response_header_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; offset 65530 + length 20 = 65550 > 65536
+            (i64.or (i64.shl (i64.const 65530) (i64.const 32)) (i64.const 20))
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_guards_out_of_bounds_memory_bounds() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(oob_response_header_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(80, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    let (_, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WasmTransformError::InvalidMemoryBounds {
+                ptr: 65530,
+                len: 20,
+                mem_size: 65536
+            }
+        ),
+        "Expected WasmTransformError::InvalidMemoryBounds, got: {err:?}"
+    );
+}
+
+fn integer_overflow_response_header_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; ptr = u32::MAX (0xFFFF_FFFF), len = 20
+            ;; (0xFFFF_FFFF_u64 << 32) | 20 = 0xFFFF_FFFF_0000_0014_u64 = -4294967276_i64
+            (i64.const -4294967276)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_guards_integer_overflow_memory_bounds() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(integer_overflow_response_header_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(81, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    let (_, err) = worker.execute_batch(SignalBatch::Logs(batch)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            WasmTransformError::InvalidMemoryBounds {
+                ptr: u32::MAX,
+                len: 20,
+                ..
+            }
+        ),
+        "Expected WasmTransformError::InvalidMemoryBounds for integer overflow, got: {err:?}"
+    );
+}
+
+fn identity_pointer_wat() -> &'static str {
+    r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param $len i32) (result i32)
+            (i32.const 1024)
+        )
+        (func (export "datalake_dealloc") (param $ptr i32) (param $len i32)
+            ;; Trap on double-free of input buffer (1024)
+            (if (i32.eq (local.get $ptr) (i32.const 1024))
+                (then
+                    (if (i32.eq (i32.load (i32.const 400)) (i32.const 1))
+                        (then (unreachable))
+                    )
+                    (i32.store (i32.const 400) (i32.const 1))
+                    (call $metric (i32.const 0) (i32.const 500) (i32.const 11) (i64.const 1))
+                )
+            )
+        )
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Header at 200: status=0, batch_count=1, batches_ptr=240, message_ptr=0, message_len=0
+            (i32.store (i32.const 200) (i32.const 0))
+            (i32.store (i32.const 204) (i32.const 1))
+            (i32.store (i32.const 208) (i32.const 240))
+            (i32.store (i32.const 212) (i32.const 0))
+            (i32.store (i32.const 216) (i32.const 0))
+            ;; BatchDescriptor at 240: output_ptr = $ptr (1024), len = $len
+            (i32.store (i32.const 240) (local.get $ptr))
+            (i32.store (i32.const 244) (local.get $len))
+            (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 20))
+        )
+        (data (i32.const 500) "dealloc_ipc")
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_identity_pointer_deallocates_once_no_double_free() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(identity_pointer_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(82, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.registry().read_counter("dealloc_ipc"), 1);
+}
+
+fn distinct_pointer_wat() -> &'static str {
+    r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param $len i32) (result i32)
+            (i32.const 1024)
+        )
+        (func (export "datalake_dealloc") (param $ptr i32) (param $len i32)
+            (if (i32.eq (local.get $ptr) (i32.const 1024))
+                (then
+                    (if (i32.eq (i32.load (i32.const 400)) (i32.const 1))
+                        (then (unreachable))
+                    )
+                    (i32.store (i32.const 400) (i32.const 1))
+                    (call $metric (i32.const 0) (i32.const 500) (i32.const 11) (i64.const 1))
+                )
+            )
+            (if (i32.eq (local.get $ptr) (i32.const 4096))
+                (then
+                    (if (i32.eq (i32.load (i32.const 404)) (i32.const 1))
+                        (then (unreachable))
+                    )
+                    (i32.store (i32.const 404) (i32.const 1))
+                    (call $metric (i32.const 0) (i32.const 520) (i32.const 11) (i64.const 1))
+                )
+            )
+        )
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Copy $len bytes from $ptr (1024) to 4096 (distinct output_ptr)
+            (memory.copy (i32.const 4096) (local.get $ptr) (local.get $len))
+            ;; Header at 200: status=0, batch_count=1, batches_ptr=240, message_ptr=0, message_len=0
+            (i32.store (i32.const 200) (i32.const 0))
+            (i32.store (i32.const 204) (i32.const 1))
+            (i32.store (i32.const 208) (i32.const 240))
+            (i32.store (i32.const 212) (i32.const 0))
+            (i32.store (i32.const 216) (i32.const 0))
+            ;; BatchDescriptor at 240: output_ptr = 4096, len = $len
+            (i32.store (i32.const 240) (i32.const 4096))
+            (i32.store (i32.const 244) (local.get $len))
+            (i64.or (i64.shl (i64.const 200) (i64.const 32)) (i64.const 20))
+        )
+        (data (i32.const 500) "dealloc_ipc")
+        (data (i32.const 520) "dealloc_out")
+    )"#
+}
+
+#[tokio::test]
+async fn test_worker_distinct_pointer_deallocates_both() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).unwrap());
+    let module = cache
+        .compile_module(&wat::parse_str(distinct_pointer_wat()).unwrap())
+        .unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(83, Arc::clone(&cache), module, cfg, test_registry()).unwrap();
+    let batch = create_test_record_batch();
+
+    let outcome = worker.execute_batch(SignalBatch::Logs(batch)).unwrap();
+    assert!(matches!(outcome, WorkerOutcome::Emitted(_)));
+    assert_eq!(worker.registry().read_counter("dealloc_ipc"), 1);
+    assert_eq!(worker.registry().read_counter("dealloc_out"), 1);
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenate_instantiate_failure_returns_unrecoverable() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+
+    // With concurrency = 1, pooling headroom allocates 1 * 2 = 2 total instance slots
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let cfg = default_test_config();
+    let mut worker = WasmWorker::new(
+        84,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        cfg,
+        test_registry(),
+    )
+    .unwrap();
+    assert!(worker.instance().is_some());
+
+    // Allocate the second (and final) pool slot with a second worker so the pool is 100% full
+    let _occupant = WasmWorker::new(
+        85,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        default_test_config(),
+        test_registry(),
+    )
+    .unwrap();
+
+    // Rejuvenate now attempts candidate instantiation prior to swapping, which exhausts the pool deterministically
+    let err = worker.rejuvenate().unwrap_err();
+    assert!(
+        matches!(err, WasmTransformError::Unrecoverable(ref msg) if msg.contains("failed rejuvenation replacement")),
+        "Expected Unrecoverable error, got: {err}"
+    );
+
+    // Verify candidate failure did not drop the existing active instance
+    assert!(worker.instance().is_some());
+}
+
+#[tokio::test]
+async fn test_worker_rejuvenate_instantiate_failure_resets_counter_and_avoids_retry_storm() {
+    let wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+    )"#;
+
+    // With concurrency = 1, pooling headroom allocates 1 * 2 = 2 total instance slots
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).unwrap());
+    let module = cache.compile_module(&wat::parse_str(wat).unwrap()).unwrap();
+
+    let mut cfg = default_test_config();
+    cfg.rejuvenate_batches = 1; // Trigger rejuvenation on every batch
+    let mut worker = WasmWorker::new(
+        99,
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        cfg,
+        test_registry(),
+    )
+    .unwrap();
+
+    // Fill pool slot by creating another worker so rejuvenation candidate instantiation fails
+    let _other_worker = WasmWorker::new(
+        100,
+        Arc::clone(&cache),
+        module,
+        default_test_config(),
+        test_registry(),
+    )
+    .unwrap();
+
+    let batch = create_test_record_batch();
+    // First batch succeeds, but post-batch rejuvenation fails due to pool exhaustion
+    let res = worker.execute_batch(SignalBatch::Logs(batch.clone()));
+    assert!(res.is_ok());
+
+    // Counter must be reset or backed off, so subsequent batch does not immediately re-attempt candidate instantiation
+    assert_eq!(worker.batches_processed(), 0);
 }
