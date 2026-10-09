@@ -177,8 +177,18 @@ impl VariantEncoder {
     }
 
     fn encode_json_internal(&mut self, trimmed: &str) -> Result<(), ParquetSinkError> {
-        let parsed: serde_json::Value = serde_json::from_str(trimmed)
-            .map_err(|e| ParquetSinkError::VariantEncoding(format!("invalid JSON payload: {e}")))?;
+        // If input is not valid JSON, check if it was intended as a JSON object/array or plain text
+        let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(e) => {
+                if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                    return Err(ParquetSinkError::VariantEncoding(format!(
+                        "invalid JSON payload: {e}"
+                    )));
+                }
+                serde_json::Value::String(trimmed.to_string())
+            }
+        };
 
         match parsed {
             serde_json::Value::Object(map) => {
@@ -202,6 +212,22 @@ impl VariantEncoder {
                 self.encode_dictionary_metadata(&all_keys)?;
                 self.val_buf.clear();
                 encode_object_to_buf(&map, &all_keys, &mut self.val_buf)?;
+                Ok(())
+            }
+            serde_json::Value::Array(arr) => {
+                // Recursively collect dictionary keys across array elements
+                let mut all_keys: Vec<&str> = Vec::new();
+                for v in &arr {
+                    collect_all_keys(v, &mut all_keys);
+                }
+                all_keys.sort_unstable();
+                all_keys.dedup();
+
+                self.encode_dictionary_metadata(&all_keys)?;
+                self.val_buf.clear();
+                let mut scratch: SmallVec<[u8; 256]> = SmallVec::new();
+                encode_array_value(&arr, &all_keys, &mut scratch)?;
+                self.val_buf.extend_from_slice(&scratch);
                 Ok(())
             }
             primitive => {
@@ -921,5 +947,34 @@ mod tests {
         let mut encoder = VariantEncoder::new();
         let (_meta, val) = encoder.encode_json_str("{}").unwrap().unwrap();
         assert_eq!(val, vec![0x02, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_plain_text_log_body_encodes_as_variant_string() {
+        let mut encoder = VariantEncoder::new();
+        let res = encoder.encode_json_str("test raw log message body");
+        assert!(res.is_ok());
+        let (meta, val) = res.unwrap().unwrap();
+        assert_eq!(meta[0], 0x01); // Version 1
+        // Short string has basic type 1: (len << 2) | 0x01
+        assert_eq!(val[0] & 0x03, 0x01);
+        assert_eq!(&val[1..], b"test raw log message body");
+    }
+
+    #[test]
+    fn test_top_level_array_with_nested_objects_resolves_dictionary() {
+        let mut encoder = VariantEncoder::new();
+        let json = r#"[{"key1": "val1"}, {"key2": "val2"}]"#;
+        let res = encoder.encode_json_str(json);
+        assert!(
+            res.is_ok(),
+            "Top-level array with objects should encode: {:?}",
+            res.err()
+        );
+        let (meta, val) = res.unwrap().unwrap();
+        assert_eq!(meta[0], 0x01);
+        let keys = encoder.extract_dictionary_keys(&meta);
+        assert_eq!(keys, vec!["key1", "key2"]);
+        assert_eq!(val[0] & 0x03, 0x03); // Array type
     }
 }

@@ -158,6 +158,8 @@ pub struct PartitionManager {
     global_memory_bytes: AtomicUsize,
     file_sequence: u16,
     in_flight_uploads: Vec<tokio::task::JoinHandle<Result<(), ParquetSinkError>>>,
+    error_sender: tokio::sync::mpsc::UnboundedSender<ParquetSinkError>,
+    error_receiver: tokio::sync::mpsc::UnboundedReceiver<ParquetSinkError>,
 }
 
 impl PartitionManager {
@@ -165,6 +167,7 @@ impl PartitionManager {
     #[must_use]
     pub fn new(config: ParquetSinkConfig, operator: Operator) -> Self {
         let namer = FileNamer::new(config.node_id.clone());
+        let (error_sender, error_receiver) = tokio::sync::mpsc::unbounded_channel();
         Self {
             config,
             operator,
@@ -174,6 +177,8 @@ impl PartitionManager {
             global_memory_bytes: AtomicUsize::new(0),
             file_sequence: 0,
             in_flight_uploads: Vec::new(),
+            error_sender,
+            error_receiver,
         }
     }
 
@@ -214,6 +219,8 @@ impl PartitionManager {
         batch: &RecordBatch,
         signal: &'static str,
     ) -> Result<(), ParquetSinkError> {
+        self.check_background_errors()?;
+
         let num_rows = batch.num_rows();
         if num_rows == 0 {
             return Ok(());
@@ -308,6 +315,15 @@ impl PartitionManager {
         }
 
         let batch_memory = batch.get_array_memory_size();
+        if self.config.global_memory_limit_bytes > 0
+            && batch_memory > self.config.global_memory_limit_bytes
+        {
+            return Err(ParquetSinkError::Config(format!(
+                "RecordBatch size ({batch_memory} bytes) exceeds global memory limit ({} bytes)",
+                self.config.global_memory_limit_bytes
+            )));
+        }
+
         self.global_memory_bytes
             .fetch_add(batch_memory, Ordering::Relaxed);
 
@@ -325,9 +341,13 @@ impl PartitionManager {
 
         // If writer already exists, check rolling triggers
         if let Some(active_writer) = self.writers.get_mut(&partition_id) {
-            let should_roll = active_writer.writer.records_written() >= self.config.max_records
-                || active_writer.writer.bytes_written() >= self.config.max_file_size_bytes
-                || active_writer.opened_at.elapsed().as_secs() >= self.config.max_file_interval_sec;
+            let should_roll = (self.config.max_records > 0
+                && active_writer.writer.records_written() >= self.config.max_records)
+                || (self.config.max_file_size_bytes > 0
+                    && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
+                || (self.config.max_file_interval_sec > 0
+                    && active_writer.opened_at.elapsed().as_secs()
+                        >= self.config.max_file_interval_sec);
 
             if should_roll {
                 self.close_writer(&partition_id)?;
@@ -341,8 +361,10 @@ impl PartitionManager {
                 active_writer.buffered_memory += batch_memory;
                 active_writer.writer.write_batch(batch)?;
 
-                if active_writer.writer.records_written() >= self.config.max_records
-                    || active_writer.writer.bytes_written() >= self.config.max_file_size_bytes
+                if (self.config.max_records > 0
+                    && active_writer.writer.records_written() >= self.config.max_records)
+                    || (self.config.max_file_size_bytes > 0
+                        && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
                 {
                     self.close_writer(&partition_id)?;
                 }
@@ -375,25 +397,52 @@ impl PartitionManager {
             buffered_memory: batch_memory,
         };
 
-        if active.writer.records_written() >= self.config.max_records
-            || active.writer.bytes_written() >= self.config.max_file_size_bytes
+        if (self.config.max_records > 0
+            && active.writer.records_written() >= self.config.max_records)
+            || (self.config.max_file_size_bytes > 0
+                && active.writer.bytes_written() >= self.config.max_file_size_bytes)
         {
-            self.global_memory_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(active.buffered_memory))
-                })
-                .ok();
-            active.writer.close()?;
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let jh =
-                    handle.spawn(async move { active.uploader_handle.wait_for_completion().await });
-                self.in_flight_uploads.push(jh);
-            }
+            self.retire_active_writer(active)?;
+            self.in_flight_uploads.retain(|jh| !jh.is_finished());
+            self.check_background_errors()?;
         } else {
             self.writers.insert(partition_id.clone(), active);
             self.lru_order.push_back(partition_id);
         }
 
+        Ok(())
+    }
+
+    /// Retires an active partition writer, finalizes the Parquet file, and spawns
+    /// a tracked background task to commit the upload with error reporting.
+    fn retire_active_writer(&mut self, active: ActiveWriter) -> Result<(), ParquetSinkError> {
+        self.global_memory_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(active.buffered_memory))
+            })
+            .ok();
+
+        active.writer.close()?;
+
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            ParquetSinkError::Internal(
+                "No active Tokio runtime available to spawn background upload completion"
+                    .to_string(),
+            )
+        })?;
+
+        let err_sender = self.error_sender.clone();
+        let jh = handle.spawn(async move {
+            let res = active.uploader_handle.wait_for_completion().await;
+            if let Err(ref e) = res {
+                tracing::error!("Background Parquet upload failed: {e}");
+                let _ = err_sender.send(ParquetSinkError::Internal(format!(
+                    "Background upload failed: {e}"
+                )));
+            }
+            res
+        });
+        self.in_flight_uploads.push(jh);
         Ok(())
     }
 
@@ -404,22 +453,22 @@ impl PartitionManager {
         }
 
         if let Some(active) = self.writers.remove(partition_id) {
-            self.global_memory_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(active.buffered_memory))
-                })
-                .ok();
-
-            active.writer.close()?;
-
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let jh =
-                    handle.spawn(async move { active.uploader_handle.wait_for_completion().await });
-                self.in_flight_uploads.push(jh);
-            }
+            self.retire_active_writer(active)?;
         }
 
         self.in_flight_uploads.retain(|jh| !jh.is_finished());
+        self.check_background_errors()?;
+        Ok(())
+    }
+
+    /// Checks for any asynchronous upload failures encountered by background tasks.
+    ///
+    /// # Errors
+    /// Returns [`ParquetSinkError`] if any background upload task failed.
+    pub fn check_background_errors(&mut self) -> Result<(), ParquetSinkError> {
+        if let Ok(err) = self.error_receiver.try_recv() {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -436,6 +485,7 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if closing or committing any expired writer fails.
     pub fn sweep_idle_writers(&mut self) -> Result<(), ParquetSinkError> {
+        self.check_background_errors()?;
         let max_interval = Duration::from_secs(self.config.max_file_interval_sec);
         let idle_keys: Vec<PartitionId> = self
             .writers
@@ -447,6 +497,7 @@ impl PartitionManager {
         for key in idle_keys {
             self.close_writer(&key)?;
         }
+        self.check_background_errors()?;
         Ok(())
     }
 
@@ -457,10 +508,12 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if closing or committing any writer fails.
     pub fn flush_all(&mut self) -> Result<(), ParquetSinkError> {
+        self.check_background_errors()?;
         let all_keys: Vec<PartitionId> = self.writers.keys().cloned().collect();
         for key in all_keys {
             self.close_writer(&key)?;
         }
+        self.check_background_errors()?;
         Ok(())
     }
 
@@ -473,6 +526,7 @@ impl PartitionManager {
             jh.await
                 .map_err(|e| ParquetSinkError::Internal(e.to_string()))??;
         }
+        self.check_background_errors()?;
         Ok(())
     }
 }
@@ -868,5 +922,28 @@ mod tests {
         manager.flush_all().unwrap();
         assert_eq!(manager.active_writer_count(), 0);
         manager.wait_for_all_uploads().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_background_upload_failure_propagates_to_manager() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        // Directly simulate an async background upload failure
+        manager
+            .error_sender
+            .send(ParquetSinkError::Internal(
+                "Simulated S3 failure".to_string(),
+            ))
+            .unwrap();
+
+        let err = manager.check_background_errors();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("Simulated S3 failure")
+        );
     }
 }

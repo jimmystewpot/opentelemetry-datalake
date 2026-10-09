@@ -215,13 +215,10 @@ impl ParquetSinkConfig {
             ));
         }
 
-        if let Some(path) = uri.strip_prefix("file://") {
+        let op = if let Some(path) = uri.strip_prefix("file://") {
             let builder = opendal::services::Fs::default().root(path);
-            let op = opendal::Operator::new(builder)?;
-            return Ok(op);
-        }
-
-        if let Some(s3_path) = uri.strip_prefix("s3://") {
+            opendal::Operator::new(builder)?
+        } else if let Some(s3_path) = uri.strip_prefix("s3://") {
             let (bucket, root) = match s3_path.find('/') {
                 Some(idx) => (&s3_path[..idx], &s3_path[idx..]),
                 None => (s3_path, "/"),
@@ -252,16 +249,12 @@ impl ParquetSinkConfig {
                     _ => {}
                 }
             }
-            let op = opendal::Operator::new(builder)?;
-            return Ok(op);
-        }
-
-        if uri.starts_with("memory://") {
+            opendal::Operator::new(builder)?
+        } else if uri.starts_with("memory://") {
             #[cfg(any(test, feature = "services-memory"))]
             {
                 let builder = opendal::services::Memory::default();
-                let op = opendal::Operator::new(builder)?;
-                return Ok(op);
+                opendal::Operator::new(builder)?
             }
             #[cfg(not(any(test, feature = "services-memory")))]
             {
@@ -269,17 +262,16 @@ impl ParquetSinkConfig {
                     "memory storage service is not enabled".to_string(),
                 ));
             }
-        }
-
-        if !uri.contains("://") {
+        } else if !uri.contains("://") {
             let builder = opendal::services::Fs::default().root(uri);
-            let op = opendal::Operator::new(builder)?;
-            return Ok(op);
-        }
+            opendal::Operator::new(builder)?
+        } else {
+            return Err(ParquetSinkError::Config(format!(
+                "unsupported storage URI scheme: '{uri}'"
+            )));
+        };
 
-        Err(ParquetSinkError::Config(format!(
-            "unsupported storage URI scheme: '{uri}'"
-        )))
+        Ok(op.layer(opendal::layers::RetryLayer::default()))
     }
 }
 

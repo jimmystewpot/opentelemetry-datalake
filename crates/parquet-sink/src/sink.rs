@@ -78,7 +78,7 @@ impl Sink for ParquetSink {
             tokio::select! {
                 maybe_batch = input.recv() => {
                     if let Some(batch) = maybe_batch {
-                        tokio::task::block_in_place(|| {
+                        run_blocking(|| {
                             let prepared = self.router.route_and_prepare(batch)?;
                             self.manager.route_prepared_batch(&prepared)
                         })?;
@@ -88,17 +88,31 @@ impl Sink for ParquetSink {
                     }
                 }
                 _ = ticker.tick() => {
-                    tokio::task::block_in_place(|| {
-                        self.manager.sweep_idle_writers()
-                    })?;
+                    run_blocking(|| self.manager.sweep_idle_writers())?;
                 }
             }
         }
 
-        tokio::task::block_in_place(|| self.manager.flush_all())?;
+        run_blocking(|| self.manager.flush_all())?;
         self.manager.wait_for_all_uploads().await?;
         tracing::info!("ParquetSink successfully drained and committed all pending uploads");
 
         Ok(())
+    }
+}
+
+/// Executes a closure, leveraging `block_in_place` on multi-threaded runtimes to prevent
+/// executor starvation while safely falling back to direct execution on current-thread runtimes.
+fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let is_multithread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+
+    if is_multithread {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
     }
 }

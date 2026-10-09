@@ -11,7 +11,7 @@ use opendal::Operator;
 const DEFAULT_CHANNEL_CAPACITY: usize = 8;
 
 /// Sender handle for streaming byte chunks into the asynchronous uploader.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct UploaderSender {
     tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
 }

@@ -19,6 +19,7 @@ struct AppConfig {
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
     starrocks: Option<starrocks_sink::StarRocksSinkConfig>,
     elasticsearch: Option<elasticsearch_sink::ElasticsearchSinkConfig>,
+    parquet: Option<parquet_sink::ParquetSinkConfig>,
     #[serde(default)]
     pub wasm_transformer: Option<pipeline_core::config::WasmTransformerConfig>,
 }
@@ -94,9 +95,10 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         && config.iceberg.is_none()
         && config.starrocks.is_none()
         && config.elasticsearch.is_none()
+        && config.parquet.is_none()
     {
         anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], [elasticsearch], or [parquet] configuration must be provided"
         );
     }
 
@@ -905,9 +907,36 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Kafka sink error: {}", e);
             }
         });
+    } else if let Some(parquet_cfg) = config.parquet {
+        tracing::info!(
+            storage_uri = %parquet_cfg.storage_uri,
+            "Initializing Parquet sinks"
+        );
+
+        let mut logs_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
+        let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
+        let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg)?;
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs Parquet sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces Parquet sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics Parquet sink error: {}", e);
+            }
+        });
     } else {
         return Err(anyhow::anyhow!(
-            "One of [iceberg], [elasticsearch], [starrocks], or [kafka] configuration must be provided"
+            "One of [iceberg], [elasticsearch], [starrocks], [kafka], or [parquet] configuration must be provided"
         ));
     }
 
@@ -1141,13 +1170,14 @@ mod tests {
         assert!(config.iceberg.is_none());
         assert!(config.starrocks.is_none());
         assert!(config.elasticsearch.is_none());
+        assert!(config.parquet.is_none());
 
         let err = validate_config(&config)
             .expect_err("Validation should fail when no sink is configured");
         assert!(
             err.to_string()
-                .contains("one of [kafka], [iceberg], [starrocks], or [elasticsearch]"),
-            "Error message should mention all four sinks: {err}"
+                .contains("one of [kafka], [iceberg], [starrocks], [elasticsearch], or [parquet]"),
+            "Error message should mention all five sinks: {err}"
         );
     }
 
@@ -1173,6 +1203,27 @@ mod tests {
             .extract()
             .expect("Kafka config should deserialize");
 
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_succeeds_with_parquet() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        node_id = "test-node"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Parquet config should deserialize");
+
+        assert!(config.parquet.is_some());
         assert!(validate_config(&config).is_ok());
     }
 

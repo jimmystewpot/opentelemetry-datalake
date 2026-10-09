@@ -127,12 +127,9 @@ impl std::io::Write for ChannelWriter {
 
 impl Drop for ChannelWriter {
     fn drop(&mut self) {
-        if self.sender.is_some() {
-            let _ = self.flush_buffer();
-            if let Some(sender) = self.sender.take() {
-                let _ = sender.finish();
-            }
-        }
+        // If sender is still Some, finish() was never called (e.g. failure during write).
+        // Do NOT flush buffered bytes or finalize; drop the sender without finishing.
+        self.sender.take();
     }
 }
 
@@ -200,9 +197,9 @@ impl PartitionWriter {
 
     /// Writes an Arrow [`RecordBatch`] into the Parquet file.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), ParquetSinkError> {
-        let mut guard = self
+        let guard = self
             .arrow_writer
-            .lock()
+            .get_mut()
             .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
         let writer = guard.as_mut().ok_or_else(|| {
             ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
@@ -217,11 +214,11 @@ impl PartitionWriter {
     /// Writes the Parquet metadata footer, flushes all remaining buffered bytes
     /// into the underlying [`UploaderSender`], and signals completion to the uploader.
     pub fn close(self) -> Result<(), ParquetSinkError> {
-        let mut guard = self
+        let guard = self
             .arrow_writer
-            .lock()
+            .into_inner()
             .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
-        let arrow_writer = guard.take().ok_or_else(|| {
+        let arrow_writer = guard.ok_or_else(|| {
             ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
         })?;
         let mut channel_writer = arrow_writer.into_inner()?;
@@ -231,9 +228,9 @@ impl PartitionWriter {
 
     /// Flushes in-progress Arrow row groups to the underlying uploader.
     pub fn flush(&mut self) -> Result<(), ParquetSinkError> {
-        let mut guard = self
+        let guard = self
             .arrow_writer
-            .lock()
+            .get_mut()
             .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
         if let Some(writer) = guard.as_mut() {
             writer.flush()?;
