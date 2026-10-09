@@ -799,7 +799,7 @@ mod tests {
         // 2. Empty object handling
         let (empty_meta, _empty_val) = encoder.encode_json_str("{}").unwrap().unwrap();
         assert_eq!(empty_meta[0], 0x01); // version 1
-        assert_eq!(empty_meta.len(), 5); // version + 4-byte count (0)
+        assert_eq!(empty_meta.len(), 3); // version + 1-byte count (0) + 1-byte offset
 
         // 3. Lexicographical sorting
         let (meta, _val) = encoder
@@ -979,7 +979,7 @@ mod tests {
         let res = encoder.encode_json_str("test raw log message body");
         assert!(res.is_ok());
         let (meta, val) = res.unwrap().unwrap();
-        assert_eq!(meta[0], 0x01); // Version 1
+        assert_eq!(meta[0] & 0x0F, 0x01); // Version 1
         // Short string has basic type 1: (len << 2) | 0x01
         assert_eq!(val[0] & 0x03, 0x01);
         assert_eq!(&val[1..], b"test raw log message body");
@@ -996,7 +996,7 @@ mod tests {
             res.err()
         );
         let (meta, val) = res.unwrap().unwrap();
-        assert_eq!(meta[0], 0x01);
+        assert_eq!(meta[0] & 0x0F, 0x01);
         let keys = encoder.extract_dictionary_keys(&meta);
         assert_eq!(keys, vec!["key1", "key2"]);
         assert_eq!(val[0] & 0x03, 0x03); // Array type

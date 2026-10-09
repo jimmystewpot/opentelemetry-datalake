@@ -170,7 +170,7 @@ A partition writer rolls when:
 ## 8. Configuration Reference
 
 ```toml
-[sink.parquet]
+[parquet]
 type = "parquet"
 enabled = true
 storage_uri = "s3://otel-datalake-production/telemetry"
@@ -188,7 +188,7 @@ max_open_partitions = 16
 global_memory_limit_bytes = 1073741824 # 1 GB
 partition_pattern = "signal={signal}/date={date}/hour={hour}"
 
-[sink.parquet.storage_options]
+[parquet.storage_options]
 aws_region = "us-east-1"
 ```
 

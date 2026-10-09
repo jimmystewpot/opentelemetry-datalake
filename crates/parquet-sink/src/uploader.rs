@@ -12,8 +12,14 @@ const DEFAULT_CHANNEL_CAPACITY: usize = 8;
 
 /// Sender handle for streaming byte chunks into the asynchronous uploader.
 #[derive(Debug)]
+pub enum UploaderMessage {
+    Chunk(bytes::Bytes),
+    Finish,
+}
+
+#[derive(Debug)]
 pub struct UploaderSender {
-    tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    tx: tokio::sync::mpsc::Sender<UploaderMessage>,
 }
 
 impl UploaderSender {
@@ -23,7 +29,7 @@ impl UploaderSender {
     /// inside worker threads or `spawn_blocking`). If the bounded channel is full,
     /// it blocks until buffer space becomes available.
     pub fn send_chunk(&self, chunk: bytes::Bytes) -> Result<(), ParquetSinkError> {
-        match self.tx.try_send(chunk) {
+        match self.tx.try_send(UploaderMessage::Chunk(chunk)) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(
                 ParquetSinkError::Internal("Uploader channel closed".to_string()),
@@ -40,7 +46,7 @@ impl UploaderSender {
     /// Awaits until space is available in the bounded buffer before enqueuing.
     pub async fn send_chunk_async(&self, chunk: bytes::Bytes) -> Result<(), ParquetSinkError> {
         self.tx
-            .send(chunk)
+            .send(UploaderMessage::Chunk(chunk))
             .await
             .map_err(|e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")))
     }
@@ -48,6 +54,16 @@ impl UploaderSender {
     /// Explicitly completes the sender, closing the channel and notifying the
     /// background task that all chunks have been emitted.
     pub fn finish(self) -> Result<(), ParquetSinkError> {
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) = self.tx.try_send(UploaderMessage::Finish) {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let tx = self.tx.clone();
+                handle.spawn(async move {
+                    let _ = tx.send(msg).await;
+                });
+            } else {
+                let _ = self.tx.blocking_send(msg);
+            }
+        }
         drop(self);
         Ok(())
     }
@@ -131,7 +147,7 @@ impl AsyncUploader {
             ));
         }
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(DEFAULT_CHANNEL_CAPACITY);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<UploaderMessage>(DEFAULT_CHANNEL_CAPACITY);
         let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel::<()>();
 
         let path_owned = path.to_string();
@@ -153,15 +169,19 @@ impl AsyncUploader {
                         aborted = true;
                         break;
                     }
-                    chunk = rx.recv() => {
-                        match chunk {
-                            Some(bytes) => {
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(UploaderMessage::Chunk(bytes)) => {
                                 if let Err(e) = writer.write(bytes).await {
                                     let _ = writer.abort().await;
                                     return Err(ParquetSinkError::from(e));
                                 }
                             }
+                            Some(UploaderMessage::Finish) => {
+                                break;
+                            }
                             None => {
+                                aborted = true;
                                 break;
                             }
                         }
