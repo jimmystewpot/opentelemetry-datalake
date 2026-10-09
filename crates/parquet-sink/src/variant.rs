@@ -265,11 +265,11 @@ impl VariantEncoder {
         }
 
         let max_val = std::cmp::max(total_len, count);
-        let offset_size = if max_val <= u8::MAX as usize {
+        let offset_size = if u8::try_from(max_val).is_ok() {
             1
-        } else if max_val <= u16::MAX as usize {
+        } else if u16::try_from(max_val).is_ok() {
             2
-        } else if max_val <= 0xFF_FFFF as usize {
+        } else if max_val <= 0xFF_FFFF_usize {
             3
         } else {
             4

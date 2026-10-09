@@ -376,7 +376,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_route_metrics_without_datapoints() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
