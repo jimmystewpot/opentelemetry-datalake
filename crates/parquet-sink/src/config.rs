@@ -138,6 +138,10 @@ pub struct ParquetSinkConfig {
     #[serde(default = "default_max_open_partitions")]
     pub max_open_partitions: usize,
 
+    /// Maximum active concurrent background uploads across all partitions (default: 16).
+    #[serde(default = "default_max_concurrent_uploads")]
+    pub max_concurrent_uploads: usize,
+
     /// Global memory ceiling for active partition buffers in bytes (default: 1 GB).
     #[serde(default = "default_global_memory_limit_bytes")]
     pub global_memory_limit_bytes: usize,
@@ -183,6 +187,10 @@ const fn default_max_open_partitions() -> usize {
     16
 }
 
+const fn default_max_concurrent_uploads() -> usize {
+    16
+}
+
 const fn default_global_memory_limit_bytes() -> usize {
     1_073_741_824
 }
@@ -208,6 +216,7 @@ impl Default for ParquetSinkConfig {
             max_file_size_bytes: default_max_file_size_bytes(),
             max_file_interval_sec: default_max_file_interval_sec(),
             max_open_partitions: default_max_open_partitions(),
+            max_concurrent_uploads: default_max_concurrent_uploads(),
             global_memory_limit_bytes: default_global_memory_limit_bytes(),
             variant_encoding: default_variant_encoding(),
             max_records: default_max_records(),
@@ -362,6 +371,7 @@ mod tests {
         assert_eq!(config.max_file_size_bytes, 67_108_864);
         assert_eq!(config.max_file_interval_sec, 60);
         assert_eq!(config.max_open_partitions, 16);
+        assert_eq!(config.max_concurrent_uploads, 16);
         assert_eq!(config.global_memory_limit_bytes, 1_073_741_824);
         assert!(config.variant_encoding);
     }
