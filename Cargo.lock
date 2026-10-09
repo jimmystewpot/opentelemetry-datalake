@@ -4046,6 +4046,7 @@ name = "parquet-sink"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "chrono",
  "opendal",
@@ -4054,6 +4055,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.6+spec-1.1.0",

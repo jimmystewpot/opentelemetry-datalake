@@ -24,7 +24,9 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
 opendal = { version = "0.58", default-features = false, features = ["services-memory"] }
+tempfile = "3"

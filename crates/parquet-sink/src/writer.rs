@@ -5,7 +5,7 @@
 //! and Bloom filters on `trace_id` and `span_id` columns, streaming encoded byte chunks
 //! into an asynchronous [`UploaderSender`].
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -169,7 +169,7 @@ fn build_writer_properties(config: &ParquetSinkConfig) -> WriterProperties {
 /// for tracing identifiers (`trace_id` and `span_id`).
 #[derive(Debug)]
 pub struct PartitionWriter {
-    arrow_writer: ArrowWriter<ChannelWriter>,
+    arrow_writer: Mutex<Option<ArrowWriter<ChannelWriter>>>,
     records_written: usize,
 }
 
@@ -184,7 +184,7 @@ impl PartitionWriter {
         let channel_writer = ChannelWriter::new(uploader, DEFAULT_CHUNK_BUFFER_SIZE);
         let arrow_writer = ArrowWriter::try_new(channel_writer, schema, Some(props))?;
         Ok(Self {
-            arrow_writer,
+            arrow_writer: Mutex::new(Some(arrow_writer)),
             records_written: 0,
         })
     }
@@ -200,7 +200,14 @@ impl PartitionWriter {
 
     /// Writes an Arrow [`RecordBatch`] into the Parquet file.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), ParquetSinkError> {
-        self.arrow_writer.write(batch)?;
+        let mut guard = self
+            .arrow_writer
+            .lock()
+            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
+        let writer = guard.as_mut().ok_or_else(|| {
+            ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
+        })?;
+        writer.write(batch)?;
         self.records_written += batch.num_rows();
         Ok(())
     }
@@ -210,14 +217,27 @@ impl PartitionWriter {
     /// Writes the Parquet metadata footer, flushes all remaining buffered bytes
     /// into the underlying [`UploaderSender`], and signals completion to the uploader.
     pub fn close(self) -> Result<(), ParquetSinkError> {
-        let mut channel_writer = self.arrow_writer.into_inner()?;
+        let mut guard = self
+            .arrow_writer
+            .lock()
+            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
+        let arrow_writer = guard.take().ok_or_else(|| {
+            ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
+        })?;
+        let mut channel_writer = arrow_writer.into_inner()?;
         channel_writer.finish()?;
         Ok(())
     }
 
     /// Flushes in-progress Arrow row groups to the underlying uploader.
     pub fn flush(&mut self) -> Result<(), ParquetSinkError> {
-        self.arrow_writer.flush()?;
+        let mut guard = self
+            .arrow_writer
+            .lock()
+            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
+        if let Some(writer) = guard.as_mut() {
+            writer.flush()?;
+        }
         Ok(())
     }
 
@@ -230,13 +250,25 @@ impl PartitionWriter {
     /// Returns the total number of bytes written to the underlying uploader so far.
     #[must_use]
     pub fn bytes_written(&self) -> usize {
-        self.arrow_writer.bytes_written()
+        match self.arrow_writer.lock() {
+            Ok(guard) => guard.as_ref().map_or(0, ArrowWriter::bytes_written),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .map_or(0, ArrowWriter::bytes_written),
+        }
     }
 
     /// Returns the estimated in-progress row group memory size in bytes.
     #[must_use]
     pub fn in_progress_size(&self) -> usize {
-        self.arrow_writer.in_progress_size()
+        match self.arrow_writer.lock() {
+            Ok(guard) => guard.as_ref().map_or(0, ArrowWriter::in_progress_size),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .map_or(0, ArrowWriter::in_progress_size),
+        }
     }
 }
 
