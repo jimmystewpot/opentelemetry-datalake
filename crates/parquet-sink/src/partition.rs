@@ -194,7 +194,7 @@ pub struct PartitionManager {
     lru_order: VecDeque<PartitionId>,
     global_memory_bytes: Arc<AtomicUsize>,
     file_sequence: u16,
-    in_flight_uploads: Vec<tokio::task::JoinHandle<Result<(), ParquetSinkError>>>,
+    in_flight_uploads: VecDeque<tokio::task::JoinHandle<Result<(), ParquetSinkError>>>,
     upload_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -218,7 +218,7 @@ impl PartitionManager {
             lru_order: VecDeque::new(),
             global_memory_bytes: Arc::new(AtomicUsize::new(0)),
             file_sequence: 0,
-            in_flight_uploads: Vec::new(),
+            in_flight_uploads: VecDeque::new(),
             upload_semaphore,
         }
     }
@@ -395,11 +395,10 @@ impl PartitionManager {
                 > self.config.global_memory_limit_bytes
             && !self.writers.is_empty()
         {
-            if let Some(oldest_key) = self.lru_order.front().cloned() {
-                self.close_writer(&oldest_key)?;
-            } else {
-                break;
-            }
+            let oldest_key = self.lru_order.front().cloned().ok_or_else(|| {
+                ParquetSinkError::Internal("LRU order out of sync with active writers".to_string())
+            })?;
+            self.close_writer(&oldest_key)?;
         }
 
         let mut current_batch = batch.clone();
@@ -471,11 +470,12 @@ impl PartitionManager {
                 };
 
                 while self.writers.len() >= effective_max_partitions && !self.writers.is_empty() {
-                    if let Some(oldest_key) = self.lru_order.front().cloned() {
-                        self.close_writer(&oldest_key)?;
-                    } else {
-                        break;
-                    }
+                    let oldest_key = self.lru_order.front().cloned().ok_or_else(|| {
+                        ParquetSinkError::Internal(
+                            "LRU order out of sync with active writers".to_string(),
+                        )
+                    })?;
+                    self.close_writer(&oldest_key)?;
                 }
 
                 while self.config.max_concurrent_uploads > 0
@@ -485,44 +485,47 @@ impl PartitionManager {
                     if !self.in_flight_uploads.is_empty() {
                         self.wait_oldest_in_flight_upload()?;
                     } else if !self.writers.is_empty() {
-                        if let Some(oldest_key) = self.lru_order.front().cloned() {
-                            self.close_writer(&oldest_key)?;
-                        } else {
-                            break;
-                        }
+                        let oldest_key = self.lru_order.front().cloned().ok_or_else(|| {
+                            ParquetSinkError::Internal(
+                                "LRU order out of sync with active writers".to_string(),
+                            )
+                        })?;
+                        self.close_writer(&oldest_key)?;
                     } else {
                         break;
                     }
                 }
 
                 let permit = if let Some(sem) = self.upload_semaphore.as_ref().map(Arc::clone) {
-                    let mut acquired = None;
-                    while acquired.is_none() {
+                    loop {
                         match sem.clone().try_acquire_owned() {
-                            Ok(p) => {
-                                acquired = Some(p);
-                                break;
-                            }
+                            Ok(p) => break Some(p),
                             Err(_) => {
                                 if !self.in_flight_uploads.is_empty() {
                                     self.wait_oldest_in_flight_upload()?;
                                 } else if !self.writers.is_empty() {
-                                    if let Some(oldest_key) = self.lru_order.front().cloned() {
-                                        self.close_writer(&oldest_key)?;
-                                    } else {
-                                        break;
-                                    }
+                                    let oldest_key =
+                                        self.lru_order.front().cloned().ok_or_else(|| {
+                                            ParquetSinkError::Internal(
+                                                "LRU order out of sync with active writers"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                    self.close_writer(&oldest_key)?;
                                 } else {
-                                    let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                                        ParquetSinkError::Internal(
-                                            "No active Tokio runtime available to wait for upload permit".to_string(),
-                                        )
-                                    })?;
+                                    let handle =
+                                        tokio::runtime::Handle::try_current().map_err(|_| {
+                                            ParquetSinkError::Internal(
+                                                "No active Tokio runtime available to wait for upload permit"
+                                                    .to_string(),
+                                            )
+                                        })?;
                                     if handle.runtime_flavor()
                                         != tokio::runtime::RuntimeFlavor::MultiThread
                                     {
                                         return Err(ParquetSinkError::Internal(
-                                            "ParquetSink requires a multi-threaded Tokio runtime to wait for upload permits".to_string(),
+                                            "ParquetSink requires a multi-threaded Tokio runtime to wait for upload permits"
+                                                .to_string(),
                                         ));
                                     }
                                     let sem_clone = Arc::clone(&sem);
@@ -532,13 +535,11 @@ impl PartitionManager {
                                     .map_err(|e| {
                                         ParquetSinkError::Internal(format!("Semaphore closed: {e}"))
                                     })?;
-                                    acquired = Some(p);
-                                    break;
+                                    break Some(p);
                                 }
                             }
                         }
                     }
-                    acquired
                 } else {
                     None
                 };
@@ -586,32 +587,10 @@ impl PartitionManager {
 
     /// Waits for the oldest in-flight background upload task to finish and verifies its result.
     fn wait_oldest_in_flight_upload(&mut self) -> Result<(), ParquetSinkError> {
-        if self.in_flight_uploads.is_empty() {
+        let Some(oldest) = self.in_flight_uploads.pop_front() else {
             return Ok(());
-        }
+        };
 
-        if self.in_flight_uploads[0].is_finished() {
-            let oldest = self.in_flight_uploads.remove(0);
-            let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(waker);
-            let mut pinned = std::pin::pin!(oldest);
-            if let std::task::Poll::Ready(res) = std::future::Future::poll(pinned.as_mut(), &mut cx)
-            {
-                match res {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e),
-                    Err(e) => {
-                        return Err(ParquetSinkError::Internal(format!(
-                            "Background upload task panicked: {e}"
-                        )));
-                    }
-                }
-                self.check_background_errors()?;
-                return Ok(());
-            }
-        }
-
-        let oldest = self.in_flight_uploads.remove(0);
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             ParquetSinkError::Internal(
                 "No active Tokio runtime available to wait for background upload".to_string(),
@@ -673,7 +652,7 @@ impl PartitionManager {
             }
             res
         });
-        self.in_flight_uploads.push(jh);
+        self.in_flight_uploads.push_back(jh);
 
         close_res?;
         if let Some(err) = wait_err {
@@ -707,7 +686,9 @@ impl PartitionManager {
         let mut first_error = None;
         while i < self.in_flight_uploads.len() {
             if self.in_flight_uploads[i].is_finished() {
-                let jh = self.in_flight_uploads.remove(i);
+                let Some(jh) = self.in_flight_uploads.remove(i) else {
+                    continue;
+                };
                 let waker = std::task::Waker::noop();
                 let mut cx = std::task::Context::from_waker(waker);
                 let mut pinned = std::pin::pin!(jh);
@@ -1255,7 +1236,7 @@ mod tests {
             }
         })
         .await;
-        manager.in_flight_uploads.push(jh);
+        manager.in_flight_uploads.push_back(jh);
 
         let err = manager.check_background_errors();
         assert!(err.is_err());
@@ -1273,16 +1254,18 @@ mod tests {
         let mut manager = PartitionManager::new(config, op);
 
         // First task fails
-        manager.in_flight_uploads.push(tokio::spawn(async {
+        manager.in_flight_uploads.push_back(tokio::spawn(async {
             Err(ParquetSinkError::Internal("First failed".to_string()))
         }));
 
         // Second task simulates long-running and succeeds
         let (tx, rx) = tokio::sync::oneshot::channel();
-        manager.in_flight_uploads.push(tokio::spawn(async move {
-            rx.await.unwrap();
-            Ok(())
-        }));
+        manager
+            .in_flight_uploads
+            .push_back(tokio::spawn(async move {
+                rx.await.unwrap();
+                Ok(())
+            }));
 
         // Send completion to second task after a short delay
         tokio::spawn(async move {
@@ -1449,10 +1432,12 @@ mod tests {
         ]));
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        manager.in_flight_uploads.push(tokio::spawn(async move {
-            let _ = rx.await;
-            Ok(())
-        }));
+        manager
+            .in_flight_uploads
+            .push_back(tokio::spawn(async move {
+                let _ = rx.await;
+                Ok(())
+            }));
 
         let b1 = RecordBatch::try_new(
             schema.clone(),
@@ -1501,7 +1486,7 @@ mod tests {
         .await;
         assert!(panicked_jh.is_finished());
 
-        manager.in_flight_uploads.push(panicked_jh);
+        manager.in_flight_uploads.push_back(panicked_jh);
 
         let res = manager.check_background_errors();
         assert!(res.is_err());
@@ -1610,7 +1595,7 @@ mod tests {
         })
         .await;
 
-        manager.in_flight_uploads.push(panicked_jh);
+        manager.in_flight_uploads.push_back(panicked_jh);
 
         let res = manager.wait_for_all_uploads().await;
         assert!(res.is_err());
@@ -1735,7 +1720,7 @@ mod tests {
         while !failed_jh.is_finished() {
             tokio::task::yield_now().await;
         }
-        manager.in_flight_uploads.push(failed_jh);
+        manager.in_flight_uploads.push_back(failed_jh);
 
         // Open an active writer and write a batch
         let schema = Arc::new(Schema::new(vec![
@@ -1793,7 +1778,7 @@ mod tests {
         while !failed_jh.is_finished() {
             tokio::task::yield_now().await;
         }
-        manager.in_flight_uploads.push(failed_jh);
+        manager.in_flight_uploads.push_back(failed_jh);
 
         // Open two active writers across different partitions
         let schema = Arc::new(Schema::new(vec![
@@ -1845,6 +1830,188 @@ mod tests {
             entries.len(),
             2,
             "Both active writers must be finalized to storage!"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_upload_permit_strictly_enforced_when_max_concurrent_uploads_configured() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_open_partitions: 4,
+            max_concurrent_uploads: 2,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+
+        // Route to partition 1
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["msg1"])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b1, "logs").unwrap();
+
+        // Route to partition 2
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000 + 3600 * 1_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["msg2"])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b2, "logs").unwrap();
+
+        assert_eq!(manager.active_writer_count(), 2);
+        // Verify every active writer has acquired an upload permit
+        for (pid, writer) in &manager.writers {
+            assert!(
+                writer.upload_permit.is_some(),
+                "Active writer for partition {pid} must hold an upload permit"
+            );
+        }
+
+        // Route to partition 3, which must evict an active writer because max_concurrent_uploads is 2
+        let b3 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000 + 7200 * 1_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["msg3"])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b3, "logs").unwrap();
+
+        // All active writers still strictly hold permits
+        for (pid, writer) in &manager.writers {
+            assert!(
+                writer.upload_permit.is_some(),
+                "Active writer for partition {pid} after eviction must hold an upload permit"
+            );
+        }
+
+        manager.flush_all().unwrap();
+        manager.wait_for_all_uploads().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_upload_queue_pop_and_drain_fifo_order() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut senders = Vec::new();
+
+        for i in 0..5 {
+            let order_clone = Arc::clone(&order);
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            senders.push(tx);
+            manager
+                .in_flight_uploads
+                .push_back(tokio::spawn(async move {
+                    let _ = rx.await;
+                    order_clone.lock().unwrap().push(i);
+                    Ok(())
+                }));
+        }
+
+        assert_eq!(manager.in_flight_uploads.len(), 5);
+
+        // Release the first task and wait oldest
+        let _ = senders.remove(0).send(());
+        manager.wait_oldest_in_flight_upload().unwrap();
+        assert_eq!(manager.in_flight_uploads.len(), 4);
+
+        // The first task (0) was waited on and completed
+        {
+            let guard = order.lock().unwrap();
+            assert_eq!(guard.len(), 1);
+            assert_eq!(guard[0], 0);
+        }
+
+        // Release remaining tasks
+        for tx in senders {
+            let _ = tx.send(());
+        }
+
+        // Drain the rest via wait_for_all_uploads
+        manager.wait_for_all_uploads().await.unwrap();
+        assert!(manager.in_flight_uploads.is_empty());
+        assert_eq!(order.lock().unwrap().len(), 5);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_lru_out_of_sync_returns_internal_error() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_open_partitions: 2,
+            max_concurrent_uploads: 1,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["msg1"])),
+            ],
+        )
+        .unwrap();
+        manager.route_batch(&b1, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+
+        // Artificially desynchronize lru_order while writers is non-empty
+        manager.lru_order.clear();
+
+        let b2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000 + 3600 * 1_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["msg2"])),
+            ],
+        )
+        .unwrap();
+
+        // Routing should fail with Internal error reporting LRU order out of sync
+        let res = manager.route_batch(&b2, "logs");
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("LRU order out of sync with active writers"),
+            "Unexpected error: {err_msg}"
         );
     }
 }
