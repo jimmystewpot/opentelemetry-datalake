@@ -209,9 +209,11 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     }
 
     // Call datalake_transform supporting v1 (3 args), legacy (2 args), or descriptor (1 arg)
-    let (header_ptr, _header_len) = if let Ok(f) =
-        instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
-    {
+    let transform_fn = instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
+        .map_err(|e| anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}"))?;
+    let (header_ptr, _header_len) = {
+        let f = transform_fn.clone();
+
         let packed = f
             .call(&mut store, (0, ipc_ptr, ipc_len))
             .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
@@ -224,50 +226,7 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
             anyhow::bail!("datalake_transform returned header length < 20: {len}");
         }
         (ptr, len)
-    } else if let Ok(f) =
-        instance.get_typed_func::<(u32, u32), u64>(&mut store, "datalake_transform")
-    {
-        let packed = f
-            .call(&mut store, (ipc_ptr, ipc_len))
-            .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
-        let ptr = u32::try_from(packed >> 32).unwrap_or(0);
-        let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
-        (
-            if ptr != 0 {
-                ptr
-            } else {
-                u32::try_from(packed).unwrap_or(0)
-            },
-            if len >= 20 { len } else { 20 },
-        )
-    } else if let Ok(f) =
-        instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
-    {
-        let ptr = f
-            .call(&mut store, (ipc_ptr, ipc_len))
-            .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
-        (ptr, 20)
-    } else if let Ok(f) = instance.get_typed_func::<u32, u64>(&mut store, "datalake_transform") {
-        let packed = f
-            .call(&mut store, desc_ptr)
-            .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
-        let ptr = u32::try_from(packed >> 32).unwrap_or(0);
-        let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
-        (
-            if ptr != 0 {
-                ptr
-            } else {
-                u32::try_from(packed).unwrap_or(0)
-            },
-            if len >= 20 { len } else { 20 },
-        )
-    } else if let Ok(f) = instance.get_typed_func::<u32, u32>(&mut store, "datalake_transform") {
-        let ptr = f
-            .call(&mut store, desc_ptr)
-            .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
-        (ptr, 20)
-    } else {
-        anyhow::bail!("Unsupported datalake_transform signature");
+    
     };
 
     let mem_size = memory.data_size(&store);

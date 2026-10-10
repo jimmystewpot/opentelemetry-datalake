@@ -22,14 +22,6 @@ pub struct BenchResult {
     pub allocated_memory_bytes: usize,
 }
 
-enum BenchTransform {
-    V1(TypedFunc<(u32, u32, u32), u64>),
-    V0I64(TypedFunc<(u32, u32), u64>),
-    V0I32(TypedFunc<(u32, u32), u32>),
-    DescI64(TypedFunc<u32, u64>),
-    DescI32(TypedFunc<u32, u32>),
-}
-
 /// Executes local latency/throughput benchmarks for a guest WASM module.
 ///
 /// Isolates wasmtime module compilation and host memory allocation overhead
@@ -139,30 +131,13 @@ pub fn run_benchmark(
         let _ = memory.write(&mut store, desc_ptr as usize, &desc_bytes);
     }
 
-    let transform = if let Ok(f) =
-        instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
-    {
-        BenchTransform::V1(f)
-    } else if let Ok(f) =
-        instance.get_typed_func::<(u32, u32), u64>(&mut store, "datalake_transform")
-    {
-        BenchTransform::V0I64(f)
-    } else if let Ok(f) =
-        instance.get_typed_func::<(u32, u32), u32>(&mut store, "datalake_transform")
-    {
-        BenchTransform::V0I32(f)
-    } else if let Ok(f) = instance.get_typed_func::<u32, u64>(&mut store, "datalake_transform") {
-        BenchTransform::DescI64(f)
-    } else if let Ok(f) = instance.get_typed_func::<u32, u32>(&mut store, "datalake_transform") {
-        BenchTransform::DescI32(f)
-    } else {
-        anyhow::bail!("Unsupported datalake_transform signature");
-    };
-
+    let transform_fn = instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
+        .map_err(|e| anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}"))?;
     let start_time = std::time::Instant::now();
     for _ in 0..iterations {
-        let header_ptr = match &transform {
-            BenchTransform::V1(f) => {
+        let header_ptr = {
+                let f = transform_fn.clone();
+
                 let packed = f.call(&mut store, (0, ipc_ptr, ipc_len)).map_err(|e| {
                     anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
                 })?;
@@ -175,38 +150,9 @@ pub fn run_benchmark(
                     anyhow::bail!("datalake_transform returned header length < 20: {len}");
                 }
                 ptr
-            }
-            BenchTransform::V0I64(f) => {
-                let packed = f.call(&mut store, (ipc_ptr, ipc_len)).map_err(|e| {
-                    anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
-                })?;
-                let ptr = u32::try_from(packed >> 32).unwrap_or(0);
-                if ptr != 0 {
-                    ptr
-                } else {
-                    u32::try_from(packed).unwrap_or(0)
-                }
-            }
-            BenchTransform::V0I32(f) => f.call(&mut store, (ipc_ptr, ipc_len)).map_err(|e| {
-                anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
-            })?,
-            BenchTransform::DescI64(f) => {
-                let packed = f.call(&mut store, desc_ptr).map_err(|e| {
-                    anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
-                })?;
-                let ptr = u32::try_from(packed >> 32).unwrap_or(0);
-                if ptr != 0 {
-                    ptr
-                } else {
-                    u32::try_from(packed).unwrap_or(0)
-                }
-            }
-            BenchTransform::DescI32(f) => f.call(&mut store, desc_ptr).map_err(|e| {
-                anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
-            })?,
-        };
-
-        let mut status_bytes = [0u8; 4];
+            
+            };
+            let mut status_bytes = [0u8; 4];
         memory
             .read(&store, header_ptr as usize, &mut status_bytes)
             .map_err(|e| {

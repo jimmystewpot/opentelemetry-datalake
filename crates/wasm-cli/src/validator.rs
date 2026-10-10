@@ -154,15 +154,10 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
                     && matches!(params[2], ValType::I32)
                     && results.len() == 1
                     && matches!(results[0], ValType::I64);
-                let is_v0 = params.len() == 2
-                    && matches!(params[0], ValType::I32)
-                    && matches!(params[1], ValType::I32)
-                    && results.len() == 1
-                    && (matches!(results[0], ValType::I32) || matches!(results[0], ValType::I64));
-                if !is_v1 && !is_v0 {
+                if !is_v1 {
                     return Err(ValidationError::InvalidSignature {
                         name: name.to_string(),
-                        expected: "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64".to_string(),
+                        expected: "(i32, i32, i32) -> i64".to_string(),
                     });
                 }
             }

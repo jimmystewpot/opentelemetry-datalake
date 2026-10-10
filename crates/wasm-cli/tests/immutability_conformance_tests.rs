@@ -158,17 +158,17 @@ fn valid_echo_wat() -> &'static str {
         )
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
-            ;; Header at 0: status=0, batch_count=1, batches_ptr=32
-            (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 1))
-            (i32.store (i32.const 8) (i32.const 32))
-            (i32.store (i32.const 12) (i32.const 0))
-            (i32.store (i32.const 16) (i32.const 0))
-            ;; BatchDescriptor at 32: ptr=$ptr, len=$len
-            (i32.store (i32.const 32) (local.get $ptr))
-            (i32.store (i32.const 36) (local.get $len))
+            ;; Header at 128: status=0, batch_count=1, batches_ptr=160
+            (i32.store (i32.const 128) (i32.const 0))
+            (i32.store (i32.const 132) (i32.const 1))
+            (i32.store (i32.const 136) (i32.const 160))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            ;; BatchDescriptor at 160: ptr=$ptr, len=$len
+            (i32.store (i32.const 160) (local.get $ptr))
+            (i32.store (i32.const 164) (local.get $len))
             ;; Return (0 << 32) | 20
-            (i64.const 20)
+            (i64.const 549755813908)
         )
     )"#
 }
@@ -198,16 +198,16 @@ fn tampered_trace_wat() -> &'static str {
             )
             (i32.store8 (local.get $i) (i32.const 57))
 
-            ;; Header at 0: status=0, batch_count=1, batches_ptr=32
-            (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 1))
-            (i32.store (i32.const 8) (i32.const 32))
-            (i32.store (i32.const 12) (i32.const 0))
-            (i32.store (i32.const 16) (i32.const 0))
-            ;; BatchDescriptor at 32: ptr=$ptr, len=$len
-            (i32.store (i32.const 32) (local.get $ptr))
-            (i32.store (i32.const 36) (local.get $len))
-            (i64.const 20)
+            ;; Header at 128: status=0, batch_count=1, batches_ptr=160
+            (i32.store (i32.const 128) (i32.const 0))
+            (i32.store (i32.const 132) (i32.const 1))
+            (i32.store (i32.const 136) (i32.const 160))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            ;; BatchDescriptor at 160: ptr=$ptr, len=$len
+            (i32.store (i32.const 160) (local.get $ptr))
+            (i32.store (i32.const 164) (local.get $len))
+            (i64.const 549755813908)
         )
     )"#
 }
@@ -235,9 +235,9 @@ fn error_status_wat() -> &'static str {
             (i32.store (i32.const 0) (i32.const 3)) ;; status = 3 (Error)
             (i32.store (i32.const 4) (i32.const 0))
             (i32.store (i32.const 8) (i32.const 0))
-            (i32.store (i32.const 12) (i32.const 0))
-            (i32.store (i32.const 16) (i32.const 0))
-            (i64.const 20)
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            (i64.const 549755813908)
         )
     )"#
 }
@@ -287,15 +287,15 @@ fn missing_column_wasm() -> Vec<u8> {
             (func (export "datalake_dealloc") (param i32 i32))
             (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
                 ;; TransformResponseHeader at 0: status=0, batch_count=1, batches_ptr=32
-                (i32.store (i32.const 0) (i32.const 0))
-                (i32.store (i32.const 4) (i32.const 1))
-                (i32.store (i32.const 8) (i32.const 32))
-                (i32.store (i32.const 12) (i32.const 0))
-                (i32.store (i32.const 16) (i32.const 0))
-                ;; BatchDescriptor at 32: ptr=65536, len={len}
-                (i32.store (i32.const 32) (i32.const 65536))
-                (i32.store (i32.const 36) (i32.const {len}))
-                (i64.const 20)
+                (i32.store (i32.const 128) (i32.const 0))
+                (i32.store (i32.const 132) (i32.const 1))
+                (i32.store (i32.const 136) (i32.const 160))
+                (i32.store (i32.const 140) (i32.const 0))
+                (i32.store (i32.const 144) (i32.const 0))
+                ;; BatchDescriptor at 160: ptr=65536, len={len}
+                (i32.store (i32.const 160) (i32.const 65536))
+                (i32.store (i32.const 164) (i32.const {len}))
+                (i64.const 549755813908)
             )
         )"#,
         len = ipc_bytes.len()
@@ -384,9 +384,9 @@ fn test_run_benchmark_handles_infinite_loop_with_fuel_exhaustion() {
         (func (export "datalake_abi_version") (result i32) (i32.const 1))
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
         (func (export "datalake_dealloc") (param i32 i32))
-        (func (export "datalake_transform") (param i32 i32) (result i32)
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
             (loop (br 0))
-            (i32.const 0)
+            (i64.const 0)
         )
     )"#;
     let wasm = wat::parse_str(infinite_loop_wat).unwrap();
@@ -412,7 +412,7 @@ fn test_run_conformance_suite_rejects_failed_datalake_init() {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 1))
-        (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
     )"#;
     let wasm = wat::parse_str(failed_init_wat).unwrap();
     let res = run_immutability_suite(&wasm, "unknown", "{}");
