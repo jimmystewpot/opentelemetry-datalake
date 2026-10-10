@@ -132,9 +132,15 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         sr_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    } else if let Some(sort_cfg) = config.kafka.as_ref().and_then(|k| k.order_by.as_ref()) {
-        pipeline_core::sort::BatchSorter::from_config(sort_cfg)
-            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if let Some(ref kafka_cfg) = config.kafka {
+        if let Some(sort_cfg) = kafka_cfg.order_by.as_ref() {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)
+                .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+        }
+    } else if let Some(ref parquet_cfg) = config.parquet {
+        parquet_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Parquet configuration validation failed: {e}"))?;
     }
 
     if let Some(admin_addr) = config.server.admin_addr {
@@ -2052,6 +2058,58 @@ mod tests {
         assert!(
             res_invalid.is_err(),
             "validate_config must fail when WASM module path does not exist"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_parquet_config() {
+        let toml_invalid_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        compression = "zstd"
+        compression_level = 999
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_invalid_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = validate_config(&config);
+        assert!(
+            res.is_err(),
+            "validate_config must reject invalid Parquet config at startup"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Parquet configuration validation failed"));
+        assert!(err_msg.contains("Invalid Zstd compression level"));
+    }
+
+    #[test]
+    fn test_validate_config_accepts_valid_parquet_config() {
+        let toml_valid_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        compression = "zstd"
+        compression_level = 5
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_valid_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        assert!(
+            validate_config(&config).is_ok(),
+            "validate_config should accept valid Parquet config"
         );
     }
 

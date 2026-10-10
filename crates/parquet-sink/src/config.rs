@@ -231,6 +231,20 @@ impl Default for ParquetSinkConfig {
     }
 }
 
+/// Helper to construct the default isolated staging directory (`<path>/.tmp`).
+fn default_atomic_write_dir(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        if path.starts_with('/') {
+            "/.tmp".to_string()
+        } else {
+            ".tmp".to_string()
+        }
+    } else {
+        format!("{trimmed}/.tmp")
+    }
+}
+
 impl ParquetSinkConfig {
     /// Returns the effective compression codec, applying `compression_level` when configured.
     ///
@@ -248,6 +262,85 @@ impl ParquetSinkConfig {
         Ok(self.compression)
     }
 
+    /// Returns the resolved atomic write staging directory for filesystem storage.
+    ///
+    /// When using local filesystem storage (`file://` or a path without a scheme),
+    /// this returns the custom `atomic_write_dir` from `storage_options` if specified,
+    /// or defaults to `<path>/.tmp` isolated from queryable partition directories.
+    #[must_use]
+    pub fn resolve_atomic_write_dir(&self) -> Option<String> {
+        if let Some(custom) = self.storage_options.get("atomic_write_dir") {
+            return Some(custom.clone());
+        }
+        let uri = self.storage_uri.trim();
+        if let Some(path) = uri.strip_prefix("file://") {
+            Some(default_atomic_write_dir(path))
+        } else if !uri.contains("://") && !uri.is_empty() {
+            Some(default_atomic_write_dir(uri))
+        } else {
+            None
+        }
+    }
+
+    /// Eagerly validates the configuration parameters.
+    ///
+    /// Checks that:
+    /// - Compression codec and compression level are valid and convertible to Parquet settings.
+    /// - Storage URI is non-empty and has a valid supported scheme.
+    /// - Storage options and `OpenDAL` operator builder options are valid.
+    /// - Maximum open partitions is greater than 0.
+    ///
+    /// # Errors
+    /// Returns [`ParquetSinkError::Config`] or [`ParquetSinkError::OpenDal`] if any configuration
+    /// constraint is violated.
+    pub fn validate(&self) -> Result<(), ParquetSinkError> {
+        let _ = self.effective_compression()?.to_parquet_compression()?;
+
+        let uri = self.storage_uri.trim();
+        if uri.is_empty() {
+            return Err(ParquetSinkError::Config(
+                "storage_uri cannot be empty".to_string(),
+            ));
+        }
+
+        if uri.contains("://") {
+            let is_supported = uri.starts_with("file://")
+                || uri.starts_with("s3://")
+                || uri.starts_with("gs://")
+                || uri.starts_with("gcs://")
+                || uri.starts_with("azblob://")
+                || uri.starts_with("abfs://")
+                || uri.starts_with("memory://");
+            if !is_supported {
+                return Err(ParquetSinkError::Config(format!(
+                    "unsupported storage URI scheme: '{uri}'"
+                )));
+            }
+        }
+
+        if self.node_id.trim().is_empty() {
+            return Err(ParquetSinkError::Config(
+                "node_id cannot be empty".to_string(),
+            ));
+        }
+
+        if self.partition_pattern.trim().is_empty() {
+            return Err(ParquetSinkError::Config(
+                "partition_pattern cannot be empty".to_string(),
+            ));
+        }
+
+        if self.max_open_partitions == 0 {
+            return Err(ParquetSinkError::Config(
+                "max_open_partitions must be greater than 0".to_string(),
+            ));
+        }
+
+        let _ = self.build_operator()?;
+
+        Ok(())
+    }
+
     /// Builds an `OpenDAL` [`opendal::Operator`] configured according to `storage_uri` and `storage_options`.
     #[allow(clippy::too_many_lines)]
     pub fn build_operator(&self) -> Result<opendal::Operator, ParquetSinkError> {
@@ -259,10 +352,11 @@ impl ParquetSinkConfig {
         }
 
         let op = if let Some(path) = uri.strip_prefix("file://") {
+            let default_dir = default_atomic_write_dir(path);
             let atomic_dir = self
                 .storage_options
                 .get("atomic_write_dir")
-                .map_or(path, String::as_str);
+                .map_or(default_dir.as_str(), String::as_str);
             let builder = opendal::services::Fs::default()
                 .root(path)
                 .atomic_write_dir(atomic_dir);
@@ -417,10 +511,11 @@ impl ParquetSinkConfig {
                 ));
             }
         } else if !uri.contains("://") {
+            let default_dir = default_atomic_write_dir(uri);
             let atomic_dir = self
                 .storage_options
                 .get("atomic_write_dir")
-                .map_or(uri, String::as_str);
+                .map_or(default_dir.as_str(), String::as_str);
             let builder = opendal::services::Fs::default()
                 .root(uri)
                 .atomic_write_dir(atomic_dir);
@@ -825,5 +920,158 @@ mod tests {
         "#;
         let invalid_config: ParquetSinkConfig = toml::from_str(invalid_toml).unwrap();
         assert!(invalid_config.effective_compression().is_err());
+    }
+
+    #[test]
+    fn test_validate_default_config_succeeds() {
+        let config = ParquetSinkConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_fails_on_invalid_compression_level() {
+        let config = ParquetSinkConfig {
+            compression: CompressionCodec::Zstd { level: Some(3) },
+            compression_level: Some(999),
+            ..Default::default()
+        };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("Invalid Zstd compression level")
+        );
+    }
+
+    #[test]
+    fn test_validate_fails_on_empty_storage_uri() {
+        let config = ParquetSinkConfig {
+            storage_uri: "   ".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("storage_uri cannot be empty")
+        );
+    }
+
+    #[test]
+    fn test_validate_fails_on_unsupported_scheme() {
+        let config = ParquetSinkConfig {
+            storage_uri: "ftp://storage.host/data".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("unsupported storage URI scheme")
+        );
+    }
+
+    #[test]
+    fn test_validate_fails_on_zero_max_open_partitions() {
+        let config = ParquetSinkConfig {
+            max_open_partitions: 0,
+            ..Default::default()
+        };
+        let err = config.validate();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("max_open_partitions must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_validate_fails_on_empty_node_id_or_partition_pattern() {
+        let config_node = ParquetSinkConfig {
+            node_id: "  ".to_string(),
+            ..Default::default()
+        };
+        assert!(config_node.validate().is_err());
+
+        let config_pattern = ParquetSinkConfig {
+            partition_pattern: String::new(),
+            ..Default::default()
+        };
+        assert!(config_pattern.validate().is_err());
+    }
+
+    #[test]
+    fn test_default_atomic_staging_directory_resolves_to_tmp() {
+        let config_file = ParquetSinkConfig {
+            storage_uri: "file:///var/data".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_file.resolve_atomic_write_dir(),
+            Some("/var/data/.tmp".to_string())
+        );
+
+        let config_file_trailing = ParquetSinkConfig {
+            storage_uri: "file:///var/data/".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_file_trailing.resolve_atomic_write_dir(),
+            Some("/var/data/.tmp".to_string())
+        );
+
+        let config_root = ParquetSinkConfig {
+            storage_uri: "file:///".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_root.resolve_atomic_write_dir(),
+            Some("/.tmp".to_string())
+        );
+
+        let config_local = ParquetSinkConfig {
+            storage_uri: "./data".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_local.resolve_atomic_write_dir(),
+            Some("./data/.tmp".to_string())
+        );
+
+        let config_local_rel = ParquetSinkConfig {
+            storage_uri: "data".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config_local_rel.resolve_atomic_write_dir(),
+            Some("data/.tmp".to_string())
+        );
+
+        // Custom override via storage_options takes precedence
+        let mut storage_options = HashMap::new();
+        storage_options.insert(
+            "atomic_write_dir".to_string(),
+            "/custom/staging".to_string(),
+        );
+        let config_custom = ParquetSinkConfig {
+            storage_uri: "file:///var/data".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        assert_eq!(
+            config_custom.resolve_atomic_write_dir(),
+            Some("/custom/staging".to_string())
+        );
+
+        // Remote storage returns None when not set
+        let config_s3 = ParquetSinkConfig {
+            storage_uri: "s3://bucket/prefix".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(config_s3.resolve_atomic_write_dir(), None);
     }
 }
