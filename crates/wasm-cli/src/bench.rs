@@ -160,16 +160,40 @@ pub fn run_benchmark(
                 ptr
             
             };
-            let mut status_bytes = [0u8; 4];
+        let mut header_buf = [0u8; 20];
         memory
-            .read(&store, header_ptr as usize, &mut status_bytes)
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to read response status from guest memory: {e}")
-            })?;
-        let status = u32::from_le_bytes(status_bytes);
+            .read(&store, header_ptr as usize, &mut header_buf)
+            .map_err(|e| anyhow::anyhow!("Failed to read response header from guest memory: {e}"))?;
+            
+        let status = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         if status != 0 {
             anyhow::bail!("datalake_transform returned non-zero status {status} during benchmark");
         }
+        
+        let batch_count = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+        let batches_ptr = u32::from_le_bytes(header_buf[8..12].try_into().unwrap());
+        let msg_ptr = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
+        let msg_len = u32::from_le_bytes(header_buf[16..20].try_into().unwrap());
+
+        if msg_ptr != 0 && msg_len > 0 {
+            let _ = dealloc_fn.call(&mut store, (msg_ptr, msg_len));
+        }
+
+        if batch_count > 0 && batches_ptr != 0 {
+            let mut desc_buf = vec![0u8; (batch_count * 8) as usize];
+            if memory.read(&store, batches_ptr as usize, &mut desc_buf).is_ok() {
+                for i in 0..batch_count as usize {
+                    let b_ptr = u32::from_le_bytes(desc_buf[i*8 .. i*8+4].try_into().unwrap());
+                    let b_len = u32::from_le_bytes(desc_buf[i*8+4 .. i*8+8].try_into().unwrap());
+                    if b_ptr != 0 && b_len > 0 {
+                        let _ = dealloc_fn.call(&mut store, (b_ptr, b_len));
+                    }
+                }
+            }
+            let _ = dealloc_fn.call(&mut store, (batches_ptr, batch_count * 8));
+        }
+        let _ = dealloc_fn.call(&mut store, (header_ptr, 20));
+
     }
     let elapsed = start_time.elapsed();
 
