@@ -227,7 +227,7 @@ impl Default for ParquetSinkConfig {
 }
 
 impl ParquetSinkConfig {
-    /// Builds an `OpenDAL` [`Operator`] configured according to `storage_uri` and `storage_options`.
+    /// Builds an `OpenDAL` [`opendal::Operator`] configured according to `storage_uri` and `storage_options`.
     #[allow(clippy::too_many_lines)]
     pub fn build_operator(&self) -> Result<opendal::Operator, ParquetSinkError> {
         let uri = self.storage_uri.trim();

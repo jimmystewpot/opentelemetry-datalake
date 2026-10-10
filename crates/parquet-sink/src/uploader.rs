@@ -74,7 +74,7 @@ impl UploaderSender {
 
 /// Completion handle for an active background upload.
 ///
-/// If dropped before [`wait_for_completion`] successfully returns, the background
+/// If dropped before [`Self::wait_for_completion`] successfully returns, the background
 /// writer task is instructed to abort the upload, preventing orphaned multipart uploads.
 #[derive(Debug)]
 pub struct UploaderHandle {

@@ -1395,7 +1395,12 @@ mod tests {
             panic!("fatal background worker panic");
         });
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(2000), async {
+            while !panicked_jh.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         assert!(panicked_jh.is_finished());
 
         manager.in_flight_uploads.push(panicked_jh);
