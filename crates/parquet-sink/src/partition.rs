@@ -131,19 +131,55 @@ fn format_partition_path(
     day: i32,
     hour: i32,
 ) -> String {
-    let date_str = format!("{year:04}-{month:02}-{day:02}");
-    let hour_str = format!("{hour:02}");
-    let year_str = format!("{year:04}");
-    let month_str = format!("{month:02}");
-    let day_str = format!("{day:02}");
+    use std::fmt::Write;
 
-    pattern
-        .replace("{signal}", signal)
-        .replace("{date}", &date_str)
-        .replace("{hour}", &hour_str)
-        .replace("{year}", &year_str)
-        .replace("{month}", &month_str)
-        .replace("{day}", &day_str)
+    // Fast path for canonical Hive template: "signal={signal}/date={date}/hour={hour}"
+    if pattern == "signal={signal}/date={date}/hour={hour}" {
+        let mut path = String::with_capacity(12 + signal.len() + 16 + 8);
+        let _ = write!(
+            path,
+            "signal={signal}/date={year:04}-{month:02}-{day:02}/hour={hour:02}"
+        );
+        return path;
+    }
+
+    // General single-pass path: pre-allocated output buffer scanning tokens
+    let mut result = String::with_capacity(pattern.len() + 32);
+    let mut chars = pattern;
+    while let Some(open) = chars.find('{') {
+        result.push_str(&chars[..open]);
+        let rest = &chars[open..];
+        if let Some(close) = rest.find('}') {
+            let token = &rest[1..close];
+            match token {
+                "signal" => result.push_str(signal),
+                "date" => {
+                    let _ = write!(result, "{year:04}-{month:02}-{day:02}");
+                }
+                "hour" => {
+                    let _ = write!(result, "{hour:02}");
+                }
+                "year" => {
+                    let _ = write!(result, "{year:04}");
+                }
+                "month" => {
+                    let _ = write!(result, "{month:02}");
+                }
+                "day" => {
+                    let _ = write!(result, "{day:02}");
+                }
+                _ => {
+                    result.push_str(&rest[..=close]);
+                }
+            }
+            chars = &rest[close + 1..];
+        } else {
+            result.push_str(rest);
+            break;
+        }
+    }
+    result.push_str(chars);
+    result
 }
 
 /// Manages vectorized partitioning, active Parquet writer lifecycles,

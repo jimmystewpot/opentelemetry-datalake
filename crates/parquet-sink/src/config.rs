@@ -268,7 +268,31 @@ impl ParquetSinkConfig {
                     "secret_access_key" | "aws_secret_access_key" => {
                         builder = builder.secret_access_key(v);
                     }
-                    _ => {}
+                    "session_token" | "aws_session_token" | "security_token" => {
+                        builder = builder.session_token(v);
+                    }
+                    "role_arn" | "aws_role_arn" => {
+                        builder = builder.role_arn(v);
+                    }
+                    "enable_virtual_host_style" => {
+                        if v.eq_ignore_ascii_case("true") || v == "1" {
+                            builder = builder.enable_virtual_host_style();
+                        }
+                    }
+                    "allow_anonymous" | "skip_signature" => {
+                        if v.eq_ignore_ascii_case("true") || v == "1" {
+                            builder = builder.skip_signature();
+                        }
+                    }
+                    "server_side_encryption" => {
+                        builder = builder.server_side_encryption(v);
+                    }
+                    "server_side_encryption_aws_kms_key_id" => {
+                        builder = builder.server_side_encryption_aws_kms_key_id(v);
+                    }
+                    other => {
+                        tracing::warn!("Unrecognized or unhandled S3 storage option: '{other}'");
+                    }
                 }
             }
             opendal::Operator::new(builder)?
@@ -297,7 +321,20 @@ impl ParquetSinkConfig {
                     "credential" | "gcs_credential" | "credentials" => {
                         builder = builder.credential(v);
                     }
-                    _ => {}
+                    "credential_path" | "gcs_credential_path" => {
+                        builder = builder.credential_path(v);
+                    }
+                    "service_account" | "gcs_service_account" => {
+                        builder = builder.service_account(v);
+                    }
+                    "allow_anonymous" | "skip_signature" => {
+                        if v.eq_ignore_ascii_case("true") || v == "1" {
+                            builder = builder.skip_signature();
+                        }
+                    }
+                    other => {
+                        tracing::warn!("Unrecognized or unhandled GCS storage option: '{other}'");
+                    }
                 }
             }
             opendal::Operator::new(builder)?
@@ -329,7 +366,14 @@ impl ParquetSinkConfig {
                     "account_key" | "azure_account_key" => {
                         builder = builder.account_key(v);
                     }
-                    _ => {}
+                    "sas_token" | "azure_sas_token" => {
+                        builder = builder.sas_token(v);
+                    }
+                    other => {
+                        tracing::warn!(
+                            "Unrecognized or unhandled Azblob storage option: '{other}'"
+                        );
+                    }
                 }
             }
             opendal::Operator::new(builder)?
