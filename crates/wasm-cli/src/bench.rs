@@ -133,12 +133,20 @@ pub fn run_benchmark(
 
     let transform_fn = instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
         .map_err(|e| anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}"))?;
+
+    let signal_bytes = signal.as_bytes();
+    let signal_len = u32::try_from(signal_bytes.len()).unwrap_or(0);
+    let signal_ptr = alloc_fn.call(&mut store, signal_len).unwrap_or(0);
+    if signal_ptr != 0 {
+        let _ = memory.write(&mut store, signal_ptr as usize, signal_bytes);
+    }
+
     let start_time = std::time::Instant::now();
     for _ in 0..iterations {
         let header_ptr = {
                 let f = transform_fn.clone();
 
-                let packed = f.call(&mut store, (0, ipc_ptr, ipc_len)).map_err(|e| {
+                let packed = f.call(&mut store, (signal_ptr, ipc_ptr, ipc_len)).map_err(|e| {
                     anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
                 })?;
                 let ptr = u32::try_from(packed >> 32).unwrap_or(0);
@@ -184,6 +192,8 @@ pub fn run_benchmark(
         std::time::Duration::ZERO
     };
     let allocated_memory_bytes = memory.data_size(&store);
+
+    let _ = dealloc_fn.call(&mut store, (signal_ptr, signal_len));
 
     Ok(BenchResult {
         iterations,

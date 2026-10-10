@@ -209,13 +209,21 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     }
 
     // Call datalake_transform supporting v1 (3 args), legacy (2 args), or descriptor (1 arg)
+
+    let signal_bytes = signal.as_bytes();
+    let signal_len = u32::try_from(signal_bytes.len()).unwrap_or(0);
+    let signal_ptr = alloc_fn.call(&mut store, signal_len).unwrap_or(0);
+    if signal_ptr != 0 {
+        let _ = memory.write(&mut store, signal_ptr as usize, signal_bytes);
+    }
+
     let transform_fn = instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
         .map_err(|e| anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}"))?;
     let (header_ptr, _header_len) = {
         let f = transform_fn.clone();
 
         let packed = f
-            .call(&mut store, (0, ipc_ptr, ipc_len))
+            .call(&mut store, (signal_ptr, ipc_ptr, ipc_len))
             .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
         let ptr = u32::try_from(packed >> 32).unwrap_or(0);
         let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
@@ -334,6 +342,7 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     println!(
         "✓ Passed immutability & conformance test suite ({verified_count} batch(es) verified)"
     );
+    let _ = dealloc_fn.call(&mut store, (signal_ptr, signal_len));
     Ok(())
 }
 
