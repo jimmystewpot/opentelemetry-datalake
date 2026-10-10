@@ -352,14 +352,10 @@ impl ParquetSinkConfig {
         }
 
         let op = if let Some(path) = uri.strip_prefix("file://") {
-            let default_dir = default_atomic_write_dir(path);
-            let atomic_dir = self
-                .storage_options
-                .get("atomic_write_dir")
-                .map_or(default_dir.as_str(), String::as_str);
-            let builder = opendal::services::Fs::default()
-                .root(path)
-                .atomic_write_dir(atomic_dir);
+            let mut builder = opendal::services::Fs::default().root(path);
+            if let Some(ref atomic_dir) = self.resolve_atomic_write_dir() {
+                builder = builder.atomic_write_dir(atomic_dir);
+            }
             opendal::Operator::new(builder)?
         } else if let Some(s3_path) = uri.strip_prefix("s3://") {
             let (bucket, root) = match s3_path.find('/') {
@@ -511,14 +507,10 @@ impl ParquetSinkConfig {
                 ));
             }
         } else if !uri.contains("://") {
-            let default_dir = default_atomic_write_dir(uri);
-            let atomic_dir = self
-                .storage_options
-                .get("atomic_write_dir")
-                .map_or(default_dir.as_str(), String::as_str);
-            let builder = opendal::services::Fs::default()
-                .root(uri)
-                .atomic_write_dir(atomic_dir);
+            let mut builder = opendal::services::Fs::default().root(uri);
+            if let Some(ref atomic_dir) = self.resolve_atomic_write_dir() {
+                builder = builder.atomic_write_dir(atomic_dir);
+            }
             opendal::Operator::new(builder)?
         } else {
             return Err(ParquetSinkError::Config(format!(

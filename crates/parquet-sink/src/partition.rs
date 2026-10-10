@@ -695,15 +695,8 @@ impl PartitionManager {
                 let Some(jh) = self.in_flight_uploads.remove(i) else {
                     continue;
                 };
-                let waker = std::task::Waker::noop();
-                let mut cx = std::task::Context::from_waker(waker);
-                let mut pinned = std::pin::pin!(jh);
-                let res = match std::future::Future::poll(pinned.as_mut(), &mut cx) {
-                    std::task::Poll::Ready(res) => res,
-                    std::task::Poll::Pending => {
-                        continue;
-                    }
-                };
+                let res =
+                    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(jh));
                 match res {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -1224,7 +1217,7 @@ mod tests {
         manager.wait_for_all_uploads().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_background_upload_failure_propagates_to_manager() {
         let op = Operator::new(Memory::default()).unwrap();
         let config = crate::config::ParquetSinkConfig::default();
@@ -1711,7 +1704,7 @@ mod tests {
         manager.wait_for_all_uploads().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_retire_active_writer_finalizes_when_previous_upload_failed() {
         let op = Operator::new(Memory::default()).unwrap();
         let config = crate::config::ParquetSinkConfig::default();
@@ -1769,7 +1762,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_flush_all_finalizes_active_writers_when_previous_upload_failed() {
         let op = Operator::new(Memory::default()).unwrap();
         let config = crate::config::ParquetSinkConfig::default();

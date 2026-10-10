@@ -28,11 +28,14 @@ pub struct ParquetSink {
 impl ParquetSink {
     /// Creates a new `ParquetSink` from configuration.
     ///
-    /// Initializes the `OpenDAL` storage operator, signal router, and partition manager.
+    /// Validates configuration and initializes the `OpenDAL` storage operator,
+    /// signal router, and partition manager.
     ///
     /// # Errors
-    /// Returns [`PipelineError`] if the storage operator cannot be constructed.
+    /// Returns [`PipelineError`] if configuration validation fails or if the storage
+    /// operator cannot be constructed.
     pub fn try_new(config: ParquetSinkConfig) -> Result<Self, PipelineError> {
+        config.validate()?;
         let operator = config.build_operator()?;
         let router = SignalRouter::new(config.variant_encoding);
         let manager = PartitionManager::new(config.clone(), operator);
@@ -236,6 +239,20 @@ mod tests {
         };
         let err = ParquetSink::try_new(invalid_config);
         assert!(err.is_err());
+
+        let invalid_node_config = ParquetSinkConfig {
+            storage_uri: "memory://test-sink".to_string(),
+            node_id: "   ".to_string(),
+            ..Default::default()
+        };
+        assert!(ParquetSink::try_new(invalid_node_config).is_err());
+
+        let invalid_partitions_config = ParquetSinkConfig {
+            storage_uri: "memory://test-sink".to_string(),
+            max_open_partitions: 0,
+            ..Default::default()
+        };
+        assert!(ParquetSink::try_new(invalid_partitions_config).is_err());
     }
 
     #[test]
