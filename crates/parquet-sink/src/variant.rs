@@ -656,8 +656,12 @@ impl VariantTransformer {
         let mut new_fields = Vec::with_capacity(schema.fields().len());
         let mut new_columns = Vec::with_capacity(batch.num_columns());
 
-        let mut extension_meta = std::collections::HashMap::with_capacity(1);
-        extension_meta.insert("ARROW:extension:name".to_string(), "variant".to_string());
+        let mut extension_meta = std::collections::HashMap::with_capacity(2);
+        extension_meta.insert(
+            "ARROW:extension:name".to_string(),
+            "arrow.parquet.variant".to_string(),
+        );
+        extension_meta.insert("ARROW:extension:metadata".to_string(), String::new());
 
         let struct_fields = Fields::from(vec![
             Field::new("metadata", DataType::Binary, false),
@@ -834,7 +838,7 @@ mod tests {
         assert!(matches!(field.data_type(), DataType::Struct(_)));
         assert_eq!(
             field.metadata().get("ARROW:extension:name"),
-            Some(&"variant".to_string())
+            Some(&"arrow.parquet.variant".to_string())
         );
 
         let struct_col = transformed

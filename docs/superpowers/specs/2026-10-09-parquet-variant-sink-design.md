@@ -171,8 +171,6 @@ A partition writer rolls when:
 
 ```toml
 [parquet]
-type = "parquet"
-enabled = true
 storage_uri = "s3://otel-datalake-production/telemetry"
 node_id = "collector-pod-01"
 

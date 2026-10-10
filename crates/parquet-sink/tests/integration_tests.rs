@@ -155,8 +155,8 @@ fn assert_variant_struct_field(field: &Field) {
             .metadata()
             .get("ARROW:extension:name")
             .map(String::as_str),
-        Some("variant"),
-        "Field '{}' must be annotated with ARROW:extension:name = variant",
+        Some("arrow.parquet.variant"),
+        "Field '{}' must be annotated with ARROW:extension:name = arrow.parquet.variant",
         field.name()
     );
 
@@ -438,24 +438,76 @@ async fn test_path_partitioning_hierarchy() {
     assert!(found_hour_23, "Hour 23 partition file found");
 }
 
-#[test]
-fn test_s3_compatible_storage_configuration() {
+#[tokio::test]
+#[allow(clippy::collapsible_if)]
+async fn test_s3_compatible_storage_configuration() {
+    let endpoint =
+        std::env::var("RUSTFS_ENDPOINT").unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
+
+    let addr = endpoint
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let is_running = tokio::net::TcpStream::connect(addr).await.is_ok();
+
     let mut storage_options = HashMap::new();
-    storage_options.insert("endpoint".to_string(), "http://127.0.0.1:9000".to_string());
+    storage_options.insert("endpoint".to_string(), endpoint);
     storage_options.insert("region".to_string(), "us-east-1".to_string());
-    storage_options.insert("access_key_id".to_string(), "minioadmin".to_string());
-    storage_options.insert("secret_access_key".to_string(), "minioadmin".to_string());
+    storage_options.insert("access_key_id".to_string(), "admin".to_string());
+    storage_options.insert("secret_access_key".to_string(), "password".to_string());
+    storage_options.insert("enable_virtual_host_style".to_string(), "false".to_string());
 
     let config = ParquetSinkConfig {
-        storage_uri: "s3://telemetry-bucket/otlp-data".to_string(),
-        storage_options,
+        storage_uri: "s3://warehouse/otlp-data".to_string(),
+        storage_options: storage_options.clone(),
+        max_records: 10,
         ..Default::default()
     };
 
-    let sink_res = ParquetSink::try_new(config);
+    let sink_res = ParquetSink::try_new(config.clone());
     assert!(
         sink_res.is_ok(),
         "S3-compatible sink initialization should succeed: {:?}",
         sink_res.err()
     );
+
+    if !is_running {
+        eprintln!("RustFS/S3 endpoint is not running; skipping live upload/read test");
+        return;
+    }
+
+    let mut sink = sink_res.unwrap();
+    let (tx, rx) = mpsc::channel(4);
+    let batch = create_logs_batch();
+    let num_rows = batch.num_rows();
+    tx.send(SignalBatch::Logs(batch)).await.unwrap();
+    drop(tx);
+
+    let run_res = sink.run(rx).await;
+    assert!(
+        run_res.is_ok(),
+        "Sink write to RustFS should succeed: {:?}",
+        run_res.err()
+    );
+
+    let op = config.build_operator().unwrap();
+    if let Ok(entries) = op.list_with("otlp-data/").recursive(true).await {
+        use opendal::EntryMode;
+        for entry in entries {
+            if let Ok(meta) = op.stat(entry.path()).await {
+                if meta.mode() == EntryMode::FILE && entry.path().ends_with(".parquet") {
+                    let bs = op.read(entry.path()).await.unwrap();
+                    let reader = ParquetRecordBatchReaderBuilder::try_new(bs.to_bytes())
+                        .unwrap()
+                        .build()
+                        .unwrap();
+                    let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+                    assert_eq!(
+                        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                        num_rows
+                    );
+                    return;
+                }
+            }
+        }
+    }
 }

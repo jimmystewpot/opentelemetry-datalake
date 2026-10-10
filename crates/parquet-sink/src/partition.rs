@@ -451,18 +451,36 @@ impl PartitionManager {
     }
     fn retire_active_writer(&mut self, active: ActiveWriter) -> Result<(), ParquetSinkError> {
         self.global_memory_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(active.buffered_memory))
             })
             .ok();
 
-        active.writer.close()?;
+        self.in_flight_uploads.retain(|jh| !jh.is_finished());
 
-        if self.in_flight_uploads.len() >= self.config.max_concurrent_uploads {
-            return Err(crate::error::ParquetSinkError::Internal(
-                "Max concurrent uploads reached".into(),
-            ));
+        while self.config.max_concurrent_uploads > 0
+            && self.in_flight_uploads.len() >= self.config.max_concurrent_uploads
+        {
+            let oldest = self.in_flight_uploads.remove(0);
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                ParquetSinkError::Internal(
+                    "No active Tokio runtime available to wait for background upload".to_string(),
+                )
+            })?;
+            let res = tokio::task::block_in_place(|| handle.block_on(oldest));
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(e) => {
+                    return Err(ParquetSinkError::Internal(format!(
+                        "Background upload task panicked: {e}"
+                    )));
+                }
+            }
+            self.in_flight_uploads.retain(|jh| !jh.is_finished());
         }
+
+        active.writer.close()?;
 
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             ParquetSinkError::Internal(
@@ -1167,7 +1185,7 @@ mod tests {
         assert_eq!(manager.in_flight_uploads.len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_in_flight_uploads_applies_backpressure_at_limit() {
         let op = Operator::new(Memory::default()).unwrap();
         let config = crate::config::ParquetSinkConfig {
@@ -1204,16 +1222,19 @@ mod tests {
 
         manager.route_batch(&b1, "logs").unwrap();
 
-        // Now flush_all should fail with Max concurrent uploads reached
-        let err = manager.flush_all();
-        assert!(err.is_err());
-        assert!(
-            err.unwrap_err()
-                .to_string()
-                .contains("Max concurrent uploads reached")
-        );
+        // Release the blocking in-flight task after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            let _ = tx.send(());
+        });
 
-        // Release the task
-        let _ = tx.send(());
+        // flush_all should now gracefully wait for the slot and succeed without dropping files
+        let res = manager.flush_all();
+        assert!(
+            res.is_ok(),
+            "flush_all should wait for slot and succeed: {:?}",
+            res.err()
+        );
+        assert_eq!(manager.in_flight_uploads.len(), 1);
     }
 }

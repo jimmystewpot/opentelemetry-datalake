@@ -13,7 +13,7 @@ services-memory = ["opendal/services-memory"]
 [dependencies]
 pipeline-core = { workspace = true }
 arrow = { workspace = true, features = ["json"] }
-parquet = { workspace = true, features = ["arrow", "async", "zstd", "snap"] }
+parquet = { workspace = true, features = ["arrow", "async", "zstd", "snap", "variant_experimental"] }
 opendal = { version = "0.58", default-features = false, features = ["services-fs", "services-s3", "services-gcs", "services-azblob", "layers-retry"] }
 tokio = { workspace = true }
 thiserror = { workspace = true }

@@ -64,7 +64,7 @@ impl FileNamer {
 
         let timestamp_nano = self
             .last_nanos
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
                 if now > prev {
                     Some(now)
                 } else {
