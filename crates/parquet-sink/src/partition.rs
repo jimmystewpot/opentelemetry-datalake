@@ -1409,4 +1409,216 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("panicked"));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_max_concurrent_uploads_strictly_bounds_active_plus_in_flight_uploads() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_open_partitions: 8,
+            max_concurrent_uploads: 2,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+
+        // Route batches to 4 different hours
+        for h in 0..4 {
+            let ts = 1_700_000_000_000_000_000 + (h as i64) * 3600 * 1_000_000_000;
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampNanosecondArray::from(vec![ts])),
+                    Arc::new(StringArray::from(vec![format!("msg-{h}").as_str()])),
+                ],
+            )
+            .unwrap();
+
+            manager.route_batch(&batch, "logs").unwrap();
+
+            // At every step, active_writer_count + in_flight_uploads.len() MUST NOT exceed max_concurrent_uploads (2)
+            let total_uploads = manager.active_writer_count() + manager.in_flight_uploads.len();
+            assert!(
+                total_uploads <= 2,
+                "Total concurrent uploads {total_uploads} exceeded limit 2 at iteration {h}"
+            );
+        }
+
+        manager.flush_all().unwrap();
+        manager.wait_for_all_uploads().await.unwrap();
+        assert_eq!(manager.active_writer_count(), 0);
+        assert_eq!(manager.in_flight_uploads.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_current_memory_bytes_and_active_writer_count_accessors() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        assert_eq!(manager.active_writer_count(), 0);
+        assert_eq!(manager.current_memory_bytes(), 0);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("val", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&batch, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+        assert!(manager.current_memory_bytes() > 0);
+
+        manager.flush_all().unwrap();
+        assert_eq!(manager.active_writer_count(), 0);
+        assert_eq!(manager.current_memory_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_all_uploads_reports_task_panic() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        let panicked_jh = tokio::spawn(async {
+            panic!("fatal worker panic during shutdown");
+        });
+
+        let _ = tokio::time::timeout(tokio::time::Duration::from_millis(2000), async {
+            while !panicked_jh.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        manager.in_flight_uploads.push(panicked_jh);
+
+        let res = manager.wait_for_all_uploads().await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("panicked"));
+    }
+
+    #[test]
+    fn test_format_partition_path_custom_tokens() {
+        let pattern = "telemetry/{signal}/{year}-{month}-{day}/h_{hour}/{literal}";
+        let path = format_partition_path(pattern, "traces", 2026, 10, 9, 14);
+        assert_eq!(path, "telemetry/traces/2026-10-09/h_14/{literal}");
+
+        let date_pattern = "{signal}/date={date}/hour={hour}";
+        let date_path = format_partition_path(date_pattern, "logs", 2026, 5, 4, 8);
+        assert_eq!(date_path, "logs/date=2026-05-04/hour=08");
+    }
+
+    #[tokio::test]
+    async fn test_route_batch_with_heterogeneous_timestamps_in_single_batch() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+
+        // Single batch with 3 rows spanning 3 different hours
+        let ts_base = 1_700_000_000_000_000_000;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    ts_base,
+                    ts_base + 3600 * 1_000_000_000,
+                    ts_base + 7200 * 1_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["h0", "h1", "h2"])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&batch, "logs").unwrap();
+        // 3 separate partitions must be opened for the 3 hours
+        assert_eq!(manager.active_writer_count(), 3);
+
+        manager.flush_all().unwrap();
+        manager.wait_for_all_uploads().await.unwrap();
+        assert_eq!(manager.active_writer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_route_batch_with_int64_and_null_timestamp_columns() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        // 1. Int64 timestamp column
+        let schema_int64 = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch_int64 = RecordBatch::try_new(
+            schema_int64,
+            vec![
+                Arc::new(Int64Array::from(vec![1_700_000_000_000_000_000])),
+                Arc::new(StringArray::from(vec!["int64-ts"])),
+            ],
+        )
+        .unwrap();
+        assert!(manager.route_batch(&batch_int64, "traces").is_ok());
+
+        // 2. Null timestamp values
+        let schema_null = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch_null = RecordBatch::try_new(
+            schema_null,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![None])),
+                Arc::new(StringArray::from(vec!["null-ts"])),
+            ],
+        )
+        .unwrap();
+        assert!(manager.route_batch(&batch_null, "metrics").is_ok());
+
+        // 3. Missing timestamp column altogether
+        let schema_missing = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
+        let batch_missing = RecordBatch::try_new(
+            schema_missing,
+            vec![Arc::new(StringArray::from(vec!["no-ts"]))],
+        )
+        .unwrap();
+        assert!(manager.route_batch(&batch_missing, "logs").is_ok());
+
+        manager.flush_all().unwrap();
+        manager.wait_for_all_uploads().await.unwrap();
+    }
 }

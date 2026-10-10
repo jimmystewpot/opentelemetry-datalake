@@ -193,4 +193,23 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn test_parquet_sink_accessors_and_invalid_config() {
+        let valid_config = ParquetSinkConfig {
+            storage_uri: "memory://test-sink".to_string(),
+            ..Default::default()
+        };
+        let sink = ParquetSink::try_new(valid_config.clone()).unwrap();
+        assert_eq!(sink.config().storage_uri, "memory://test-sink");
+        assert_eq!(sink.manager().active_writer_count(), 0);
+        assert!(sink.router().is_variant_enabled());
+
+        let invalid_config = ParquetSinkConfig {
+            storage_uri: "unsupported_scheme://bucket/prefix".to_string(),
+            ..Default::default()
+        };
+        let err = ParquetSink::try_new(invalid_config);
+        assert!(err.is_err());
+    }
 }

@@ -636,4 +636,76 @@ mod tests {
         let num_col = row_group.column(1);
         assert!(num_col.statistics().is_some());
     }
+
+    #[tokio::test]
+    async fn test_partition_writer_new_alias_and_flush() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let path = "test/new_alias_and_flush.parquet";
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut writer = PartitionWriter::new(schema.clone(), sender, &config).unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["hello", "world"]))],
+        )
+        .unwrap();
+
+        writer.write_batch(&batch).unwrap();
+        assert_eq!(writer.records_written(), 2);
+        assert!(writer.bytes_written() > 0);
+
+        writer.flush().unwrap();
+        writer.close().unwrap();
+        handle.wait_for_completion().await.unwrap();
+
+        let meta = op.stat(path).await.unwrap();
+        assert!(meta.content_length() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_channel_writer_zero_capacity_fallback_and_empty_write() {
+        use std::io::Write;
+
+        let op = Operator::new(Memory::default()).unwrap();
+        let path = "test/zero_cap.bin";
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+
+        // 0 capacity falls back to DEFAULT_CHUNK_BUFFER_SIZE
+        let mut channel_writer = ChannelWriter::new(sender, 0);
+
+        // Empty write returns Ok(0)
+        let written = channel_writer.write(&[]).unwrap();
+        assert_eq!(written, 0);
+
+        let written_bytes = channel_writer.write(b"non-empty chunk").unwrap();
+        assert_eq!(written_bytes, 15);
+        assert_eq!(channel_writer.bytes_written(), 15);
+
+        // Explicit flush
+        channel_writer.flush().unwrap();
+
+        // Finish
+        channel_writer.finish().unwrap();
+
+        // Flush or write exceeding buffer after finish fails with BrokenPipe
+        assert!(channel_writer.flush().is_ok());
+        // buffer was cleared by finish(), so let's put data into buffer and flush
+        let _ = channel_writer.write(b"after finish");
+        let flush_res = channel_writer.flush();
+        assert!(flush_res.is_err());
+        assert_eq!(
+            flush_res.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+
+        // Calling finish a second time is safe
+        assert!(channel_writer.finish().is_ok());
+
+        handle.wait_for_completion().await.unwrap();
+        let meta = op.stat(path).await.unwrap();
+        assert_eq!(meta.content_length(), 15);
+    }
 }

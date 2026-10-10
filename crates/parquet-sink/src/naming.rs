@@ -174,4 +174,39 @@ mod tests {
         assert!(name.contains("orig-node"));
         assert!(name.ends_with("_0042.parquet"));
     }
+
+    #[test]
+    fn test_naming_slash_only_prefix() {
+        let namer = FileNamer::new("node-slash".to_string());
+        let file = namer.generate_filename("///", 10);
+        assert!(!file.starts_with('/'));
+        assert!(file.contains("_node-slash_"));
+        assert!(file.ends_with("_0010.parquet"));
+    }
+
+    #[test]
+    fn test_naming_concurrent_threads() {
+        use std::sync::Arc;
+        let namer = Arc::new(FileNamer::new("concurrent-node".to_string()));
+        let mut handles = Vec::new();
+
+        for t in 0..8 {
+            let namer_clone = Arc::clone(&namer);
+            handles.push(std::thread::spawn(move || {
+                let mut names = Vec::new();
+                for i in 0..100 {
+                    names.push(namer_clone.generate_filename("part", (t * 100 + i) as u16));
+                }
+                names
+            }));
+        }
+
+        let mut all_names = HashSet::new();
+        for h in handles {
+            let thread_names = h.join().unwrap();
+            for n in thread_names {
+                assert!(all_names.insert(n), "Filename collision under concurrency!");
+            }
+        }
+    }
 }

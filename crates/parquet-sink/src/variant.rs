@@ -1009,4 +1009,165 @@ mod tests {
         assert_eq!(keys, vec!["key1", "key2"]);
         assert_eq!(val[0] & 0x03, 0x03); // Array type
     }
+
+    #[test]
+    fn test_large_utf8_column_transforms_to_variant() {
+        let transformer = VariantTransformer::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "large_attrs",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let col = Arc::new(arrow::array::LargeStringArray::from(vec![
+            Some(r#"{"service": "auth", "count": 10}"#),
+            None,
+            Some("plain string"),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
+        let res = transformer.transform_to_variant(&batch, &["large_attrs"]);
+        assert!(res.is_ok());
+        let transformed = res.unwrap();
+        assert_eq!(transformed.num_rows(), 3);
+        assert!(matches!(
+            transformed.schema().field(0).data_type(),
+            DataType::Struct(_)
+        ));
+    }
+
+    #[test]
+    fn test_transform_to_variant_empty_column_names_returns_unchanged() {
+        let transformer = VariantTransformer::default();
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
+        let res = transformer.transform_to_variant(&batch, &[]);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn test_encode_json_value_primitive_and_array_types() {
+        let mut encoder = VariantEncoder::default();
+        // Array with boolean, null, number, string, nested array
+        let json = r#"[true, false, null, 42, -100, 3.14159, "hello", [], [1, 2]]"#;
+        let res = encoder.encode_json_str(json);
+        assert!(res.is_ok());
+        let (meta, val) = res.unwrap().unwrap();
+        assert!(!val.is_empty());
+        assert_eq!(meta[0] & 0x0F, 0x01);
+
+        // Object with primitive numbers and booleans
+        let obj_json =
+            r#"{"a": true, "b": false, "c": null, "d": 123456789, "e": -987654321, "f": 2.71828}"#;
+        let obj_res = encoder.encode_json_str(obj_json);
+        assert!(obj_res.is_ok());
+        let (meta, val) = obj_res.unwrap().unwrap();
+        assert_eq!(meta[0] & 0x0F, 0x01);
+        let keys = VariantEncoder::parse_dictionary_keys(&meta);
+        assert_eq!(keys, vec!["a", "b", "c", "d", "e", "f"]);
+        assert_eq!(val[0] & 0x03, 0x02); // Object type
+    }
+
+    #[test]
+    fn test_encode_large_object_and_array_exceeding_255_elements() {
+        let mut encoder = VariantEncoder::default();
+
+        // 1. Large object with 260 elements (triggers is_large=true and 2-byte field ID size)
+        let mut obj = serde_json::Map::new();
+        for i in 0..260 {
+            obj.insert(format!("key_{i:03}"), serde_json::Value::from(i));
+        }
+        let json_str = serde_json::Value::Object(obj).to_string();
+        let res = encoder.encode_json_str(&json_str);
+        assert!(res.is_ok());
+        let (meta, val) = res.unwrap().unwrap();
+        assert!(!meta.is_empty());
+        assert!(!val.is_empty());
+        let keys = VariantEncoder::parse_dictionary_keys(&meta);
+        assert_eq!(keys.len(), 260);
+
+        // 2. Large array with 260 elements (triggers array is_large=true)
+        let arr: Vec<serde_json::Value> = (0..260).map(serde_json::Value::from).collect();
+        let arr_str = serde_json::Value::Array(arr).to_string();
+        let arr_res = encoder.encode_json_str(&arr_str);
+        assert!(arr_res.is_ok());
+        let (_arr_meta, arr_val) = arr_res.unwrap().unwrap();
+        assert_eq!(arr_val[0] & 0x03, 0x03); // Array type
+    }
+
+    #[test]
+    fn test_encode_long_primitive_string_exceeding_64_bytes() {
+        let mut encoder = VariantEncoder::default();
+        let long_str = "a".repeat(128);
+        let res = encoder.encode_json_str(&long_str);
+        assert!(res.is_ok());
+        let (_meta, val) = res.unwrap().unwrap();
+        // Byte 0 for long string is 0x40
+        assert_eq!(val[0], 0x40);
+        let len_bytes = &val[1..5];
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap());
+        assert_eq!(len, 128);
+    }
+
+    #[test]
+    fn test_encode_invalid_json_object_or_array_returns_error() {
+        let mut encoder = VariantEncoder::default();
+        let res1 = encoder.encode_json_str(r#"{"unterminated": "#);
+        assert!(res1.is_err());
+        assert!(matches!(
+            res1.unwrap_err(),
+            ParquetSinkError::VariantEncoding(_)
+        ));
+
+        let res2 = encoder.encode_json_str(r#"[1, 2, "#);
+        assert!(res2.is_err());
+        assert!(matches!(
+            res2.unwrap_err(),
+            ParquetSinkError::VariantEncoding(_)
+        ));
+    }
+
+    #[test]
+    fn test_parse_dictionary_keys_corrupt_metadata_returns_empty() {
+        assert!(VariantEncoder::parse_dictionary_keys(&[]).is_empty());
+        // Header with invalid version
+        assert!(VariantEncoder::parse_dictionary_keys(&[0x00]).is_empty());
+        // Truncated count
+        assert!(VariantEncoder::parse_dictionary_keys(&[0x01]).is_empty());
+        // Truncated offsets
+        assert!(VariantEncoder::parse_dictionary_keys(&[0x01, 10, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn test_transform_to_variant_errors_on_missing_or_non_string_column() {
+        let transformer = VariantTransformer::default();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("num", DataType::Int64, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![42])),
+                Arc::new(StringArray::from(vec![r#"{"hello": "world"}"#])),
+            ],
+        )
+        .unwrap();
+
+        // "missing_col" is not in schema
+        let res_missing = transformer.transform_to_variant(&batch, &["missing_col"]);
+        assert!(res_missing.is_err());
+        assert!(matches!(
+            res_missing.unwrap_err(),
+            ParquetSinkError::VariantEncoding(_)
+        ));
+
+        // "num" is Int64 (non-string)
+        let res_non_str = transformer.transform_to_variant(&batch, &["num"]);
+        assert!(res_non_str.is_err());
+        assert!(matches!(
+            res_non_str.unwrap_err(),
+            ParquetSinkError::VariantEncoding(_)
+        ));
+    }
 }

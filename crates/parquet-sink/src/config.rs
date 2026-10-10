@@ -612,4 +612,162 @@ mod tests {
         let op = config.build_operator();
         assert!(matches!(op, Err(ParquetSinkError::Config(_))));
     }
+
+    #[test]
+    fn test_build_operator_all_s3_storage_options() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert("aws_region".to_string(), "eu-west-1".to_string());
+        storage_options.insert(
+            "aws_endpoint".to_string(),
+            "http://localhost:9000".to_string(),
+        );
+        storage_options.insert("aws_access_key_id".to_string(), "minioadmin".to_string());
+        storage_options.insert(
+            "aws_secret_access_key".to_string(),
+            "minioadmin".to_string(),
+        );
+        storage_options.insert("aws_session_token".to_string(), "session123".to_string());
+        storage_options.insert(
+            "aws_role_arn".to_string(),
+            "arn:aws:iam::123456789012:role/S3Access".to_string(),
+        );
+        storage_options.insert("enable_virtual_host_style".to_string(), "true".to_string());
+        storage_options.insert("skip_signature".to_string(), "true".to_string());
+        storage_options.insert("server_side_encryption".to_string(), "aws:kms".to_string());
+        storage_options.insert(
+            "server_side_encryption_aws_kms_key_id".to_string(),
+            "kms-key-id".to_string(),
+        );
+        storage_options.insert(
+            "custom_unknown_option".to_string(),
+            "ignored_val".to_string(),
+        );
+
+        let config = ParquetSinkConfig {
+            storage_uri: "s3://my-bucket/prefix/path".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok(), "op is err: {:?}", op.err());
+
+        // Test empty S3 bucket
+        let empty_bucket_config = ParquetSinkConfig {
+            storage_uri: "s3:///prefix".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            empty_bucket_config.build_operator(),
+            Err(ParquetSinkError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_operator_all_gcs_storage_options() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert(
+            "gcs_endpoint".to_string(),
+            "http://localhost:4443".to_string(),
+        );
+        storage_options.insert("gcs_credential".to_string(), "{}".to_string());
+        storage_options.insert(
+            "gcs_credential_path".to_string(),
+            "/path/to/key.json".to_string(),
+        );
+        storage_options.insert(
+            "gcs_service_account".to_string(),
+            "sa@proj.iam.gserviceaccount.com".to_string(),
+        );
+        storage_options.insert("allow_anonymous".to_string(), "true".to_string());
+        storage_options.insert("custom_gcs_option".to_string(), "ignored".to_string());
+
+        let config = ParquetSinkConfig {
+            storage_uri: "gcs://my-gcs-bucket/telemetry".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok(), "op is err: {:?}", op.err());
+
+        let empty_gcs_config = ParquetSinkConfig {
+            storage_uri: "gs:///telemetry".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            empty_gcs_config.build_operator(),
+            Err(ParquetSinkError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_operator_all_azblob_storage_options() {
+        let mut storage_options = HashMap::new();
+        storage_options.insert("account_name".to_string(), "myaccount".to_string());
+        storage_options.insert(
+            "account_key".to_string(),
+            "c2VjcmV0a2V5MTIzNDU2".to_string(),
+        );
+        storage_options.insert("sas_token".to_string(), "sastoken123".to_string());
+        storage_options.insert(
+            "endpoint".to_string(),
+            "https://myaccount.blob.core.windows.net".to_string(),
+        );
+        storage_options.insert("custom_az_opt".to_string(), "ignored".to_string());
+
+        let config = ParquetSinkConfig {
+            storage_uri: "abfs://my-container/telemetry".to_string(),
+            storage_options,
+            ..Default::default()
+        };
+        let op = config.build_operator();
+        assert!(op.is_ok(), "op is err: {:?}", op.err());
+
+        let empty_az_config = ParquetSinkConfig {
+            storage_uri: "azblob:///telemetry".to_string(),
+            ..Default::default()
+        };
+        assert!(matches!(
+            empty_az_config.build_operator(),
+            Err(ParquetSinkError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn test_build_operator_local_fs_path_without_scheme_and_unsupported_scheme() {
+        let fs_config = ParquetSinkConfig {
+            storage_uri: "./local_data_dir".to_string(),
+            ..Default::default()
+        };
+        let op = fs_config.build_operator();
+        assert!(
+            op.is_ok(),
+            "Local fs without scheme should build: {:?}",
+            op.err()
+        );
+
+        let unsupported_config = ParquetSinkConfig {
+            storage_uri: "ftp://remote.host/data".to_string(),
+            ..Default::default()
+        };
+        let err = unsupported_config.build_operator();
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("unsupported storage URI scheme")
+        );
+    }
+
+    #[test]
+    fn test_compression_codec_invalid_zstd_level_and_deserialize_errors() {
+        let invalid_codec = CompressionCodec::Zstd { level: Some(999) };
+        assert!(invalid_codec.to_parquet_compression().is_err());
+
+        let unknown_err = serde_json::from_str::<CompressionCodec>(r#""bogus_compression""#);
+        assert!(unknown_err.is_err());
+
+        let invalid_zstd_err =
+            serde_json::from_str::<CompressionCodec>(r#"{"zstd": {"level": 999}}"#);
+        assert!(invalid_zstd_err.is_err());
+    }
 }

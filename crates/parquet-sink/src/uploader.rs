@@ -367,4 +367,86 @@ mod tests {
         let meta = op.stat(path).await.unwrap();
         assert_eq!(meta.content_length(), (25 * 64 * 1024) as u64);
     }
+
+    #[tokio::test]
+    async fn test_uploader_sender_dropped_without_finish_triggers_abort() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let path = "test/dropped_sender_abort.parquet";
+        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+
+        let chunk = bytes::Bytes::from_static(b"incomplete write");
+        sender.send_chunk(chunk).unwrap();
+        // Drop sender without calling finish()
+        drop(sender);
+
+        let res = handle.wait_for_completion().await;
+        assert!(
+            res.is_err(),
+            "Must report error when sender is dropped without finish()"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Upload aborted"),
+            "Expected aborted error: {err_msg}"
+        );
+
+        let exists = op.exists(path).await.unwrap();
+        assert!(!exists, "Aborted upload must not exist in storage");
+    }
+
+    #[tokio::test]
+    async fn test_uploader_handle_task_panicked() {
+        let panicked_jh = tokio::spawn(async {
+            panic!("uploader internal panic");
+        });
+
+        let handle = UploaderHandle {
+            join_handle: Some(panicked_jh),
+            abort_tx: None,
+            completed: false,
+        };
+
+        let res = handle.wait_for_completion().await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Uploader task panicked:"));
+    }
+
+    #[tokio::test]
+    async fn test_uploader_handle_task_cancelled() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let jh = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            Ok(())
+        });
+
+        started_rx.await.unwrap();
+        jh.abort();
+
+        let handle = UploaderHandle {
+            join_handle: Some(jh),
+            abort_tx: None,
+            completed: false,
+        };
+
+        let res = handle.wait_for_completion().await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Uploader task was cancelled"));
+    }
+
+    #[tokio::test]
+    async fn test_uploader_handle_already_completed() {
+        let handle = UploaderHandle {
+            join_handle: None,
+            abort_tx: None,
+            completed: true,
+        };
+
+        let res = handle.wait_for_completion().await;
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Uploader task already completed"));
+    }
 }
