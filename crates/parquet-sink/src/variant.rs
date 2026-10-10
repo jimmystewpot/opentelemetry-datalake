@@ -125,7 +125,7 @@ impl VariantEncoder {
             return Vec::new();
         }
 
-        let offset_size = (((header >> 4) & 0x03) + 1) as usize;
+        let offset_size = (((header >> 6) & 0x03) + 1) as usize;
         let mut pos = 1;
 
         if metadata.len() < pos + offset_size {
@@ -275,10 +275,10 @@ impl VariantEncoder {
             4
         };
 
-        // version 1 (bits 0-3), offset_size_minus_1 (bits 4-5), is_sorted = 1 (bit 6)
+        // version 1 (bits 0-3), is_sorted = 1 (bit 4), reserved (bit 5), offset_size_minus_1 (bits 6-7)
         #[allow(clippy::cast_possible_truncation)]
         let offset_size_minus_1 = (offset_size - 1) as u8;
-        let header_byte = 1 | (offset_size_minus_1 << 4) | (1 << 6);
+        let header_byte = 1 | (1 << 4) | (offset_size_minus_1 << 6);
         self.meta_buf.push(header_byte);
 
         Self::write_int_le(&mut self.meta_buf, count, offset_size);
