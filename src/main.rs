@@ -917,6 +917,10 @@ async fn main() -> anyhow::Result<()> {
         let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
         let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg)?;
 
+        // Share aggregate memory tracking and upload concurrency limits across signal sinks
+        traces_sink.share_state_from(&logs_sink);
+        metrics_sink.share_state_from(&logs_sink);
+
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {
                 tracing::error!("Logs Parquet sink error: {}", e);

@@ -39,7 +39,7 @@ kafka-sink = { workspace = true }
 storage = { workspace = true, features = ["aws"] }
 starrocks-sink = { workspace = true }
 elasticsearch-sink = { workspace = true }
-parquet-sink = { workspace = true }
+parquet-sink = { workspace = true, features = ["services-memory"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

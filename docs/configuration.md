@@ -212,9 +212,10 @@ Configures the Apache Parquet streaming sink. This sink streams telemetry signal
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `storage_uri` | String | `"file://./data"` | Storage URI (`file://`, `s3://`, `gcs://`, `gs://`, `azblob://`, `abfs://`, or `memory://`). |
+| `storage_uri` | String | `"file://./data"` | Storage URI (`file://`, `s3://`, `gcs://`, `gs://`, `azblob://`, `abfs://`, or `memory://` for ephemeral/testing use). |
 | `node_id` | String | `"default-node"` | Unique node identifier used for collision-free file naming. |
 | `compression` | String / Table | `"zstd"` | Page compression codec: `"zstd"` (with optional level), `"snappy"`, `"lz4raw"`, `"gzip"`, or `"uncompressed"`. |
+| `compression_level` | Integer | `null` | Optional Zstd compression level (e.g. `3`). When specified with `compression = "zstd"`, sets the compression level. |
 | `max_file_size_bytes` | Integer | `67108864` (64 MiB) | Maximum file size in bytes before triggering a roll. `0` disables size-based rolling. |
 | `max_file_interval_sec` | Integer | `60` | Maximum seconds before an active partition writer is closed and flushed. `0` disables interval-based rolling. |
 | `max_records` | Integer | `500000` | Maximum records per file before triggering a roll. `0` disables record-based rolling. |

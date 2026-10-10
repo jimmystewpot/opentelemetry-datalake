@@ -126,6 +126,10 @@ pub struct ParquetSinkConfig {
     #[serde(default = "default_compression")]
     pub compression: CompressionCodec,
 
+    /// Optional compression level applied when compression codec is Zstd.
+    #[serde(default)]
+    pub compression_level: Option<i32>,
+
     /// Maximum file size in bytes before rolling a partition file (default: 64 MB).
     #[serde(default = "default_max_file_size_bytes")]
     pub max_file_size_bytes: usize,
@@ -213,6 +217,7 @@ impl Default for ParquetSinkConfig {
             storage_uri: default_storage_uri(),
             node_id: default_node_id(),
             compression: default_compression(),
+            compression_level: None,
             max_file_size_bytes: default_max_file_size_bytes(),
             max_file_interval_sec: default_max_file_interval_sec(),
             max_open_partitions: default_max_open_partitions(),
@@ -227,6 +232,22 @@ impl Default for ParquetSinkConfig {
 }
 
 impl ParquetSinkConfig {
+    /// Returns the effective compression codec, applying `compression_level` when configured.
+    ///
+    /// # Errors
+    /// Returns [`ParquetSinkError::Config`] if `compression_level` is set but represents an invalid Zstd level.
+    pub fn effective_compression(&self) -> Result<CompressionCodec, ParquetSinkError> {
+        if let Some(level) = self.compression_level
+            && matches!(self.compression, CompressionCodec::Zstd { .. })
+        {
+            ZstdLevel::try_new(level).map_err(|e| {
+                ParquetSinkError::Config(format!("Invalid Zstd compression level: {e}"))
+            })?;
+            return Ok(CompressionCodec::Zstd { level: Some(level) });
+        }
+        Ok(self.compression)
+    }
+
     /// Builds an `OpenDAL` [`opendal::Operator`] configured according to `storage_uri` and `storage_options`.
     #[allow(clippy::too_many_lines)]
     pub fn build_operator(&self) -> Result<opendal::Operator, ParquetSinkError> {
@@ -238,7 +259,13 @@ impl ParquetSinkConfig {
         }
 
         let op = if let Some(path) = uri.strip_prefix("file://") {
-            let builder = opendal::services::Fs::default().root(path);
+            let atomic_dir = self
+                .storage_options
+                .get("atomic_write_dir")
+                .map_or(path, String::as_str);
+            let builder = opendal::services::Fs::default()
+                .root(path)
+                .atomic_write_dir(atomic_dir);
             opendal::Operator::new(builder)?
         } else if let Some(s3_path) = uri.strip_prefix("s3://") {
             let (bucket, root) = match s3_path.find('/') {
@@ -390,7 +417,13 @@ impl ParquetSinkConfig {
                 ));
             }
         } else if !uri.contains("://") {
-            let builder = opendal::services::Fs::default().root(uri);
+            let atomic_dir = self
+                .storage_options
+                .get("atomic_write_dir")
+                .map_or(uri, String::as_str);
+            let builder = opendal::services::Fs::default()
+                .root(uri)
+                .atomic_write_dir(atomic_dir);
             opendal::Operator::new(builder)?
         } else {
             return Err(ParquetSinkError::Config(format!(
@@ -769,5 +802,28 @@ mod tests {
         let invalid_zstd_err =
             serde_json::from_str::<CompressionCodec>(r#"{"zstd": {"level": 999}}"#);
         assert!(invalid_zstd_err.is_err());
+    }
+
+    #[test]
+    fn test_compression_level_toml_parsing_and_override() {
+        let toml_str = r#"
+            storage_uri = "file://./data"
+            compression = "zstd"
+            compression_level = 7
+        "#;
+        let config: ParquetSinkConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.compression_level, Some(7));
+        assert_eq!(
+            config.effective_compression().unwrap(),
+            CompressionCodec::Zstd { level: Some(7) }
+        );
+
+        let invalid_toml = r#"
+            storage_uri = "file://./data"
+            compression = "zstd"
+            compression_level = 999
+        "#;
+        let invalid_config: ParquetSinkConfig = toml::from_str(invalid_toml).unwrap();
+        assert!(invalid_config.effective_compression().is_err());
     }
 }

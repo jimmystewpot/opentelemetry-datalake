@@ -139,7 +139,7 @@ fn build_writer_properties(
 ) -> Result<WriterProperties, ParquetSinkError> {
     let mut builder = WriterProperties::builder()
         .set_writer_version(WriterVersion::PARQUET_2_0)
-        .set_compression(config.compression.to_parquet_compression()?)
+        .set_compression(config.effective_compression()?.to_parquet_compression()?)
         .set_dictionary_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Page);
 

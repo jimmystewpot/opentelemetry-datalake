@@ -58,6 +58,11 @@ impl ParquetSink {
     pub fn router(&self) -> &SignalRouter {
         &self.router
     }
+
+    /// Shares aggregate memory tracking and upload concurrency limits with another sink instance.
+    pub fn share_state_from(&mut self, other: &Self) {
+        self.manager.share_limits_from(&other.manager);
+    }
 }
 
 #[async_trait]
@@ -211,5 +216,44 @@ mod tests {
         };
         let err = ParquetSink::try_new(invalid_config);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parquet_sink_share_state_shares_memory_and_upload_limits() {
+        let config = ParquetSinkConfig {
+            storage_uri: "memory://shared-state-sink".to_string(),
+            max_concurrent_uploads: 4,
+            ..Default::default()
+        };
+        let logs_sink = ParquetSink::try_new(config.clone()).unwrap();
+        let mut traces_sink = ParquetSink::try_new(config.clone()).unwrap();
+        let mut metrics_sink = ParquetSink::try_new(config).unwrap();
+
+        // Before sharing, memory trackers and semaphores are distinct
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &traces_sink.manager().global_memory_tracker()
+        ));
+
+        traces_sink.share_state_from(&logs_sink);
+        metrics_sink.share_state_from(&logs_sink);
+
+        // After sharing, all point to the exact same Arc for memory tracking
+        assert!(std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &traces_sink.manager().global_memory_tracker()
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &metrics_sink.manager().global_memory_tracker()
+        ));
+
+        // And the exact same Arc for upload concurrency limiting
+        let logs_sem = logs_sink.manager().upload_semaphore().unwrap();
+        let traces_sem = traces_sink.manager().upload_semaphore().unwrap();
+        let metrics_sem = metrics_sink.manager().upload_semaphore().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &metrics_sem));
+        assert_eq!(logs_sem.available_permits(), 4);
     }
 }

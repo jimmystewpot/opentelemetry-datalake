@@ -1026,17 +1026,17 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
         let res = transformer.transform_to_variant(&batch, &["large_attrs"]);
         assert!(res.is_ok());
-        let transformed = res.unwrap();
-        assert_eq!(transformed.num_rows(), 3);
+        let output_batch = res.unwrap();
+        assert_eq!(output_batch.num_rows(), 3);
         assert!(matches!(
-            transformed.schema().field(0).data_type(),
+            output_batch.schema().field(0).data_type(),
             DataType::Struct(_)
         ));
     }
 
     #[test]
     fn test_transform_to_variant_empty_column_names_returns_unchanged() {
-        let transformer = VariantTransformer::default();
+        let transformer = VariantTransformer;
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["hello"]))]).unwrap();
@@ -1119,7 +1119,7 @@ mod tests {
             ParquetSinkError::VariantEncoding(_)
         ));
 
-        let res2 = encoder.encode_json_str(r#"[1, 2, "#);
+        let res2 = encoder.encode_json_str(r"[1, 2, ");
         assert!(res2.is_err());
         assert!(matches!(
             res2.unwrap_err(),
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn test_transform_to_variant_errors_on_missing_or_non_string_column() {
-        let transformer = VariantTransformer::default();
+        let transformer = VariantTransformer;
         let schema = Arc::new(Schema::new(vec![
             Field::new("num", DataType::Int64, false),
             Field::new("text", DataType::Utf8, false),

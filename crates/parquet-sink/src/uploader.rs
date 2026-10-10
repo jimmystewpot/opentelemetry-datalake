@@ -10,6 +10,10 @@ use opendal::Operator;
 /// Default capacity for the bounded chunk channel.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8;
 
+/// Minimum multipart chunk size for `OpenDAL` uploads (8 MiB).
+/// AWS S3 / `RustFS` multipart uploads require non-final parts to be at least 5 MiB.
+const OPENDAL_UPLOAD_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Sender handle for streaming byte chunks into the asynchronous uploader.
 #[derive(Debug)]
 pub enum UploaderMessage {
@@ -53,11 +57,20 @@ impl UploaderSender {
 
     /// Explicitly completes the sender, closing the channel and notifying the
     /// background task that all chunks have been emitted.
+    ///
+    /// # Errors
+    /// Returns [`ParquetSinkError::Internal`] if called on a current-thread runtime while the channel is full.
     pub fn finish(self) -> Result<(), ParquetSinkError> {
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) =
             self.tx.try_send(UploaderMessage::Finish)
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                    return Err(ParquetSinkError::Internal(
+                        "Cannot block in place on a current-thread Tokio runtime when uploader channel is full. \
+                         Use finish_async() or execute within a multi-threaded Tokio runtime.".to_string(),
+                    ));
+                }
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
                         let _ = self.tx.send(msg).await;
@@ -67,6 +80,20 @@ impl UploaderSender {
                 let _ = self.tx.blocking_send(msg);
             }
         }
+        drop(self);
+        Ok(())
+    }
+
+    /// Asynchronously completes the sender, closing the channel and notifying the
+    /// background task that all chunks have been emitted.
+    ///
+    /// # Errors
+    /// Returns [`ParquetSinkError`] if the uploader channel is closed.
+    pub async fn finish_async(self) -> Result<(), ParquetSinkError> {
+        self.tx
+            .send(UploaderMessage::Finish)
+            .await
+            .map_err(|e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")))?;
         drop(self);
         Ok(())
     }
@@ -157,7 +184,11 @@ impl AsyncUploader {
         let op_clone = op.clone();
 
         let join_handle = tokio::spawn(async move {
-            let mut writer = match op_clone.writer(&path_owned).await {
+            let mut writer = match op_clone
+                .writer_with(&path_owned)
+                .chunk(OPENDAL_UPLOAD_CHUNK_SIZE)
+                .await
+            {
                 Ok(w) => w,
                 Err(e) => return Err(ParquetSinkError::from(e)),
             };
@@ -448,5 +479,53 @@ mod tests {
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(err_msg.contains("Uploader task already completed"));
+    }
+
+    #[test]
+    fn test_uploader_finish_on_current_thread_when_full_returns_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let op = Operator::new(Memory::default()).unwrap();
+            let path = "test/current_thread_full.parquet";
+            let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+
+            // Fill channel buffer (capacity 8)
+            for i in 0..8 {
+                let chunk = bytes::Bytes::from(vec![i; 1024]);
+                sender.send_chunk_async(chunk).await.unwrap();
+            }
+
+            // On current-thread runtime, when channel is full, finish() must NOT panic; it must return Err
+            let res = sender.finish();
+            assert!(res.is_err());
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("Cannot block in place on a current-thread Tokio runtime")
+            );
+
+            drop(handle);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_uploader_finish_async_succeeds() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let path = "test/finish_async.parquet";
+        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+
+        sender
+            .send_chunk_async(bytes::Bytes::from_static(b"async data"))
+            .await
+            .unwrap();
+        assert!(sender.finish_async().await.is_ok());
+
+        assert!(handle.wait_for_completion().await.is_ok());
+        let meta = op.stat(path).await.unwrap();
+        assert_eq!(meta.content_length(), 10);
     }
 }

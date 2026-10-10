@@ -193,19 +193,20 @@ mod tests {
         for t in 0..8 {
             let namer_clone = Arc::clone(&namer);
             handles.push(std::thread::spawn(move || {
-                let mut names = Vec::new();
+                let mut generated_files = Vec::new();
                 for i in 0..100 {
-                    names.push(namer_clone.generate_filename("part", (t * 100 + i) as u16));
+                    let seq = u16::try_from(t * 100 + i).unwrap();
+                    generated_files.push(namer_clone.generate_filename("part", seq));
                 }
-                names
+                generated_files
             }));
         }
 
-        let mut all_names = HashSet::new();
+        let mut all_files = HashSet::new();
         for h in handles {
             let thread_names = h.join().unwrap();
             for n in thread_names {
-                assert!(all_names.insert(n), "Filename collision under concurrency!");
+                assert!(all_files.insert(n), "Filename collision under concurrency!");
             }
         }
     }
