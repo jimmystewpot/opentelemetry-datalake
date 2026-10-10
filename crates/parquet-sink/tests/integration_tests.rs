@@ -490,6 +490,7 @@ async fn test_s3_compatible_storage_configuration() {
     );
 
     let op = config.build_operator().unwrap();
+    let mut found_file = false;
     if let Ok(entries) = op.list_with("otlp-data/").recursive(true).await {
         use opendal::EntryMode;
         for entry in entries {
@@ -505,9 +506,14 @@ async fn test_s3_compatible_storage_configuration() {
                         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
                         num_rows
                     );
-                    return;
+                    found_file = true;
+                    break;
                 }
             }
         }
     }
+    assert!(
+        found_file,
+        "At least one Parquet file must be written and readable from RustFS"
+    );
 }

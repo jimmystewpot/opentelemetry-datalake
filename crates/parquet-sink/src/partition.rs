@@ -194,8 +194,6 @@ pub struct PartitionManager {
     global_memory_bytes: AtomicUsize,
     file_sequence: u16,
     in_flight_uploads: Vec<tokio::task::JoinHandle<Result<(), ParquetSinkError>>>,
-    error_sender: tokio::sync::mpsc::UnboundedSender<ParquetSinkError>,
-    error_receiver: tokio::sync::mpsc::UnboundedReceiver<ParquetSinkError>,
 }
 
 impl PartitionManager {
@@ -203,7 +201,6 @@ impl PartitionManager {
     #[must_use]
     pub fn new(config: ParquetSinkConfig, operator: Operator) -> Self {
         let namer = FileNamer::new(config.node_id.clone());
-        let (error_sender, error_receiver) = tokio::sync::mpsc::unbounded_channel();
         Self {
             config,
             operator,
@@ -213,8 +210,6 @@ impl PartitionManager {
             global_memory_bytes: AtomicUsize::new(0),
             file_sequence: 0,
             in_flight_uploads: Vec::new(),
-            error_sender,
-            error_receiver,
         }
     }
 
@@ -439,11 +434,34 @@ impl PartitionManager {
                     self.close_writer(&partition_id)?;
                 }
             } else {
-                while self.writers.len() >= self.config.max_open_partitions
-                    && !self.writers.is_empty()
-                {
+                let effective_max_partitions = if self.config.max_concurrent_uploads > 0 {
+                    self.config
+                        .max_open_partitions
+                        .min(self.config.max_concurrent_uploads)
+                } else {
+                    self.config.max_open_partitions
+                };
+
+                while self.writers.len() >= effective_max_partitions && !self.writers.is_empty() {
                     if let Some(oldest_key) = self.lru_order.front().cloned() {
                         self.close_writer(&oldest_key)?;
+                    } else {
+                        break;
+                    }
+                }
+
+                while self.config.max_concurrent_uploads > 0
+                    && (self.writers.len() + self.in_flight_uploads.len())
+                        >= self.config.max_concurrent_uploads
+                {
+                    if !self.in_flight_uploads.is_empty() {
+                        self.wait_oldest_in_flight_upload()?;
+                    } else if !self.writers.is_empty() {
+                        if let Some(oldest_key) = self.lru_order.front().cloned() {
+                            self.close_writer(&oldest_key)?;
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -488,6 +506,60 @@ impl PartitionManager {
 
         Ok(())
     }
+
+    /// Waits for the oldest in-flight background upload task to finish and verifies its result.
+    fn wait_oldest_in_flight_upload(&mut self) -> Result<(), ParquetSinkError> {
+        if self.in_flight_uploads.is_empty() {
+            return Ok(());
+        }
+
+        if self.in_flight_uploads[0].is_finished() {
+            let oldest = self.in_flight_uploads.remove(0);
+            let waker = std::task::Waker::noop();
+            let mut cx = std::task::Context::from_waker(waker);
+            let mut pinned = std::pin::pin!(oldest);
+            if let std::task::Poll::Ready(res) = std::future::Future::poll(pinned.as_mut(), &mut cx)
+            {
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(e),
+                    Err(e) => {
+                        return Err(ParquetSinkError::Internal(format!(
+                            "Background upload task panicked: {e}"
+                        )));
+                    }
+                }
+                self.check_background_errors()?;
+                return Ok(());
+            }
+        }
+
+        let oldest = self.in_flight_uploads.remove(0);
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            ParquetSinkError::Internal(
+                "No active Tokio runtime available to wait for background upload".to_string(),
+            )
+        })?;
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Err(ParquetSinkError::Internal(
+                "ParquetSink requires a multi-threaded Tokio runtime to wait for pending uploads"
+                    .to_string(),
+            ));
+        }
+        let res = tokio::task::block_in_place(|| handle.block_on(oldest));
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(ParquetSinkError::Internal(format!(
+                    "Background upload task panicked: {e}"
+                )));
+            }
+        }
+        self.check_background_errors()?;
+        Ok(())
+    }
+
     fn retire_active_writer(&mut self, active: ActiveWriter) -> Result<(), ParquetSinkError> {
         self.global_memory_bytes
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
@@ -500,23 +572,7 @@ impl PartitionManager {
         while self.config.max_concurrent_uploads > 0
             && self.in_flight_uploads.len() >= self.config.max_concurrent_uploads
         {
-            let oldest = self.in_flight_uploads.remove(0);
-            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                ParquetSinkError::Internal(
-                    "No active Tokio runtime available to wait for background upload".to_string(),
-                )
-            })?;
-            let res = tokio::task::block_in_place(|| handle.block_on(oldest));
-            match res {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(e) => {
-                    return Err(ParquetSinkError::Internal(format!(
-                        "Background upload task panicked: {e}"
-                    )));
-                }
-            }
-            self.check_background_errors()?;
+            self.wait_oldest_in_flight_upload()?;
         }
 
         active.writer.close()?;
@@ -528,14 +584,10 @@ impl PartitionManager {
             )
         })?;
 
-        let err_sender = self.error_sender.clone();
         let jh = handle.spawn(async move {
             let res = active.uploader_handle.wait_for_completion().await;
             if let Err(ref e) = res {
                 tracing::error!("Background Parquet upload failed: {e}");
-                let _ = err_sender.send(ParquetSinkError::Internal(format!(
-                    "Background upload failed: {e}"
-                )));
             }
             res
         });
@@ -563,16 +615,29 @@ impl PartitionManager {
     /// Returns [`ParquetSinkError`] if any background upload task failed.
     pub fn check_background_errors(&mut self) -> Result<(), ParquetSinkError> {
         let mut i = 0;
+        let mut first_error = None;
         while i < self.in_flight_uploads.len() {
             if self.in_flight_uploads[i].is_finished() {
                 let jh = self.in_flight_uploads.remove(i);
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let res = tokio::task::block_in_place(|| handle.block_on(jh));
-                    match res {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => return Err(e),
-                        Err(e) => {
-                            return Err(ParquetSinkError::Internal(format!(
+                let waker = std::task::Waker::noop();
+                let mut cx = std::task::Context::from_waker(waker);
+                let mut pinned = std::pin::pin!(jh);
+                let res = match std::future::Future::poll(pinned.as_mut(), &mut cx) {
+                    std::task::Poll::Ready(res) => res,
+                    std::task::Poll::Pending => {
+                        continue;
+                    }
+                };
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(ParquetSinkError::Internal(format!(
                                 "Background upload task panicked: {e}"
                             )));
                         }
@@ -583,7 +648,7 @@ impl PartitionManager {
             }
         }
 
-        if let Ok(err) = self.error_receiver.try_recv() {
+        if let Some(err) = first_error {
             return Err(err);
         }
         Ok(())
@@ -614,10 +679,19 @@ impl PartitionManager {
             .map(|(k, _)| k.clone())
             .collect();
 
+        let mut first_error = None;
         for key in idle_keys {
-            self.close_writer(&key)?;
+            if let Err(e) = self.close_writer(&key) {
+                tracing::error!("Error closing idle partition writer: {e}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
         self.check_background_errors()?;
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -630,10 +704,19 @@ impl PartitionManager {
     pub fn flush_all(&mut self) -> Result<(), ParquetSinkError> {
         self.check_background_errors()?;
         let all_keys: Vec<PartitionId> = self.writers.keys().cloned().collect();
+        let mut first_error = None;
         for key in all_keys {
-            self.close_writer(&key)?;
+            if let Err(e) = self.close_writer(&key) {
+                tracing::error!("Error closing partition writer during flush_all: {e}");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
         self.check_background_errors()?;
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1063,12 +1146,18 @@ mod tests {
         let mut manager = PartitionManager::new(config, op);
 
         // Directly simulate an async background upload failure
-        manager
-            .error_sender
-            .send(ParquetSinkError::Internal(
+        let jh = tokio::spawn(async {
+            Err(ParquetSinkError::Internal(
                 "Simulated S3 failure".to_string(),
             ))
-            .unwrap();
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while !jh.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        manager.in_flight_uploads.push(jh);
 
         let err = manager.check_background_errors();
         assert!(err.is_err());
@@ -1278,13 +1367,13 @@ mod tests {
         )
         .unwrap();
 
-        manager.route_batch(&b1, "logs").unwrap();
-
-        // Release the blocking in-flight task after a short delay
+        // Release the blocking in-flight task after a short delay so route_batch can acquire upload slot
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             let _ = tx.send(());
         });
+
+        manager.route_batch(&b1, "logs").unwrap();
 
         // flush_all should now gracefully wait for the slot and succeed without dropping files
         let res = manager.flush_all();
