@@ -306,14 +306,14 @@ fn missing_column_wasm() -> Vec<u8> {
 #[test]
 fn test_run_immutability_suite_accepts_valid_transform() {
     let wasm = wat::parse_str(valid_echo_wat()).unwrap();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(res.is_ok(), "Expected valid transform to pass: {res:?}");
 }
 
 #[test]
 fn test_run_immutability_suite_rejects_tampered_immutable_column() {
     let wasm = wat::parse_str(tampered_trace_wat()).unwrap();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(res.is_err(), "Expected tampered trace_id to be rejected");
     let err_str = res.unwrap_err().to_string();
     assert!(
@@ -325,7 +325,7 @@ fn test_run_immutability_suite_rejects_tampered_immutable_column() {
 #[test]
 fn test_run_immutability_suite_rejects_missing_immutable_column() {
     let wasm = missing_column_wasm();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(
         res.is_err(),
         "Expected missing immutable column to be rejected"
@@ -340,7 +340,7 @@ fn test_run_immutability_suite_rejects_missing_immutable_column() {
 #[test]
 fn test_run_immutability_suite_traps_infinite_loop_via_fuel() {
     let wasm = wat::parse_str(infinite_loop_wat()).unwrap();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(
         res.is_err(),
         "Expected infinite loop to trap via fuel exhaustion"
@@ -355,7 +355,7 @@ fn test_run_immutability_suite_traps_infinite_loop_via_fuel() {
 #[test]
 fn test_run_immutability_suite_rejects_error_status() {
     let wasm = wat::parse_str(error_status_wat()).unwrap();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(res.is_err(), "Expected non-zero status to be rejected");
 }
 
@@ -364,7 +364,7 @@ fn test_run_benchmark_calculates_latency_and_throughput() {
     use datalake_wasm_tool::bench::run_benchmark;
 
     let wasm = wat::parse_str(valid_echo_wat()).unwrap();
-    let res = run_benchmark(&wasm, 100);
+    let res = run_benchmark(&wasm, 100, "unknown", "{}");
     assert!(res.is_ok(), "Expected benchmark to succeed: {res:?}");
     let bench_res = res.unwrap();
     assert_eq!(bench_res.iterations, 100);
@@ -390,7 +390,7 @@ fn test_run_benchmark_handles_infinite_loop_with_fuel_exhaustion() {
         )
     )"#;
     let wasm = wat::parse_str(infinite_loop_wat).unwrap();
-    let res = run_benchmark(&wasm, 1);
+    let res = run_benchmark(&wasm, 1, "unknown", "{}");
     assert!(
         res.is_err(),
         "Expected infinite loop to trap via fuel exhaustion"
@@ -415,7 +415,7 @@ fn test_run_conformance_suite_rejects_failed_datalake_init() {
         (func (export "datalake_transform") (param i32 i32) (result i32) (i32.const 0))
     )"#;
     let wasm = wat::parse_str(failed_init_wat).unwrap();
-    let res = run_immutability_suite(&wasm);
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(
         res.is_err(),
         "Expected non-zero datalake_init to fail conformance suite"
@@ -432,14 +432,14 @@ fn test_run_benchmark_handles_trapping_module() {
     use datalake_wasm_tool::bench::run_benchmark;
 
     let wasm = wat::parse_str(trapping_wat()).unwrap();
-    let res = run_benchmark(&wasm, 10);
+    let res = run_benchmark(&wasm, 10, "unknown", "{}");
     assert!(res.is_err(), "Expected trapping module to return Err");
 }
 
 #[test]
 fn test_run_benchmark_with_disclaimer_succeeds() {
     let wasm = wat::parse_str(valid_echo_wat()).unwrap();
-    let res = run_benchmark_with_disclaimer(&wasm);
+    let res = run_benchmark_with_disclaimer(&wasm, "unknown", "{}");
     assert!(
         res.is_ok(),
         "Expected benchmark with disclaimer to succeed: {res:?}"

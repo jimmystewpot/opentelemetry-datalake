@@ -138,17 +138,17 @@ fn valid_echo_wat() -> &'static str {
         )
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
-            ;; Header at 0: status=0, batch_count=1, batches_ptr=32
-            (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 1))
-            (i32.store (i32.const 8) (i32.const 32))
-            (i32.store (i32.const 12) (i32.const 0))
-            (i32.store (i32.const 16) (i32.const 0))
-            ;; BatchDescriptor at 32: ptr=$ptr, len=$len
-            (i32.store (i32.const 32) (local.get $ptr))
-            (i32.store (i32.const 36) (local.get $len))
+            ;; Header at 64: status=0, batch_count=1, batches_ptr=96
+            (i32.store (i32.const 64) (i32.const 0))
+            (i32.store (i32.const 68) (i32.const 1))
+            (i32.store (i32.const 72) (i32.const 96))
+            (i32.store (i32.const 76) (i32.const 0))
+            (i32.store (i32.const 80) (i32.const 0))
+            ;; BatchDescriptor at 96: ptr=$ptr, len=$len
+            (i32.store (i32.const 96) (local.get $ptr))
+            (i32.store (i32.const 100) (local.get $len))
             ;; Return (0 << 32) | 20
-            (i64.const 20)
+            (i64.const 274877906964) ;; (64 << 32) | 20
         )
     )"#
 }
@@ -178,16 +178,16 @@ fn tampered_trace_wat() -> &'static str {
             )
             (i32.store8 (local.get $i) (i32.const 57))
 
-            ;; Header at 0: status=0, batch_count=1, batches_ptr=32
-            (i32.store (i32.const 0) (i32.const 0))
-            (i32.store (i32.const 4) (i32.const 1))
-            (i32.store (i32.const 8) (i32.const 32))
-            (i32.store (i32.const 12) (i32.const 0))
-            (i32.store (i32.const 16) (i32.const 0))
-            ;; BatchDescriptor at 32: ptr=$ptr, len=$len
-            (i32.store (i32.const 32) (local.get $ptr))
-            (i32.store (i32.const 36) (local.get $len))
-            (i64.const 20)
+            ;; Header at 64: status=0, batch_count=1, batches_ptr=96
+            (i32.store (i32.const 64) (i32.const 0))
+            (i32.store (i32.const 68) (i32.const 1))
+            (i32.store (i32.const 72) (i32.const 96))
+            (i32.store (i32.const 76) (i32.const 0))
+            (i32.store (i32.const 80) (i32.const 0))
+            ;; BatchDescriptor at 96: ptr=$ptr, len=$len
+            (i32.store (i32.const 96) (local.get $ptr))
+            (i32.store (i32.const 100) (local.get $len))
+            (i64.const 274877906964) ;; (64 << 32) | 20
         )
     )"#
 }

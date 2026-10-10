@@ -40,7 +40,12 @@ enum BenchTransform {
 /// Returns an error if module validation, compilation, or execution traps,
 /// or if `datalake_transform` returns a non-zero status code.
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
-pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
+pub fn run_benchmark(
+    bytes: &[u8],
+    iterations: usize,
+    signal: &str,
+    config_json: &str,
+) -> Result<BenchResult> {
     crate::validator::validate_wasm_bytes(bytes)
         .map_err(|e| anyhow::anyhow!("Module validation failed: {e}"))?;
 
@@ -75,9 +80,36 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
         .ok_or_else(|| anyhow::anyhow!("Missing 'memory' export"))?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init") {
+        let parsed_config = serde_json::from_str::<serde_json::Value>(config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let init_payload = serde_json::json!({
+            "signal": signal,
+            "env": {},
+            "config": parsed_config,
+        });
+        let init_bytes =
+            serde_json::to_vec(&init_payload).context("Failed to serialize init payload")?;
+        let init_len =
+            u32::try_from(init_bytes.len()).context("Init payload size exceeds u32 limit")?;
+
+        let init_ptr = alloc_fn
+            .call(&mut store, init_len)
+            .map_err(|e| anyhow::anyhow!("datalake_alloc failed for init payload: {e}"))?;
+
+        if init_ptr == 0 {
+            anyhow::bail!("datalake_alloc returned null pointer during initialization");
+        }
+
+        memory
+            .write(&mut store, init_ptr as usize, &init_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to write init payload to guest memory: {e}"))?;
+
         let status = init_fn
-            .call(&mut store, (0, 0))
+            .call(&mut store, (init_ptr, init_len))
             .map_err(|e| anyhow::anyhow!("datalake_init trapped during initialization: {e}"))?;
+
+        let _ = dealloc_fn.call(&mut store, (init_ptr, init_len));
+
         if status != 0 {
             anyhow::bail!("datalake_init returned non-zero status code: {status}");
         }
@@ -134,7 +166,15 @@ pub fn run_benchmark(bytes: &[u8], iterations: usize) -> Result<BenchResult> {
                 let packed = f.call(&mut store, (0, ipc_ptr, ipc_len)).map_err(|e| {
                     anyhow::anyhow!("datalake_transform execution trapped or failed: {e}")
                 })?;
-                u32::try_from(packed >> 32).unwrap_or(0)
+                let ptr = u32::try_from(packed >> 32).unwrap_or(0);
+                let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
+                if ptr == 0 {
+                    anyhow::bail!("datalake_transform returned a null pointer for response header");
+                }
+                if len < 20 {
+                    anyhow::bail!("datalake_transform returned header length < 20: {len}");
+                }
+                ptr
             }
             BenchTransform::V0I64(f) => {
                 let packed = f.call(&mut store, (ipc_ptr, ipc_len)).map_err(|e| {
@@ -253,11 +293,11 @@ fn print_benchmark_table(res: &BenchResult) {
 ///
 /// Returns an error if module validation, compilation, or execution traps,
 /// or if `datalake_transform` returns a non-zero status code.
-pub fn run_benchmark_with_disclaimer(bytes: &[u8]) -> Result<()> {
+pub fn run_benchmark_with_disclaimer(bytes: &[u8], signal: &str, config_json: &str) -> Result<()> {
     println!(
         "WARNING: This bench measures raw IPC round-trip for profiling only.\n         The CI latency gate is: cargo test --test latency_gate_tests"
     );
-    let result = run_benchmark(bytes, 10_000)?;
+    let result = run_benchmark(bytes, 10_000, signal, config_json)?;
     print_benchmark_table(&result);
     Ok(())
 }

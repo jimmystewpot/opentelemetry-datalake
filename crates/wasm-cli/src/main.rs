@@ -25,11 +25,23 @@ enum Commands {
     Test {
         /// Path to the compiled .wasm binary.
         path: PathBuf,
+        /// Signal type (logs, metrics, traces) to pass during initialization.
+        #[arg(long, default_value = "unknown")]
+        signal: String,
+        /// Optional JSON configuration payload.
+        #[arg(long, default_value = "{}")]
+        config: String,
     },
     /// Run local latency and throughput benchmarks.
     Bench {
         /// Path to the compiled .wasm binary.
         path: PathBuf,
+        /// Signal type (logs, metrics, traces) to pass during initialization.
+        #[arg(long, default_value = "unknown")]
+        signal: String,
+        /// Optional JSON configuration payload.
+        #[arg(long, default_value = "{}")]
+        config: String,
     },
 }
 
@@ -41,13 +53,21 @@ fn main() -> Result<()> {
             validator::validate_wasm_bytes(&bytes)?;
             println!("✓ {} is a valid ABI v1 module", path.display());
         }
-        Commands::Test { path } => {
+        Commands::Test {
+            path,
+            signal,
+            config,
+        } => {
             let bytes = std::fs::read(&path)?;
-            tester::run_immutability_suite(&bytes)?;
+            tester::run_immutability_suite(&bytes, &signal, &config)?;
         }
-        Commands::Bench { path } => {
+        Commands::Bench {
+            path,
+            signal,
+            config,
+        } => {
             let bytes = std::fs::read(&path)?;
-            bench::run_benchmark_with_disclaimer(&bytes)?;
+            bench::run_benchmark_with_disclaimer(&bytes, &signal, &config)?;
         }
     }
     Ok(())

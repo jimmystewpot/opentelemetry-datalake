@@ -119,7 +119,7 @@ pub fn verify_batch_immutability(
 /// - Output batches cannot be parsed from Arrow IPC.
 /// - Any canonical immutable column is missing or altered.
 #[allow(clippy::too_many_lines)]
-pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
+pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> Result<()> {
     crate::validator::validate_wasm_bytes(bytes)
         .map_err(|e| anyhow::anyhow!("Module validation failed: {e}"))?;
 
@@ -149,9 +149,36 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Missing 'memory' export"))?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init") {
+        let parsed_config = serde_json::from_str::<serde_json::Value>(config_json)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let init_payload = serde_json::json!({
+            "signal": signal,
+            "env": {},
+            "config": parsed_config,
+        });
+        let init_bytes =
+            serde_json::to_vec(&init_payload).context("Failed to serialize init payload")?;
+        let init_len =
+            u32::try_from(init_bytes.len()).context("Init payload size exceeds u32 limit")?;
+
+        let init_ptr = alloc_fn
+            .call(&mut store, init_len)
+            .map_err(|e| anyhow::anyhow!("datalake_alloc failed for init payload: {e}"))?;
+
+        if init_ptr == 0 {
+            anyhow::bail!("datalake_alloc returned null pointer during initialization");
+        }
+
+        memory
+            .write(&mut store, init_ptr as usize, &init_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to write init payload to guest memory: {e}"))?;
+
         let status = init_fn
-            .call(&mut store, (0, 0))
+            .call(&mut store, (init_ptr, init_len))
             .map_err(|e| anyhow::anyhow!("datalake_init trapped during initialization: {e}"))?;
+
+        let _ = dealloc_fn.call(&mut store, (init_ptr, init_len));
+
         if status != 0 {
             anyhow::bail!("datalake_init returned non-zero status code: {status}");
         }
@@ -190,7 +217,13 @@ pub fn run_immutability_suite(bytes: &[u8]) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
         let ptr = u32::try_from(packed >> 32).unwrap_or(0);
         let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
-        (ptr, if len >= 20 { len } else { 20 })
+        if ptr == 0 {
+            anyhow::bail!("datalake_transform returned a null pointer for response header");
+        }
+        if len < 20 {
+            anyhow::bail!("datalake_transform returned header length < 20: {len}");
+        }
+        (ptr, len)
     } else if let Ok(f) =
         instance.get_typed_func::<(u32, u32), u64>(&mut store, "datalake_transform")
     {
