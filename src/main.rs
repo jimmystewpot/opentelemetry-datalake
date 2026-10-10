@@ -19,6 +19,7 @@ struct AppConfig {
     iceberg: Option<storage::iceberg::IcebergSinkConfig>,
     starrocks: Option<starrocks_sink::StarRocksSinkConfig>,
     elasticsearch: Option<elasticsearch_sink::ElasticsearchSinkConfig>,
+    parquet: Option<parquet_sink::ParquetSinkConfig>,
     #[serde(default)]
     pub wasm_transformer: Option<pipeline_core::config::WasmTransformerConfig>,
 }
@@ -94,9 +95,10 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         && config.iceberg.is_none()
         && config.starrocks.is_none()
         && config.elasticsearch.is_none()
+        && config.parquet.is_none()
     {
         anyhow::bail!(
-            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], or [elasticsearch] configuration must be provided"
+            "Configuration validation failed: one of [kafka], [iceberg], [starrocks], [elasticsearch], or [parquet] configuration must be provided"
         );
     }
 
@@ -130,9 +132,15 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         sr_cfg
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-    } else if let Some(sort_cfg) = config.kafka.as_ref().and_then(|k| k.order_by.as_ref()) {
-        pipeline_core::sort::BatchSorter::from_config(sort_cfg)
-            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+    } else if let Some(ref kafka_cfg) = config.kafka {
+        if let Some(sort_cfg) = kafka_cfg.order_by.as_ref() {
+            pipeline_core::sort::BatchSorter::from_config(sort_cfg)
+                .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+        }
+    } else if let Some(ref parquet_cfg) = config.parquet {
+        parquet_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Parquet configuration validation failed: {e}"))?;
     }
 
     if let Some(admin_addr) = config.server.admin_addr {
@@ -905,9 +913,45 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Kafka sink error: {}", e);
             }
         });
+    } else if let Some(mut parquet_cfg) = config.parquet {
+        tracing::info!(
+            storage_uri = %parquet_cfg.storage_uri,
+            "Initializing Parquet sinks"
+        );
+
+        if parquet_cfg.global_memory_limit_bytes > 0 {
+            parquet_cfg.global_memory_limit_bytes =
+                (parquet_cfg.global_memory_limit_bytes / 3).max(1);
+        }
+
+        let mut logs_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
+        let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
+        let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg)?;
+
+        // Share upload concurrency limits across signal sinks while maintaining isolated memory budgets
+        traces_sink.share_upload_limits_from(&logs_sink);
+        metrics_sink.share_upload_limits_from(&logs_sink);
+
+        logs_sink_handle = tokio::spawn(async move {
+            if let Err(e) = logs_sink.run(logs_sink_rx).await {
+                tracing::error!("Logs Parquet sink error: {}", e);
+            }
+        });
+
+        traces_sink_handle = tokio::spawn(async move {
+            if let Err(e) = traces_sink.run(traces_sink_rx).await {
+                tracing::error!("Traces Parquet sink error: {}", e);
+            }
+        });
+
+        metrics_sink_handle = tokio::spawn(async move {
+            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
+                tracing::error!("Metrics Parquet sink error: {}", e);
+            }
+        });
     } else {
         return Err(anyhow::anyhow!(
-            "One of [iceberg], [elasticsearch], [starrocks], or [kafka] configuration must be provided"
+            "One of [iceberg], [elasticsearch], [starrocks], [kafka], or [parquet] configuration must be provided"
         ));
     }
 
@@ -1141,13 +1185,14 @@ mod tests {
         assert!(config.iceberg.is_none());
         assert!(config.starrocks.is_none());
         assert!(config.elasticsearch.is_none());
+        assert!(config.parquet.is_none());
 
         let err = validate_config(&config)
             .expect_err("Validation should fail when no sink is configured");
         assert!(
             err.to_string()
-                .contains("one of [kafka], [iceberg], [starrocks], or [elasticsearch]"),
-            "Error message should mention all four sinks: {err}"
+                .contains("one of [kafka], [iceberg], [starrocks], [elasticsearch], or [parquet]"),
+            "Error message should mention all five sinks: {err}"
         );
     }
 
@@ -1173,6 +1218,27 @@ mod tests {
             .extract()
             .expect("Kafka config should deserialize");
 
+        assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_succeeds_with_parquet() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        node_id = "test-node"
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Parquet config should deserialize");
+
+        assert!(config.parquet.is_some());
         assert!(validate_config(&config).is_ok());
     }
 
@@ -1998,6 +2064,111 @@ mod tests {
             res_invalid.is_err(),
             "validate_config must fail when WASM module path does not exist"
         );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_parquet_config() {
+        let toml_invalid_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        compression = "zstd"
+        compression_level = 999
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_invalid_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        let res = validate_config(&config);
+        assert!(
+            res.is_err(),
+            "validate_config must reject invalid Parquet config at startup"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Parquet configuration validation failed"));
+        assert!(err_msg.contains("Invalid Zstd compression level"));
+    }
+
+    #[test]
+    fn test_validate_config_accepts_valid_parquet_config() {
+        let toml_valid_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "file://./data"
+        compression = "zstd"
+        compression_level = 5
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_valid_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        assert!(
+            validate_config(&config).is_ok(),
+            "validate_config should accept valid Parquet config"
+        );
+    }
+
+    #[test]
+    fn test_parquet_sinks_per_signal_memory_budget_divided_and_isolated() {
+        let toml_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "memory://per-signal-test"
+        global_memory_limit_bytes = 900000000
+        max_concurrent_uploads = 6
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        let mut parquet_cfg = config.parquet.expect("Parquet config must be present");
+        let orig_limit = parquet_cfg.global_memory_limit_bytes;
+        if parquet_cfg.global_memory_limit_bytes > 0 {
+            parquet_cfg.global_memory_limit_bytes =
+                (parquet_cfg.global_memory_limit_bytes / 3).max(1);
+        }
+
+        assert_eq!(parquet_cfg.global_memory_limit_bytes, orig_limit / 3);
+
+        let logs_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone()).unwrap();
+        let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone()).unwrap();
+        let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg).unwrap();
+
+        traces_sink.share_upload_limits_from(&logs_sink);
+        metrics_sink.share_upload_limits_from(&logs_sink);
+
+        // Memory trackers must be isolated (distinct Arc pointers)
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &traces_sink.manager().global_memory_tracker()
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &metrics_sink.manager().global_memory_tracker()
+        ));
+
+        // Upload semaphore must be shared
+        let logs_sem = logs_sink.manager().upload_semaphore().unwrap();
+        let traces_sem = traces_sink.manager().upload_semaphore().unwrap();
+        let metrics_sem = metrics_sink.manager().upload_semaphore().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &metrics_sem));
+        assert_eq!(logs_sem.available_permits(), 6);
     }
 
     #[test]
