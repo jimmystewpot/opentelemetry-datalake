@@ -167,6 +167,25 @@ impl VariantEncoder {
         usize::try_from(u64::from_le_bytes(buf)).unwrap_or(0)
     }
 
+    fn encode_primitive_string(&mut self, trimmed: &str) {
+        self.meta_buf.clear();
+        self.meta_buf.extend_from_slice(&STATIC_EMPTY_METADATA);
+        self.val_buf.clear();
+
+        let bytes = trimmed.as_bytes();
+        if bytes.len() < 64 {
+            #[allow(clippy::cast_possible_truncation)]
+            let len_u8 = bytes.len() as u8;
+            self.val_buf.push((len_u8 << 2) | 0x01);
+        } else {
+            self.val_buf.push(0x40);
+            if let Ok(len_u32) = u32::try_from(bytes.len()) {
+                self.val_buf.extend_from_slice(&len_u32.to_le_bytes());
+            }
+        }
+        self.val_buf.extend_from_slice(bytes);
+    }
+
     fn encode_json_internal(&mut self, trimmed: &str) -> Result<(), ParquetSinkError> {
         // If input is not valid JSON, check if it was intended as a JSON object/array or plain text
         let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
@@ -178,25 +197,7 @@ impl VariantEncoder {
                     )));
                 }
                 // FAST PATH: Zero-allocation primitive string encoding
-                self.meta_buf.clear();
-                self.meta_buf.extend_from_slice(&STATIC_EMPTY_METADATA);
-                self.val_buf.clear();
-
-                let bytes = trimmed.as_bytes();
-                if bytes.len() < 64 {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let len_u8 = bytes.len() as u8;
-                    self.val_buf.push((len_u8 << 2) | 0x01);
-                } else {
-                    self.val_buf.push(0x40);
-                    let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
-                        ParquetSinkError::VariantEncoding(
-                            "string length exceeds u32::MAX".to_string(),
-                        )
-                    })?;
-                    self.val_buf.extend_from_slice(&len_u32.to_le_bytes());
-                }
-                self.val_buf.extend_from_slice(bytes);
+                self.encode_primitive_string(trimmed);
                 return Ok(());
             }
         };
@@ -752,10 +753,13 @@ impl VariantTransformer {
 
             for row_idx in 0..num_rows {
                 let (meta_slice, val_slice, is_valid) = if let Some(str_val) = get_row(row_idx) {
-                    if let Some((m, v)) = encoder.encode_to_scratch(str_val)? {
-                        (m, v, true)
-                    } else {
-                        (&[][..], &[][..], false)
+                    match encoder.encode_to_scratch(str_val) {
+                        Ok(Some((m, v))) => (m, v, true),
+                        Ok(None) => (&[][..], &[][..], false),
+                        Err(_) => {
+                            encoder.encode_primitive_string(str_val.trim());
+                            (&encoder.meta_buf[..], &encoder.val_buf[..], true)
+                        }
                     }
                 } else {
                     (&[][..], &[][..], false)

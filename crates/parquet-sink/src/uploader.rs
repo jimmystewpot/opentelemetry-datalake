@@ -58,9 +58,10 @@ impl UploaderSender {
             self.tx.try_send(UploaderMessage::Finish)
         {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let tx = self.tx.clone();
-                handle.spawn(async move {
-                    let _ = tx.send(msg).await;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        let _ = self.tx.send(msg).await;
+                    });
                 });
             } else {
                 let _ = self.tx.blocking_send(msg);

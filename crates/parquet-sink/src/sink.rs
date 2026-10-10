@@ -72,8 +72,13 @@ impl Sink for ParquetSink {
     /// Returns [`PipelineError`] if batch routing, flushing, or background uploading fails.
     #[allow(clippy::collapsible_if)]
     async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
-        let sweep_interval = 1;
+        let sweep_interval = if self.config.max_file_interval_sec > 0 {
+            self.config.max_file_interval_sec.clamp(1, 5)
+        } else {
+            60
+        };
         let mut ticker = tokio::time::interval(Duration::from_secs(sweep_interval));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut final_res = Ok(());
 

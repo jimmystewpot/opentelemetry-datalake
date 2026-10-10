@@ -502,7 +502,7 @@ async fn test_s3_compatible_storage_configuration() {
                         .unwrap();
                     let batches: Vec<RecordBatch> = reader.collect::<Result<Vec<_>, _>>().unwrap();
                     assert_eq!(
-                        batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
                         num_rows
                     );
                     return;

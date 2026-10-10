@@ -327,12 +327,12 @@ impl PartitionManager {
             )));
         }
 
-        self.global_memory_bytes
-            .fetch_add(total_batch_memory, Ordering::Relaxed);
-
-        // Evict oldest partition if memory limit exceeded
+        // Evict oldest partition if adding this batch would exceed global memory limit
         while self.config.global_memory_limit_bytes > 0
-            && self.global_memory_bytes.load(Ordering::Relaxed)
+            && self
+                .global_memory_bytes
+                .load(Ordering::Relaxed)
+                .saturating_add(total_batch_memory)
                 > self.config.global_memory_limit_bytes
             && !self.writers.is_empty()
         {
@@ -390,8 +390,10 @@ impl PartitionManager {
                 }
                 self.lru_order.push_back(partition_id.clone());
 
-                active_writer.buffered_memory += slice_memory;
                 active_writer.writer.write_batch(&slice)?;
+                active_writer.buffered_memory += slice_memory;
+                self.global_memory_bytes
+                    .fetch_add(slice_memory, Ordering::Relaxed);
 
                 if (self.config.max_records > 0
                     && active_writer.writer.records_written() >= self.config.max_records)
@@ -426,6 +428,8 @@ impl PartitionManager {
                     opened_at: Instant::now(),
                     buffered_memory: slice_memory,
                 };
+                self.global_memory_bytes
+                    .fetch_add(slice_memory, Ordering::Relaxed);
 
                 if (self.config.max_records > 0
                     && active.writer.records_written() >= self.config.max_records)
@@ -433,7 +437,6 @@ impl PartitionManager {
                         && active.writer.bytes_written() >= self.config.max_file_size_bytes)
                 {
                     self.retire_active_writer(active)?;
-                    self.in_flight_uploads.retain(|jh| !jh.is_finished());
                     self.check_background_errors()?;
                 } else {
                     self.writers.insert(partition_id.clone(), active);
@@ -456,7 +459,7 @@ impl PartitionManager {
             })
             .ok();
 
-        self.in_flight_uploads.retain(|jh| !jh.is_finished());
+        self.check_background_errors()?;
 
         while self.config.max_concurrent_uploads > 0
             && self.in_flight_uploads.len() >= self.config.max_concurrent_uploads
@@ -477,7 +480,7 @@ impl PartitionManager {
                     )));
                 }
             }
-            self.in_flight_uploads.retain(|jh| !jh.is_finished());
+            self.check_background_errors()?;
         }
 
         active.writer.close()?;
@@ -514,7 +517,6 @@ impl PartitionManager {
             self.retire_active_writer(active)?;
         }
 
-        self.in_flight_uploads.retain(|jh| !jh.is_finished());
         self.check_background_errors()?;
         Ok(())
     }
@@ -524,7 +526,27 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if any background upload task failed.
     pub fn check_background_errors(&mut self) -> Result<(), ParquetSinkError> {
-        self.in_flight_uploads.retain(|jh| !jh.is_finished());
+        let mut i = 0;
+        while i < self.in_flight_uploads.len() {
+            if self.in_flight_uploads[i].is_finished() {
+                let jh = self.in_flight_uploads.remove(i);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let res = tokio::task::block_in_place(|| handle.block_on(jh));
+                    match res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => return Err(e),
+                        Err(e) => {
+                            return Err(ParquetSinkError::Internal(format!(
+                                "Background upload task panicked: {e}"
+                            )));
+                        }
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+
         if let Ok(err) = self.error_receiver.try_recv() {
             return Err(err);
         }
@@ -1236,5 +1258,25 @@ mod tests {
             res.err()
         );
         assert_eq!(manager.in_flight_uploads.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_check_background_errors_detects_task_panic() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig::default();
+        let mut manager = PartitionManager::new(config, op);
+
+        let panicked_jh = tokio::spawn(async {
+            panic!("fatal background worker panic");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        assert!(panicked_jh.is_finished());
+
+        manager.in_flight_uploads.push(panicked_jh);
+
+        let res = manager.check_background_errors();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("panicked"));
     }
 }
