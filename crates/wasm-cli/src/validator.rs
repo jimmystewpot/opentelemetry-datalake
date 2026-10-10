@@ -53,6 +53,7 @@ const REQUIRED_EXPORTS: &[&str] = &[
 /// - The module cannot be instantiated ([`ValidationError::InstantiationFailed`]).
 /// - Calling `datalake_abi_version` fails ([`ValidationError::AbiFunctionMissing`] or [`ValidationError::AbiTrap`]).
 /// - The module's ABI version does not match the expected version ([`ValidationError::AbiMismatch`]).
+#[allow(clippy::too_many_lines)]
 pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationError> {
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -153,15 +154,10 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
                     && matches!(params[2], ValType::I32)
                     && results.len() == 1
                     && matches!(results[0], ValType::I64);
-                let is_v0 = params.len() == 2
-                    && matches!(params[0], ValType::I32)
-                    && matches!(params[1], ValType::I32)
-                    && results.len() == 1
-                    && (matches!(results[0], ValType::I32) || matches!(results[0], ValType::I64));
-                if !is_v1 && !is_v0 {
+                if !is_v1 {
                     return Err(ValidationError::InvalidSignature {
                         name: name.to_string(),
-                        expected: "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64".to_string(),
+                        expected: "(i32, i32, i32) -> i64".to_string(),
                     });
                 }
             }
