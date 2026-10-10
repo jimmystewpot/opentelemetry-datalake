@@ -241,6 +241,12 @@ impl PartitionManager {
         self.upload_semaphore = other.upload_semaphore.as_ref().map(Arc::clone);
     }
 
+    /// Shares aggregate upload concurrency limiters with another partition manager,
+    /// leaving memory tracking isolated per partition manager.
+    pub fn share_upload_limits_from(&mut self, other: &Self) {
+        self.upload_semaphore = other.upload_semaphore.as_ref().map(Arc::clone);
+    }
+
     /// Returns the number of currently active partition writers.
     #[must_use]
     pub fn active_writer_count(&self) -> usize {

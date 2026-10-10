@@ -377,7 +377,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_uploader_spawn_blocking_drains_many_chunks() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/many_chunks_blocking.parquet";

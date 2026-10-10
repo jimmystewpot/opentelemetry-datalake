@@ -1,5 +1,6 @@
 //! Implementation of the `Sink` pipeline trait and graceful shutdown drain for `ParquetSink`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -21,6 +22,7 @@ pub struct ParquetSink {
     config: ParquetSinkConfig,
     manager: PartitionManager,
     router: SignalRouter,
+    dropped_batches: AtomicU64,
 }
 
 impl ParquetSink {
@@ -38,6 +40,7 @@ impl ParquetSink {
             config,
             manager,
             router,
+            dropped_batches: AtomicU64::new(0),
         })
     }
 
@@ -59,9 +62,21 @@ impl ParquetSink {
         &self.router
     }
 
+    /// Returns the number of malformed or invalid batches dropped by the sink.
+    #[must_use]
+    pub fn dropped_batches(&self) -> u64 {
+        self.dropped_batches.load(Ordering::Relaxed)
+    }
+
     /// Shares aggregate memory tracking and upload concurrency limits with another sink instance.
     pub fn share_state_from(&mut self, other: &Self) {
         self.manager.share_limits_from(&other.manager);
+    }
+
+    /// Shares aggregate upload concurrency limits with another sink instance while maintaining
+    /// isolated memory budgets.
+    pub fn share_upload_limits_from(&mut self, other: &Self) {
+        self.manager.share_upload_limits_from(&other.manager);
     }
 }
 
@@ -103,8 +118,13 @@ impl Sink for ParquetSink {
                                 break;
                             },
                             Ok(Err(e)) => {
-                                final_res = Err(e.into());
-                                break;
+                                if e.is_batch_scoped() {
+                                    self.dropped_batches.fetch_add(1, Ordering::Relaxed);
+                                    tracing::warn!("Dropping malformed telemetry batch: {e}");
+                                } else {
+                                    final_res = Err(e.into());
+                                    break;
+                                }
                             }
                         }
                     } else {
@@ -254,6 +274,31 @@ mod tests {
         let metrics_sem = metrics_sink.manager().upload_semaphore().unwrap();
         assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
         assert!(std::sync::Arc::ptr_eq(&logs_sem, &metrics_sem));
+        assert_eq!(logs_sem.available_permits(), 4);
+    }
+
+    #[test]
+    fn test_parquet_sink_share_upload_limits_keeps_memory_isolated() {
+        let config = ParquetSinkConfig {
+            storage_uri: "memory://isolated-mem-sink".to_string(),
+            max_concurrent_uploads: 4,
+            ..Default::default()
+        };
+        let logs_sink = ParquetSink::try_new(config.clone()).unwrap();
+        let mut traces_sink = ParquetSink::try_new(config).unwrap();
+
+        traces_sink.share_upload_limits_from(&logs_sink);
+
+        // Memory trackers remain distinct
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &traces_sink.manager().global_memory_tracker()
+        ));
+
+        // Upload semaphore is shared
+        let logs_sem = logs_sink.manager().upload_semaphore().unwrap();
+        let traces_sem = traces_sink.manager().upload_semaphore().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
         assert_eq!(logs_sem.available_permits(), 4);
     }
 }

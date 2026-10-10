@@ -30,6 +30,15 @@ pub enum ParquetSinkError {
     Internal(String),
 }
 
+impl ParquetSinkError {
+    /// Returns `true` if this error is batch-scoped (e.g. payload formatting, Arrow compute,
+    /// or Variant JSON encoding error) rather than a fatal sink or storage failure.
+    #[must_use]
+    pub fn is_batch_scoped(&self) -> bool {
+        matches!(self, Self::VariantEncoding(_) | Self::Arrow(_))
+    }
+}
+
 impl From<ParquetSinkError> for pipeline_core::error::PipelineError {
     fn from(err: ParquetSinkError) -> Self {
         Self::Storage(Box::new(err))
@@ -82,5 +91,26 @@ mod tests {
         let pipeline_err: PipelineError = err.into();
         assert!(matches!(pipeline_err, PipelineError::Storage(_)));
         assert!(pipeline_err.to_string().contains("bad config"));
+    }
+
+    #[test]
+    fn test_error_is_batch_scoped() {
+        let variant_err = ParquetSinkError::VariantEncoding("bad json".to_string());
+        assert!(variant_err.is_batch_scoped());
+
+        let arrow_err = ParquetSinkError::from(arrow::error::ArrowError::DivideByZero);
+        assert!(arrow_err.is_batch_scoped());
+
+        let config_err = ParquetSinkError::Config("bad uri".to_string());
+        assert!(!config_err.is_batch_scoped());
+
+        let internal_err = ParquetSinkError::Internal("worker panicked".to_string());
+        assert!(!internal_err.is_batch_scoped());
+
+        let opendal_err = ParquetSinkError::OpenDal(opendal::Error::new(
+            opendal::ErrorKind::NotFound,
+            "not found",
+        ));
+        assert!(!opendal_err.is_batch_scoped());
     }
 }

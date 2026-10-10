@@ -753,13 +753,9 @@ impl VariantTransformer {
 
             for row_idx in 0..num_rows {
                 let (meta_slice, val_slice, is_valid) = if let Some(str_val) = get_row(row_idx) {
-                    match encoder.encode_to_scratch(str_val) {
-                        Ok(Some((m, v))) => (m, v, true),
-                        Ok(None) => (&[][..], &[][..], false),
-                        Err(_) => {
-                            encoder.encode_primitive_string(str_val.trim());
-                            (&encoder.meta_buf[..], &encoder.val_buf[..], true)
-                        }
+                    match encoder.encode_to_scratch(str_val)? {
+                        Some((m, v)) => (m, v, true),
+                        None => (&[][..], &[][..], false),
                     }
                 } else {
                     (&[][..], &[][..], false)

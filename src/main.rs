@@ -913,19 +913,24 @@ async fn main() -> anyhow::Result<()> {
                 tracing::error!("Metrics Kafka sink error: {}", e);
             }
         });
-    } else if let Some(parquet_cfg) = config.parquet {
+    } else if let Some(mut parquet_cfg) = config.parquet {
         tracing::info!(
             storage_uri = %parquet_cfg.storage_uri,
             "Initializing Parquet sinks"
         );
 
+        if parquet_cfg.global_memory_limit_bytes > 0 {
+            parquet_cfg.global_memory_limit_bytes =
+                (parquet_cfg.global_memory_limit_bytes / 3).max(1);
+        }
+
         let mut logs_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
         let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone())?;
         let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg)?;
 
-        // Share aggregate memory tracking and upload concurrency limits across signal sinks
-        traces_sink.share_state_from(&logs_sink);
-        metrics_sink.share_state_from(&logs_sink);
+        // Share upload concurrency limits across signal sinks while maintaining isolated memory budgets
+        traces_sink.share_upload_limits_from(&logs_sink);
+        metrics_sink.share_upload_limits_from(&logs_sink);
 
         logs_sink_handle = tokio::spawn(async move {
             if let Err(e) = logs_sink.run(logs_sink_rx).await {
@@ -2111,6 +2116,59 @@ mod tests {
             validate_config(&config).is_ok(),
             "validate_config should accept valid Parquet config"
         );
+    }
+
+    #[test]
+    fn test_parquet_sinks_per_signal_memory_budget_divided_and_isolated() {
+        let toml_parquet = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [parquet]
+        storage_uri = "memory://per-signal-test"
+        global_memory_limit_bytes = 900000000
+        max_concurrent_uploads = 6
+        "#;
+
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_parquet))
+            .extract()
+            .expect("Config should deserialize");
+
+        let mut parquet_cfg = config.parquet.expect("Parquet config must be present");
+        let orig_limit = parquet_cfg.global_memory_limit_bytes;
+        if parquet_cfg.global_memory_limit_bytes > 0 {
+            parquet_cfg.global_memory_limit_bytes =
+                (parquet_cfg.global_memory_limit_bytes / 3).max(1);
+        }
+
+        assert_eq!(parquet_cfg.global_memory_limit_bytes, orig_limit / 3);
+
+        let logs_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone()).unwrap();
+        let mut traces_sink = parquet_sink::ParquetSink::try_new(parquet_cfg.clone()).unwrap();
+        let mut metrics_sink = parquet_sink::ParquetSink::try_new(parquet_cfg).unwrap();
+
+        traces_sink.share_upload_limits_from(&logs_sink);
+        metrics_sink.share_upload_limits_from(&logs_sink);
+
+        // Memory trackers must be isolated (distinct Arc pointers)
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &traces_sink.manager().global_memory_tracker()
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            &logs_sink.manager().global_memory_tracker(),
+            &metrics_sink.manager().global_memory_tracker()
+        ));
+
+        // Upload semaphore must be shared
+        let logs_sem = logs_sink.manager().upload_semaphore().unwrap();
+        let traces_sem = traces_sink.manager().upload_semaphore().unwrap();
+        let metrics_sem = metrics_sink.manager().upload_semaphore().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
+        assert!(std::sync::Arc::ptr_eq(&logs_sem, &metrics_sem));
+        assert_eq!(logs_sem.available_permits(), 6);
     }
 
     #[test]

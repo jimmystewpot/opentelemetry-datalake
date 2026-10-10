@@ -224,3 +224,169 @@ fn test_parquet_sink_try_new_invalid_config() {
     let res = ParquetSink::try_new(config);
     assert!(res.is_err(), "Invalid storage scheme should fail try_new");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parquet_sink_survives_malformed_batch_and_processes_subsequent_batches() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ParquetSinkConfig {
+        storage_uri: format!("file://{}", temp_dir.path().display()),
+        max_file_interval_sec: 10,
+        variant_encoding: true,
+        ..Default::default()
+    };
+
+    let mut sink = ParquetSink::try_new(config).unwrap();
+    let (tx, rx) = mpsc::channel(10);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("attributes", DataType::Utf8, false),
+    ]));
+
+    // Batch 1: Corrupted JSON that fails variant encoding
+    let malformed_batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_700_000_000_000_000_000,
+            ])),
+            Arc::new(StringArray::from(vec!["{not valid json!@#$"])),
+        ],
+    )
+    .unwrap();
+
+    // Batch 2: Valid JSON batch that succeeds
+    let valid_batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_700_000_000_000_000_000,
+            ])),
+            Arc::new(StringArray::from(vec![r#"{"key":"valid_value"}"#])),
+        ],
+    )
+    .unwrap();
+
+    tx.send(SignalBatch::Logs(malformed_batch)).await.unwrap();
+    tx.send(SignalBatch::Logs(valid_batch)).await.unwrap();
+    drop(tx);
+
+    let res = sink.run(rx).await;
+    assert!(
+        res.is_ok(),
+        "Sink must survive malformed batch and complete gracefully"
+    );
+    assert_eq!(
+        sink.dropped_batches(),
+        1,
+        "Exactly one batch must have been dropped"
+    );
+
+    let parquet_files = find_parquet_files(temp_dir.path());
+    assert!(
+        !parquet_files.is_empty(),
+        "Parquet file must be written for the subsequent valid batch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parquet_sink_fatal_storage_error_shuts_down_cleanly() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ParquetSinkConfig {
+        storage_uri: format!("file://{}", temp_dir.path().display()),
+        max_file_interval_sec: 10,
+        ..Default::default()
+    };
+
+    let mut sink = ParquetSink::try_new(config).unwrap();
+
+    // After try_new succeeds, replace the directory with a regular file.
+    // Any subsequent background upload write inside it will fail with ENOTDIR.
+    let path = temp_dir.path().to_path_buf();
+    std::fs::remove_dir_all(&path).unwrap();
+    std::fs::write(&path, b"blocking file").unwrap();
+
+    let (tx, rx) = mpsc::channel(10);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_700_000_000_000_000_000,
+            ])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+
+    tx.send(SignalBatch::Logs(batch)).await.unwrap();
+    drop(tx);
+
+    let res = sink.run(rx).await;
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::create_dir(&path);
+    assert!(
+        res.is_err(),
+        "Fatal storage error must cause sink to return Err"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_parquet_sink_fatal_routing_error_breaks_and_propagates() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = ParquetSinkConfig {
+        storage_uri: format!("file://{}", temp_dir.path().display()),
+        // Set memory limit to 1 byte so any batch exceeds limit and causes fatal Config error
+        global_memory_limit_bytes: 1,
+        max_file_interval_sec: 10,
+        ..Default::default()
+    };
+
+    let mut sink = ParquetSink::try_new(config).unwrap();
+    let (tx, rx) = mpsc::channel(10);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new("val", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampNanosecondArray::from(vec![
+                1_700_000_000_000_000_000,
+            ])),
+            Arc::new(Int64Array::from(vec![100])),
+        ],
+    )
+    .unwrap();
+
+    tx.send(SignalBatch::Logs(batch)).await.unwrap();
+    drop(tx);
+
+    let res = sink.run(rx).await;
+    assert!(
+        res.is_err(),
+        "Fatal routing error must cause sink to return Err"
+    );
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("exceeds global memory limit"),
+        "Unexpected error: {err_str}"
+    );
+}
