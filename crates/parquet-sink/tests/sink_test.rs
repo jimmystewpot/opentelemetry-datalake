@@ -226,12 +226,10 @@ fn test_parquet_sink_try_new_invalid_config() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_parquet_sink_survives_malformed_batch_and_processes_subsequent_batches() {
+async fn test_parquet_sink_propagates_batch_error_for_backpressure() {
     let temp_dir = tempfile::tempdir().unwrap();
     let config = ParquetSinkConfig {
         storage_uri: format!("file://{}", temp_dir.path().display()),
-        max_file_interval_sec: 10,
-        variant_encoding: true,
         ..Default::default()
     };
 
@@ -247,9 +245,9 @@ async fn test_parquet_sink_survives_malformed_batch_and_processes_subsequent_bat
         Field::new("attributes", DataType::Utf8, false),
     ]));
 
-    // Batch 1: Corrupted JSON that fails variant encoding
+    // Batch with corrupted JSON that fails variant encoding
     let malformed_batch = RecordBatch::try_new(
-        schema.clone(),
+        schema,
         vec![
             Arc::new(TimestampNanosecondArray::from(vec![
                 1_700_000_000_000_000_000,
@@ -259,37 +257,13 @@ async fn test_parquet_sink_survives_malformed_batch_and_processes_subsequent_bat
     )
     .unwrap();
 
-    // Batch 2: Valid JSON batch that succeeds
-    let valid_batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(TimestampNanosecondArray::from(vec![
-                1_700_000_000_000_000_000,
-            ])),
-            Arc::new(StringArray::from(vec![r#"{"key":"valid_value"}"#])),
-        ],
-    )
-    .unwrap();
-
     tx.send(SignalBatch::Logs(malformed_batch)).await.unwrap();
-    tx.send(SignalBatch::Logs(valid_batch)).await.unwrap();
     drop(tx);
 
     let res = sink.run(rx).await;
     assert!(
-        res.is_ok(),
-        "Sink must survive malformed batch and complete gracefully"
-    );
-    assert_eq!(
-        sink.dropped_batches(),
-        1,
-        "Exactly one batch must have been dropped"
-    );
-
-    let parquet_files = find_parquet_files(temp_dir.path());
-    assert!(
-        !parquet_files.is_empty(),
-        "Parquet file must be written for the subsequent valid batch"
+        res.is_err(),
+        "Sink must propagate batch error to enforce backpressure rather than silently dropping"
     );
 }
 

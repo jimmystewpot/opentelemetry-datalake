@@ -121,13 +121,9 @@ impl Sink for ParquetSink {
                                 break;
                             },
                             Ok(Err(e)) => {
-                                if e.is_batch_scoped() {
-                                    self.dropped_batches.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!("Dropping malformed telemetry batch: {e}");
-                                } else {
-                                    final_res = Err(e.into());
-                                    break;
-                                }
+                                tracing::error!("ParquetSink failed to route or write batch: {e}");
+                                final_res = Err(e.into());
+                                break;
                             }
                         }
                     } else {
