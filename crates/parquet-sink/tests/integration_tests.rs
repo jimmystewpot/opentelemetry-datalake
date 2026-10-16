@@ -491,7 +491,7 @@ async fn test_s3_compatible_storage_configuration() {
 
     let op = config.build_operator().unwrap();
     let mut found_file = false;
-    if let Ok(entries) = op.list_with("otlp-data/").recursive(true).await {
+    if let Ok(entries) = op.list_with("").recursive(true).await {
         use opendal::EntryMode;
         for entry in entries {
             if let Ok(meta) = op.stat(entry.path()).await {
