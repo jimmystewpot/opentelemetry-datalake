@@ -61,7 +61,6 @@ struct ActiveWriter {
     uploader_handle: UploaderHandle,
     opened_at: Instant,
     buffered_memory: usize,
-    upload_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Extracted temporal components from an Arrow timestamp array.
@@ -245,6 +244,11 @@ impl PartitionManager {
     /// leaving memory tracking isolated per partition manager.
     pub fn share_upload_limits_from(&mut self, other: &Self) {
         self.upload_semaphore = other.upload_semaphore.as_ref().map(Arc::clone);
+    }
+
+    /// Sets or replaces the upload concurrency limiter semaphore.
+    pub fn set_upload_semaphore(&mut self, sem: Arc<tokio::sync::Semaphore>) {
+        self.upload_semaphore = Some(sem);
     }
 
     /// Returns the number of currently active partition writers.
@@ -467,15 +471,9 @@ impl PartitionManager {
                     self.close_writer(&partition_id)?;
                 }
             } else {
-                let effective_max_partitions = if self.config.max_concurrent_uploads > 0 {
-                    self.config
-                        .max_open_partitions
-                        .min(self.config.max_concurrent_uploads)
-                } else {
-                    self.config.max_open_partitions
-                };
-
-                while self.writers.len() >= effective_max_partitions && !self.writers.is_empty() {
+                while self.writers.len() >= self.config.max_open_partitions
+                    && !self.writers.is_empty()
+                {
                     let oldest_key = self.lru_order.front().cloned().ok_or_else(|| {
                         ParquetSinkError::Internal(
                             "LRU order out of sync with active writers".to_string(),
@@ -483,72 +481,6 @@ impl PartitionManager {
                     })?;
                     self.close_writer(&oldest_key)?;
                 }
-
-                while self.config.max_concurrent_uploads > 0
-                    && (self.writers.len() + self.in_flight_uploads.len())
-                        >= self.config.max_concurrent_uploads
-                {
-                    if !self.in_flight_uploads.is_empty() {
-                        self.wait_oldest_in_flight_upload()?;
-                    } else if !self.writers.is_empty() {
-                        let oldest_key = self.lru_order.front().cloned().ok_or_else(|| {
-                            ParquetSinkError::Internal(
-                                "LRU order out of sync with active writers".to_string(),
-                            )
-                        })?;
-                        self.close_writer(&oldest_key)?;
-                    } else {
-                        break;
-                    }
-                }
-
-                let permit = if let Some(sem) = self.upload_semaphore.as_ref().map(Arc::clone) {
-                    loop {
-                        match sem.clone().try_acquire_owned() {
-                            Ok(p) => break Some(p),
-                            Err(_) => {
-                                if !self.in_flight_uploads.is_empty() {
-                                    self.wait_oldest_in_flight_upload()?;
-                                } else if !self.writers.is_empty() {
-                                    let oldest_key =
-                                        self.lru_order.front().cloned().ok_or_else(|| {
-                                            ParquetSinkError::Internal(
-                                                "LRU order out of sync with active writers"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                    self.close_writer(&oldest_key)?;
-                                } else {
-                                    let handle =
-                                        tokio::runtime::Handle::try_current().map_err(|_| {
-                                            ParquetSinkError::Internal(
-                                                "No active Tokio runtime available to wait for upload permit"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                    if handle.runtime_flavor()
-                                        != tokio::runtime::RuntimeFlavor::MultiThread
-                                    {
-                                        return Err(ParquetSinkError::Internal(
-                                            "ParquetSink requires a multi-threaded Tokio runtime to wait for upload permits"
-                                                .to_string(),
-                                        ));
-                                    }
-                                    let sem_clone = Arc::clone(&sem);
-                                    let p = tokio::task::block_in_place(|| {
-                                        handle.block_on(sem_clone.acquire_owned())
-                                    })
-                                    .map_err(|e| {
-                                        ParquetSinkError::Internal(format!("Semaphore closed: {e}"))
-                                    })?;
-                                    break Some(p);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    None
-                };
 
                 let seq = self.next_sequence();
                 let filename = self.namer.generate_filename(&partition_id.path, seq);
@@ -564,7 +496,6 @@ impl PartitionManager {
                     uploader_handle,
                     opened_at: Instant::now(),
                     buffered_memory: slice_memory,
-                    upload_permit: permit,
                 };
                 self.global_memory_bytes
                     .fetch_add(slice_memory, Ordering::Relaxed);
@@ -649,7 +580,39 @@ impl PartitionManager {
             )
         })?;
 
-        let permit = active.upload_permit;
+        let upload_semaphore = self.upload_semaphore.as_ref().map(Arc::clone);
+        let permit = if let Some(sem) = upload_semaphore {
+            loop {
+                match sem.clone().try_acquire_owned() {
+                    Ok(p) => break Some(p),
+                    Err(_) => {
+                        if self.in_flight_uploads.is_empty() {
+                            if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread
+                            {
+                                return Err(ParquetSinkError::Internal(
+                                    "ParquetSink requires a multi-threaded Tokio runtime to wait for upload permits".to_string(),
+                                ));
+                            }
+                            let sem_clone = Arc::clone(&sem);
+                            let p = tokio::task::block_in_place(|| {
+                                handle.block_on(sem_clone.acquire_owned())
+                            })
+                            .map_err(|e| {
+                                ParquetSinkError::Internal(format!("Semaphore closed: {e}"))
+                            })?;
+                            break Some(p);
+                        } else if let Err(e) = self.wait_oldest_in_flight_upload()
+                            && wait_err.is_none()
+                        {
+                            wait_err = Some(e);
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         let jh = handle.spawn(async move {
             let _permit = permit;
             let res = active.uploader_handle.wait_for_completion().await;
@@ -832,6 +795,7 @@ mod tests {
     use opendal::Operator;
     use opendal::services::Memory;
     use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_heterogeneous_signals_routed_to_separate_writers_without_schema_conflict() {
@@ -1524,19 +1488,19 @@ mod tests {
             .unwrap();
 
             manager.route_batch(&batch, "logs").unwrap();
-
-            // At every step, active_writer_count + in_flight_uploads.len() MUST NOT exceed max_concurrent_uploads (2)
-            let total_uploads = manager.active_writer_count() + manager.in_flight_uploads.len();
-            assert!(
-                total_uploads <= 2,
-                "Total concurrent uploads {total_uploads} exceeded limit 2 at iteration {h}"
-            );
         }
+
+        // Active writers are bounded by max_open_partitions (8), not max_concurrent_uploads (2).
+        assert_eq!(manager.active_writer_count(), 4);
+        assert_eq!(manager.in_flight_uploads.len(), 0);
+        // Upload permits are unconsumed by active buffering writers
+        assert_eq!(manager.upload_semaphore().unwrap().available_permits(), 2);
 
         manager.flush_all().unwrap();
         manager.wait_for_all_uploads().await.unwrap();
         assert_eq!(manager.active_writer_count(), 0);
         assert_eq!(manager.in_flight_uploads.len(), 0);
+        assert_eq!(manager.upload_semaphore().unwrap().available_permits(), 2);
     }
 
     #[tokio::test]
@@ -1878,15 +1842,10 @@ mod tests {
         manager.route_batch(&b2, "logs").unwrap();
 
         assert_eq!(manager.active_writer_count(), 2);
-        // Verify every active writer has acquired an upload permit
-        for (pid, writer) in &manager.writers {
-            assert!(
-                writer.upload_permit.is_some(),
-                "Active writer for partition {pid} must hold an upload permit"
-            );
-        }
+        // Active writers do not hold upload permits; all semaphore permits remain available
+        assert_eq!(manager.upload_semaphore().unwrap().available_permits(), 2);
 
-        // Route to partition 3, which must evict an active writer because max_concurrent_uploads is 2
+        // Route to partition 3; writers are bounded by max_open_partitions (4), not max_concurrent_uploads (2)
         let b3 = RecordBatch::try_new(
             schema,
             vec![
@@ -1899,16 +1858,15 @@ mod tests {
         .unwrap();
         manager.route_batch(&b3, "logs").unwrap();
 
-        // All active writers still strictly hold permits
-        for (pid, writer) in &manager.writers {
-            assert!(
-                writer.upload_permit.is_some(),
-                "Active writer for partition {pid} after eviction must hold an upload permit"
-            );
-        }
+        // 3 active writers open concurrently without acquiring upload permits
+        assert_eq!(manager.active_writer_count(), 3);
+        assert_eq!(manager.upload_semaphore().unwrap().available_permits(), 2);
 
         manager.flush_all().unwrap();
         manager.wait_for_all_uploads().await.unwrap();
+        assert_eq!(manager.active_writer_count(), 0);
+        assert_eq!(manager.in_flight_uploads.len(), 0);
+        assert_eq!(manager.upload_semaphore().unwrap().available_permits(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1962,8 +1920,7 @@ mod tests {
     async fn test_lru_out_of_sync_returns_internal_error() {
         let op = Operator::new(Memory::default()).unwrap();
         let config = crate::config::ParquetSinkConfig {
-            max_open_partitions: 2,
-            max_concurrent_uploads: 1,
+            max_open_partitions: 1,
             ..Default::default()
         };
         let mut manager = PartitionManager::new(config, op);
@@ -2011,6 +1968,88 @@ mod tests {
         assert!(
             err_msg.contains("LRU order out of sync with active writers"),
             "Unexpected error: {err_msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cross_signal_idle_writers_do_not_starve_upload_semaphore() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = crate::config::ParquetSinkConfig {
+            max_open_partitions: 4,
+            max_concurrent_uploads: 2,
+            max_file_interval_sec: 0, // Never sweep automatically
+            ..Default::default()
+        };
+        let shared_sem = Arc::new(tokio::sync::Semaphore::new(2));
+
+        let mut manager_logs = PartitionManager::new(config.clone(), op.clone());
+        manager_logs.set_upload_semaphore(Arc::clone(&shared_sem));
+
+        let mut manager_traces = PartitionManager::new(config, op);
+        manager_traces.set_upload_semaphore(Arc::clone(&shared_sem));
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+
+        // Manager Logs opens 2 writers (which equals max_concurrent_uploads = 2)
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["log1"])),
+            ],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000 + 3600 * 1_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["log2"])),
+            ],
+        )
+        .unwrap();
+        manager_logs.route_batch(&b1, "logs").unwrap();
+        manager_logs.route_batch(&b2, "logs").unwrap();
+        assert_eq!(manager_logs.active_writer_count(), 2);
+
+        // Manager Traces must NOT block when opening its own writer
+        let b3 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["trace1"])),
+            ],
+        )
+        .unwrap();
+
+        // This call must succeed immediately without blocking indefinitely
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || manager_traces.route_batch(&b3, "traces")),
+        )
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "Opening a writer on traces must not time out due to idle logs writers"
+        );
+        let inner_res = res.unwrap().unwrap();
+        assert!(
+            inner_res.is_ok(),
+            "Opening writer on traces must succeed: {:?}",
+            inner_res.err()
         );
     }
 }
