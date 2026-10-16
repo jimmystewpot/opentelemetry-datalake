@@ -7,7 +7,8 @@
 use crate::error::WasmTransformError;
 use dashmap::DashMap;
 use opentelemetry_datalake_wasm_sdk::abi::{
-    LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_WARN,
+    HostLogRecord, LOG_LEVEL_DEBUG, LOG_LEVEL_ERROR, LOG_LEVEL_INFO, LOG_LEVEL_TRACE,
+    LOG_LEVEL_WARN,
 };
 use opentelemetry_datalake_wasm_sdk::metrics::{
     METRIC_TYPE_COUNTER, METRIC_TYPE_DURATION, METRIC_TYPE_GAUGE,
@@ -515,14 +516,370 @@ fn with_guest_str<R>(
     }
 }
 
+/// Safely decodes a UTF-8 string from guest linear memory with bounds checking and length capping.
+fn read_str_from_mem<'a>(
+    mem: &'a [u8],
+    ptr: u32,
+    len: u32,
+    max_len: usize,
+    field_name: &'static str,
+) -> Option<std::borrow::Cow<'a, str>> {
+    if len == 0 {
+        return Some(std::borrow::Cow::Borrowed(""));
+    }
+    let Some(end_u32) = ptr.checked_add(len) else {
+        tracing::warn!(
+            ptr,
+            len,
+            field = field_name,
+            "WASM guest memory address addition overflow"
+        );
+        return None;
+    };
+    let offset = ptr as usize;
+    let total_end = end_u32 as usize;
+    if total_end > mem.len() {
+        tracing::warn!(
+            offset,
+            len = len as usize,
+            memory_len = mem.len(),
+            field = field_name,
+            "WASM guest memory read out of bounds"
+        );
+        return None;
+    }
+    let read_len = (len as usize).min(max_len);
+    let slice = &mem[offset..offset + read_len];
+    if let Ok(s) = std::str::from_utf8(slice) {
+        Some(std::borrow::Cow::Borrowed(s))
+    } else {
+        Some(String::from_utf8_lossy(slice))
+    }
+}
+
+/// Handles `datalake_host_metric_emit` host call for both `datalake_host_v1` and `env`.
+fn handle_host_metric_emit(
+    mut caller: Caller<'_, HostState>,
+    metric_type: u32,
+    name_ptr: u32,
+    name_len: u32,
+    value: u64,
+) {
+    let _ = with_guest_str(
+        &mut caller,
+        name_ptr,
+        name_len,
+        MAX_METRIC_NAME_LEN,
+        |caller_ref, name| {
+            if name.is_empty() {
+                tracing::warn!("WASM guest emitted metric with empty name");
+                return;
+            }
+
+            match metric_type {
+                METRIC_TYPE_COUNTER => {
+                    caller_ref.data().registry.record_counter(name, value);
+                }
+                METRIC_TYPE_GAUGE => {
+                    caller_ref.data().registry.record_gauge(name, value);
+                }
+                METRIC_TYPE_DURATION => {
+                    caller_ref.data().registry.record_duration(name, value);
+                }
+                _ => {
+                    tracing::warn!(
+                        metric_type,
+                        name = %name,
+                        "Received unknown metric type from guest WebAssembly module"
+                    );
+                }
+            }
+        },
+    );
+}
+
+/// Handles legacy 3-argument `datalake_host_log(level, msg_ptr, msg_len)` under `env`.
+fn handle_legacy_host_log(
+    mut caller: Caller<'_, HostState>,
+    level: u32,
+    msg_ptr: u32,
+    msg_len: u32,
+) {
+    let _ = with_guest_str(
+        &mut caller,
+        msg_ptr,
+        msg_len,
+        MAX_LOG_MESSAGE_LEN,
+        |caller_ref, msg| {
+            let comp_id = caller_ref.data().registry.component_id();
+            match level {
+                LOG_LEVEL_ERROR => {
+                    tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_WARN => {
+                    tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_INFO => {
+                    tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                LOG_LEVEL_DEBUG => {
+                    tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
+                }
+                _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
+            }
+        },
+    );
+}
+
+/// Decodes and validates a 32-byte [`HostLogRecord`] from guest linear memory.
+fn decode_log_record(mem: &[u8], record_ptr: u32) -> Option<HostLogRecord> {
+    let Some(record_end) = record_ptr.checked_add(32) else {
+        tracing::warn!(
+            record_ptr,
+            "WASM guest log record pointer arithmetic overflow"
+        );
+        return None;
+    };
+
+    let record_offset = record_ptr as usize;
+    let total_record_end = record_end as usize;
+
+    if total_record_end > mem.len() {
+        tracing::warn!(
+            record_offset,
+            record_size = 32,
+            memory_len = mem.len(),
+            "WASM guest HostLogRecord read out of bounds"
+        );
+        return None;
+    }
+
+    let record_slice = &mem[record_offset..total_record_end];
+    Some(HostLogRecord {
+        level: u32::from_le_bytes([
+            record_slice[0],
+            record_slice[1],
+            record_slice[2],
+            record_slice[3],
+        ]),
+        msg_ptr: u32::from_le_bytes([
+            record_slice[4],
+            record_slice[5],
+            record_slice[6],
+            record_slice[7],
+        ]),
+        msg_len: u32::from_le_bytes([
+            record_slice[8],
+            record_slice[9],
+            record_slice[10],
+            record_slice[11],
+        ]),
+        target_ptr: u32::from_le_bytes([
+            record_slice[12],
+            record_slice[13],
+            record_slice[14],
+            record_slice[15],
+        ]),
+        target_len: u32::from_le_bytes([
+            record_slice[16],
+            record_slice[17],
+            record_slice[18],
+            record_slice[19],
+        ]),
+        file_ptr: u32::from_le_bytes([
+            record_slice[20],
+            record_slice[21],
+            record_slice[22],
+            record_slice[23],
+        ]),
+        file_len: u32::from_le_bytes([
+            record_slice[24],
+            record_slice[25],
+            record_slice[26],
+            record_slice[27],
+        ]),
+        line: u32::from_le_bytes([
+            record_slice[28],
+            record_slice[29],
+            record_slice[30],
+            record_slice[31],
+        ]),
+    })
+}
+
+/// Bridges a decoded guest log record to a host [`tracing::event!`].
+fn emit_structured_event(
+    level: u32,
+    comp_id: &str,
+    target: &str,
+    file: &str,
+    line: u32,
+    msg: &str,
+) {
+    match level {
+        LOG_LEVEL_ERROR => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::ERROR,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+        LOG_LEVEL_WARN => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::WARN,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+        LOG_LEVEL_INFO => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::INFO,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+        LOG_LEVEL_DEBUG => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::DEBUG,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+        LOG_LEVEL_TRACE => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::TRACE,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+        _ => {
+            tracing::event!(
+                target: "wasm_guest",
+                tracing::Level::TRACE,
+                component = %comp_id,
+                target = %target,
+                file = %file,
+                line = line,
+                "{msg}"
+            );
+        }
+    }
+}
+
+/// Handles structured 1-argument `datalake_host_log(record_ptr)` under `datalake_host_v1`.
+fn handle_structured_host_log(mut caller: Caller<'_, HostState>, record_ptr: u32) {
+    let Some(export) = caller.get_export("memory") else {
+        tracing::warn!("WASM guest invoked datalake_host_log without exporting 'memory'");
+        return;
+    };
+    let Some(memory) = export.into_memory() else {
+        tracing::warn!("WASM guest export 'memory' is not a linear memory");
+        return;
+    };
+
+    let mem_data = memory.data(&caller);
+    let Some(record) = decode_log_record(mem_data, record_ptr) else {
+        return;
+    };
+
+    let (Some(msg), Some(target), Some(file)) = (
+        read_str_from_mem(
+            mem_data,
+            record.msg_ptr,
+            record.msg_len,
+            MAX_LOG_MESSAGE_LEN,
+            "msg",
+        ),
+        read_str_from_mem(
+            mem_data,
+            record.target_ptr,
+            record.target_len,
+            MAX_METRIC_NAME_LEN,
+            "target",
+        ),
+        read_str_from_mem(
+            mem_data,
+            record.file_ptr,
+            record.file_len,
+            MAX_METRIC_NAME_LEN,
+            "file",
+        ),
+    ) else {
+        return;
+    };
+
+    let comp_id = caller.data().registry.component_id();
+    emit_structured_event(record.level, comp_id, &target, &file, record.line, &msg);
+}
+
+/// Handles `datalake_host_has_capability` query.
+fn handle_host_has_capability(
+    mut caller: Caller<'_, HostState>,
+    cap_name_ptr: u32,
+    cap_name_len: u32,
+) -> u32 {
+    if caller.data().phase != HostPhase::Init {
+        tracing::warn!(
+            "Guest module queried datalake_host_has_capability outside of init phase; returning 0"
+        );
+        return 0;
+    }
+
+    with_guest_str(
+        &mut caller,
+        cap_name_ptr,
+        cap_name_len,
+        MAX_METRIC_NAME_LEN,
+        |_caller_ref, cap_name| {
+            tracing::warn!(
+                capability = %cap_name,
+                "Guest module queried unrecognized capability in datalake_host_has_capability; returning 0"
+            );
+            0
+        },
+    )
+    .unwrap_or(0)
+}
+
+/// Handles `datalake_host_now_nanos` timestamp query.
+fn handle_host_now_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
 /// Builds and configures a Wasmtime [`Linker`] with standard host functions.
 ///
 /// Links the following imports:
 /// - `"wasi_snapshot_preview1"`: WASI Preview 1 host imports from [`wasmtime_wasi::p1`].
-/// - `"env:datalake_host_metric_emit"`: Safe metric emission from guest to [`MetricRegistry`].
-/// - `"env:datalake_host_log"`: Safe logging forwarding from guest to host [`tracing`].
-/// - `"env:datalake_host_has_capability"`: Host capability negotiation during initialization.
-/// - `"env:datalake_host_now_nanos"`: Fast monotonic timestamp query in nanoseconds.
+/// - `"datalake_host_v1:datalake_host_metric_emit"`: Safe metric emission from guest to [`MetricRegistry`].
+/// - `"datalake_host_v1:datalake_host_log"`: Safe structured logging forwarding from guest to host [`tracing`].
+/// - `"datalake_host_v1:datalake_host_has_capability"`: Host capability negotiation during initialization.
+/// - `"datalake_host_v1:datalake_host_now_nanos"`: Fast monotonic timestamp query in nanoseconds.
+/// - `"env:datalake_host_metric_emit"`: Backward-compatible metric emission import.
+/// - `"env:datalake_host_log"`: Backward-compatible legacy 3-argument log forwarding import.
+/// - `"env:datalake_host_has_capability"`: Backward-compatible capability query import.
+/// - `"env:datalake_host_now_nanos"`: Backward-compatible timestamp query import.
 ///
 /// # Errors
 ///
@@ -533,112 +890,37 @@ pub fn build_host_linker(engine: &Engine) -> Result<Linker<HostState>, WasmTrans
 
     wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostState| &mut state.wasi)?;
 
+    // Modern datalake_host_v1 imports
     linker.func_wrap(
-        "env",
+        "datalake_host_v1",
         "datalake_host_metric_emit",
-        |mut caller: Caller<'_, HostState>,
-         metric_type: u32,
-         name_ptr: u32,
-         name_len: u32,
-         value: u64| {
-            let _ = with_guest_str(
-                &mut caller,
-                name_ptr,
-                name_len,
-                MAX_METRIC_NAME_LEN,
-                |caller_ref, name| {
-                    if name.is_empty() {
-                        tracing::warn!("WASM guest emitted metric with empty name");
-                        return;
-                    }
-
-                    match metric_type {
-                        METRIC_TYPE_COUNTER => {
-                            caller_ref.data().registry.record_counter(name, value);
-                        }
-                        METRIC_TYPE_GAUGE => {
-                            caller_ref.data().registry.record_gauge(name, value);
-                        }
-                        METRIC_TYPE_DURATION => {
-                            caller_ref.data().registry.record_duration(name, value);
-                        }
-                        _ => {
-                            tracing::warn!(
-                                metric_type,
-                                name = %name,
-                                "Received unknown metric type from guest WebAssembly module"
-                            );
-                        }
-                    }
-                },
-            );
-        },
+        handle_host_metric_emit,
     )?;
-
     linker.func_wrap(
-        "env",
+        "datalake_host_v1",
         "datalake_host_log",
-        |mut caller: Caller<'_, HostState>, level: u32, msg_ptr: u32, msg_len: u32| {
-            let _ = with_guest_str(
-                &mut caller,
-                msg_ptr,
-                msg_len,
-                MAX_LOG_MESSAGE_LEN,
-                |caller_ref, msg| {
-                    let comp_id = caller_ref.data().registry.component_id();
-                    match level {
-                        LOG_LEVEL_ERROR => {
-                            tracing::error!(target: "wasm_guest", component = %comp_id, "{msg}");
-                        }
-                        LOG_LEVEL_WARN => {
-                            tracing::warn!(target: "wasm_guest", component = %comp_id, "{msg}");
-                        }
-                        LOG_LEVEL_INFO => {
-                            tracing::info!(target: "wasm_guest", component = %comp_id, "{msg}");
-                        }
-                        LOG_LEVEL_DEBUG => {
-                            tracing::debug!(target: "wasm_guest", component = %comp_id, "{msg}");
-                        }
-                        _ => tracing::trace!(target: "wasm_guest", component = %comp_id, "{msg}"),
-                    }
-                },
-            );
-        },
+        handle_structured_host_log,
+    )?;
+    linker.func_wrap(
+        "datalake_host_v1",
+        "datalake_host_has_capability",
+        handle_host_has_capability,
+    )?;
+    linker.func_wrap(
+        "datalake_host_v1",
+        "datalake_host_now_nanos",
+        handle_host_now_nanos,
     )?;
 
+    // Backward-compatible env imports
+    linker.func_wrap("env", "datalake_host_metric_emit", handle_host_metric_emit)?;
+    linker.func_wrap("env", "datalake_host_log", handle_legacy_host_log)?;
     linker.func_wrap(
         "env",
         "datalake_host_has_capability",
-        |mut caller: Caller<'_, HostState>, cap_name_ptr: u32, cap_name_len: u32| -> u32 {
-            if caller.data().phase != HostPhase::Init {
-                tracing::warn!(
-                    "Guest module queried datalake_host_has_capability outside of init phase; returning 0"
-                );
-                return 0;
-            }
-
-            with_guest_str(
-                &mut caller,
-                cap_name_ptr,
-                cap_name_len,
-                MAX_METRIC_NAME_LEN,
-                |_caller_ref, cap_name| {
-                    tracing::warn!(
-                        capability = %cap_name,
-                        "Guest module queried unrecognized capability in datalake_host_has_capability; returning 0"
-                    );
-                    0
-                },
-            )
-            .unwrap_or(0)
-        },
+        handle_host_has_capability,
     )?;
-
-    linker.func_wrap("env", "datalake_host_now_nanos", || -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
-    })?;
+    linker.func_wrap("env", "datalake_host_now_nanos", handle_host_now_nanos)?;
 
     Ok(linker)
 }

@@ -718,3 +718,386 @@ fn test_metric_registry_concurrent_registrations_respect_capacity() {
 
     assert_eq!(registry.metrics().len(), MAX_METRIC_ENTRIES);
 }
+
+#[test]
+fn test_host_linker_defines_datalake_host_v1_namespace_imports() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("v1_comp"));
+    let linker = build_host_linker(&engine).unwrap();
+
+    let wat = r#"(module
+        (import "datalake_host_v1" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (import "datalake_host_v1" "datalake_host_log" (func $log (param i32)))
+        (import "datalake_host_v1" "datalake_host_has_capability" (func $cap (param i32 i32) (result i32)))
+        (import "datalake_host_v1" "datalake_host_now_nanos" (func $now (result i64)))
+        (memory (export "memory") 1)
+        (func (export "test_calls") (result i64)
+            (call $metric (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 42))
+            (call $log (i32.const 100))
+            (drop (call $cap (i32.const 0) (i32.const 0)))
+            (call $now)
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let test_fn = instance
+        .get_typed_func::<(), u64>(&mut store, "test_calls")
+        .unwrap();
+    let now = test_fn.call(&mut store, ()).unwrap();
+    assert!(now > 0);
+}
+
+#[test]
+fn test_host_linker_backward_compatibility_env_namespace() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("env_comp"));
+    let linker = build_host_linker(&engine).unwrap();
+
+    let wat = r#"(module
+        (import "env" "datalake_host_metric_emit" (func $metric (param i32 i32 i32 i64)))
+        (import "env" "datalake_host_log" (func $log (param i32 i32 i32)))
+        (import "env" "datalake_host_has_capability" (func $cap (param i32 i32) (result i32)))
+        (import "env" "datalake_host_now_nanos" (func $now (result i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "test_counter")
+        (data (i32.const 50) "test_msg")
+        (func (export "test_env_calls") (result i64)
+            (call $metric (i32.const 0) (i32.const 0) (i32.const 12) (i64.const 99))
+            (call $log (i32.const 3) (i32.const 50) (i32.const 8))
+            (drop (call $cap (i32.const 0) (i32.const 0)))
+            (call $now)
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Init, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let test_fn = instance
+        .get_typed_func::<(), u64>(&mut store, "test_env_calls")
+        .unwrap();
+    let now = test_fn.call(&mut store, ()).unwrap();
+    assert!(now > 0);
+    assert_eq!(registry.read_counter("test_counter"), 99);
+}
+
+#[test]
+fn test_legacy_3arg_vs_new_1arg_log_signature_mismatch_prevention() {
+    let engine = Engine::default();
+    let linker = build_host_linker(&engine).unwrap();
+
+    // 1. Importing "env" "datalake_host_log" with 1-arg signature must fail instantiation (signature mismatch)
+    let wat_env_wrong_sig = r#"(module
+        (import "env" "datalake_host_log" (func $log (param i32)))
+        (func (export "call_log") (call $log (i32.const 0)))
+    )"#;
+    let wasm_bytes = wat::parse_str(wat_env_wrong_sig).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(
+            HostPhase::Execution,
+            Arc::new(MetricRegistry::new("sig_test")),
+        ),
+    );
+    let err = linker.instantiate(&mut store, &module).unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("incompatible import type")
+            || err_str.contains("signature mismatch")
+            || err_str.contains("expected func of type"),
+        "Unexpected error: {err_str}"
+    );
+
+    // 2. Importing "datalake_host_v1" "datalake_host_log" with 3-arg signature must fail instantiation (signature mismatch)
+    let wat_v1_wrong_sig = r#"(module
+        (import "datalake_host_v1" "datalake_host_log" (func $log (param i32 i32 i32)))
+        (func (export "call_log") (call $log (i32.const 1) (i32.const 0) (i32.const 0)))
+    )"#;
+    let wasm_bytes = wat::parse_str(wat_v1_wrong_sig).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let err = linker.instantiate(&mut store, &module).unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("incompatible import type")
+            || err_str.contains("signature mismatch")
+            || err_str.contains("expected func of type"),
+        "Unexpected error: {err_str}"
+    );
+
+    // 3. Module importing both with their correct respective signatures instantiates cleanly
+    let wat_both = r#"(module
+        (import "env" "datalake_host_log" (func $legacy_log (param i32 i32 i32)))
+        (import "datalake_host_v1" "datalake_host_log" (func $v1_log (param i32)))
+        (memory (export "memory") 1)
+        (func (export "test_both")
+            (call $legacy_log (i32.const 1) (i32.const 0) (i32.const 0))
+            (call $v1_log (i32.const 0))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat_both).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let test_fn = instance
+        .get_typed_func::<(), ()>(&mut store, "test_both")
+        .unwrap();
+    assert!(test_fn.call(&mut store, ()).is_ok());
+}
+
+#[derive(Clone)]
+struct CapturedLog {
+    level: tracing::Level,
+    target: String,
+    file: String,
+    line: u32,
+    component: String,
+    message: String,
+}
+
+impl Default for CapturedLog {
+    fn default() -> Self {
+        Self {
+            level: tracing::Level::TRACE,
+            target: String::new(),
+            file: String::new(),
+            line: 0,
+            component: String::new(),
+            message: String::new(),
+        }
+    }
+}
+
+struct FieldVisitor<'a>(&'a mut CapturedLog);
+
+impl tracing::field::Visit for FieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let formatted = format!("{value:?}");
+        match field.name() {
+            "message" => self.0.message = formatted,
+            "component" => self.0.component = formatted,
+            "target" => self.0.target = formatted,
+            "file" => self.0.file = formatted,
+            _ => {}
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        match field.name() {
+            "component" => self.0.component = value.to_string(),
+            "target" => self.0.target = value.to_string(),
+            "file" => self.0.file = value.to_string(),
+            _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "line"
+            && let Ok(val) = u32::try_from(value)
+        {
+            self.0.line = val;
+        }
+    }
+}
+
+#[derive(Default, Clone)]
+struct LogCollector(Arc<std::sync::Mutex<Vec<CapturedLog>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCollector {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut log = CapturedLog {
+            level: *event.metadata().level(),
+            ..Default::default()
+        };
+
+        event.record(&mut FieldVisitor(&mut log));
+        if let Ok(mut lock) = self.0.lock() {
+            lock.push(log);
+        }
+    }
+}
+
+#[test]
+fn test_host_log_record_decoding_all_5_log_levels() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("levels_comp"));
+    let linker = build_host_linker(&engine).unwrap();
+
+    let wat = r#"(module
+        (import "datalake_host_v1" "datalake_host_log" (func $log (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 100) "structured log message")
+        (data (i32.const 150) "wasm_module::plugin")
+        (data (i32.const 200) "src/lib.rs")
+        (func (export "emit_level") (param $level i32) (param $line i32)
+            ;; level
+            (i32.store (i32.const 0) (local.get $level))
+            ;; msg_ptr = 100, msg_len = 22
+            (i32.store (i32.const 4) (i32.const 100))
+            (i32.store (i32.const 8) (i32.const 22))
+            ;; target_ptr = 150, target_len = 19
+            (i32.store (i32.const 12) (i32.const 150))
+            (i32.store (i32.const 16) (i32.const 19))
+            ;; file_ptr = 200, file_len = 10
+            (i32.store (i32.const 20) (i32.const 200))
+            (i32.store (i32.const 24) (i32.const 10))
+            ;; line
+            (i32.store (i32.const 28) (local.get $line))
+            ;; call host log with record_ptr = 0
+            (call $log (i32.const 0))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let emit_fn = instance
+        .get_typed_func::<(i32, i32), ()>(&mut store, "emit_level")
+        .unwrap();
+
+    let collector = LogCollector::default();
+    let subscriber = tracing_subscriber::registry().with(collector.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        for (level, line) in [(1, 42), (2, 84), (3, 126), (4, 168), (5, 210), (99, 252)] {
+            assert!(emit_fn.call(&mut store, (level, line)).is_ok());
+        }
+    });
+
+    let events = collector.0.lock().unwrap().clone();
+    assert_eq!(events.len(), 6);
+
+    // Verify first event (level 1 = ERROR, line = 42)
+    assert_eq!(events[0].level, tracing::Level::ERROR);
+    assert_eq!(events[0].line, 42);
+    assert_eq!(events[0].component, "levels_comp");
+    assert_eq!(events[0].target, "wasm_module::plugin");
+    assert_eq!(events[0].file, "src/lib.rs");
+    assert!(events[0].message.contains("structured log message"));
+
+    // Verify second event (level 2 = WARN, line = 84)
+    assert_eq!(events[1].level, tracing::Level::WARN);
+    assert_eq!(events[1].line, 84);
+
+    // Verify third event (level 3 = INFO, line = 126)
+    assert_eq!(events[2].level, tracing::Level::INFO);
+    assert_eq!(events[2].line, 126);
+
+    // Verify fourth event (level 4 = DEBUG, line = 168)
+    assert_eq!(events[3].level, tracing::Level::DEBUG);
+    assert_eq!(events[3].line, 168);
+
+    // Verify fifth event (level 5 = TRACE, line = 210)
+    assert_eq!(events[4].level, tracing::Level::TRACE);
+    assert_eq!(events[4].line, 210);
+
+    // Verify unknown level 99 falls back to TRACE, line = 252
+    assert_eq!(events[5].level, tracing::Level::TRACE);
+    assert_eq!(events[5].line, 252);
+}
+
+#[test]
+fn test_host_log_record_memory_boundary_checks() {
+    let engine = Engine::default();
+    let registry = Arc::new(MetricRegistry::new("bounds_comp"));
+    let linker = build_host_linker(&engine).unwrap();
+
+    // 1 page = 65,536 bytes
+    let wat = r#"(module
+        (import "datalake_host_v1" "datalake_host_log" (func $log (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 100) "valid msg")
+        (data (i32.const 150) "valid target")
+        (data (i32.const 200) "valid file")
+        (func (export "test_record_oob")
+            ;; record_ptr entirely beyond 64KB (offset 70000)
+            (call $log (i32.const 70000))
+            ;; record_ptr + 32 overflows 64KB (offset 65520 + 32 = 65552 > 65536)
+            (call $log (i32.const 65520))
+            ;; record_ptr addition overflow (u32::MAX)
+            (call $log (i32.const 4294967295))
+        )
+        (func (export "test_fields_oob")
+            ;; Set base record at offset 0
+            ;; level = 1
+            (i32.store (i32.const 0) (i32.const 1))
+
+            ;; 1. msg_ptr OOB (msg_ptr = 80000, msg_len = 10)
+            (i32.store (i32.const 4) (i32.const 80000))
+            (i32.store (i32.const 8) (i32.const 10))
+            (i32.store (i32.const 12) (i32.const 150))
+            (i32.store (i32.const 16) (i32.const 12))
+            (i32.store (i32.const 20) (i32.const 200))
+            (i32.store (i32.const 24) (i32.const 10))
+            (i32.store (i32.const 28) (i32.const 1))
+            (call $log (i32.const 0))
+
+            ;; 2. msg_ptr + msg_len overflow
+            (i32.store (i32.const 4) (i32.const 4294967290))
+            (i32.store (i32.const 8) (i32.const 100))
+            (call $log (i32.const 0))
+
+            ;; 3. target_ptr OOB (target_ptr = 90000, target_len = 10)
+            (i32.store (i32.const 4) (i32.const 100))
+            (i32.store (i32.const 8) (i32.const 9))
+            (i32.store (i32.const 12) (i32.const 90000))
+            (i32.store (i32.const 16) (i32.const 10))
+            (call $log (i32.const 0))
+
+            ;; 4. target_ptr + target_len overflow
+            (i32.store (i32.const 12) (i32.const 4294967290))
+            (i32.store (i32.const 16) (i32.const 100))
+            (call $log (i32.const 0))
+
+            ;; 5. file_ptr OOB (file_ptr = 95000, file_len = 10)
+            (i32.store (i32.const 12) (i32.const 150))
+            (i32.store (i32.const 16) (i32.const 12))
+            (i32.store (i32.const 20) (i32.const 95000))
+            (i32.store (i32.const 24) (i32.const 10))
+            (call $log (i32.const 0))
+
+            ;; 6. file_ptr + file_len overflow
+            (i32.store (i32.const 20) (i32.const 4294967290))
+            (i32.store (i32.const 24) (i32.const 100))
+            (call $log (i32.const 0))
+
+            ;; 7. Zero target_len and zero file_len should safely use defaults
+            (i32.store (i32.const 20) (i32.const 0))
+            (i32.store (i32.const 24) (i32.const 0))
+            (i32.store (i32.const 12) (i32.const 0))
+            (i32.store (i32.const 16) (i32.const 0))
+            (call $log (i32.const 0))
+        )
+    )"#;
+    let wasm_bytes = wat::parse_str(wat).unwrap();
+    let module = wasmtime::Module::new(&engine, &wasm_bytes).unwrap();
+    let mut store = Store::new(
+        &engine,
+        HostState::with_default_wasi(HostPhase::Execution, Arc::clone(&registry)),
+    );
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+
+    let test_record_oob = instance
+        .get_typed_func::<(), ()>(&mut store, "test_record_oob")
+        .unwrap();
+    assert!(test_record_oob.call(&mut store, ()).is_ok());
+
+    let test_fields_oob = instance
+        .get_typed_func::<(), ()>(&mut store, "test_fields_oob")
+        .unwrap();
+    assert!(test_fields_oob.call(&mut store, ()).is_ok());
+}
