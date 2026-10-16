@@ -145,18 +145,305 @@ fn test_verify_batch_immutability_when_immutable_column_not_in_input() {
     assert!(res.is_ok());
 }
 
-#[test]
-fn test_run_immutability_suite_not_yet_implemented() {
-    let res = run_immutability_suite(&[]);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
+fn valid_echo_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 4)
+        (global $heap (mut i32) (i32.const 1024))
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param $size i32) (result i32)
+            (local $old i32)
+            (local.set $old (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $old)
+        )
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            ;; Header at 128: status=0, batch_count=1, batches_ptr=160
+            (i32.store (i32.const 128) (i32.const 0))
+            (i32.store (i32.const 132) (i32.const 1))
+            (i32.store (i32.const 136) (i32.const 160))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            ;; BatchDescriptor at 160: ptr=$ptr, len=$len
+            (i32.store (i32.const 160) (local.get $ptr))
+            (i32.store (i32.const 164) (local.get $len))
+            ;; Return (0 << 32) | 20
+            (i64.const 549755813908)
+        )
+    )"#
+}
+
+fn tampered_trace_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 4)
+        (global $heap (mut i32) (i32.const 1024))
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param $size i32) (result i32)
+            (local $old i32)
+            (local.set $old (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $old)
+        )
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            (local $i i32)
+            (local.set $i (local.get $ptr))
+            ;; Find first byte equal to '0' (48) in input buffer and replace with '9' (57)
+            (block $found
+                (loop $search
+                    (br_if $found (i32.eq (i32.load8_u (local.get $i)) (i32.const 48)))
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                    (br_if $search (i32.lt_u (local.get $i) (i32.add (local.get $ptr) (local.get $len))))
+                )
+            )
+            (i32.store8 (local.get $i) (i32.const 57))
+
+            ;; Header at 128: status=0, batch_count=1, batches_ptr=160
+            (i32.store (i32.const 128) (i32.const 0))
+            (i32.store (i32.const 132) (i32.const 1))
+            (i32.store (i32.const 136) (i32.const 160))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            ;; BatchDescriptor at 160: ptr=$ptr, len=$len
+            (i32.store (i32.const 160) (local.get $ptr))
+            (i32.store (i32.const 164) (local.get $len))
+            (i64.const 549755813908)
+        )
+    )"#
+}
+
+fn infinite_loop_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)
+        )
+    )"#
+}
+
+fn error_status_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            (i32.store (i32.const 0) (i32.const 3)) ;; status = 3 (Error)
+            (i32.store (i32.const 4) (i32.const 0))
+            (i32.store (i32.const 8) (i32.const 0))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            (i64.const 549755813908)
+        )
+    )"#
+}
+
+fn trapping_wat() -> &'static str {
+    r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            (unreachable)
+        )
+    )"#
+}
+
+fn missing_column_wasm() -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "span_id",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["span_123"]))],
+    )
+    .unwrap();
+    let mut ipc_bytes = Vec::new();
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc_bytes, &schema).unwrap();
+    writer.write(&batch).unwrap();
+    writer.finish().unwrap();
+
+    let hex_escaped: String = ipc_bytes.iter().map(|b| format!("\\{:02x}", b)).collect();
+
+    let wat = format!(
+        r#"(module
+            (memory (export "memory") 4)
+            (data (i32.const 65536) "{hex_escaped}")
+            (global $heap (mut i32) (i32.const 131072))
+            (func (export "datalake_abi_version") (result i32) (i32.const 1))
+            (func (export "datalake_alloc") (param $size i32) (result i32)
+                (local $old i32)
+                (local.set $old (global.get $heap))
+                (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+                (local.get $old)
+            )
+            (func (export "datalake_dealloc") (param i32 i32))
+            (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+                ;; TransformResponseHeader at 0: status=0, batch_count=1, batches_ptr=32
+                (i32.store (i32.const 128) (i32.const 0))
+                (i32.store (i32.const 132) (i32.const 1))
+                (i32.store (i32.const 136) (i32.const 160))
+                (i32.store (i32.const 140) (i32.const 0))
+                (i32.store (i32.const 144) (i32.const 0))
+                ;; BatchDescriptor at 160: ptr=65536, len={len}
+                (i32.store (i32.const 160) (i32.const 65536))
+                (i32.store (i32.const 164) (i32.const {len}))
+                (i64.const 549755813908)
+            )
+        )"#,
+        len = ipc_bytes.len()
+    );
+    wat::parse_str(&wat).unwrap()
 }
 
 #[test]
-fn test_run_benchmark_with_disclaimer_not_yet_implemented() {
-    let res = run_benchmark_with_disclaimer(&[]);
-    assert!(res.is_err());
-    assert_eq!(res.unwrap_err().to_string(), "Not yet implemented");
+fn test_run_immutability_suite_accepts_valid_transform() {
+    let wasm = wat::parse_str(valid_echo_wat()).unwrap();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(res.is_ok(), "Expected valid transform to pass: {res:?}");
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_tampered_immutable_column() {
+    let wasm = wat::parse_str(tampered_trace_wat()).unwrap();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(res.is_err(), "Expected tampered trace_id to be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("trace_id") || err_str.contains("Value mismatch"),
+        "Unexpected error: {err_str}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_missing_immutable_column() {
+    let wasm = missing_column_wasm();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(
+        res.is_err(),
+        "Expected missing immutable column to be rejected"
+    );
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("MissingColumn") || err_str.contains("missing from output"),
+        "Unexpected error: {err_str}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_traps_infinite_loop_via_fuel() {
+    let wasm = wat::parse_str(infinite_loop_wat()).unwrap();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(
+        res.is_err(),
+        "Expected infinite loop to trap via fuel exhaustion"
+    );
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("fuel") || err_str.contains("trap") || err_str.contains("exhausted"),
+        "Unexpected error: {err_str}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_error_status() {
+    let wasm = wat::parse_str(error_status_wat()).unwrap();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(res.is_err(), "Expected non-zero status to be rejected");
+}
+
+#[test]
+fn test_run_benchmark_calculates_latency_and_throughput() {
+    use datalake_wasm_tool::bench::run_benchmark;
+
+    let wasm = wat::parse_str(valid_echo_wat()).unwrap();
+    let res = run_benchmark(&wasm, 100, "unknown", "{}");
+    assert!(res.is_ok(), "Expected benchmark to succeed: {res:?}");
+    let bench_res = res.unwrap();
+    assert_eq!(bench_res.iterations, 100);
+    assert!(bench_res.payload_bytes > 0);
+    assert!(bench_res.total_bytes >= bench_res.payload_bytes * 100);
+    assert!(bench_res.avg_latency > std::time::Duration::ZERO);
+    assert!(bench_res.throughput_mb_per_sec > 0.0);
+    assert!(bench_res.allocated_memory_bytes > 0);
+}
+
+#[test]
+fn test_run_benchmark_handles_infinite_loop_with_fuel_exhaustion() {
+    use datalake_wasm_tool::bench::run_benchmark;
+
+    let infinite_loop_wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)
+        )
+    )"#;
+    let wasm = wat::parse_str(infinite_loop_wat).unwrap();
+    let res = run_benchmark(&wasm, 1, "unknown", "{}");
+    assert!(
+        res.is_err(),
+        "Expected infinite loop to trap via fuel exhaustion"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("fuel") || err.contains("trapped"),
+        "Unexpected error message: {err}"
+    );
+}
+
+#[test]
+fn test_run_conformance_suite_rejects_failed_datalake_init() {
+    use datalake_wasm_tool::tester::run_immutability_suite;
+
+    let failed_init_wat = r#"(module
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 100))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32) (i32.const 1))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+    )"#;
+    let wasm = wat::parse_str(failed_init_wat).unwrap();
+    let res = run_immutability_suite(&wasm, "unknown", "{}");
+    assert!(
+        res.is_err(),
+        "Expected non-zero datalake_init to fail conformance suite"
+    );
+    let err = res.unwrap_err().to_string();
+    assert!(
+        err.contains("datalake_init returned non-zero status code: 1"),
+        "Unexpected error: {err}"
+    );
+}
+
+#[test]
+fn test_run_benchmark_handles_trapping_module() {
+    use datalake_wasm_tool::bench::run_benchmark;
+
+    let wasm = wat::parse_str(trapping_wat()).unwrap();
+    let res = run_benchmark(&wasm, 10, "unknown", "{}");
+    assert!(res.is_err(), "Expected trapping module to return Err");
+}
+
+#[test]
+fn test_run_benchmark_with_disclaimer_succeeds() {
+    let wasm = wat::parse_str(valid_echo_wat()).unwrap();
+    let res = run_benchmark_with_disclaimer(&wasm, "unknown", "{}");
+    assert!(
+        res.is_ok(),
+        "Expected benchmark with disclaimer to succeed: {res:?}"
+    );
 }
 
 #[test]

@@ -23,6 +23,7 @@ name = "datalake-wasm"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 wasmtime = { workspace = true }
@@ -32,3 +33,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 wat = "1.220"
+
