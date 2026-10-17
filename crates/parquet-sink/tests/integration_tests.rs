@@ -438,7 +438,7 @@ async fn test_path_partitioning_hierarchy() {
     assert!(found_hour_23, "Hour 23 partition file found");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::collapsible_if)]
 async fn test_s3_compatible_storage_configuration() {
     let endpoint =
