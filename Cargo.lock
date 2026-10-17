@@ -1994,12 +1994,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dissimilar"
-version = "1.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aeda16ab4059c5fd2a83f2b9c9e9c981327b18aa8e3b313f7e6563799d4f093e"
-
-[[package]]
 name = "dlv-list"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2126,16 +2120,6 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
-]
-
-[[package]]
-name = "expect-test"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63af43ff4431e848fb47472a920f14fa71c24de13255a5692e93d4e90302acb0"
-dependencies = [
- "dissimilar",
- "once_cell",
 ]
 
 [[package]]
@@ -2702,7 +2686,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2725,7 +2709,6 @@ dependencies = [
  "chrono",
  "crc32fast",
  "derive_builder",
- "expect-test",
  "fastnum",
  "flate2",
  "fnv",
@@ -2761,7 +2744,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2776,7 +2759,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2796,7 +2779,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-s3tables"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2809,7 +2792,7 @@ dependencies = [
 [[package]]
 name = "iceberg-property-macro"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2819,7 +2802,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.1"
-source = "git+https://github.com/apache/iceberg-rust.git?rev=492234eb43b1aceee1b9379d5c676e4635b5d4d7#492234eb43b1aceee1b9379d5c676e4635b5d4d7"
+source = "git+https://github.com/apache/iceberg-rust.git?rev=ab047b5e2f6e2ba6b999731653a3f7722b84e6f7#ab047b5e2f6e2ba6b999731653a3f7722b84e6f7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2827,6 +2810,7 @@ dependencies = [
  "cfg-if",
  "futures",
  "iceberg",
+ "iceberg-property-macro",
  "opendal",
  "reqsign-aws-v4",
  "reqsign-core",
