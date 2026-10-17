@@ -59,25 +59,32 @@ impl UploaderSender {
     /// background task that all chunks have been emitted.
     ///
     /// # Errors
-    /// Returns [`ParquetSinkError::Internal`] if called on a current-thread runtime while the channel is full.
+    /// Returns [`ParquetSinkError::Internal`] if the uploader channel is closed,
+    /// or if called on a current-thread runtime while the channel is full.
     pub fn finish(self) -> Result<(), ParquetSinkError> {
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) =
-            self.tx.try_send(UploaderMessage::Finish)
-        {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                    return Err(ParquetSinkError::Internal(
-                        "Cannot block in place on a current-thread Tokio runtime when uploader channel is full. \
-                         Use finish_async() or execute within a multi-threaded Tokio runtime.".to_string(),
-                    ));
+        match self.tx.try_send(UploaderMessage::Finish) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ParquetSinkError::Internal(
+                    "Uploader channel closed".to_string(),
+                ));
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                        return Err(ParquetSinkError::Internal(
+                            "Cannot block in place on a current-thread Tokio runtime when uploader channel is full. \
+                             Use finish_async() or execute within a multi-threaded Tokio runtime.".to_string(),
+                        ));
+                    }
+                    tokio::task::block_in_place(|| handle.block_on(self.tx.send(msg))).map_err(
+                        |e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")),
+                    )?;
+                } else {
+                    self.tx.blocking_send(msg).map_err(|e| {
+                        ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))
+                    })?;
                 }
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        let _ = self.tx.send(msg).await;
-                    });
-                });
-            } else {
-                let _ = self.tx.blocking_send(msg);
             }
         }
         drop(self);
@@ -527,5 +534,22 @@ mod tests {
         assert!(handle.wait_for_completion().await.is_ok());
         let meta = op.stat(path).await.unwrap();
         assert_eq!(meta.content_length(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_uploader_finish_returns_error_when_channel_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sender = UploaderSender { tx };
+        drop(rx); // Close the receiver
+
+        let res = sender.finish();
+        assert!(
+            res.is_err(),
+            "finish() must return Err when channel is closed"
+        );
+        assert!(
+            matches!(res, Err(ParquetSinkError::Internal(ref msg)) if msg.contains("channel closed")),
+            "Expected channel closed error, got: {res:?}"
+        );
     }
 }
