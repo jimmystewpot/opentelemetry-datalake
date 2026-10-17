@@ -6,6 +6,7 @@
 
 use crate::error::ParquetSinkError;
 use opendal::Operator;
+use std::sync::Arc;
 
 /// Default capacity for the bounded chunk channel.
 const DEFAULT_CHANNEL_CAPACITY: usize = 8;
@@ -168,9 +169,16 @@ impl AsyncUploader {
     ///
     /// Spawns a background task that receives chunks over a bounded channel of capacity 8
     /// and streams them into an `opendal::Writer`.
+    ///
+    /// Physical storage I/O concurrency (`writer.write` and `writer.close`) is bounded
+    /// across the pipeline by the optional `upload_semaphore`. Permits are acquired
+    /// only during active physical I/O and released immediately thereafter, ensuring idle
+    /// uploaders waiting on channel inputs do not consume permits.
+    #[allow(clippy::too_many_lines)]
     pub fn start(
         op: &Operator,
         path: &str,
+        upload_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Result<(UploaderSender, UploaderHandle), ParquetSinkError> {
         if path.trim().is_empty() {
             return Err(ParquetSinkError::Config(
@@ -213,6 +221,19 @@ impl AsyncUploader {
                     msg = rx.recv() => {
                         match msg {
                             Some(UploaderMessage::Chunk(bytes)) => {
+                                let _permit = if let Some(ref sem) = upload_semaphore {
+                                    match sem.acquire().await {
+                                        Ok(p) => Some(p),
+                                        Err(e) => {
+                                            let _ = writer.abort().await;
+                                            return Err(ParquetSinkError::Internal(format!(
+                                                "Upload semaphore closed: {e}"
+                                            )));
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 if let Err(e) = writer.write(bytes).await {
                                     let _ = writer.abort().await;
                                     return Err(ParquetSinkError::from(e));
@@ -246,12 +267,26 @@ impl AsyncUploader {
                         "Upload aborted for path: {path_owned}"
                     )))
                 }
-                close_res = writer.close() => {
+                close_res = async {
+                    let _permit = if let Some(ref sem) = upload_semaphore {
+                        match sem.acquire().await {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                return Err(ParquetSinkError::Internal(format!(
+                                    "Upload semaphore closed: {e}"
+                                )));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    writer.close().await.map_err(ParquetSinkError::from)
+                } => {
                     match close_res {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             let _ = writer.abort().await;
-                            Err(ParquetSinkError::from(e))
+                            Err(e)
                         }
                     }
                 }
@@ -279,7 +314,7 @@ mod tests {
     async fn test_upload_file_smaller_than_5mb_succeeds_on_complete() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/small.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         // Send a 1MB chunk (less than 5MB S3 limit)
         let chunk = bytes::Bytes::from(vec![0u8; 1024 * 1024]);
@@ -296,7 +331,7 @@ mod tests {
     async fn test_upload_multiple_chunks_succeeds() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/multi_chunk.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         let chunk_size = 512 * 1024;
         for _ in 0..4 {
@@ -315,7 +350,7 @@ mod tests {
     async fn test_upload_async_sender_succeeds() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/async_chunks.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         let chunk = bytes::Bytes::from_static(b"hello world via async send");
         sender.send_chunk_async(chunk).await.unwrap();
@@ -331,7 +366,7 @@ mod tests {
     async fn test_uploader_drop_handle_aborts_upload() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/dropped_handle.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         let chunk = bytes::Bytes::from(vec![1u8; 1024 * 1024]);
         sender.send_chunk(chunk).unwrap();
@@ -350,7 +385,7 @@ mod tests {
     #[tokio::test]
     async fn test_uploader_empty_path_rejected() {
         let op = Operator::new(Memory::default()).unwrap();
-        let res = AsyncUploader::start(&op, "");
+        let res = AsyncUploader::start(&op, "", None);
         assert!(res.is_err(), "Empty path must be rejected");
     }
 
@@ -358,7 +393,7 @@ mod tests {
     async fn test_uploader_send_chunk_fails_when_aborted() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/aborted_sender.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         // Drop handle prematurely
         drop(handle);
@@ -375,7 +410,7 @@ mod tests {
     #[test]
     fn test_uploader_outside_tokio_runtime_returns_error() {
         let op = Operator::new(Memory::default()).unwrap();
-        let res = AsyncUploader::start(&op, "test/no_runtime.parquet");
+        let res = AsyncUploader::start(&op, "test/no_runtime.parquet", None);
         assert!(res.is_err());
         assert!(
             res.unwrap_err()
@@ -388,7 +423,7 @@ mod tests {
     async fn test_uploader_spawn_blocking_drains_many_chunks() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/many_chunks_blocking.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         // 25 chunks of 64KB exceeds channel capacity of 8
         let jh = tokio::task::spawn_blocking(move || {
@@ -410,7 +445,7 @@ mod tests {
     async fn test_uploader_sender_dropped_without_finish_triggers_abort() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/dropped_sender_abort.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         let chunk = bytes::Bytes::from_static(b"incomplete write");
         sender.send_chunk(chunk).unwrap();
@@ -498,7 +533,7 @@ mod tests {
         rt.block_on(async {
             let op = Operator::new(Memory::default()).unwrap();
             let path = "test/current_thread_full.parquet";
-            let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+            let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
             // Fill channel buffer (capacity 8)
             for i in 0..8 {
@@ -523,7 +558,7 @@ mod tests {
     async fn test_uploader_finish_async_succeeds() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/finish_async.parquet";
-        let (sender, handle) = AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = AsyncUploader::start(&op, path, None).unwrap();
 
         sender
             .send_chunk_async(bytes::Bytes::from_static(b"async data"))
@@ -551,5 +586,29 @@ mod tests {
             matches!(res, Err(ParquetSinkError::Internal(ref msg)) if msg.contains("channel closed")),
             "Expected channel closed error, got: {res:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_uploader_storage_io_bounded_by_semaphore() {
+        use std::sync::Arc;
+
+        let op = Operator::new(Memory::default()).unwrap();
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let (s1, h1) = AsyncUploader::start(&op, "file1.parquet", Some(Arc::clone(&sem))).unwrap();
+        let (s2, h2) = AsyncUploader::start(&op, "file2.parquet", Some(Arc::clone(&sem))).unwrap();
+
+        // Verify both uploaders can write chunks and complete without deadlocking
+        s1.send_chunk(bytes::Bytes::from_static(b"chunk1")).unwrap();
+        s2.send_chunk(bytes::Bytes::from_static(b"chunk2")).unwrap();
+
+        s1.finish().unwrap();
+        s2.finish().unwrap();
+
+        h1.wait_for_completion().await.unwrap();
+        h2.wait_for_completion().await.unwrap();
+
+        // Semaphore permits must be fully returned
+        assert_eq!(sem.available_permits(), 1);
     }
 }

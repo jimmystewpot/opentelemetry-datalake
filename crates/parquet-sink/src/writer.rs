@@ -285,7 +285,7 @@ mod tests {
     async fn test_writer_with_zstd_and_bloom_filter() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/test.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
@@ -356,7 +356,7 @@ mod tests {
     async fn test_writer_with_span_id_bloom_filter() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/span_test.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("span_id", DataType::Utf8, false),
@@ -392,7 +392,7 @@ mod tests {
     async fn test_writer_multiple_batches_and_counters() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/multi_batch.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("trace_id", DataType::Utf8, false),
@@ -459,7 +459,7 @@ mod tests {
         for (idx, (codec, expected_parquet_comp)) in codecs.into_iter().enumerate() {
             let op = Operator::new(Memory::default()).unwrap();
             let path = format!("test/comp_{idx}.parquet");
-            let (sender, handle) = crate::uploader::AsyncUploader::start(&op, &path).unwrap();
+            let (sender, handle) = crate::uploader::AsyncUploader::start(&op, &path, None).unwrap();
 
             let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
 
@@ -493,7 +493,7 @@ mod tests {
     async fn test_writer_empty_batch() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/empty_batch.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
 
@@ -525,7 +525,7 @@ mod tests {
     async fn test_writer_schema_mismatch_returns_error() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/mismatch.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
 
@@ -552,7 +552,7 @@ mod tests {
 
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/channel_writer.bin";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let mut channel_writer = ChannelWriter::new(sender, 1024);
 
@@ -584,7 +584,7 @@ mod tests {
 
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/closed_channel.bin";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let mut channel_writer = ChannelWriter::new(sender, 1024);
 
@@ -601,7 +601,7 @@ mod tests {
     async fn test_writer_dictionary_and_page_statistics() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/dict_stats.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("category", DataType::Utf8, false),
@@ -641,7 +641,7 @@ mod tests {
     async fn test_partition_writer_new_alias_and_flush() {
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/new_alias_and_flush.parquet";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
         let config = crate::config::ParquetSinkConfig::default();
@@ -671,7 +671,7 @@ mod tests {
 
         let op = Operator::new(Memory::default()).unwrap();
         let path = "test/zero_cap.bin";
-        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path).unwrap();
+        let (sender, handle) = crate::uploader::AsyncUploader::start(&op, path, None).unwrap();
 
         // 0 capacity falls back to DEFAULT_CHUNK_BUFFER_SIZE
         let mut channel_writer = ChannelWriter::new(sender, 0);

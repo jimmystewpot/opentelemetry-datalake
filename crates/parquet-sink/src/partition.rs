@@ -485,7 +485,7 @@ impl PartitionManager {
                 let seq = self.next_sequence();
                 let filename = self.namer.generate_filename(&partition_id.path, seq);
                 let (uploader_sender, uploader_handle) =
-                    AsyncUploader::start(&self.operator, &filename)?;
+                    AsyncUploader::start(&self.operator, &filename, self.upload_semaphore.clone())?;
                 let mut partition_writer =
                     PartitionWriter::try_new(slice.schema(), uploader_sender, &self.config)?;
 
@@ -580,41 +580,7 @@ impl PartitionManager {
             )
         })?;
 
-        let upload_semaphore = self.upload_semaphore.as_ref().map(Arc::clone);
-        let permit = if let Some(sem) = upload_semaphore {
-            loop {
-                match sem.clone().try_acquire_owned() {
-                    Ok(p) => break Some(p),
-                    Err(_) => {
-                        if self.in_flight_uploads.is_empty() {
-                            if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread
-                            {
-                                return Err(ParquetSinkError::Internal(
-                                    "ParquetSink requires a multi-threaded Tokio runtime to wait for upload permits".to_string(),
-                                ));
-                            }
-                            let sem_clone = Arc::clone(&sem);
-                            let p = tokio::task::block_in_place(|| {
-                                handle.block_on(sem_clone.acquire_owned())
-                            })
-                            .map_err(|e| {
-                                ParquetSinkError::Internal(format!("Semaphore closed: {e}"))
-                            })?;
-                            break Some(p);
-                        } else if let Err(e) = self.wait_oldest_in_flight_upload()
-                            && wait_err.is_none()
-                        {
-                            wait_err = Some(e);
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
-
         let jh = handle.spawn(async move {
-            let _permit = permit;
             let res = active.uploader_handle.wait_for_completion().await;
             if let Err(ref e) = res {
                 tracing::error!("Background Parquet upload failed: {e}");
