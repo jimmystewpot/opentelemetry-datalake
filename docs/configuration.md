@@ -11,9 +11,10 @@ The configuration is divided into several main sections:
 - `[kafka]`: Kafka storage sink settings (optional).
 - `[starrocks]`: StarRocks Stream Load sink settings (optional).
 - `[elasticsearch]`: Elasticsearch & OpenSearch data streams sink settings (optional).
+- `[parquet]`: Apache Parquet direct streaming storage sink settings (optional).
 - `[telemetry]`: Internal self-monitoring telemetry settings (part of the core pipeline).
 
-One of `[iceberg]`, `[kafka]`, `[starrocks]`, or `[elasticsearch]` must be provided.
+One of `[iceberg]`, `[kafka]`, `[starrocks]`, `[elasticsearch]`, or `[parquet]` must be provided.
 
 ## Global Environment Overrides
 
@@ -202,6 +203,28 @@ verification = "full" # "full" (default)
 | `ca_cert_path` | String | `null` | Optional path to a custom PEM-encoded Certificate Authority file. Validated at startup. |
 | `verification` | String | `"full"` | TLS verification mode: `"full"` (validates CA chain and hostname; default). Disabling verification is rejected for security. |
 | `insecure_skip_verify` | Boolean | `null` | Backward-compatibility alias for `verification = "disabled"`. Disabling verification is rejected for security. |
+
+---
+
+## Parquet Section (`[parquet]`)
+
+Configures the Apache Parquet streaming sink. This sink streams telemetry signals directly into partitioned Parquet files on object storage (S3, GCS, Azure Blob) or local filesystems via Apache OpenDAL, with optional binary Variant encoding for attributes.
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `storage_uri` | String | `"file://./data"` | Storage URI (`file://`, `s3://`, `gcs://`, `gs://`, `azblob://`, `abfs://`, or `memory://` for ephemeral/testing use). |
+| `node_id` | String | `"default-node"` | Unique node identifier used for collision-free file naming. |
+| `compression` | String / Table | `"zstd"` | Page compression codec: `"zstd"` (with optional level), `"snappy"`, `"lz4raw"`, `"gzip"`, or `"uncompressed"`. |
+| `compression_level` | Integer | `null` | Optional Zstd compression level (e.g. `3`). When specified with `compression = "zstd"`, sets the compression level. |
+| `max_file_size_bytes` | Integer | `67108864` (64 MiB) | Maximum file size in bytes before triggering a roll. `0` disables size-based rolling. |
+| `max_file_interval_sec` | Integer | `60` | Maximum seconds before an active partition writer is closed and flushed. `0` disables interval-based rolling. |
+| `max_records` | Integer | `500000` | Maximum records per file before triggering a roll. `0` disables record-based rolling. |
+| `max_open_partitions` | Integer | `16` | Maximum concurrently open partition writers before LRU eviction kicks in. |
+| `max_concurrent_uploads` | Integer | `16` | Maximum active concurrent background upload tasks before applying backpressure. |
+| `global_memory_limit_bytes` | Integer | `1073741824` (1 GiB) | Maximum aggregate buffer memory before oldest writer eviction. `0` disables memory-based eviction. |
+| `variant_encoding` | Boolean | `true` | Enables binary encoding of semi-structured attributes conforming to Apache Parquet / Spark Variant. |
+| `partition_pattern` | String | `"signal={signal}/date={date}/hour={hour}"` | Partition directory hierarchy template. |
+| `storage_options` | Table | `{}` | Backend-specific storage options (e.g. `endpoint`, `region`, `access_key_id`, `secret_access_key`). |
 
 ---
 
