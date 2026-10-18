@@ -287,6 +287,7 @@ impl ParquetSinkConfig {
     /// Checks that:
     /// - Compression codec and compression level are valid and convertible to Parquet settings.
     /// - Storage URI is non-empty and has a valid supported scheme.
+    /// - `node_id` is non-empty and free of path traversal or control characters.
     /// - Storage options and `OpenDAL` operator builder options are valid.
     /// - Maximum open partitions is greater than 0.
     ///
@@ -294,6 +295,14 @@ impl ParquetSinkConfig {
     /// Returns [`ParquetSinkError::Config`] or [`ParquetSinkError::OpenDal`] if any configuration
     /// constraint is violated.
     pub fn validate(&self) -> Result<(), ParquetSinkError> {
+        let _ = self.validate_and_build_operator()?;
+        Ok(())
+    }
+
+    /// Validates all configuration parameters and builds the `OpenDAL` [`opendal::Operator`] in a single pass.
+    pub(crate) fn validate_and_build_operator(
+        &self,
+    ) -> Result<opendal::Operator, ParquetSinkError> {
         let _ = self.effective_compression()?.to_parquet_compression()?;
 
         let uri = self.storage_uri.trim();
@@ -318,9 +327,19 @@ impl ParquetSinkConfig {
             }
         }
 
-        if self.node_id.trim().is_empty() {
+        let node_id = self.node_id.trim();
+        if node_id.is_empty() {
             return Err(ParquetSinkError::Config(
                 "node_id cannot be empty".to_string(),
+            ));
+        }
+        if node_id.contains('/')
+            || node_id.contains('\\')
+            || node_id.contains("..")
+            || self.node_id.chars().any(char::is_control)
+        {
+            return Err(ParquetSinkError::Config(
+                "node_id contains invalid path or control characters".to_string(),
             ));
         }
 
@@ -336,9 +355,7 @@ impl ParquetSinkConfig {
             ));
         }
 
-        let _ = self.build_operator()?;
-
-        Ok(())
+        self.build_operator()
     }
 
     /// Builds an `OpenDAL` [`opendal::Operator`] configured according to `storage_uri` and `storage_options`.
@@ -518,7 +535,7 @@ impl ParquetSinkConfig {
             )));
         };
 
-        Ok(op.layer(opendal::layers::RetryLayer::default()))
+        Ok(op.layer(opendal::layers::RetryLayer::default().with_jitter()))
     }
 }
 
@@ -1065,5 +1082,21 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config_s3.resolve_atomic_write_dir(), None);
+    }
+
+    #[test]
+    fn test_validate_rejects_unsafe_node_id_path_traversal() {
+        for unsafe_id in ["../escaped", "node/sub", "node\\sub", "..", "node\0id"] {
+            let cfg = ParquetSinkConfig {
+                storage_uri: "memory://test".to_string(),
+                node_id: unsafe_id.to_string(),
+                ..Default::default()
+            };
+            let res = cfg.validate();
+            assert!(
+                res.is_err(),
+                "Expected node_id '{unsafe_id}' to be rejected by validate()"
+            );
+        }
     }
 }
