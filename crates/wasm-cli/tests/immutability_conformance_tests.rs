@@ -232,9 +232,9 @@ fn error_status_wat() -> &'static str {
         (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
         (func (export "datalake_dealloc") (param i32 i32))
         (func (export "datalake_transform") (param i32 i32 i32) (result i64)
-            (i32.store (i32.const 0) (i32.const 3)) ;; status = 3 (Error)
-            (i32.store (i32.const 4) (i32.const 0))
-            (i32.store (i32.const 8) (i32.const 0))
+            (i32.store (i32.const 128) (i32.const 3)) ;; status = 3 (Error)
+            (i32.store (i32.const 132) (i32.const 0))
+            (i32.store (i32.const 136) (i32.const 0))
             (i32.store (i32.const 140) (i32.const 0))
             (i32.store (i32.const 144) (i32.const 0))
             (i64.const 549755813908)
@@ -357,6 +357,92 @@ fn test_run_immutability_suite_rejects_error_status() {
     let wasm = wat::parse_str(error_status_wat()).unwrap();
     let res = run_immutability_suite(&wasm, "unknown", "{}");
     assert!(res.is_err(), "Expected non-zero status to be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("Transform failed with status 3"),
+        "Expected status 3 failure, got: {err_str}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_supports_wasi_and_env_host_imports_and_signal_discriminant() {
+    let wat = r#"(module
+        (import "wasi_snapshot_preview1" "sched_yield" (func $sched_yield (result i32)))
+        (import "env" "datalake_host_metric_emit" (func $metric_emit (param i32 i32 i32 i64)))
+        (import "env" "datalake_host_log" (func $host_log (param i32 i32 i32)))
+        (import "env" "datalake_host_has_capability" (func $has_cap (param i32 i32) (result i32)))
+        (import "env" "datalake_host_now_nanos" (func $now_nanos (result i64)))
+        (memory (export "memory") 4)
+        (global $heap (mut i32) (i32.const 1024))
+        (global $ipc_ptr (mut i32) (i32.const 0))
+        (global $ipc_dealloc_count (mut i32) (i32.const 0))
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param $size i32) (result i32)
+            (local $old i32)
+            (local.set $old (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size)))
+            (local.get $old)
+        )
+        (func (export "datalake_dealloc") (param $ptr i32) (param $len i32)
+            (if (i32.and (i32.ne (global.get $ipc_ptr) (i32.const 0)) (i32.eq (local.get $ptr) (global.get $ipc_ptr)))
+                (then
+                    (global.set $ipc_dealloc_count (i32.add (global.get $ipc_dealloc_count) (i32.const 1)))
+                    (if (i32.gt_u (global.get $ipc_dealloc_count) (i32.const 1))
+                        (then (unreachable))
+                    )
+                )
+            )
+        )
+        (func (export "datalake_init") (param $ptr i32) (param $len i32) (result i32)
+            (drop (call $sched_yield))
+            (call $host_log (i32.const 2) (local.get $ptr) (local.get $len))
+            (drop (call $has_cap (local.get $ptr) (local.get $len)))
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param $signal i32) (param $ptr i32) (param $len i32) (result i64)
+            (global.set $ipc_ptr (local.get $ptr))
+            (drop (call $sched_yield))
+            (call $metric_emit (i32.const 0) (local.get $ptr) (i32.const 4) (call $now_nanos))
+            (call $host_log (i32.const 3) (local.get $ptr) (i32.const 4))
+            (drop (call $has_cap (local.get $ptr) (i32.const 4)))
+            (if (i32.ne (local.get $signal) (i32.const 2))
+                (then
+                    (i32.store (i32.const 128) (i32.const 3))
+                    (i32.store (i32.const 132) (i32.const 0))
+                    (i32.store (i32.const 136) (i32.const 0))
+                    (i32.store (i32.const 140) (i32.const 0))
+                    (i32.store (i32.const 144) (i32.const 0))
+                    (return (i64.const 549755813908))
+                )
+            )
+            (i32.store (i32.const 128) (i32.const 0))
+            (i32.store (i32.const 132) (i32.const 1))
+            (i32.store (i32.const 136) (i32.const 160))
+            (i32.store (i32.const 140) (i32.const 0))
+            (i32.store (i32.const 144) (i32.const 0))
+            (i32.store (i32.const 160) (local.get $ptr))
+            (i32.store (i32.const 164) (local.get $len))
+            (i64.const 549755813908)
+        )
+    )"#;
+    let wasm = wat::parse_str(wat).unwrap();
+    let res = run_immutability_suite(&wasm, "traces", "{}");
+    assert!(
+        res.is_ok(),
+        "Expected WASI + env host imports and traces signal discriminant to pass: {res:?}"
+    );
+}
+
+#[test]
+fn test_run_immutability_suite_rejects_invalid_config_json() {
+    let wasm = wat::parse_str(valid_echo_wat()).unwrap();
+    let res = run_immutability_suite(&wasm, "traces", "{not-valid-json}");
+    assert!(res.is_err(), "Expected invalid config JSON to be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("Invalid JSON provided for --config"),
+        "Expected invalid config JSON error, got: {err_str}"
+    );
 }
 
 #[test]

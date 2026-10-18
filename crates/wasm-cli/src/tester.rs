@@ -9,7 +9,7 @@ use arrow::record_batch::RecordBatch;
 use opentelemetry_datalake_wasm_sdk::helpers::IMMUTABLE_COLUMNS;
 use std::sync::Arc;
 use thiserror::Error;
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Module, Store};
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum TesterError {
@@ -123,6 +123,9 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     crate::validator::validate_wasm_bytes(bytes)
         .map_err(|e| anyhow::anyhow!("Module validation failed: {e}"))?;
 
+    let parsed_config: serde_json::Value =
+        serde_json::from_str(config_json).context("Invalid JSON provided for --config")?;
+
     let mut config = Config::new();
     config.consume_fuel(true);
     let engine = Engine::new(&config)
@@ -130,12 +133,14 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     let module = Module::new(&engine, bytes)
         .map_err(|e| anyhow::anyhow!("Failed to compile WebAssembly module: {e}"))?;
 
-    let mut store = Store::new(&engine, ());
+    let mut store = Store::new(&engine, crate::default_wasi_ctx());
     store
         .set_fuel(1_000_000)
         .map_err(|e| anyhow::anyhow!("Failed to configure fuel limit: {e}"))?;
-
-    let instance = Instance::new(&mut store, &module, &[])
+    let linker = crate::build_cli_linker(&engine)
+        .map_err(|e| anyhow::anyhow!("Failed to configure host linker: {e}"))?;
+    let instance = linker
+        .instantiate(&mut store, &module)
         .map_err(|e| anyhow::anyhow!("Failed to instantiate WebAssembly module: {e}"))?;
 
     let alloc_fn = instance
@@ -149,8 +154,6 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
         .ok_or_else(|| anyhow::anyhow!("Missing 'memory' export"))?;
 
     if let Ok(init_fn) = instance.get_typed_func::<(u32, u32), i32>(&mut store, "datalake_init") {
-        let parsed_config = serde_json::from_str::<serde_json::Value>(config_json)
-            .unwrap_or_else(|_| serde_json::json!({}));
         let init_payload = serde_json::json!({
             "signal": signal,
             "env": {},
@@ -200,30 +203,16 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
         .write(&mut store, ipc_ptr as usize, &ipc_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to write IPC payload into guest memory: {e}"))?;
 
-    let desc_ptr = alloc_fn.call(&mut store, 8).unwrap_or(0);
-    if desc_ptr != 0 {
-        let mut desc_bytes = [0u8; 8];
-        desc_bytes[0..4].copy_from_slice(&ipc_ptr.to_le_bytes());
-        desc_bytes[4..8].copy_from_slice(&ipc_len.to_le_bytes());
-        let _ = memory.write(&mut store, desc_ptr as usize, &desc_bytes);
-    }
+    let signal_type = crate::parse_signal_type(signal);
 
-    // Call datalake_transform supporting v1 (3 args), legacy (2 args), or descriptor (1 arg)
-
-    let signal_bytes = signal.as_bytes();
-    let signal_len = u32::try_from(signal_bytes.len()).unwrap_or(0);
-    let signal_ptr = alloc_fn.call(&mut store, signal_len).unwrap_or(0);
-    if signal_ptr != 0 {
-        let _ = memory.write(&mut store, signal_ptr as usize, signal_bytes);
-    }
-
-    let transform_fn = instance.get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
-        .map_err(|e| anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}"))?;
-    let (header_ptr, _header_len) = {
-        let f = transform_fn.clone();
-
-        let packed = f
-            .call(&mut store, (signal_ptr, ipc_ptr, ipc_len))
+    let transform_fn = instance
+        .get_typed_func::<(u32, u32, u32), u64>(&mut store, "datalake_transform")
+        .map_err(|e| {
+            anyhow::anyhow!("Module must implement ABI v1 datalake_transform signature: {e}")
+        })?;
+    let (header_ptr, header_len) = {
+        let packed = transform_fn
+            .call(&mut store, (signal_type, ipc_ptr, ipc_len))
             .map_err(|e| anyhow::anyhow!("datalake_transform execution trapped or failed: {e}"))?;
         let ptr = u32::try_from(packed >> 32).unwrap_or(0);
         let len = u32::try_from(packed & 0xFFFF_FFFF).unwrap_or(0);
@@ -234,11 +223,10 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
             anyhow::bail!("datalake_transform returned header length < 20: {len}");
         }
         (ptr, len)
-    
     };
 
     let mem_size = memory.data_size(&store);
-    if (header_ptr as usize).saturating_add(20) > mem_size {
+    if (header_ptr as usize).saturating_add(header_len as usize) > mem_size {
         anyhow::bail!("Transform response header out of guest memory bounds");
     }
 
@@ -319,6 +307,10 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
             .read(&store, start, &mut out_ipc_bytes)
             .context("Failed to read batch IPC bytes")?;
 
+        if b_ptr != ipc_ptr {
+            let _ = dealloc_fn.call(&mut store, (b_ptr, b_len));
+        }
+
         let cursor = std::io::Cursor::new(out_ipc_bytes);
         let reader = StreamReader::try_new(cursor, None).map_err(|e| {
             anyhow::anyhow!("Failed to initialize Arrow StreamReader on output batch: {e}")
@@ -334,35 +326,21 @@ pub fn run_immutability_suite(bytes: &[u8], signal: &str, config_json: &str) -> 
     }
 
     // Cleanup guest and host allocations
-
-    if message_ptr != 0 && message_len > 0 {
+    if message_ptr != 0
+        && message_len > 0
+        && (message_ptr as usize).saturating_add(message_len as usize) <= mem_size
+    {
         let _ = dealloc_fn.call(&mut store, (message_ptr, message_len));
     }
-
     if batch_count > 0 && batches_ptr != 0 {
-        let mut desc_buf = vec![0u8; (batch_count * 8) as usize];
-        if memory.read(&store, batches_ptr as usize, &mut desc_buf).is_ok() {
-            for i in 0..batch_count as usize {
-                let b_ptr = u32::from_le_bytes(desc_buf[i*8 .. i*8+4].try_into().unwrap());
-                let b_len = u32::from_le_bytes(desc_buf[i*8+4 .. i*8+8].try_into().unwrap());
-                if b_ptr != 0 && b_len > 0 {
-                    let _ = dealloc_fn.call(&mut store, (b_ptr, b_len));
-                }
-            }
-        }
-        let _ = dealloc_fn.call(&mut store, (batches_ptr, batch_count * 8));
+        let _ = dealloc_fn.call(&mut store, (batches_ptr, batch_count.saturating_mul(8)));
     }
-    let _ = dealloc_fn.call(&mut store, (header_ptr, 20));
-
+    let _ = dealloc_fn.call(&mut store, (header_ptr, header_len));
     let _ = dealloc_fn.call(&mut store, (ipc_ptr, ipc_len));
-    if desc_ptr != 0 {
-        let _ = dealloc_fn.call(&mut store, (desc_ptr, 8));
-    }
 
     println!(
         "✓ Passed immutability & conformance test suite ({verified_count} batch(es) verified)"
     );
-    let _ = dealloc_fn.call(&mut store, (signal_ptr, signal_len));
     Ok(())
 }
 
