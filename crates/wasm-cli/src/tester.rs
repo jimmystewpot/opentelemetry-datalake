@@ -11,10 +11,13 @@ use std::sync::Arc;
 use thiserror::Error;
 use wasmtime::{Config, Engine, Module, Store};
 
+/// Errors returned when a guest transform violates column immutability invariants.
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum TesterError {
+    /// An immutable column's values were modified by the guest transform.
     #[error("Value mismatch in immutable column {0}")]
     ValueMismatch(&'static str),
+    /// An immutable column present in the input batch was dropped from the output batch.
     #[error("Immutable column '{0}' present in input but missing from output")]
     MissingColumn(&'static str),
 }

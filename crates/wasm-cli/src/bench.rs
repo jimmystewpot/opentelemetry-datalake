@@ -394,9 +394,10 @@ mod tests {
         let wasm = wat::parse_str(wat_src).unwrap();
         let res = run_benchmark(&wasm, 5, "traces", "{invalid-json}");
         assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid JSON provided for --config"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("Invalid JSON provided for --config")
+        );
     }
 }
