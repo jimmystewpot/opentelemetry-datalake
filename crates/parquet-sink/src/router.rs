@@ -12,9 +12,7 @@ use smallvec::SmallVec;
 use crate::error::ParquetSinkError;
 use crate::variant::VariantTransformer;
 
-static LOG_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
-static TRACE_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
-static METRIC_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
+static VARIANT_CANDIDATE_COLUMNS: [&str; 2] = ["attributes", "resource_attributes"];
 
 /// A record batch prepared and annotated with its signal type for partitioning and storage.
 #[derive(Debug, Clone)]
@@ -27,8 +25,8 @@ pub struct PreparedBatch {
 
 /// Routes incoming telemetry signals and prepares Arrow schemas for Parquet storage.
 ///
-/// When Variant encoding is enabled, semi-structured columns (`attributes`, `resource_attributes`,
-/// `body`, and `datapoints`) are converted into Parquet / Spark Variant binary `StructArray` columns.
+/// When Variant encoding is enabled, semi-structured columns (`attributes` and
+/// `resource_attributes`) are converted into Parquet / Spark Variant binary `StructArray` columns.
 /// Concurrency characteristics: `SignalRouter` is thread-safe (`Send + Sync`) and stateless,
 /// designed for concurrent execution across worker threads.
 #[derive(Debug, Clone, Default)]
@@ -63,13 +61,13 @@ impl SignalRouter {
     pub fn route_and_prepare(&self, batch: SignalBatch) -> Result<PreparedBatch, ParquetSinkError> {
         match batch {
             SignalBatch::Logs(record_batch) => {
-                self.prepare_batch("logs", record_batch, &LOG_CANDIDATE_COLUMNS)
+                self.prepare_batch("logs", record_batch, &VARIANT_CANDIDATE_COLUMNS)
             }
             SignalBatch::Traces(record_batch) => {
-                self.prepare_batch("traces", record_batch, &TRACE_CANDIDATE_COLUMNS)
+                self.prepare_batch("traces", record_batch, &VARIANT_CANDIDATE_COLUMNS)
             }
             SignalBatch::Metrics(record_batch) => {
-                self.prepare_batch("metrics", record_batch, &METRIC_CANDIDATE_COLUMNS)
+                self.prepare_batch("metrics", record_batch, &VARIANT_CANDIDATE_COLUMNS)
             }
         }
     }

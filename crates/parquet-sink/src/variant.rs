@@ -8,8 +8,11 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryBuilder, LargeStringArray, RecordBatch, StringArray, StructArray};
-use arrow::buffer::{BooleanBuffer, NullBuffer};
+use arrow::array::{
+    Array, BinaryBuilder, BooleanBufferBuilder, LargeStringArray, RecordBatch, StringArray,
+    StructArray,
+};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use smallvec::SmallVec;
 
@@ -26,6 +29,12 @@ pub static STATIC_EMPTY_METADATA: [u8; 3] = [0x01, 0x00, 0x00];
 
 /// Static minimal value for an empty object: Object basic type (0x02) with 0 count (0x00) and 0 offset (0x00).
 pub static STATIC_EMPTY_VALUE: [u8; 3] = [0x02, 0x00, 0x00];
+
+/// Maximum retained capacity (16 KiB) for the thread-local metadata buffer before shrinking back to inline stack storage.
+const MAX_RETAINED_META_CAPACITY: usize = 16 * 1024;
+
+/// Maximum retained capacity (64 KiB) for the thread-local value buffer before shrinking back to inline stack storage.
+const MAX_RETAINED_VAL_CAPACITY: usize = 64 * 1024;
 
 thread_local! {
     static LOCAL_ENCODER: RefCell<VariantEncoder> = RefCell::new(VariantEncoder::new());
@@ -53,6 +62,22 @@ impl VariantEncoder {
         Self {
             meta_buf: SmallVec::new(),
             val_buf: SmallVec::new(),
+        }
+    }
+
+    /// Returns the current capacities `(meta_capacity, val_capacity)` of the internal scratch buffers.
+    #[must_use]
+    pub fn scratch_capacities(&self) -> (usize, usize) {
+        (self.meta_buf.capacity(), self.val_buf.capacity())
+    }
+
+    /// Reclaims heap memory if either scratch buffer grew beyond its maximum retained threshold.
+    pub fn reclaim_oversized_buffers(&mut self) {
+        if self.meta_buf.capacity() > MAX_RETAINED_META_CAPACITY {
+            self.meta_buf = SmallVec::new();
+        }
+        if self.val_buf.capacity() > MAX_RETAINED_VAL_CAPACITY {
+            self.val_buf = SmallVec::new();
         }
     }
 
@@ -167,7 +192,7 @@ impl VariantEncoder {
         usize::try_from(u64::from_le_bytes(buf)).unwrap_or(0)
     }
 
-    fn encode_primitive_string(&mut self, trimmed: &str) {
+    fn encode_primitive_string(&mut self, trimmed: &str) -> Result<(), ParquetSinkError> {
         self.meta_buf.clear();
         self.meta_buf.extend_from_slice(&STATIC_EMPTY_METADATA);
         self.val_buf.clear();
@@ -179,11 +204,13 @@ impl VariantEncoder {
             self.val_buf.push((len_u8 << 2) | 0x01);
         } else {
             self.val_buf.push(0x40);
-            if let Ok(len_u32) = u32::try_from(bytes.len()) {
-                self.val_buf.extend_from_slice(&len_u32.to_le_bytes());
-            }
+            let len_u32 = u32::try_from(bytes.len()).map_err(|_| {
+                ParquetSinkError::VariantEncoding("string length exceeds u32::MAX".to_string())
+            })?;
+            self.val_buf.extend_from_slice(&len_u32.to_le_bytes());
         }
         self.val_buf.extend_from_slice(bytes);
+        Ok(())
     }
 
     fn encode_json_internal(&mut self, trimmed: &str) -> Result<(), ParquetSinkError> {
@@ -197,7 +224,7 @@ impl VariantEncoder {
                     )));
                 }
                 // FAST PATH: Zero-allocation primitive string encoding
-                self.encode_primitive_string(trimmed);
+                self.encode_primitive_string(trimmed)?;
                 return Ok(());
             }
         };
@@ -332,26 +359,16 @@ fn encode_object_to_buf(
     entries.dedup_by(|(k1, _), (k2, _)| k1 == k2);
 
     let num_elements = entries.len();
-    let mut encoded_values: SmallVec<[SmallVec<[u8; 256]>; 16]> =
-        SmallVec::with_capacity(num_elements);
-    let mut val_scratch: SmallVec<[u8; 256]> = SmallVec::new();
-
-    for (_, v) in &entries {
-        val_scratch.clear();
-        encode_json_value(v, dictionary, &mut val_scratch)?;
-        encoded_values.push(val_scratch.clone());
-    }
-
-    let mut total_val_len: usize = 0;
+    let mut values_staging: SmallVec<[u8; 256]> = SmallVec::new();
     let mut val_offsets: SmallVec<[usize; 17]> = SmallVec::with_capacity(num_elements + 1);
     val_offsets.push(0);
 
-    for ev in &encoded_values {
-        total_val_len = total_val_len.checked_add(ev.len()).ok_or_else(|| {
-            ParquetSinkError::VariantEncoding("value offset overflow".to_string())
-        })?;
-        val_offsets.push(total_val_len);
+    for (_, v) in &entries {
+        encode_json_value(v, dictionary, &mut values_staging)?;
+        val_offsets.push(values_staging.len());
     }
+
+    let total_val_len = values_staging.len();
 
     let is_large = num_elements > 255;
     let field_id_size = if dictionary.len() <= 256 {
@@ -416,9 +433,7 @@ fn encode_object_to_buf(
     }
 
     // Values payload
-    for ev in encoded_values {
-        buf.extend_from_slice(&ev);
-    }
+    buf.extend_from_slice(&values_staging);
 
     Ok(())
 }
@@ -534,25 +549,16 @@ fn encode_array_value(
 ) -> Result<(), ParquetSinkError> {
     let num_elements = arr.len();
     let is_large = num_elements > 255;
-    let mut elements: SmallVec<[SmallVec<[u8; 256]>; 8]> = SmallVec::with_capacity(num_elements);
-    let mut elem_scratch: SmallVec<[u8; 256]> = SmallVec::new();
-
-    for elem in arr {
-        elem_scratch.clear();
-        encode_json_value(elem, dictionary, &mut elem_scratch)?;
-        elements.push(elem_scratch.clone());
-    }
-
-    let mut total_len: usize = 0;
+    let mut elements_staging: SmallVec<[u8; 256]> = SmallVec::new();
     let mut offsets: SmallVec<[usize; 9]> = SmallVec::with_capacity(num_elements + 1);
     offsets.push(0);
 
-    for el in &elements {
-        total_len = total_len.checked_add(el.len()).ok_or_else(|| {
-            ParquetSinkError::VariantEncoding("array offset overflow".to_string())
-        })?;
-        offsets.push(total_len);
+    for elem in arr {
+        encode_json_value(elem, dictionary, &mut elements_staging)?;
+        offsets.push(elements_staging.len());
     }
+
+    let total_len = elements_staging.len();
 
     let field_offset_size = if total_len <= 255 {
         1
@@ -606,9 +612,7 @@ fn encode_array_value(
         }
     }
 
-    for el in elements {
-        buf.extend_from_slice(&el);
-    }
+    buf.extend_from_slice(&elements_staging);
 
     Ok(())
 }
@@ -749,7 +753,8 @@ impl VariantTransformer {
             let mut encoder = cell.borrow_mut();
             let mut meta_builder = BinaryBuilder::with_capacity(num_rows, num_rows * 64);
             let mut val_builder = BinaryBuilder::with_capacity(num_rows, num_rows * 128);
-            let mut validity = Vec::with_capacity(num_rows);
+            let mut validity = BooleanBufferBuilder::new(num_rows);
+            let mut null_count: usize = 0;
 
             for row_idx in 0..num_rows {
                 let (meta_slice, val_slice, is_valid) = if let Some(str_val) = get_row(row_idx) {
@@ -763,15 +768,20 @@ impl VariantTransformer {
 
                 meta_builder.append_value(meta_slice);
                 val_builder.append_value(val_slice);
-                validity.push(is_valid);
+                validity.append(is_valid);
+                if !is_valid {
+                    null_count += 1;
+                }
             }
+
+            encoder.reclaim_oversized_buffers();
 
             let meta_array = meta_builder.finish();
             let val_array = val_builder.finish();
-            let null_buffer = if validity.iter().all(|&v| v) {
+            let null_buffer = if null_count == 0 {
                 None
             } else {
-                Some(NullBuffer::from(BooleanBuffer::from(validity)))
+                Some(NullBuffer::new(validity.finish()))
             };
 
             StructArray::try_new(
@@ -1165,5 +1175,39 @@ mod tests {
             res_non_str.unwrap_err(),
             ParquetSinkError::VariantEncoding(_)
         ));
+    }
+
+    #[test]
+    fn test_local_encoder_reclaims_oversized_scratch_buffers_after_large_payload() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "attributes",
+            DataType::Utf8,
+            true,
+        )]));
+        // Construct a >128 KiB JSON object payload that forces val_buf to grow beyond 64 KiB
+        let large_val = "x".repeat(130_000);
+        let large_json = format!(r#"{{"large_key":"{large_val}"}}"#);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![Some(large_json.as_str())]))],
+        )
+        .unwrap();
+
+        let transformer = VariantTransformer::new();
+        let out = transformer
+            .transform_to_variant(&batch, &["attributes"])
+            .unwrap();
+        assert_eq!(out.num_rows(), 1);
+
+        // Verify thread-local encoder reclaimed oversized buffer capacity
+        let (meta_cap, val_cap) = LOCAL_ENCODER.with(|cell| cell.borrow().scratch_capacities());
+        assert!(
+            meta_cap <= 16 * 1024,
+            "Expected meta_buf capacity <= 16 KiB after reclamation, got {meta_cap}"
+        );
+        assert!(
+            val_cap <= 64 * 1024,
+            "Expected val_buf capacity <= 64 KiB after reclamation, got {val_cap}"
+        );
     }
 }
