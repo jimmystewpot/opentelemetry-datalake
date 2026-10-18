@@ -550,6 +550,28 @@ fn spawn_sighup_reload_task(
     tokio::spawn(async {})
 }
 
+/// Evaluates the unexpected termination of a sink task inside the main supervision loop,
+/// logging the failure and returning a formatted [`anyhow::Error`] for non-zero exit propagation.
+fn supervise_sink_exit(
+    signal_name: &str,
+    res: Result<Result<(), pipeline_core::error::PipelineError>, tokio::task::JoinError>,
+) -> anyhow::Error {
+    match res {
+        Ok(Err(e)) => {
+            tracing::error!("{signal_name} sink failed: {e}");
+            anyhow::anyhow!("{signal_name} sink failed: {e}")
+        }
+        Ok(Ok(())) => {
+            tracing::error!("{signal_name} sink exited prematurely");
+            anyhow::anyhow!("{signal_name} sink exited prematurely")
+        }
+        Err(e) => {
+            tracing::error!("{signal_name} sink task panicked: {e}");
+            anyhow::anyhow!("{signal_name} sink task panicked: {e}")
+        }
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -736,9 +758,15 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Spawn sinks
-    let logs_sink_handle;
-    let traces_sink_handle;
-    let metrics_sink_handle;
+    let mut logs_sink_handle: tokio::task::JoinHandle<
+        Result<(), pipeline_core::error::PipelineError>,
+    >;
+    let mut traces_sink_handle: tokio::task::JoinHandle<
+        Result<(), pipeline_core::error::PipelineError>,
+    >;
+    let mut metrics_sink_handle: tokio::task::JoinHandle<
+        Result<(), pipeline_core::error::PipelineError>,
+    >;
 
     if let Some(ref iceberg_cfg) = config.iceberg {
         let logs_table = iceberg_cfg
@@ -774,21 +802,27 @@ async fn main() -> anyhow::Result<()> {
         let mut metrics_sink = storage::iceberg::IcebergSink::new(metrics_cfg);
 
         logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs Iceberg sink error: {}", e);
+            let res = logs_sink.run(logs_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Logs Iceberg sink error: {e}");
             }
+            res
         });
 
         traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces Iceberg sink error: {}", e);
+            let res = traces_sink.run(traces_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Traces Iceberg sink error: {e}");
             }
+            res
         });
 
         metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics Iceberg sink error: {}", e);
+            let res = metrics_sink.run(metrics_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Metrics Iceberg sink error: {e}");
             }
+            res
         });
     } else if let Some(es_cfg) = config.elasticsearch {
         tracing::info!(
@@ -811,21 +845,27 @@ async fn main() -> anyhow::Result<()> {
         metrics_sink.share_state_from(&logs_sink);
 
         logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs Elasticsearch sink error: {}", e);
+            let res = logs_sink.run(logs_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Logs Elasticsearch sink error: {e}");
             }
+            res
         });
 
         traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces Elasticsearch sink error: {}", e);
+            let res = traces_sink.run(traces_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Traces Elasticsearch sink error: {e}");
             }
+            res
         });
 
         metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics Elasticsearch sink error: {}", e);
+            let res = metrics_sink.run(metrics_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Metrics Elasticsearch sink error: {e}");
             }
+            res
         });
     } else if let Some(starrocks_cfg) = config.starrocks {
         tracing::info!(
@@ -847,21 +887,27 @@ async fn main() -> anyhow::Result<()> {
             starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager)?;
 
         logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs StarRocks sink error: {}", e);
+            let res = logs_sink.run(logs_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Logs StarRocks sink error: {e}");
             }
+            res
         });
 
         traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces StarRocks sink error: {}", e);
+            let res = traces_sink.run(traces_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Traces StarRocks sink error: {e}");
             }
+            res
         });
 
         metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics StarRocks sink error: {}", e);
+            let res = metrics_sink.run(metrics_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Metrics StarRocks sink error: {e}");
             }
+            res
         });
     } else if let Some(ref kafka_cfg) = config.kafka {
         tracing::info!("Initializing Kafka sinks");
@@ -897,21 +943,27 @@ async fn main() -> anyhow::Result<()> {
         .with_sorting(sorter, kafka_cfg.metrics_partition_key.clone());
 
         logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs Kafka sink error: {}", e);
+            let res = logs_sink.run(logs_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Logs Kafka sink error: {e}");
             }
+            res
         });
 
         traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces Kafka sink error: {}", e);
+            let res = traces_sink.run(traces_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Traces Kafka sink error: {e}");
             }
+            res
         });
 
         metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics Kafka sink error: {}", e);
+            let res = metrics_sink.run(metrics_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Metrics Kafka sink error: {e}");
             }
+            res
         });
     } else if let Some(mut parquet_cfg) = config.parquet {
         tracing::info!(
@@ -933,21 +985,27 @@ async fn main() -> anyhow::Result<()> {
         metrics_sink.share_upload_limits_from(&logs_sink);
 
         logs_sink_handle = tokio::spawn(async move {
-            if let Err(e) = logs_sink.run(logs_sink_rx).await {
-                tracing::error!("Logs Parquet sink error: {}", e);
+            let res = logs_sink.run(logs_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Logs Parquet sink error: {e}");
             }
+            res
         });
 
         traces_sink_handle = tokio::spawn(async move {
-            if let Err(e) = traces_sink.run(traces_sink_rx).await {
-                tracing::error!("Traces Parquet sink error: {}", e);
+            let res = traces_sink.run(traces_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Traces Parquet sink error: {e}");
             }
+            res
         });
 
         metrics_sink_handle = tokio::spawn(async move {
-            if let Err(e) = metrics_sink.run(metrics_sink_rx).await {
-                tracing::error!("Metrics Parquet sink error: {}", e);
+            let res = metrics_sink.run(metrics_sink_rx).await;
+            if let Err(ref e) = res {
+                tracing::error!("Metrics Parquet sink error: {e}");
             }
+            res
         });
     } else {
         return Err(anyhow::anyhow!(
@@ -1039,10 +1097,22 @@ async fn main() -> anyhow::Result<()> {
             }
             let _ = shutdown_tx.send(true);
         }
+        res = &mut logs_sink_handle => {
+            exit_err = Some(supervise_sink_exit("Logs", res));
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut traces_sink_handle => {
+            exit_err = Some(supervise_sink_exit("Traces", res));
+            let _ = shutdown_tx.send(true);
+        }
+        res = &mut metrics_sink_handle => {
+            exit_err = Some(supervise_sink_exit("Metrics", res));
+            let _ = shutdown_tx.send(true);
+        }
     }
 
     // Wait for pipeline to drain
-    let _ = tokio::join!(
+    let ((), (), (), logs_drain_res, traces_drain_res, metrics_drain_res) = tokio::join!(
         async {
             if !logs_trans_handle.is_finished() {
                 let _ = logs_trans_handle.await;
@@ -1058,10 +1128,53 @@ async fn main() -> anyhow::Result<()> {
                 let _ = metrics_trans_handle.await;
             }
         },
-        logs_sink_handle,
-        traces_sink_handle,
-        metrics_sink_handle
+        async {
+            if logs_sink_handle.is_finished() {
+                None
+            } else {
+                Some(logs_sink_handle.await)
+            }
+        },
+        async {
+            if traces_sink_handle.is_finished() {
+                None
+            } else {
+                Some(traces_sink_handle.await)
+            }
+        },
+        async {
+            if metrics_sink_handle.is_finished() {
+                None
+            } else {
+                Some(metrics_sink_handle.await)
+            }
+        }
     );
+
+    for (signal_name, drain_res) in [
+        ("Logs", logs_drain_res),
+        ("Traces", traces_drain_res),
+        ("Metrics", metrics_drain_res),
+    ] {
+        match drain_res {
+            Some(Ok(Err(e))) => {
+                if exit_err.is_none() {
+                    exit_err = Some(anyhow::anyhow!(
+                        "{signal_name} sink failed during drain: {e}"
+                    ));
+                }
+            }
+            Some(Err(join_err)) => {
+                tracing::error!("{signal_name} sink task panicked during drain: {join_err}");
+                if exit_err.is_none() {
+                    exit_err = Some(anyhow::anyhow!(
+                        "{signal_name} sink task panicked during drain: {join_err}"
+                    ));
+                }
+            }
+            Some(Ok(Ok(()))) | None => {}
+        }
+    }
 
     if let Some(h) = sighup_handle {
         let _ = h.await;
@@ -2435,5 +2548,39 @@ mod tests {
             "SIGHUP reload task must exit cleanly on shutdown channel drop without spinning"
         );
         let _ = std::fs::remove_file(&wasm_path);
+    }
+
+    #[tokio::test]
+    async fn test_supervise_sink_exit_propagates_errors_and_premature_exit() {
+        let err_handle = tokio::spawn(async {
+            Err::<(), pipeline_core::error::PipelineError>(
+                pipeline_core::error::PipelineError::Internal("disk full".to_string()),
+            )
+        });
+        let err = supervise_sink_exit("Logs", err_handle.await);
+        assert!(
+            err.to_string()
+                .contains("Logs sink failed: internal error: disk full")
+        );
+
+        let ok_handle = tokio::spawn(async { Ok::<(), pipeline_core::error::PipelineError>(()) });
+        let premature_err = supervise_sink_exit("Traces", ok_handle.await);
+        assert!(
+            premature_err
+                .to_string()
+                .contains("Traces sink exited prematurely")
+        );
+
+        let panic_handle = tokio::spawn(async {
+            panic!("simulated sink panic");
+            #[allow(unreachable_code)]
+            Ok::<(), pipeline_core::error::PipelineError>(())
+        });
+        let panic_err = supervise_sink_exit("Metrics", panic_handle.await);
+        assert!(
+            panic_err
+                .to_string()
+                .contains("Metrics sink task panicked:")
+        );
     }
 }
