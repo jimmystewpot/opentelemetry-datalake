@@ -4194,6 +4194,7 @@ dependencies = [
  "bytes",
  "chrono",
  "opendal",
+ "opentelemetry",
  "parquet",
  "pipeline-core",
  "serde",

@@ -1,6 +1,5 @@
 //! Implementation of the `Sink` pipeline trait and graceful shutdown drain for `ParquetSink`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,7 +21,6 @@ pub struct ParquetSink {
     config: ParquetSinkConfig,
     manager: PartitionManager,
     router: SignalRouter,
-    dropped_batches: AtomicU64,
 }
 
 impl ParquetSink {
@@ -35,15 +33,13 @@ impl ParquetSink {
     /// Returns [`PipelineError`] if configuration validation fails or if the storage
     /// operator cannot be constructed.
     pub fn try_new(config: ParquetSinkConfig) -> Result<Self, PipelineError> {
-        config.validate()?;
-        let operator = config.build_operator()?;
+        let operator = config.validate_and_build_operator()?;
         let router = SignalRouter::new(config.variant_encoding);
         let manager = PartitionManager::new(config.clone(), operator);
         Ok(Self {
             config,
             manager,
             router,
-            dropped_batches: AtomicU64::new(0),
         })
     }
 
@@ -65,19 +61,14 @@ impl ParquetSink {
         &self.router
     }
 
-    /// Returns the number of malformed or invalid batches dropped by the sink.
-    #[must_use]
-    pub fn dropped_batches(&self) -> u64 {
-        self.dropped_batches.load(Ordering::Relaxed)
-    }
-
-    /// Shares aggregate memory tracking and upload concurrency limits with another sink instance.
+    /// Shares aggregate memory tracking, upload concurrency limits, and the storage operator
+    /// with another sink instance.
     pub fn share_state_from(&mut self, other: &Self) {
         self.manager.share_limits_from(&other.manager);
     }
 
-    /// Shares aggregate upload concurrency limits with another sink instance while maintaining
-    /// isolated memory budgets.
+    /// Shares aggregate upload concurrency limits and the storage operator with another sink
+    /// instance while maintaining isolated memory budgets.
     pub fn share_upload_limits_from(&mut self, other: &Self) {
         self.manager.share_upload_limits_from(&other.manager);
     }
@@ -102,6 +93,7 @@ impl Sink for ParquetSink {
         };
         let mut ticker = tokio::time::interval(Duration::from_secs(sweep_interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
 
         let mut final_res = Ok(());
 
@@ -313,5 +305,26 @@ mod tests {
         let traces_sem = traces_sink.manager().upload_semaphore().unwrap();
         assert!(std::sync::Arc::ptr_eq(&logs_sem, &traces_sem));
         assert_eq!(logs_sem.available_permits(), 4);
+
+        // Operator is shared (writes via logs_sink operator are visible via traces_sink operator)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            logs_sink
+                .manager()
+                .operator()
+                .write("shared_check.txt", "ok")
+                .await
+                .unwrap();
+            let data = traces_sink
+                .manager()
+                .operator()
+                .read("shared_check.txt")
+                .await
+                .unwrap();
+            assert_eq!(data.to_bytes(), "ok");
+        });
     }
 }

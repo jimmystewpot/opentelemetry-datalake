@@ -23,6 +23,7 @@ smallvec = { version = "1.16" }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
+opentelemetry = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 

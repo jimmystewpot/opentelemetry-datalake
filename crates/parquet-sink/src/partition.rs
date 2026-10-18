@@ -228,22 +228,31 @@ impl PartitionManager {
         Arc::clone(&self.global_memory_bytes)
     }
 
+    /// Returns a reference to the underlying `OpenDAL` storage operator.
+    #[must_use]
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
     /// Returns a clone of the shared upload concurrency limiter semaphore, if enabled.
     #[must_use]
     pub fn upload_semaphore(&self) -> Option<Arc<tokio::sync::Semaphore>> {
         self.upload_semaphore.as_ref().map(Arc::clone)
     }
 
-    /// Shares aggregate memory tracking and upload concurrency limiters with another partition manager.
+    /// Shares aggregate memory tracking, upload concurrency limiters, and the storage operator
+    /// with another partition manager.
     pub fn share_limits_from(&mut self, other: &Self) {
         self.global_memory_bytes = Arc::clone(&other.global_memory_bytes);
         self.upload_semaphore = other.upload_semaphore.as_ref().map(Arc::clone);
+        self.operator = other.operator.clone();
     }
 
-    /// Shares aggregate upload concurrency limiters with another partition manager,
-    /// leaving memory tracking isolated per partition manager.
+    /// Shares aggregate upload concurrency limiters and the storage operator with another
+    /// partition manager, leaving memory tracking isolated per partition manager.
     pub fn share_upload_limits_from(&mut self, other: &Self) {
         self.upload_semaphore = other.upload_semaphore.as_ref().map(Arc::clone);
+        self.operator = other.operator.clone();
     }
 
     /// Sets or replaces the upload concurrency limiter semaphore.
@@ -261,6 +270,26 @@ impl PartitionManager {
     #[must_use]
     pub fn current_memory_bytes(&self) -> usize {
         self.global_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total estimated size of a writer (`bytes_written + in_progress_size`).
+    fn estimated_writer_bytes(w: &PartitionWriter) -> usize {
+        w.bytes_written().saturating_add(w.in_progress_size())
+    }
+
+    /// Aborts and evicts a poisoned partition writer without committing its partial file.
+    fn abort_writer(&mut self, partition_id: &PartitionId) {
+        if let Some(pos) = self.lru_order.iter().position(|k| k == partition_id) {
+            self.lru_order.remove(pos);
+        }
+        if let Some(poisoned) = self.writers.remove(partition_id) {
+            self.global_memory_bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(poisoned.buffered_memory))
+                })
+                .ok();
+            drop(poisoned);
+        }
     }
 
     /// Routes a prepared batch annotated with its signal type to target partitions.
@@ -443,7 +472,8 @@ impl PartitionManager {
 
             if let Some(active_writer) = self.writers.get_mut(&partition_id) {
                 let should_roll = (self.config.max_file_size_bytes > 0
-                    && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
+                    && Self::estimated_writer_bytes(&active_writer.writer)
+                        >= self.config.max_file_size_bytes)
                     || (self.config.max_file_interval_sec > 0
                         && active_writer.opened_at.elapsed().as_secs()
                             >= self.config.max_file_interval_sec);
@@ -453,12 +483,16 @@ impl PartitionManager {
                     continue;
                 }
 
+                if let Err(e) = active_writer.writer.write_batch(&slice) {
+                    self.abort_writer(&partition_id);
+                    return Err(e);
+                }
+
                 if let Some(pos) = self.lru_order.iter().position(|k| k == &partition_id) {
                     self.lru_order.remove(pos);
                 }
                 self.lru_order.push_back(partition_id.clone());
 
-                active_writer.writer.write_batch(&slice)?;
                 active_writer.buffered_memory += slice_memory;
                 self.global_memory_bytes
                     .fetch_add(slice_memory, Ordering::Relaxed);
@@ -466,7 +500,8 @@ impl PartitionManager {
                 if (self.config.max_records > 0
                     && active_writer.writer.records_written() >= self.config.max_records)
                     || (self.config.max_file_size_bytes > 0
-                        && active_writer.writer.bytes_written() >= self.config.max_file_size_bytes)
+                        && Self::estimated_writer_bytes(&active_writer.writer)
+                            >= self.config.max_file_size_bytes)
                 {
                     self.close_writer(&partition_id)?;
                 }
@@ -503,7 +538,8 @@ impl PartitionManager {
                 if (self.config.max_records > 0
                     && active.writer.records_written() >= self.config.max_records)
                     || (self.config.max_file_size_bytes > 0
-                        && active.writer.bytes_written() >= self.config.max_file_size_bytes)
+                        && Self::estimated_writer_bytes(&active.writer)
+                            >= self.config.max_file_size_bytes)
                 {
                     self.retire_active_writer(active)?;
                     self.check_background_errors()?;
@@ -571,6 +607,9 @@ impl PartitionManager {
             }
         }
 
+        let records = u64::try_from(active.writer.records_written()).unwrap_or(u64::MAX);
+        let bytes = u64::try_from(active.writer.bytes_written()).unwrap_or(u64::MAX);
+        let started_at = Instant::now();
         let close_res = active.writer.close();
 
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
@@ -582,8 +621,36 @@ impl PartitionManager {
 
         let jh = handle.spawn(async move {
             let res = active.uploader_handle.wait_for_completion().await;
-            if let Err(ref e) = res {
-                tracing::error!("Background Parquet upload failed: {e}");
+            match &res {
+                Ok(()) => {
+                    let elapsed_secs = started_at.elapsed().as_secs_f64();
+                    tracing::debug!(
+                        records_written = records,
+                        bytes_written = bytes,
+                        upload_duration_seconds = elapsed_secs,
+                        "Committed Parquet partition file"
+                    );
+                    let meter = opentelemetry::global::meter("parquet-sink");
+                    meter
+                        .u64_counter("datalake.sink.parquet.records_written_total")
+                        .build()
+                        .add(records, &[]);
+                    meter
+                        .u64_counter("datalake.sink.parquet.bytes_written_total")
+                        .build()
+                        .add(bytes, &[]);
+                    meter
+                        .u64_counter("datalake.sink.parquet.files_committed_total")
+                        .build()
+                        .add(1, &[]);
+                    meter
+                        .f64_histogram("datalake.sink.parquet.upload_duration_seconds")
+                        .build()
+                        .record(elapsed_secs, &[]);
+                }
+                Err(e) => {
+                    tracing::error!("Background Parquet upload failed: {e}");
+                }
             }
             res
         });
@@ -617,6 +684,13 @@ impl PartitionManager {
     /// # Errors
     /// Returns [`ParquetSinkError`] if any background upload task failed.
     pub fn check_background_errors(&mut self) -> Result<(), ParquetSinkError> {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return Ok(());
+        };
+        if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return Ok(());
+        }
+
         let mut i = 0;
         let mut first_error = None;
         while i < self.in_flight_uploads.len() {
@@ -624,8 +698,7 @@ impl PartitionManager {
                 let Some(jh) = self.in_flight_uploads.remove(i) else {
                     continue;
                 };
-                let res =
-                    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(jh));
+                let res = tokio::task::block_in_place(|| handle.block_on(jh));
                 match res {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -745,7 +818,6 @@ impl PartitionManager {
                 }
             }
         }
-        self.check_background_errors()?;
         if let Some(err) = first_error {
             return Err(err);
         }
@@ -2017,5 +2089,172 @@ mod tests {
             "Opening writer on traces must succeed: {:?}",
             inner_res.err()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_write_batch_error_aborts_poisoned_writer_and_does_not_commit_on_flush_all() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = ParquetSinkConfig {
+            max_records: 100,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op.clone());
+
+        let schema1 = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch1 = RecordBatch::try_new(
+            schema1,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["valid first batch"])),
+            ],
+        )
+        .unwrap();
+
+        // First batch opens active writer and buffers 1 record
+        manager.route_batch(&batch1, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+
+        // Second batch has incompatible schema for the same partition, causing write_batch to fail
+        let schema2 = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("different_col", DataType::Int64, false),
+        ]));
+        let batch2 = RecordBatch::try_new(
+            schema2,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![42])),
+            ],
+        )
+        .unwrap();
+
+        let err = manager.route_batch(&batch2, "logs");
+        assert!(err.is_err(), "Incompatible schema must fail write_batch");
+
+        // Poisoned writer must be immediately evicted and memory reset to 0
+        assert_eq!(manager.active_writer_count(), 0);
+        assert_eq!(manager.current_memory_bytes(), 0);
+
+        // Subsequent flush_all + wait_for_all_uploads must NOT commit the partial file to storage
+        manager.flush_all().unwrap();
+        manager.wait_for_all_uploads().await.unwrap();
+
+        let entries = op.list_with("").recursive(true).await.unwrap();
+        let parquet_files: Vec<_> = entries
+            .into_iter()
+            .filter(|e| e.path().ends_with(".parquet"))
+            .collect();
+        assert!(
+            parquet_files.is_empty(),
+            "Poisoned writer must be aborted, not committed on flush_all; found: {parquet_files:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_background_errors_and_wait_for_all_uploads_on_current_thread_do_not_panic()
+    {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = ParquetSinkConfig {
+            max_records: 1,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec!["row1"])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&batch, "logs").unwrap();
+        // Yield on current_thread runtime so the background upload task finishes
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Must not panic on current_thread runtime when background task is finished
+        assert!(manager.check_background_errors().is_ok());
+        assert!(manager.wait_for_all_uploads().await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_rolling_trigger_includes_in_progress_row_group_size() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let config = ParquetSinkConfig {
+            max_file_size_bytes: 256, // Small threshold exceeded by bytes_written + in_progress_size before row group flush
+            max_records: 100_000,
+            ..Default::default()
+        };
+        let mut manager = PartitionManager::new(config, op.clone());
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("msg", DataType::Utf8, false),
+        ]));
+        let payload1 = "x".repeat(512);
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec![payload1.as_str()])),
+            ],
+        )
+        .unwrap();
+
+        // First batch flushes a Zstd-compressed row group (< 256 bytes), keeping the writer open
+        manager.route_batch(&batch1, "logs").unwrap();
+        assert_eq!(manager.active_writer_count(), 1);
+
+        // Second batch remains in the in-progress row group (< 256 bytes alone),
+        // but bytes_written() + in_progress_size() >= 256 triggers an immediate roll
+        let payload2 = "y".repeat(128);
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_000,
+                ])),
+                Arc::new(StringArray::from(vec![payload2.as_str()])),
+            ],
+        )
+        .unwrap();
+
+        manager.route_batch(&batch2, "logs").unwrap();
+        // Because bytes_written() + in_progress_size() >= 256, the writer must have rolled immediately
+        assert_eq!(manager.active_writer_count(), 0);
+        manager.wait_for_all_uploads().await.unwrap();
     }
 }
