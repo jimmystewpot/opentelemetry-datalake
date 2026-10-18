@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 anyhow = { workspace = true }
 wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true, features = ["p1"] }
 arrow = { workspace = true, features = ["ipc"] }
 opentelemetry-datalake-wasm-sdk = { path = "../wasm-sdk" }
 thiserror = { workspace = true }

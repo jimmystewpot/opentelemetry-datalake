@@ -258,5 +258,48 @@ fn test_validate_rejects_v0_signature_if_abi_is_v1() {
     let wasm = wat::parse_str(wat_src).unwrap();
     let res = datalake_wasm_tool::validator::validate_wasm_bytes(&wasm);
     assert!(res.is_err());
-    assert!(res.unwrap_err().to_string().contains("expected (i32, i32, i32) -> i64"));
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("expected (i32, i32, i32) -> i64")
+    );
+}
+
+#[test]
+fn test_validate_accepts_module_with_wasi_and_env_host_imports() {
+    let wat_src = r#"(module
+        (import "wasi_snapshot_preview1" "sched_yield" (func $sched_yield (result i32)))
+        (import "env" "datalake_host_metric_emit" (func $metric_emit (param i32 i32 i32 i64)))
+        (import "env" "datalake_host_log" (func $host_log (param i32 i32 i32)))
+        (import "env" "datalake_host_has_capability" (func $has_cap (param i32 i32) (result i32)))
+        (import "env" "datalake_host_now_nanos" (func $now_nanos (result i64)))
+        (memory (export "memory") 1)
+        (func (export "datalake_abi_version") (result i32)
+            (drop (call $sched_yield))
+            (call $metric_emit (i32.const 0) (i32.const 0) (i32.const 0) (i64.const 1))
+            (call $host_log (i32.const 3) (i32.const 0) (i32.const 0))
+            (drop (call $has_cap (i32.const 0) (i32.const 0)))
+            (drop (call $now_nanos))
+            (i32.const 1)
+        )
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_transform") (param i32 i32 i32) (result i64) (i64.const 0))
+    )"#;
+    let wasm = wat::parse_str(wat_src).unwrap();
+    let res = validate_wasm_bytes(&wasm);
+    assert!(
+        res.is_ok(),
+        "Expected module with WASI and env host imports to validate: {res:?}"
+    );
+}
+
+#[test]
+fn test_parse_signal_type_maps_canonical_signals() {
+    assert_eq!(datalake_wasm_tool::parse_signal_type("logs"), 0);
+    assert_eq!(datalake_wasm_tool::parse_signal_type("metrics"), 1);
+    assert_eq!(datalake_wasm_tool::parse_signal_type("Metrics"), 1);
+    assert_eq!(datalake_wasm_tool::parse_signal_type("traces"), 2);
+    assert_eq!(datalake_wasm_tool::parse_signal_type("TRACES"), 2);
+    assert_eq!(datalake_wasm_tool::parse_signal_type("unknown"), 0);
 }

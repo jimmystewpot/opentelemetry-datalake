@@ -4,7 +4,7 @@
 //! including required function and memory exports and matching ABI versions.
 
 use thiserror::Error;
-use wasmtime::{Config, Engine, Instance, Module, Store, ValType};
+use wasmtime::{Config, Engine, Module, Store, ValType};
 
 #[derive(Error, Debug)]
 pub enum ValidationError {
@@ -186,13 +186,15 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
             _ => {}
         }
     }
-    let mut store: Store<()> = Store::new(&engine, ());
+    let mut store = Store::new(&engine, crate::default_wasi_ctx());
     store
         .set_fuel(100_000)
         .map_err(ValidationError::EngineInit)?;
 
-    let instance =
-        Instance::new(&mut store, &module, &[]).map_err(ValidationError::InstantiationFailed)?;
+    let linker = crate::build_cli_linker(&engine).map_err(ValidationError::EngineInit)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(ValidationError::InstantiationFailed)?;
     let abi_fn = instance
         .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
         .map_err(ValidationError::AbiFunctionMissing)?;
