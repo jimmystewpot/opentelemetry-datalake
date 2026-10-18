@@ -5,7 +5,7 @@
 //! and Bloom filters on `trace_id` and `span_id` columns, streaming encoded byte chunks
 //! into an asynchronous [`UploaderSender`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -168,8 +168,10 @@ fn build_writer_properties(
 /// for tracing identifiers (`trace_id` and `span_id`).
 #[derive(Debug)]
 pub struct PartitionWriter {
-    arrow_writer: Mutex<Option<ArrowWriter<ChannelWriter>>>,
+    arrow_writer: tokio::sync::Mutex<ArrowWriter<ChannelWriter>>,
     records_written: usize,
+    bytes_written: usize,
+    in_progress_size: usize,
 }
 
 impl PartitionWriter {
@@ -182,9 +184,13 @@ impl PartitionWriter {
         let props = build_writer_properties(config)?;
         let channel_writer = ChannelWriter::new(uploader, DEFAULT_CHUNK_BUFFER_SIZE);
         let arrow_writer = ArrowWriter::try_new(channel_writer, schema, Some(props))?;
+        let bytes_written = arrow_writer.bytes_written();
+        let in_progress_size = arrow_writer.in_progress_size();
         Ok(Self {
-            arrow_writer: Mutex::new(Some(arrow_writer)),
+            arrow_writer: tokio::sync::Mutex::new(arrow_writer),
             records_written: 0,
+            bytes_written,
+            in_progress_size,
         })
     }
 
@@ -199,14 +205,11 @@ impl PartitionWriter {
 
     /// Writes an Arrow [`RecordBatch`] into the Parquet file.
     pub fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), ParquetSinkError> {
-        let guard = self
-            .arrow_writer
-            .get_mut()
-            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
-        let writer = guard.as_mut().ok_or_else(|| {
-            ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
-        })?;
-        writer.write(batch)?;
+        let writer = self.arrow_writer.get_mut();
+        let res = writer.write(batch);
+        self.bytes_written = writer.bytes_written();
+        self.in_progress_size = writer.in_progress_size();
+        res?;
         self.records_written += batch.num_rows();
         Ok(())
     }
@@ -216,27 +219,18 @@ impl PartitionWriter {
     /// Writes the Parquet metadata footer, flushes all remaining buffered bytes
     /// into the underlying [`UploaderSender`], and signals completion to the uploader.
     pub fn close(self) -> Result<(), ParquetSinkError> {
-        let guard = self
-            .arrow_writer
-            .into_inner()
-            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
-        let arrow_writer = guard.ok_or_else(|| {
-            ParquetSinkError::Internal("PartitionWriter has already been closed".to_string())
-        })?;
-        let mut channel_writer = arrow_writer.into_inner()?;
+        let mut channel_writer = self.arrow_writer.into_inner().into_inner()?;
         channel_writer.finish()?;
         Ok(())
     }
 
     /// Flushes in-progress Arrow row groups to the underlying uploader.
     pub fn flush(&mut self) -> Result<(), ParquetSinkError> {
-        let guard = self
-            .arrow_writer
-            .get_mut()
-            .map_err(|e| ParquetSinkError::Internal(format!("Writer mutex poisoned: {e}")))?;
-        if let Some(writer) = guard.as_mut() {
-            writer.flush()?;
-        }
+        let writer = self.arrow_writer.get_mut();
+        let res = writer.flush();
+        self.bytes_written = writer.bytes_written();
+        self.in_progress_size = writer.in_progress_size();
+        res?;
         Ok(())
     }
 
@@ -249,25 +243,13 @@ impl PartitionWriter {
     /// Returns the total number of bytes written to the underlying uploader so far.
     #[must_use]
     pub fn bytes_written(&self) -> usize {
-        match self.arrow_writer.lock() {
-            Ok(guard) => guard.as_ref().map_or(0, ArrowWriter::bytes_written),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .as_ref()
-                .map_or(0, ArrowWriter::bytes_written),
-        }
+        self.bytes_written
     }
 
     /// Returns the estimated in-progress row group memory size in bytes.
     #[must_use]
     pub fn in_progress_size(&self) -> usize {
-        match self.arrow_writer.lock() {
-            Ok(guard) => guard.as_ref().map_or(0, ArrowWriter::in_progress_size),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .as_ref()
-                .map_or(0, ArrowWriter::in_progress_size),
-        }
+        self.in_progress_size
     }
 }
 

@@ -34,16 +34,7 @@ impl UploaderSender {
     /// inside worker threads or `spawn_blocking`). If the bounded channel is full,
     /// it blocks until buffer space becomes available.
     pub fn send_chunk(&self, chunk: bytes::Bytes) -> Result<(), ParquetSinkError> {
-        match self.tx.try_send(UploaderMessage::Chunk(chunk)) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(
-                ParquetSinkError::Internal("Uploader channel closed".to_string()),
-            ),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => self
-                .tx
-                .blocking_send(chunk)
-                .map_err(|e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))),
-        }
+        self.send_sync(UploaderMessage::Chunk(chunk))
     }
 
     /// Sends a chunk of bytes to the background uploader asynchronously.
@@ -63,31 +54,7 @@ impl UploaderSender {
     /// Returns [`ParquetSinkError::Internal`] if the uploader channel is closed,
     /// or if called on a current-thread runtime while the channel is full.
     pub fn finish(self) -> Result<(), ParquetSinkError> {
-        match self.tx.try_send(UploaderMessage::Finish) {
-            Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err(ParquetSinkError::Internal(
-                    "Uploader channel closed".to_string(),
-                ));
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                        return Err(ParquetSinkError::Internal(
-                            "Cannot block in place on a current-thread Tokio runtime when uploader channel is full. \
-                             Use finish_async() or execute within a multi-threaded Tokio runtime.".to_string(),
-                        ));
-                    }
-                    tokio::task::block_in_place(|| handle.block_on(self.tx.send(msg))).map_err(
-                        |e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")),
-                    )?;
-                } else {
-                    self.tx.blocking_send(msg).map_err(|e| {
-                        ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))
-                    })?;
-                }
-            }
-        }
+        self.send_sync(UploaderMessage::Finish)?;
         drop(self);
         Ok(())
     }
@@ -104,6 +71,32 @@ impl UploaderSender {
             .map_err(|e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")))?;
         drop(self);
         Ok(())
+    }
+
+    fn send_sync(&self, message: UploaderMessage) -> Result<(), ParquetSinkError> {
+        match self.tx.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(
+                ParquetSinkError::Internal("Uploader channel closed".to_string()),
+            ),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(msg)) => {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                        return Err(ParquetSinkError::Internal(
+                            "Cannot block in place on a current-thread Tokio runtime when uploader channel is full. \
+                             Use async methods or execute within a multi-threaded Tokio runtime.".to_string(),
+                        ));
+                    }
+                    tokio::task::block_in_place(|| handle.block_on(self.tx.send(msg))).map_err(
+                        |e| ParquetSinkError::Internal(format!("Uploader channel closed: {e}")),
+                    )
+                } else {
+                    self.tx.blocking_send(msg).map_err(|e| {
+                        ParquetSinkError::Internal(format!("Uploader channel closed: {e}"))
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -160,6 +153,20 @@ impl Drop for UploaderHandle {
     }
 }
 
+async fn acquire_io_permit(
+    sem: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<Option<tokio::sync::SemaphorePermit<'_>>, ParquetSinkError> {
+    if let Some(sem) = sem {
+        let permit = sem
+            .acquire()
+            .await
+            .map_err(|e| ParquetSinkError::Internal(format!("Upload semaphore closed: {e}")))?;
+        Ok(Some(permit))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Factory for launching asynchronous streaming uploads via `OpenDAL`.
 #[derive(Debug)]
 pub struct AsyncUploader;
@@ -174,7 +181,6 @@ impl AsyncUploader {
     /// across the pipeline by the optional `upload_semaphore`. Permits are acquired
     /// only during active physical I/O and released immediately thereafter, ensuring idle
     /// uploaders waiting on channel inputs do not consume permits.
-    #[allow(clippy::too_many_lines)]
     pub fn start(
         op: &Operator,
         path: &str,
@@ -221,18 +227,12 @@ impl AsyncUploader {
                     msg = rx.recv() => {
                         match msg {
                             Some(UploaderMessage::Chunk(bytes)) => {
-                                let _permit = if let Some(ref sem) = upload_semaphore {
-                                    match sem.acquire().await {
-                                        Ok(p) => Some(p),
-                                        Err(e) => {
-                                            let _ = writer.abort().await;
-                                            return Err(ParquetSinkError::Internal(format!(
-                                                "Upload semaphore closed: {e}"
-                                            )));
-                                        }
+                                let _permit = match acquire_io_permit(upload_semaphore.as_ref()).await {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        let _ = writer.abort().await;
+                                        return Err(e);
                                     }
-                                } else {
-                                    None
                                 };
                                 if let Err(e) = writer.write(bytes).await {
                                     let _ = writer.abort().await;
@@ -268,18 +268,7 @@ impl AsyncUploader {
                     )))
                 }
                 close_res = async {
-                    let _permit = if let Some(ref sem) = upload_semaphore {
-                        match sem.acquire().await {
-                            Ok(p) => Some(p),
-                            Err(e) => {
-                                return Err(ParquetSinkError::Internal(format!(
-                                    "Upload semaphore closed: {e}"
-                                )));
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    let _permit = acquire_io_permit(upload_semaphore.as_ref()).await?;
                     writer.close().await.map_err(ParquetSinkError::from)
                 } => {
                     match close_res {
@@ -610,5 +599,32 @@ mod tests {
 
         // Semaphore permits must be fully returned
         assert_eq!(sem.available_permits(), 1);
+    }
+
+    #[test]
+    fn test_uploader_send_chunk_on_current_thread_when_full_returns_error() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let sender = UploaderSender { tx };
+
+            // Fill capacity (1)
+            sender
+                .send_chunk(bytes::Bytes::from_static(b"chunk-1"))
+                .unwrap();
+
+            // Second synchronous send_chunk on current_thread runtime must return Err, not panic
+            let res = sender.send_chunk(bytes::Bytes::from_static(b"chunk-2"));
+            assert!(res.is_err());
+            assert!(
+                res.unwrap_err()
+                    .to_string()
+                    .contains("current-thread Tokio runtime")
+            );
+        });
     }
 }
