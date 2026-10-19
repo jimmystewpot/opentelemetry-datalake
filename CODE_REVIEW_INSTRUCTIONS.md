@@ -27,6 +27,7 @@ Examine the changes specifically for the following:
 3. SECURITY & CATALOG COMPLIANCE
 - Privileges & RBAC: Verify any dynamic metadata alterations adhere strictly to the additive-only rules specified for `auto` schema mode. Ensure code does not inadvertently issue drop or cast commands.
 - Multi-tenant data leakages: Ensure credentials or specific trace/log payloads do not leak metadata or expose target cloud storage keys in logs or debugging endpoints.
+- Path Injection & Control-Plane Boundaries (`rust/path-injection`): Verify that no HTTP, gRPC, or Admin endpoint constructs a `Path` or `PathBuf` or invokes `std::fs`/`tokio::fs` using request-supplied strings (CWE-22 / CWE-36 / CWE-73). Admin request DTOs MUST enforce `#[serde(deny_unknown_fields)]`, and filesystem reads MUST operate on server-pinned paths using single-FD metadata verification and `AsyncReadExt::take` bounding to prevent TOCTOU races.
 
 4. MAINTAINABILITY & INTROSPECTION
 - Idiomatic Rust: Adherence to strict Clippy preferences (pedantic lints). 
@@ -53,6 +54,7 @@ Examine the changes specifically for the following:
 Before concluding your review or marking a task complete, you must simulate or execute these checks:
 1. Run `cargo deny check advisories` at the end of every task evaluation. If advisories fail (including unmaintained or yanked crates), the code review must fail. Report the advisory block directly.
 2. If dependencies were introduced or altered, run `cargo deny check licenses` and explicitly report open-source compatibility findings (with special focus on MPL 2.0 or compatible ecosystems).
+3. Run `cargo clippy --all-targets -- -D warnings -W clippy::pedantic -A clippy::missing_errors_doc` and verify that no network handler passes user-tainted inputs to filesystem APIs (`rust/path-injection`).
 
 ---
 

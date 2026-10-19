@@ -92,3 +92,14 @@ Because `opentelemetry-datalake` operates on vectorized Apache Arrow memory frag
 * When the `/debug/pprof/heap` route is requested, the service **MUST** perform an explicit epoch advancement using the underlying allocator management controls before sampling internal state.
 * The allocator metadata memory map **SHALL** be converted into a compatible `pprof` profile block file format and returned with appropriate HTTP attachment content headers (`Content-Type: application/octet-stream`).
 * If the host platform architecture does not support raw memory profiling hooks (such as specific native MSVC compiler backends), the endpoint **MUST** gracefully return an HTTP status code `501 Not Implemented`.
+
+---
+
+## 5. WASM Hot-Reload Protocol (`/api/v1/transforms/wasm/reload`)
+
+To prevent path-injection vulnerabilities (`rust/path-injection`, CWE-22, CWE-36, CWE-73), the WebAssembly module hot-reload endpoint enforces strict server-pinned filesystem boundaries:
+
+* The `POST /api/v1/transforms/wasm/reload` endpoint **MUST** reload the WebAssembly module exclusively from the startup-configured `wasm_transformer.module_path` and **MUST NOT** accept filesystem paths, filenames, or directory overrides from the HTTP request body, query parameters, or headers.
+* Request deserialization (`WasmReloadRequest`) **MUST** enforce `#[serde(deny_unknown_fields)]` and return HTTP status code `400 Bad Request` if unknown fields (including `module_path`) or malformed JSON are supplied. An empty request body **SHALL** be treated equivalently to `{}`.
+* If `wasm_transformer.sha256` is pinned in the startup configuration, it **MUST** take precedence over any request-supplied `expected_sha` value so that callers cannot weaken or bypass operator-configured integrity checks.
+* Module loading **MUST** validate file metadata on a single opened file descriptor and bound reads via `tokio::io::AsyncReadExt::take` (`MAX_MODULE_SIZE` = 64 MiB) to prevent TOCTOU races and unbounded memory allocation.

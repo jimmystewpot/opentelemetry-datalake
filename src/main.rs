@@ -669,18 +669,16 @@ async fn main() -> anyhow::Result<()> {
         initialize_transformers(&config, &mut metric_bridges)?;
 
     let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
-        let expected_sha = config
-            .wasm_transformer
-            .as_ref()
-            .and_then(|w| w.sha256.clone());
-        let admin_router = if let Some(ref engine) = shared_engine {
-            wasm_transformer::reload::build_admin_router_with_sha(
-                std::sync::Arc::clone(engine),
-                expected_sha,
-            )
-        } else {
-            axum::Router::new()
-        };
+        let admin_router =
+            if let (Some(wasm_cfg), Some(engine)) = (&config.wasm_transformer, &shared_engine) {
+                wasm_transformer::reload::build_admin_router_with_sha(
+                    std::sync::Arc::clone(engine),
+                    std::path::PathBuf::from(&wasm_cfg.module_path),
+                    wasm_cfg.sha256.clone(),
+                )
+            } else {
+                axum::Router::new()
+            };
         let listener = tokio::net::TcpListener::bind(admin_addr)
             .await
             .map_err(|e| {
@@ -1552,12 +1550,12 @@ mod tests {
         use wasm_transformer::reload::build_admin_router;
 
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-        let router = build_admin_router(engine);
+        let router = build_admin_router(engine, std::path::PathBuf::from("/tmp/non_existent.wasm"));
         let req = Request::builder()
             .method("POST")
             .uri("/api/v1/transforms/wasm/reload")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"module_path": "/tmp/non_existent.wasm"}"#))
+            .body(Body::from("{}"))
             .expect("Request should be created successfully");
 
         let response = router
@@ -1576,7 +1574,7 @@ mod tests {
         use wasm_transformer::reload::build_admin_router_multi;
 
         let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
-        let router = build_admin_router_multi(vec![engine], None);
+        let router = build_admin_router_multi(vec![engine], std::path::PathBuf::from(""), None);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bound_addr = listener.local_addr().unwrap();
@@ -1597,7 +1595,7 @@ mod tests {
 
         // Test sending request to runtime listener over loopback TCP
         let mut stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
-        let body = r#"{"module_path": ""}"#;
+        let body = r"{}";
         let req = format!(
             "POST /api/v1/transforms/wasm/reload HTTP/1.1\r\nHost: {bound_addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()

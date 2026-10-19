@@ -126,10 +126,9 @@ pub fn spawn_sighup_listener(
 }
 
 /// Request body for the WASM hot-reload REST endpoint.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WasmReloadRequest {
-    /// Filesystem path to the new WebAssembly module.
-    pub module_path: String,
     /// Optional expected hex-encoded SHA-256 digest of the new WebAssembly module.
     #[serde(default)]
     pub expected_sha: Option<String>,
@@ -154,149 +153,178 @@ pub const MAX_MODULE_SIZE: u64 = 64 * 1024 * 1024;
 pub struct WasmReloadState {
     /// References to the shared [`EngineCache`] instances to update upon reload.
     pub engines: Vec<Arc<EngineCache>>,
+    /// Server-configured filesystem path to the WebAssembly module.
+    pub module_path: PathBuf,
     /// Optional configured fallback SHA-256 digest pinned at initialization.
     pub configured_sha: Option<String>,
-    /// Optional boundary directory restricting which WASM files may be reloaded.
-    pub allowed_directory: Option<PathBuf>,
 }
 
 impl WasmReloadState {
-    /// Creates a new [`WasmReloadState`] with a single engine and optional configured digest.
+    /// Creates a new [`WasmReloadState`] with a single engine, pinned module path, and optional configured digest.
     #[must_use]
-    pub fn new(engine: Arc<EngineCache>, configured_sha: Option<String>) -> Self {
-        Self {
-            engines: vec![engine],
-            configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
-            allowed_directory: None,
-        }
+    pub fn new(
+        engine: Arc<EngineCache>,
+        module_path: PathBuf,
+        configured_sha: Option<String>,
+    ) -> Self {
+        Self::new_multi(vec![engine], module_path, configured_sha)
     }
 
-    /// Creates a new [`WasmReloadState`] with multiple engines and optional configured digest.
+    /// Creates a new [`WasmReloadState`] with multiple engines, pinned module path, and optional configured digest.
     #[must_use]
-    pub fn new_multi(engines: Vec<Arc<EngineCache>>, configured_sha: Option<String>) -> Self {
+    pub fn new_multi(
+        engines: Vec<Arc<EngineCache>>,
+        module_path: PathBuf,
+        configured_sha: Option<String>,
+    ) -> Self {
         Self {
             engines,
+            module_path,
             configured_sha: configured_sha.filter(|s| !s.trim().is_empty()),
-            allowed_directory: None,
         }
-    }
-
-    /// Sets an allowed directory boundary for module reloading.
-    ///
-    /// Paths requested for reload will be verified to reside within this directory.
-    #[must_use]
-    pub fn with_allowed_directory(mut self, dir: PathBuf) -> Self {
-        self.allowed_directory = Some(std::fs::canonicalize(&dir).unwrap_or(dir));
-        self
-    }
-}
-
-impl From<Arc<EngineCache>> for WasmReloadState {
-    fn from(engine: Arc<EngineCache>) -> Self {
-        Self::new(engine, None)
     }
 }
 
 /// Sanitizes, bounds, and reads the WebAssembly module file at `module_path`.
 async fn validate_and_read_module(
-    module_path: &str,
-    allowed_directory: Option<&std::path::Path>,
+    module_path: &std::path::Path,
 ) -> Result<Vec<u8>, axum::http::StatusCode> {
-    let path_obj = std::path::Path::new(module_path);
-
-    // Reject path traversal components (e.g. "../")
-    if path_obj
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
-        tracing::warn!(path = %module_path, "Hot-reload REST: path traversal attempted");
+    if module_path.as_os_str().is_empty() || module_path.to_string_lossy().trim().is_empty() {
+        tracing::warn!("Hot-reload REST: empty or blank module_path configured");
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let metadata = tokio::fs::metadata(path_obj).await.map_err(|e| {
+    // Reject path traversal components (e.g. "../")
+    if module_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        tracing::warn!(
+            path = %module_path.display(),
+            "Hot-reload REST: path traversal attempted"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let metadata = tokio::fs::metadata(module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to read module metadata: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     if !metadata.is_file() {
-        tracing::warn!(path = %module_path, "Hot-reload REST: path is not a regular file");
-        return Err(axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    if metadata.len() == 0 {
-        tracing::warn!(path = %module_path, "Hot-reload REST: module file is empty");
-        return Err(axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    if metadata.len() > MAX_MODULE_SIZE {
         tracing::warn!(
-            path = %module_path,
-            size = metadata.len(),
+            path = %module_path.display(),
+            "Hot-reload REST: path is not a regular file"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    let canonical_path = tokio::fs::canonicalize(module_path).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to canonicalize module path: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let file = tokio::fs::File::open(&canonical_path).await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to open module file: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let file_meta = file.metadata().await.map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to read open file metadata: {e}");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if !file_meta.is_file() {
+        tracing::warn!(
+            path = %canonical_path.display(),
+            "Hot-reload REST: opened path is not a regular file"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    if file_meta.len() == 0 {
+        tracing::warn!(
+            path = %canonical_path.display(),
+            "Hot-reload REST: module file is empty"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    if file_meta.len() > MAX_MODULE_SIZE {
+        tracing::warn!(
+            path = %canonical_path.display(),
+            size = file_meta.len(),
             max_size = MAX_MODULE_SIZE,
             "Hot-reload REST: module file exceeds maximum allowed size"
         );
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let canonical_path = tokio::fs::canonicalize(path_obj).await.map_err(|e| {
-        tracing::warn!("Hot-reload REST: failed to canonicalize module path: {e}");
+    let mut bytes = Vec::with_capacity(usize::try_from(file_meta.len()).unwrap_or(0));
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut tokio::io::AsyncReadExt::take(file, MAX_MODULE_SIZE + 1),
+        &mut bytes,
+    )
+    .await
+    .map_err(|e| {
+        tracing::warn!("Hot-reload REST: failed to read module: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    if let Some(allowed_dir) = allowed_directory {
-        let canonical_allowed = tokio::fs::canonicalize(allowed_dir)
-            .await
-            .unwrap_or_else(|_| allowed_dir.to_path_buf());
-        if !canonical_path.starts_with(&canonical_allowed) {
-            tracing::warn!(
-                path = %canonical_path.display(),
-                allowed = %canonical_allowed.display(),
-                "Hot-reload REST: path outside allowed directory"
-            );
-            return Err(axum::http::StatusCode::BAD_REQUEST);
-        }
+    if bytes.is_empty() || u64::try_from(bytes.len()).map_or(true, |len| len > MAX_MODULE_SIZE) {
+        tracing::warn!(
+            path = %canonical_path.display(),
+            size = bytes.len(),
+            max_size = MAX_MODULE_SIZE,
+            "Hot-reload REST: read module bytes invalid or exceeded maximum allowed size"
+        );
+        return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    tokio::fs::read(&canonical_path).await.map_err(|e| {
-        tracing::warn!("Hot-reload REST: failed to read module: {e}");
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })
+    Ok(bytes)
 }
 
 /// Handler for the WASM hot-reload REST endpoint.
 ///
-/// Extracts the JSON payload containing `module_path`, emits a security audit warning,
-/// offloads compilation and atomic module swapping across all configured engines to [`tokio::task::spawn_blocking`],
-/// and returns an acceptance response.
+/// Reloads the WebAssembly module from the server-configured `state.module_path`, emits a
+/// security audit warning, offloads compilation and atomic module swapping across all configured
+/// engines to [`tokio::task::spawn_blocking`], and returns an acceptance response.
 ///
 /// # Errors
 ///
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
-/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if `module_path` is empty or whitespace, if path traversal
-/// is detected, if the path is a directory or empty file or exceeds [`MAX_MODULE_SIZE`], if outside the allowed directory,
+/// Returns [`axum::http::StatusCode::BAD_REQUEST`] if the request body is malformed JSON or
+/// contains unknown fields, if the configured `module_path` is empty or whitespace, if path
+/// traversal is detected, if the path is a directory or empty file or exceeds [`MAX_MODULE_SIZE`],
 /// if no engines are configured, or if the module compilation or SHA-256 verification fails.
 pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
-    axum::Json(payload): axum::Json<WasmReloadRequest>,
+    body: axum::body::Bytes,
 ) -> Result<axum::Json<WasmReloadResponse>, axum::http::StatusCode> {
-    let module_path = payload.module_path.trim();
+    let payload = if body.is_empty() {
+        WasmReloadRequest::default()
+    } else {
+        serde_json::from_slice::<WasmReloadRequest>(&body).map_err(|e| {
+            tracing::warn!("Hot-reload REST: invalid request payload: {e}");
+            axum::http::StatusCode::BAD_REQUEST
+        })?
+    };
+
+    let raw_path = state.module_path.to_string_lossy();
+    let trimmed_path_str = raw_path.trim();
+    let trimmed_path = std::path::Path::new(trimmed_path_str);
     tracing::warn!(
-        path = %module_path,
+        path = %trimmed_path.display(),
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
-
-    if module_path.is_empty() {
-        tracing::warn!("Hot-reload REST: empty or blank module_path provided");
-        return Err(axum::http::StatusCode::BAD_REQUEST);
-    }
 
     if state.engines.is_empty() {
         tracing::warn!("Hot-reload REST: no engines configured in state");
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let bytes = validate_and_read_module(module_path, state.allowed_directory.as_deref()).await?;
+    let bytes = validate_and_read_module(trimmed_path).await?;
 
     let engines = state.engines.clone();
     let expected_sha = if let Some(ref configured) = state.configured_sha {
@@ -330,32 +358,34 @@ pub async fn wasm_reload_handler(
 
     Ok(axum::Json(WasmReloadResponse {
         status: "reload successful".to_string(),
-        path: module_path.to_string(),
+        path: trimmed_path_str.to_string(),
         generation,
     }))
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`.
-pub fn build_admin_router(engine: Arc<EngineCache>) -> axum::Router {
-    build_admin_router_with_sha(engine, None)
+pub fn build_admin_router(engine: Arc<EngineCache>, module_path: PathBuf) -> axum::Router {
+    build_admin_router_with_sha(engine, module_path, None)
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`
 /// with a fallback configured expected SHA-256 digest.
 pub fn build_admin_router_with_sha(
     engine: Arc<EngineCache>,
+    module_path: PathBuf,
     configured_sha: Option<String>,
 ) -> axum::Router {
-    build_admin_router_multi(vec![engine], configured_sha)
+    build_admin_router_multi(vec![engine], module_path, configured_sha)
 }
 
 /// Builds the admin axum [`axum::Router`] registering `POST /api/v1/transforms/wasm/reload`
 /// across multiple [`EngineCache`] instances with an optional configured fallback SHA-256 digest.
 pub fn build_admin_router_multi(
     engines: Vec<Arc<EngineCache>>,
+    module_path: PathBuf,
     configured_sha: Option<String>,
 ) -> axum::Router {
-    let state = WasmReloadState::new_multi(engines, configured_sha);
+    let state = WasmReloadState::new_multi(engines, module_path, configured_sha);
     axum::Router::new()
         .route(
             "/api/v1/transforms/wasm/reload",

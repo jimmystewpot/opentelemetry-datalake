@@ -263,6 +263,8 @@ All agents introducing or modifying diagnostic routes must follow these architec
 2. **Non-Blocking Allocator Lookups:** When capturing `jemalloc` statistics via `tikv-jemalloc-ctl`, agents must advance the allocator epoch via `tikv_jemalloc_ctl::epoch::advance()` before executing reads.
 3. **Atomic Metrics Paths:** Counters evaluating incoming records per second must use `std::sync::atomic::AtomicU64` increments. Do not use blocking locks (`Mutex`) inside telemetry codecs or worker channels to update operational dashboard statistics.
 4. **Conditional Compilation for Profiling:** Because `jemalloc` profiling relies on low-level OS capabilities, the allocator selection and `pprof/heap` hooks must use target environment gates (`#[cfg(not(target_env = "msvc"))]`). Do not break local test builds on unsupported target architectures.
+5. **Zero User-Controlled Filesystem Paths (`rust/path-injection`):** HTTP, gRPC, and Admin API handlers MUST NEVER accept filesystem paths, filenames, or directory overrides from request bodies, query parameters, or headers (CWE-22, CWE-36, CWE-73). Endpoints that read or write local files (such as WASM module hot-reloading) MUST resolve paths exclusively from immutable, startup-validated operator configuration and read via bounded file descriptors (`AsyncReadExt::take`).
+6. **Strict Control-Plane Request DTOs:** All Admin and control-plane request structs MUST annotate `#[serde(deny_unknown_fields)]` so unexpected or legacy client-supplied fields (e.g., `module_path`) fail closed with HTTP `400 Bad Request`.
 
 
 ## Coding Standards & Quality Gates
