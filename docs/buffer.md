@@ -67,7 +67,7 @@ StarRocks, Elasticsearch and Kafka batch according to their own configuration; s
 
 ### Known gaps (not yet at-least-once)
 
-*   Only SIGINT/Ctrl-C triggers the drain today; SIGTERM does not (#126).
+*   Only SIGINT/Ctrl-C triggers the drain today; SIGTERM is not handled, and when a transformer or sink exits first, `main.rs` signals shutdown without explicitly awaiting/inspecting `source_handle` or bounding the drain join (#126).
 *   Iceberg and Elasticsearch drop buffered batches on flush failure (#127).
 *   `KafkaSink` does not flush its producer queue on shutdown (#130).
 

@@ -52,7 +52,7 @@ tracing::info!(
 The core pipeline handles the initialization of the global OpenTelemetry tracer and meter providers using the settings in `telemetry.rs`.
 
 > [!WARNING]
-> **Loopback Amplification Hazard**: Never configure `otlp_endpoint` to point at the local ingestion address (`server.grpc_addr`, default `127.0.0.1:4317`, or `server.http_addr`). Internal spans and metrics emitted during request processing would be exported back into the receiver, causing an unbounded feedback loop. Always point to an external collector.
+> **Loopback Amplification Hazard**: Never configure `otlp_endpoint` to point at the local gRPC ingestion address (`server.grpc_addr`, default `127.0.0.1:4317`). Internal spans and metrics emitted during request processing would be exported back into the gRPC receiver, causing an unbounded feedback loop. (Pointing `otlp_endpoint` at `server.http_addr` is also invalid because `telemetry.rs` uses the `tonic` OTLP/gRPC exporter, which fails protocol/route handling against the HTTP/JSON receiver.) Always point `otlp_endpoint` to an external OTLP/gRPC collector.
 >
 > **Current behavior:** telemetry export is always initialised (there is no `enabled` switch), and the built-in default `otlp_endpoint` is `http://localhost:4317`, which collides with the default gRPC receiver address. You **must** override it. A safer default and/or loopback detection is tracked in #124.
 
