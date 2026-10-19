@@ -179,15 +179,15 @@ allow = [
 
 # List of crates to deny
 deny = [
-    { crate = "opentelemetry", multiple-versions = "deny", reason = "Prevent split-brain OpenTelemetry trait/global provider mismatches across tracing-opentelemetry and opentelemetry_sdk" },
-    { crate = "opentelemetry_sdk", multiple-versions = "deny" },
-    { crate = "opentelemetry-otlp", multiple-versions = "deny" },
-    { crate = "opentelemetry-proto", multiple-versions = "deny" },
-    { crate = "tracing-opentelemetry", multiple-versions = "deny" },
-    { crate = "arrow", multiple-versions = "deny", reason = "Prevent duplicate Arrow array/RecordBatch versions across storage sinks and codecs" },
-    { crate = "parquet", multiple-versions = "deny" },
-    { crate = "wasmtime", multiple-versions = "deny" },
-    { crate = "wasmtime-wasi", multiple-versions = "deny" },
+    { crate = "opentelemetry", deny-multiple-versions = true, reason = "Prevent split-brain OpenTelemetry trait/global provider mismatches across tracing-opentelemetry and opentelemetry_sdk" },
+    { crate = "opentelemetry_sdk", deny-multiple-versions = true },
+    { crate = "opentelemetry-otlp", deny-multiple-versions = true },
+    { crate = "opentelemetry-proto", deny-multiple-versions = true },
+    { crate = "tracing-opentelemetry", deny-multiple-versions = true },
+    { crate = "arrow", deny-multiple-versions = true, reason = "Prevent duplicate Arrow array/RecordBatch versions across storage sinks and codecs" },
+    { crate = "parquet", deny-multiple-versions = true },
+    { crate = "wasmtime", deny-multiple-versions = true },
+    { crate = "wasmtime-wasi", deny-multiple-versions = true },
 ]
 
 # List of features to allow/deny
