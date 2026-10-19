@@ -47,27 +47,54 @@ tracing::info!(
 
 `opentelemetry-datalake` can export its own traces and metrics to an external OTLP collector. This is configured in the `[telemetry]` section of the configuration file.
 
-### 1. Configuration
+### 1. Configuration & Loopback Prevention
 
-The core pipeline handles the initialization of the global OpenTelemetry tracer provider using the settings in `telemetry.rs`.
+The core pipeline handles the initialization of the global OpenTelemetry tracer and meter providers using the settings in `telemetry.rs`.
+
+> [!WARNING]
+> **Loopback Amplification Hazard**: Never configure `otlp_endpoint` to point at the local gRPC ingestion address (`server.grpc_addr`, default `127.0.0.1:4317`). Internal spans and metrics emitted during request processing would be exported back into the gRPC receiver, causing an unbounded feedback loop. (Pointing `otlp_endpoint` at `server.http_addr` is also invalid because `telemetry.rs` uses the `tonic` OTLP/gRPC exporter, which fails protocol/route handling against the HTTP/JSON receiver.) Always point `otlp_endpoint` to an external OTLP/gRPC collector.
+>
+> **Current behavior:** telemetry export is always initialised (there is no `enabled` switch), and the built-in default `otlp_endpoint` is `http://localhost:4317`, which collides with the default gRPC receiver address. You **must** override it. A safer default and/or loopback detection is tracked in #124.
 
 ```toml
 [telemetry]
-otlp_endpoint = "http://localhost:4317"
+otlp_endpoint = "http://collector.monitoring.internal:4317"
 service_name = "otel-datalake"
 ```
 
-### 2. Propagation
+### 2. Shutdown Flush Guarantee
 
-Since `otel-datalake` is an async application, developers **SHOULD** use `tracing`'s instrumentation support (e.g., `#[tracing::instrument]`) to ensure that trace context is correctly propagated across task boundaries.
+**Target contract:** `TelemetryGuard` **MUST** implement `Drop` to explicitly invoke `.shutdown()` on the active `SdkTracerProvider` and `SdkMeterProvider` so buffered spans and metrics are exported before exit. **Current behavior:** no `Drop` is implemented (#124).
+
+### 3. Context Propagation
+
+Since `opentelemetry-datalake` is an async application, developers **SHOULD** use `tracing`'s instrumentation support (e.g., `#[tracing::instrument]`) to ensure that trace context is correctly propagated across task boundaries.
 
 ---
 
-## Metrics
+## Metrics Standards
 
-Currently, metrics are primarily derived from `tracing` spans and events. In the future, explicit OpenTelemetry metrics (e.g., counters for received events) may be added using the `opentelemetry` crate's metrics API.
+> [!NOTE]
+> **Status:** only `datalake.sink.parquet.*` metrics and the WASM transformer registry are implemented today. The table below is the **target contract** for all components, pending ratification in #145 and implementation in #139.
 
-When adding metrics, follow these naming conventions:
-*   Use `snake_case`.
-*   Include units where applicable (e.g., `_bytes`, `_seconds`).
-*   Counters should end with `_total`.
+All components and storage sinks **MUST** emit OpenTelemetry metrics using the global meter provider.
+
+### Naming and instruments
+
+*   Names use the `datalake.<component>.<name>` namespace, matching the existing `datalake.sink.parquet.records_written_total`.
+*   Use `snake_case` within a segment, include units where applicable (`_bytes`, `_seconds`), and end monotonic counters with `_total`.
+*   Each metric has exactly **one** instrument type, as listed below. Buffer occupancy uses an `ObservableGauge` reading an `AtomicU64`, so error paths cannot cause drift (as an `UpDownCounter` could) and no lock or allocation occurs on the hot path.
+*   Attributes: `signal` (`logs`/`traces`/`metrics`) and `sink`. Do not use unbounded-cardinality attributes (table names, service names, trace IDs).
+
+### Target metrics
+
+| Metric Name | Instrument | Unit | Description |
+|---|---|---|---|
+| `datalake.receiver.records_total` | Counter | `{record}` | Records received by OTLP receivers |
+| `datalake.receiver.bytes_total` | Counter | `By` | Raw bytes received at the ingestion edge |
+| `datalake.receiver.requests_shed_total` | Counter | `{request}` | Requests rejected because the pipeline was overloaded (#142) |
+| `datalake.sink.buffer_records` | ObservableGauge | `{record}` | Records currently buffered in memory |
+| `datalake.sink.buffer_bytes` | ObservableGauge | `By` | Bytes currently buffered in memory |
+| `datalake.sink.records_committed_total` | Counter | `{record}` | Records committed to persistent storage |
+| `datalake.sink.records_dropped_total` | Counter | `{record}` | Records dropped (oversized, rejected or unrecoverable) |
+| `datalake.sink.flush_duration_seconds` | Histogram | `s` | Latency of sink flushes and commits |

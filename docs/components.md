@@ -78,25 +78,49 @@ pub enum SignalBatch {
 
 ## Operational Requirements
 
-### 1. Backpressure Handling
+### 1. Backpressure Handling & Channel Sizing
 
-Components **MUST** respect backpressure. Since the pipeline uses bounded `mpsc` channels, `send().await` will naturally block if downstream components are slow. This backpressure propagates back to the OTLP receiver, which returns `503 Service Unavailable` or gRPC `UNAVAILABLE` to producers.
+Components **MUST** respect backpressure:
+*   Pipeline channels (`tokio::sync::mpsc`) carry `SignalBatch`es containing Arrow `RecordBatch`es. To prevent unbounded memory growth under ingestion spikes or sink latency, channel capacities **MUST** be bounded conservatively (target: 32–64 batches, or a byte-budget semaphore).
+*   **Current behavior:** when a channel is full, upstream `.send().await` stays pending, so the producer's request waits. `OtlpReceiverSource` returns `503 Service Unavailable` / gRPC `UNAVAILABLE` only when a channel is **closed**.
+*   **Target contract:** receivers wait a bounded time on a full channel and then shed with `503` / `UNAVAILABLE` and a shed metric (#142). Current channel sizing is described in [buffer.md](buffer.md) (#125).
+*   Components **MUST NOT** drop batches silently under backpressure.
 
-### 2. Error Handling
+### 2. Error Handling & Task Supervision
 
-Components **MUST** follow the zero-panic policy. Errors **MUST** be propagated via `Result` and handled in `main.rs`. Fatal errors that prevent a task from continuing should be logged at the `error` level.
+*   Components **MUST** strictly adhere to the zero-panic policy. Panicking methods (`unwrap()`, `expect()`, `.as_string::<i32>()`, `.as_primitive::<T>()`) are prohibited.
+*   Arrow array access **MUST** verify `.is_null(i)` before calling `.value(i)`.
+*   All sink and worker tasks **MUST** return `Result<(), PipelineError>` and be actively supervised in the `main.rs` event loop. Components **MUST NOT** catch, log, and swallow fatal sink errors without notifying the supervisor.
 
-### 3. Graceful Shutdown
+### 3. Graceful Shutdown & Topological Drain
 
-All components **MUST** support graceful shutdown by listening for a shutdown signal or by finishing their work when their input channel is closed.
-*   **Sources** stop listening and drop their senders.
-*   **Transformers** and **Sinks** continue processing until their input channels are drained.
+All components **MUST** support coordinated, graceful shutdown. To guarantee zero data loss, the pipeline **MUST** drain in strict topological order:
+1.  **Ingress Termination**: On SIGTERM or SIGINT, `Source` receivers stop accepting new network connections and drop their channel senders (`logs_tx`, `traces_tx`, `metrics_tx`). (Today only SIGINT is wired; SIGTERM is tracked in #126.)
+2.  **Source Task Drain**: The supervisor awaits `source_handle` completion.
+3.  **Transformer Drain**: `Transform` tasks process all remaining queued batches from their input channels and drop their sink senders (`logs_sink_tx`, `traces_sink_tx`, `metrics_sink_tx`).
+4.  **Sink Flush & Persistence**: `Sink` tasks process all pending batches, flush in-memory buffers to storage, execute ACID commits, and explicitly flush any background producer queues (e.g., `librdkafka::Producer::flush`).
+5.  **Telemetry Flush**: Global tracer and meter providers are flushed and shut down.
+
+Watch channel receivers for shutdown coordination **SHOULD** use `wait_for(|s| *s).await`; bare `.changed().await` is only safe on a receiver cloned from the original channel receiver.
+
+### 4. Buffer Retention Across Flushes
+
+Sinks that accumulate data in-memory (e.g., `IcebergSink`, `ElasticsearchSink`, `StarRocksSink`) **MUST NOT** discard their accumulated batch buffers prior to successful persistence or ACID transaction commits. On transient write or commit failures, buffers must be retained for retry or routed to dead-letter storage.
+
+### 5. Async & Blocking Isolation
+
+Synchronous, CPU-heavy operations **MUST NOT** run directly on Tokio async worker threads. The following operations **MUST** be isolated in `tokio::task::spawn_blocking`:
+*   OTLP Protobuf and JSON decoding (> 64 KB).
+*   Arrow batch concatenation (`compute::concat_batches`).
+*   Arrow sorting (`compute::lexsort_to_indices` + `compute::take`).
+*   Batch serialization (NDJSON, Arrow IPC, CSV, Parquet).
+*   WebAssembly module compilation, instantiation, and rejuvenation.
 
 ---
 
 ## Instrumentation
 
-Components **SHOULD** use the `tracing` crate for logging and instrumentation. Key events like batch reception, commit success, and errors should be logged with appropriate context (e.g., `table_identifier`, `count`).
+Components **SHOULD** use the `tracing` crate for logging and instrumentation. Key events like batch reception, commit success, and errors should be logged with appropriate context (e.g., `table_identifier`, `count`). Sinks and buffers **MUST** emit standard OpenTelemetry metrics for buffer events, buffer bytes, and flush durations.
 
 Refer to [instrumentation.md](instrumentation.md) for detailed logging and telemetry standards.
 
