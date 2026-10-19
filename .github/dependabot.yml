@@ -23,17 +23,9 @@ updates:
           - "opentelemetry-datalake*"
     ignore:
       - dependency-name: "arrow"
-        versions: [">= 59.0.0"]
+        versions: [">= 60.0.0"]
       - dependency-name: "parquet"
-        versions: [">= 59.0.0"]
-      - dependency-name: "opentelemetry"
-        versions: [">= 0.33.0"]
-      - dependency-name: "opentelemetry_sdk"
-        versions: [">= 0.33.0"]
-      - dependency-name: "opentelemetry-otlp"
-        versions: [">= 0.33.0"]
-      - dependency-name: "opentelemetry-proto"
-        versions: [">= 0.33.0"]
+        versions: [">= 60.0.0"]
 
 
   - package-ecosystem: "github-actions"
