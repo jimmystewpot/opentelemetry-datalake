@@ -4,30 +4,53 @@
 //! including required function and memory exports and matching ABI versions.
 
 use thiserror::Error;
-use wasmtime::{Config, Engine, Instance, Module, Store, ValType};
+use wasmtime::{Config, Engine, Module, Store, ValType};
 
+/// Errors encountered when validating a compiled WASM guest module against C-ABI v1.
 #[derive(Error, Debug)]
 pub enum ValidationError {
+    /// The input bytes could not be compiled as a valid WebAssembly module.
     #[error("Invalid WASM: {0}")]
     InvalidWasm(#[source] wasmtime::Error),
+    /// A required C-ABI v1 symbol export was not found in the module.
     #[error("Missing export '{0}'")]
     MissingExport(String),
+    /// An exported symbol has the wrong kind (e.g., global instead of function or memory).
     #[error("Invalid export '{name}': expected {expected}, found {found}")]
     InvalidExportKind {
+        /// The name of the exported symbol.
         name: String,
+        /// The expected export kind description.
         expected: String,
+        /// The actual export kind description found in the module.
         found: String,
     },
+    /// An exported function does not match its required C-ABI v1 parameter or result signature.
     #[error("Invalid function signature for '{name}': expected {expected}")]
-    InvalidSignature { name: String, expected: String },
+    InvalidSignature {
+        /// The name of the exported function.
+        name: String,
+        /// The expected function signature description.
+        expected: String,
+    },
+    /// The module could not be instantiated in an isolated Wasmtime store.
     #[error("Instantiation failed: {0}")]
     InstantiationFailed(#[source] wasmtime::Error),
+    /// The `datalake_abi_version` typed function export could not be resolved.
     #[error("Cannot call datalake_abi_version: {0}")]
     AbiFunctionMissing(#[source] wasmtime::Error),
+    /// Calling `datalake_abi_version` resulted in a WebAssembly trap.
     #[error("datalake_abi_version trap: {0}")]
     AbiTrap(#[source] wasmtime::Error),
+    /// The version returned by `datalake_abi_version` does not match the supported host ABI.
     #[error("ABI version mismatch: expected {expected}, got {got}")]
-    AbiMismatch { expected: u32, got: u32 },
+    AbiMismatch {
+        /// The ABI version expected by the host validator.
+        expected: u32,
+        /// The ABI version reported by the guest module.
+        got: u32,
+    },
+    /// The Wasmtime engine failed to initialize with the validator configuration.
     #[error("Engine initialization failed: {0}")]
     EngineInit(#[source] wasmtime::Error),
 }
@@ -53,6 +76,7 @@ const REQUIRED_EXPORTS: &[&str] = &[
 /// - The module cannot be instantiated ([`ValidationError::InstantiationFailed`]).
 /// - Calling `datalake_abi_version` fails ([`ValidationError::AbiFunctionMissing`] or [`ValidationError::AbiTrap`]).
 /// - The module's ABI version does not match the expected version ([`ValidationError::AbiMismatch`]).
+#[allow(clippy::too_many_lines)]
 pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationError> {
     let mut config = Config::new();
     config.consume_fuel(true);
@@ -153,15 +177,10 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
                     && matches!(params[2], ValType::I32)
                     && results.len() == 1
                     && matches!(results[0], ValType::I64);
-                let is_v0 = params.len() == 2
-                    && matches!(params[0], ValType::I32)
-                    && matches!(params[1], ValType::I32)
-                    && results.len() == 1
-                    && (matches!(results[0], ValType::I32) || matches!(results[0], ValType::I64));
-                if !is_v1 && !is_v0 {
+                if !is_v1 {
                     return Err(ValidationError::InvalidSignature {
                         name: name.to_string(),
-                        expected: "(i32, i32, i32) -> i64 or (i32, i32) -> i32/i64".to_string(),
+                        expected: "(i32, i32, i32) -> i64".to_string(),
                     });
                 }
             }
@@ -190,13 +209,15 @@ pub fn validate_wasm_bytes(bytes: &[u8]) -> std::result::Result<(), ValidationEr
             _ => {}
         }
     }
-    let mut store: Store<()> = Store::new(&engine, ());
+    let mut store = Store::new(&engine, crate::default_wasi_ctx());
     store
         .set_fuel(100_000)
         .map_err(ValidationError::EngineInit)?;
 
-    let instance =
-        Instance::new(&mut store, &module, &[]).map_err(ValidationError::InstantiationFailed)?;
+    let linker = crate::build_cli_linker(&engine).map_err(ValidationError::EngineInit)?;
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .map_err(ValidationError::InstantiationFailed)?;
     let abi_fn = instance
         .get_typed_func::<(), u32>(&mut store, "datalake_abi_version")
         .map_err(ValidationError::AbiFunctionMissing)?;

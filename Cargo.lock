@@ -1900,8 +1900,10 @@ dependencies = [
  "arrow",
  "clap",
  "opentelemetry-datalake-wasm-sdk",
+ "serde_json",
  "thiserror 2.0.21",
  "wasmtime",
+ "wasmtime-wasi",
  "wat",
 ]
 
