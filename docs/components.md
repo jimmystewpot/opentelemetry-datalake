@@ -81,8 +81,9 @@ pub enum SignalBatch {
 ### 1. Backpressure Handling & Channel Sizing
 
 Components **MUST** respect backpressure:
-*   Pipeline channels (`tokio::sync::mpsc`) carry `SignalBatch`es containing Arrow `RecordBatch`es. To prevent unbounded memory growth under ingestion spikes or sink latency, channel capacities **MUST** be bounded conservatively (defaulting to 32–64 batches, or strictly bounded via byte-budget semaphores).
-*   When a channel is full, upstream `.send().await` calls block. This backpressure propagates back to `OtlpReceiverSource`, which returns `503 Service Unavailable` or gRPC `UNAVAILABLE` to producers.
+*   Pipeline channels (`tokio::sync::mpsc`) carry `SignalBatch`es containing Arrow `RecordBatch`es. To prevent unbounded memory growth under ingestion spikes or sink latency, channel capacities **MUST** be bounded conservatively (target: 32–64 batches, or a byte-budget semaphore).
+*   **Current behavior:** when a channel is full, upstream `.send().await` stays pending, so the producer's request waits. `OtlpReceiverSource` returns `503 Service Unavailable` / gRPC `UNAVAILABLE` only when a channel is **closed**.
+*   **Target contract:** receivers wait a bounded time on a full channel and then shed with `503` / `UNAVAILABLE` and a shed metric (#142). Current channel sizing is described in [buffer.md](buffer.md) (#125).
 *   Components **MUST NOT** drop batches silently under backpressure.
 
 ### 2. Error Handling & Task Supervision
@@ -94,13 +95,13 @@ Components **MUST** respect backpressure:
 ### 3. Graceful Shutdown & Topological Drain
 
 All components **MUST** support coordinated, graceful shutdown. To guarantee zero data loss, the pipeline **MUST** drain in strict topological order:
-1.  **Ingress Termination**: `Source` receivers stop accepting new network connections and drop their channel senders (`logs_tx`, `traces_tx`, `metrics_tx`).
+1.  **Ingress Termination**: On SIGTERM or SIGINT, `Source` receivers stop accepting new network connections and drop their channel senders (`logs_tx`, `traces_tx`, `metrics_tx`). (Today only SIGINT is wired; SIGTERM is tracked in #126.)
 2.  **Source Task Drain**: The supervisor awaits `source_handle` completion.
 3.  **Transformer Drain**: `Transform` tasks process all remaining queued batches from their input channels and drop their sink senders (`logs_sink_tx`, `traces_sink_tx`, `metrics_sink_tx`).
 4.  **Sink Flush & Persistence**: `Sink` tasks process all pending batches, flush in-memory buffers to storage, execute ACID commits, and explicitly flush any background producer queues (e.g., `librdkafka::Producer::flush`).
 5.  **Telemetry Flush**: Global tracer and meter providers are flushed and shut down.
 
-Watch channel receivers for shutdown coordination **MUST** use `wait_for(|s| *s).await` rather than bare `.changed().await` to avoid missed-event deadlocks if pre-signaled.
+Watch channel receivers for shutdown coordination **SHOULD** use `wait_for(|s| *s).await`; bare `.changed().await` is only safe on a receiver cloned from the original channel receiver.
 
 ### 4. Buffer Retention Across Flushes
 

@@ -22,42 +22,18 @@ opentelemetry-datalake/
 ├── src/
 │   └── main.rs                # Entry point and pipeline orchestration
 ├── crates/
-│   ├── core/                  # Core pipeline traits, types, and telemetry
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, pipeline.rs, config.rs, error.rs, telemetry.rs}
+│   ├── core/                  # Core pipeline traits, types, config, sorting, TLS, telemetry
 │   ├── otlp-receiver/         # gRPC and HTTP/JSON OTLP ingestion endpoints
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
-│   ├── arrow-codec/           # Maps OTLP Protobuf to Arrow schemas & batching
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, common.rs, compliance.rs, logs.rs, metrics.rs, traces.rs}
+│   ├── arrow-codec/           # Maps OTLP Protobuf to Arrow schemas & batching, compliance
 │   ├── storage/               # Open Table Format sink implementations (Iceberg)
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, iceberg.rs}
 │   ├── parquet-sink/          # Local & Object storage Parquet sink with variant encoding
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, sink.rs, router.rs, writer.rs, partition.rs, variant.rs}
 │   ├── kafka-sink/            # Kafka sink implementation
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
 │   ├── starrocks-sink/        # StarRocks Stream Load sink implementation
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
 │   ├── elasticsearch-sink/    # Elasticsearch & OpenSearch data streams sink implementation
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, client.rs, config.rs, error.rs, serializer.rs, tls.rs}
 │   ├── noop-transformer/      # Example/Pass-through transformer
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
 │   ├── wasm-transformer/      # Sandboxed WebAssembly batch transformer runtime
-│   │   ├── Cargo.toml
-│   │   └── src/{lib.rs, dispatcher.rs, engine.rs, worker.rs, guard.rs, host_calls.rs}
 │   ├── wasm-sdk/              # Guest SDK for authoring WebAssembly transformation plugins
-│   │   ├── Cargo.toml
-│   │   └── src/lib.rs
 │   └── wasm-cli/              # CLI tooling for testing, validating, and benchmarking WASM plugins
-│       ├── Cargo.toml
-│       └── src/{lib.rs, main.rs, bench.rs, tester.rs, validator.rs}
 └── docs/                      # Documentation and specifications
     ├── ARCHITECTURE.md        # High-level architecture overview
     ├── administration.md      # Introspection & Admin API specification
@@ -69,6 +45,8 @@ opentelemetry-datalake/
     ├── lakehouse.md           # Lakehouse integration specification
     └── starrocks.md           # StarRocks Stream Load sink operator guide
 ```
+
+> Module files inside each crate are intentionally **not** enumerated here (such listings drift as crates evolve). Place new modules inside the owning crate; do not create new top-level directories or crates without discussion.
 
 ---
 
@@ -125,8 +103,8 @@ To ensure maximum availability under load, this codebase enforces a strict **no-
 ```rust
 // Panic vulnerability under unexpected payloads
 let batch_id = metadata.get("x-batch-id").unwrap(); 
-let ts_array = col.as_primitive::<TimestampNanosecondType>(); // PANIC if type mismatch!
-let ts_val = ts_array.value(i) * 1000; // Integer overflow & null-read vulnerability!
+let ts_array = col.as_primitive::<TimestampMicrosecondType>(); // PANIC if type mismatch!
+let ts_nanos = ts_array.value(i) * 1_000; // Overflow & null-read vulnerability (micros -> nanos)!
 ```
 
 #### Correct:
@@ -139,13 +117,19 @@ let batch_id = metadata
 
 let ts_array = col
     .as_any()
-    .downcast_ref::<TimestampNanosecondArray>()
-    .ok_or_else(|| PipelineError::Storage("Invalid TimestampNanosecondArray".into()))?;
+    .downcast_ref::<TimestampMicrosecondArray>()
+    .ok_or_else(|| PipelineError::Storage("Invalid TimestampMicrosecondArray".into()))?;
 
+// Micros -> nanos: reject overflow instead of wrapping or silently saturating.
 let ts_nanos = if ts_array.is_null(i) {
     None
 } else {
-    Some(ts_array.value(i).saturating_mul(1000))
+    Some(
+        ts_array
+            .value(i)
+            .checked_mul(1_000)
+            .ok_or_else(|| PipelineError::Storage("Timestamp overflow".into()))?,
+    )
 };
 ```
 
@@ -159,7 +143,8 @@ let ts_nanos = if ts_array.is_null(i) {
     *   **Schema caching**: Do not reconstruct `Arc<Schema>` on every batch decoding call. Cache schemas statically via `std::sync::LazyLock<SchemaRef>`.
 *   **Bounded Byte Queueing**:
     *   Channels carrying `RecordBatch` instances (`tokio::sync::mpsc`) MUST NOT use oversized default capacities (e.g. `1000`). Bounded capacities MUST default to 32–64 batches, or enforce an atomic byte-budget semaphore to strictly bound total in-flight heap memory under downstream stalls.
-    *   All gRPC and HTTP ingestion listeners MUST enforce explicit payload limits (`DefaultBodyLimit`) and active request concurrency limits (`ConcurrencyLimitLayer`).
+    *   All ingestion listeners MUST enforce explicit payload limits and request concurrency limits, using the mechanism appropriate to each protocol: HTTP (`axum`) via `DefaultBodyLimit::max` and `tower::limit::ConcurrencyLimitLayer`; gRPC (`tonic`) via `max_decoding_message_size` on each service and a Tower/tonic concurrency limit. `DefaultBodyLimit` does not apply to gRPC. Limits MUST apply to the decompressed size.
+    *   A full pipeline channel MUST NOT hold a request open indefinitely: receivers MUST wait a bounded time and then shed with a retryable status (HTTP `503` / gRPC `UNAVAILABLE`) and increment a shed counter.
 
 ### 3. Concurrency & Async
 
@@ -177,6 +162,7 @@ let ts_nanos = if ts_array.is_null(i) {
 All pipeline components, buffers, and sinks MUST adhere to standard naming and telemetry emission patterns:
 *   **Self-Referential Loop Safeguards**: The internal telemetry exporter MUST NOT default `otlp_endpoint` to the pipeline's own ingestion port (`127.0.0.1:4317` / `http://localhost:4317`) without loopback detection or disabled defaults. Exporting telemetry back into itself causes an infinite feedback storm.
 *   **Graceful Shutdown Flush**: Any telemetry handle (`TelemetryGuard`) MUST implement `Drop` to explicitly invoke `.shutdown()` on `SdkTracerProvider` and `SdkMeterProvider`, ensuring pending diagnostic spans and metrics are flushed before process exit.
+*   **Metric Naming**: Metric names use the `datalake.<component>.<name>` namespace (see `datalake.sink.parquet.*`), with one instrument type per metric as defined in [instrumentation.md](docs/instrumentation.md).
 *   **Standard Buffer & Component Telemetry**: All storage sinks (Iceberg, Parquet, Kafka, StarRocks, Elasticsearch) and buffers MUST emit standard OpenTelemetry metrics for buffer events, buffer bytes, flush latencies, and dropped records conforming to [buffer.md](docs/buffer.md) and [instrumentation.md](docs/instrumentation.md).
 
 ### 5. Lifecycle, Supervision & Graceful Shutdown
@@ -188,14 +174,15 @@ All pipeline components, buffers, and sinks MUST adhere to standard naming and t
     3. Await transformer handles so sink channel senders are dropped.
     4. Await sink handles so all remaining in-memory batches are flushed and committed to persistent storage.
     5. Flush telemetry providers and exit cleanly.
-*   **Watch Channel Notification**: Never use bare `shutdown_rx.changed().await` without checking the current state. Always use `shutdown_rx.wait_for(|shutting_down| *shutting_down).await` to prevent missed-event race conditions when shutdown is pre-signaled.
+*   **Shutdown Signals**: Graceful shutdown MUST be triggered by SIGTERM (the signal sent by Kubernetes and systemd) as well as SIGINT/Ctrl-C.
+*   **Watch Channel Notification**: Prefer `shutdown_rx.wait_for(|shutting_down| *shutting_down).await` over bare `changed().await`. Bare `changed().await` is only safe on a receiver cloned from the original channel receiver; on a receiver created with `subscribe()` after the signal may have fired it can wait forever.
 *   **Producer Queue Flush**: Sinks wrapping background producer queues (e.g. `librdkafka::Producer`, StarRocks `StreamLoadManager`) MUST flush during shutdown before exiting.
 
 ### 6. Storage & Lakehouse Transaction Integrity
 
 *   **Buffer Retention Across Flushes**: Sinks MUST NOT clear their in-memory batch buffers (`std::mem::take`) before persistent writes and ACID catalog commits succeed. If a commit or upload fails, retained batches must be preserved for retry or diverted to dead-letter storage to prevent silent data loss.
 *   **Partition Specification Adherence**: Partitioned sinks (e.g. Iceberg, Parquet) must pass partition values and specifications to table data writers rather than writing unpartitioned files.
-*   **Catalog Identifier Integrity**: Pass `catalog_name` to catalog loaders, not `table_identifier`.
+*   **Catalog Identifier Integrity**: Pass a dedicated catalog name (never a table identifier) to catalog loaders. Add an explicit `catalog_name` config field where one does not yet exist.
 *   **Optimistic Concurrency Retries**: ACID lakehouse commits must implement exponential backoff retries for transient catalog conflicts.
 
 ### 7. Rust Coding Anti-Patterns to Avoid
@@ -314,7 +301,7 @@ To guarantee downstream data lakes remain highly structured and query-optimized,
 3. **Quarantine Handling:** If the pipeline is configured in `strict` mode and an incoming data payload contains un-mappable, malformed, or missing required semantic fields, the batch must be diverted to a structured dead-letter path rather than risking data corruption or runtime panic in downstream ACID sinks (Delta/Iceberg).
 4. **Vectorized Operations over Loops:** When mutating schemas or fields for compliance updates, use Arrow column-backed manipulations or `datafusion` relational transformations rather than iterating through records element-by-element.
 
-### 13. Admin, Metrics & Profiling API Safeguards
+## 13. Admin, Metrics & Profiling API Safeguards
 
 All agents introducing or modifying diagnostic routes must follow these architectural boundaries:
 
