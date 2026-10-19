@@ -583,10 +583,10 @@ async fn test_admin_router_with_whitespace_configured_sha_normalized_to_none() {
 }
 
 #[tokio::test]
-async fn test_admin_router_reload_endpoint_trims_module_path_whitespace() {
+async fn test_admin_router_reload_endpoint_preserves_configured_module_path() {
     let temp_dir = std::env::temp_dir();
     let module_path = temp_dir.join(format!(
-        "trimmed_path_{}_{}.wasm",
+        "preserved_path_{}_{}.wasm",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -598,6 +598,7 @@ async fn test_admin_router_reload_endpoint_trims_module_path_whitespace() {
     tokio::fs::write(&module_path, &wasm_bytes).await.unwrap();
 
     let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    // A path with surrounding whitespace must not be mutated/trimmed at request time
     let padded_path = PathBuf::from(format!("  \t {} \n  ", module_path.to_str().unwrap()));
     let router = build_admin_router(Arc::clone(&engine), padded_path);
 
@@ -609,15 +610,8 @@ async fn test_admin_router_reload_endpoint_trims_module_path_whitespace() {
         .unwrap();
 
     let response = router.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(json["status"], "reload successful");
-    assert_eq!(json["path"], module_path.to_str().unwrap());
-    assert_eq!(engine.module_generation(), 1);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(engine.module_generation(), 0);
 
     let _ = tokio::fs::remove_file(&module_path).await;
 }
@@ -838,6 +832,25 @@ async fn test_admin_router_rejects_malformed_json_body() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+#[tokio::test]
+async fn test_admin_router_rejects_oversized_request_body() {
+    use wasm_transformer::reload::MAX_RELOAD_REQUEST_BYTES;
+
+    let engine = Arc::new(EngineCache::new_pooling(2, 32 * 1024 * 1024).unwrap());
+    let router = build_admin_router(engine, PathBuf::from("/tmp/unused.wasm"));
+
+    let oversized_body = " ".repeat(MAX_RELOAD_REQUEST_BYTES + 1);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/transforms/wasm/reload")
+        .header("content-type", "application/json")
+        .body(Body::from(oversized_body))
+        .unwrap();
+
+    let response = router.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
 #[test]
 fn test_security_guard_wasm_reload_contract_and_review_docs() {
     use wasm_transformer::reload::WasmReloadRequest;
@@ -865,6 +878,14 @@ fn test_security_guard_wasm_reload_contract_and_review_docs() {
         .parent()
         .unwrap()
         .to_path_buf();
+
+    let reload_rs =
+        std::fs::read_to_string(workspace_root.join("crates/wasm-transformer/src/reload.rs"))
+            .unwrap();
+    assert!(
+        !reload_rs.contains("tokio::fs::metadata("),
+        "reload.rs must rely on open file descriptor file.metadata() rather than pre-open tokio::fs::metadata()"
+    );
 
     let agents_md = std::fs::read_to_string(workspace_root.join("AGENTS.md")).unwrap();
     assert!(
