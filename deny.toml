@@ -179,11 +179,15 @@ allow = [
 
 # List of crates to deny
 deny = [
-    #"ansi_term@0.11.0",
-    #{ crate = "ansi_term@0.11.0", reason = "you can specify a reason it is banned" },
-    # Wrapper crates can optionally be specified to allow the crate when it
-    # is a direct dependency of the otherwise banned crate
-    #{ crate = "ansi_term@0.11.0", wrappers = ["this-crate-directly-depends-on-ansi_term"] },
+    { crate = "opentelemetry", multiple-versions = "deny", reason = "Prevent split-brain OpenTelemetry trait/global provider mismatches across tracing-opentelemetry and opentelemetry_sdk" },
+    { crate = "opentelemetry_sdk", multiple-versions = "deny" },
+    { crate = "opentelemetry-otlp", multiple-versions = "deny" },
+    { crate = "opentelemetry-proto", multiple-versions = "deny" },
+    { crate = "tracing-opentelemetry", multiple-versions = "deny" },
+    { crate = "arrow", multiple-versions = "deny", reason = "Prevent duplicate Arrow array/RecordBatch versions across storage sinks and codecs" },
+    { crate = "parquet", multiple-versions = "deny" },
+    { crate = "wasmtime", multiple-versions = "deny" },
+    { crate = "wasmtime-wasi", multiple-versions = "deny" },
 ]
 
 # List of features to allow/deny
