@@ -148,6 +148,9 @@ pub struct WasmReloadResponse {
 /// Maximum allowable WebAssembly module file size (64 MiB).
 pub const MAX_MODULE_SIZE: u64 = 64 * 1024 * 1024;
 
+/// Maximum allowable HTTP request body size for the WASM hot-reload endpoint (4 KiB).
+pub const MAX_RELOAD_REQUEST_BYTES: usize = 4 * 1024;
+
 /// State provided to the WASM hot-reload REST endpoint handler.
 #[derive(Clone)]
 pub struct WasmReloadState {
@@ -185,11 +188,13 @@ impl WasmReloadState {
     }
 }
 
-/// Sanitizes, bounds, and reads the WebAssembly module file at `module_path`.
+/// Sanitizes, bounds, and reads the WebAssembly module file at `module_path` using a single open file descriptor.
 async fn validate_and_read_module(
     module_path: &std::path::Path,
 ) -> Result<Vec<u8>, axum::http::StatusCode> {
-    if module_path.as_os_str().is_empty() || module_path.to_string_lossy().trim().is_empty() {
+    if module_path.as_os_str().is_empty()
+        || module_path.to_str().is_some_and(|s| s.trim().is_empty())
+    {
         tracing::warn!("Hot-reload REST: empty or blank module_path configured");
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
@@ -206,27 +211,22 @@ async fn validate_and_read_module(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let metadata = tokio::fs::metadata(module_path).await.map_err(|e| {
-        tracing::warn!("Hot-reload REST: failed to read module metadata: {e}");
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    if !metadata.is_file() {
-        tracing::warn!(
-            path = %module_path.display(),
-            "Hot-reload REST: path is not a regular file"
-        );
-        return Err(axum::http::StatusCode::BAD_REQUEST);
-    }
-
     let canonical_path = tokio::fs::canonicalize(module_path).await.map_err(|e| {
         tracing::warn!("Hot-reload REST: failed to canonicalize module path: {e}");
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
     let file = tokio::fs::File::open(&canonical_path).await.map_err(|e| {
-        tracing::warn!("Hot-reload REST: failed to open module file: {e}");
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        if e.kind() == std::io::ErrorKind::IsADirectory {
+            tracing::warn!(
+                path = %canonical_path.display(),
+                "Hot-reload REST: opened path is a directory"
+            );
+            axum::http::StatusCode::BAD_REQUEST
+        } else {
+            tracing::warn!("Hot-reload REST: failed to open module file: {e}");
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
     })?;
 
     let file_meta = file.metadata().await.map_err(|e| {
@@ -292,6 +292,7 @@ async fn validate_and_read_module(
 ///
 /// # Errors
 ///
+/// Returns [`axum::http::StatusCode::PAYLOAD_TOO_LARGE`] if the request body exceeds [`MAX_RELOAD_REQUEST_BYTES`].
 /// Returns [`axum::http::StatusCode::INTERNAL_SERVER_ERROR`] if reading the module file fails
 /// or if the background compilation task panics.
 /// Returns [`axum::http::StatusCode::BAD_REQUEST`] if the request body is malformed JSON or
@@ -302,6 +303,15 @@ pub async fn wasm_reload_handler(
     axum::extract::State(state): axum::extract::State<WasmReloadState>,
     body: axum::body::Bytes,
 ) -> Result<axum::Json<WasmReloadResponse>, axum::http::StatusCode> {
+    if body.len() > MAX_RELOAD_REQUEST_BYTES {
+        tracing::warn!(
+            size = body.len(),
+            max_size = MAX_RELOAD_REQUEST_BYTES,
+            "Hot-reload REST: request body exceeds maximum allowed size"
+        );
+        return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     let payload = if body.is_empty() {
         WasmReloadRequest::default()
     } else {
@@ -311,11 +321,8 @@ pub async fn wasm_reload_handler(
         })?
     };
 
-    let raw_path = state.module_path.to_string_lossy();
-    let trimmed_path_str = raw_path.trim();
-    let trimmed_path = std::path::Path::new(trimmed_path_str);
     tracing::warn!(
-        path = %trimmed_path.display(),
+        path = %state.module_path.display(),
         "SECURITY AUDIT: REST hot-reload endpoint invoked"
     );
 
@@ -324,7 +331,7 @@ pub async fn wasm_reload_handler(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let bytes = validate_and_read_module(trimmed_path).await?;
+    let bytes = validate_and_read_module(&state.module_path).await?;
 
     let engines = state.engines.clone();
     let expected_sha = if let Some(ref configured) = state.configured_sha {
@@ -358,7 +365,7 @@ pub async fn wasm_reload_handler(
 
     Ok(axum::Json(WasmReloadResponse {
         status: "reload successful".to_string(),
-        path: trimmed_path_str.to_string(),
+        path: state.module_path.display().to_string(),
         generation,
     }))
 }
@@ -389,7 +396,9 @@ pub fn build_admin_router_multi(
     axum::Router::new()
         .route(
             "/api/v1/transforms/wasm/reload",
-            axum::routing::post(wasm_reload_handler),
+            axum::routing::post(wasm_reload_handler).layer(axum::extract::DefaultBodyLimit::max(
+                MAX_RELOAD_REQUEST_BYTES,
+            )),
         )
         .with_state(state)
 }
