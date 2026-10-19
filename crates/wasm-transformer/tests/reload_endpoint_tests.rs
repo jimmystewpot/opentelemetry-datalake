@@ -837,3 +837,52 @@ async fn test_admin_router_rejects_malformed_json_body() {
     let response = router.oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[test]
+fn test_security_guard_wasm_reload_contract_and_review_docs() {
+    use wasm_transformer::reload::WasmReloadRequest;
+
+    for forbidden_key in ["module_path", "path", "file", "allowed_directory"] {
+        let payload = serde_json::json!({ forbidden_key: "/tmp/evil.wasm" });
+        assert!(
+            serde_json::from_value::<WasmReloadRequest>(payload).is_err(),
+            "WasmReloadRequest must reject forbidden field '{forbidden_key}'"
+        );
+    }
+
+    let empty_req = serde_json::from_value::<WasmReloadRequest>(serde_json::json!({})).unwrap();
+    assert_eq!(empty_req.expected_sha, None);
+
+    let sha_req = serde_json::from_value::<WasmReloadRequest>(serde_json::json!({
+        "expected_sha": "abc"
+    }))
+    .unwrap();
+    assert_eq!(sha_req.expected_sha.as_deref(), Some("abc"));
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let agents_md = std::fs::read_to_string(workspace_root.join("AGENTS.md")).unwrap();
+    assert!(
+        agents_md.contains("rust/path-injection") && agents_md.contains("deny_unknown_fields"),
+        "AGENTS.md must codify rust/path-injection and deny_unknown_fields safeguards"
+    );
+
+    let review_md =
+        std::fs::read_to_string(workspace_root.join("CODE_REVIEW_INSTRUCTIONS.md")).unwrap();
+    assert!(
+        review_md.contains("rust/path-injection") && review_md.contains("deny_unknown_fields"),
+        "CODE_REVIEW_INSTRUCTIONS.md must enforce rust/path-injection and deny_unknown_fields checks"
+    );
+
+    let admin_doc = std::fs::read_to_string(workspace_root.join("docs/administration.md")).unwrap();
+    assert!(
+        admin_doc.contains("/api/v1/transforms/wasm/reload")
+            && admin_doc.contains("deny_unknown_fields"),
+        "docs/administration.md must specify the pinned-path contract for /api/v1/transforms/wasm/reload"
+    );
+}
