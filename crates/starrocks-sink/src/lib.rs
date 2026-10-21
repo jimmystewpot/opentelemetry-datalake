@@ -1160,6 +1160,10 @@ mod tests {
             !Arc::ptr_eq(&sink.manager_for("logs"), &sink.manager_for("metrics")),
             "PerSignal mapping must build distinct managers per signal table"
         );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("metrics"), &sink.manager_for("traces")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
     }
 
     #[test]
@@ -1641,5 +1645,215 @@ mod tests {
         let manager = sink.manager();
         let sink2 = StarRocksSink::with_manager(config, manager).unwrap();
         assert!(sink2.config.tls.ca_cert_path.is_some());
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockHttpRequest {
+        start_line: String,
+        path: String,
+        headers: std::collections::HashMap<String, String>,
+    }
+
+    async fn handle_mock_http_connection<F>(
+        mut stream: tokio::net::TcpStream,
+        response_fn: &F,
+        recorded: &std::sync::Arc<tokio::sync::Mutex<Vec<MockHttpRequest>>>,
+    ) -> std::io::Result<()>
+    where
+        F: Fn(&str, &str) -> (u16, &'static str) + Send + Sync,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+        let mut lines = header_str.split("\r\n");
+        let start_line = lines.next().unwrap_or("").to_string();
+        let mut parts = start_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+
+        if headers.get("expect").map(|v| v.as_str()) == Some("100-continue") {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        }
+
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let already_read = buf.len() - (header_end + 4);
+        if already_read < content_length {
+            let to_read = content_length - already_read;
+            let mut remaining = vec![0u8; to_read];
+            stream.read_exact(&mut remaining).await?;
+        }
+
+        recorded.lock().await.push(MockHttpRequest {
+            start_line,
+            path: path.clone(),
+            headers,
+        });
+
+        let (status, body) = response_fn(&method, &path);
+        let resp = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        let _ = stream.shutdown().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v1_per_signal_sinks_send_to_correct_table_url_paths() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn =
+                |_method: &str, _path: &str| (200, r#"{"Status":"Success","NumberLoadedRows":3}"#);
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V1;
+
+        let primary_sink = StarRocksSink::try_new(config.clone()).unwrap();
+        let traces_manager = primary_sink.manager_for("traces");
+        let metrics_manager = primary_sink.manager_for("metrics");
+
+        let mut logs_sink = primary_sink;
+        let mut traces_sink = StarRocksSink::with_manager(config.clone(), traces_manager).unwrap();
+        let mut metrics_sink = StarRocksSink::with_manager(config, metrics_manager).unwrap();
+
+        let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(1);
+        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
+        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(1);
+
+        let logs_handle = tokio::spawn(async move { logs_sink.run(logs_rx).await });
+        let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
+        let metrics_handle = tokio::spawn(async move { metrics_sink.run(metrics_rx).await });
+
+        logs_tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(logs_tx);
+        logs_handle.await.unwrap().unwrap();
+
+        traces_tx.send(SignalBatch::Traces(make_batch())).await.unwrap();
+        drop(traces_tx);
+        traces_handle.await.unwrap().unwrap();
+
+        metrics_tx.send(SignalBatch::Metrics(make_batch())).await.unwrap();
+        drop(metrics_tx);
+        metrics_handle.await.unwrap().unwrap();
+
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 3, "Expected 3 requests, got {}", reqs.len());
+        assert_eq!(reqs[0].path, "/api/otel/otel_logs/_stream_load");
+        assert_eq!(reqs[1].path, "/api/otel/otel_traces/_stream_load");
+        assert_eq!(reqs[2].path, "/api/otel/otel_metrics/_stream_load");
+        assert!(
+            reqs[0].start_line.starts_with("PUT /api/otel/otel_logs/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[0].start_line
+        );
+        assert!(
+            reqs[1].start_line.starts_with("PUT /api/otel/otel_traces/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[1].start_line
+        );
+        assert!(
+            reqs[2].start_line.starts_with("PUT /api/otel/otel_metrics/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[2].start_line
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_per_signal_sends_matching_table_header_across_all_phases() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = |_method: &str, path: &str| {
+                if path == "/api/transaction/begin" {
+                    (200, r#"{"Status":"OK","TxnId":42}"#)
+                } else {
+                    (200, r#"{"Status":"OK"}"#)
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V2;
+
+        let primary_sink = StarRocksSink::try_new(config.clone()).unwrap();
+        let traces_manager = primary_sink.manager_for("traces");
+        let mut traces_sink = StarRocksSink::with_manager(config, traces_manager).unwrap();
+
+        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
+        let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
+
+        traces_tx.send(SignalBatch::Traces(make_batch())).await.unwrap();
+        drop(traces_tx);
+        traces_handle.await.unwrap().unwrap();
+
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(
+            reqs.len(),
+            4,
+            "Expected 4 requests in V2 transaction sequence, got {}",
+            reqs.len()
+        );
+        assert_eq!(reqs[0].path, "/api/transaction/begin");
+        assert_eq!(reqs[1].path, "/api/transaction/load");
+        assert_eq!(reqs[2].path, "/api/transaction/prepare");
+        assert_eq!(reqs[3].path, "/api/transaction/commit");
+
+        for (i, req) in reqs.iter().enumerate() {
+            assert_eq!(
+                req.headers.get("table").map(|s| s.as_str()),
+                Some("otel_traces"),
+                "Request {} ({}) missing or mismatched `table` header",
+                i,
+                req.path
+            );
+        }
     }
 }
