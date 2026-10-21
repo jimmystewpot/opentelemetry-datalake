@@ -295,6 +295,49 @@ impl StarRocksSinkConfig {
                 "StarRocks configuration error: `database` must not be empty".to_string(),
             ));
         }
+        match &self.table_mapping {
+            TableMapping::PerSignal {
+                logs,
+                metrics,
+                traces,
+            } => {
+                if logs.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.logs` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if metrics.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.metrics` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if traces.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.traces` must not be empty"
+                            .to_string(),
+                    ));
+                }
+            }
+            TableMapping::Unified {
+                table,
+                signal_type_column,
+            } => {
+                if table.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.table` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if signal_type_column.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.signal_type_column` must not be empty"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(ref sort_cfg) = self.order_by {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)?;
         }
@@ -317,7 +360,9 @@ use std::sync::Arc;
 
 pub struct StarRocksSink {
     config: StarRocksSinkConfig,
-    manager: Arc<StreamLoadManager>,
+    logs_manager: Arc<StreamLoadManager>,
+    metrics_manager: Arc<StreamLoadManager>,
+    traces_manager: Arc<StreamLoadManager>,
     sorter: pipeline_core::sort::BatchSorter,
 }
 
@@ -325,10 +370,47 @@ impl std::fmt::Debug for StarRocksSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StarRocksSink")
             .field("config", &self.config)
-            .field("manager", &"<StreamLoadManager>")
+            .field("logs_manager", &"<StreamLoadManager>")
+            .field("metrics_manager", &"<StreamLoadManager>")
+            .field("traces_manager", &"<StreamLoadManager>")
             .field("sorter", &self.sorter)
             .finish()
     }
+}
+
+fn build_manager(
+    config: &StarRocksSinkConfig,
+    table: &str,
+) -> Result<Arc<StreamLoadManager>, PipelineError> {
+    let sdk_config = StreamLoadConfig::builder(
+        config.frontend_urls.clone(),
+        config.database.clone(),
+        config.username.clone(),
+    )
+    .password(config.password.clone().unwrap_or_default())
+    .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+    .request_timeout(Duration::from_secs(config.request_timeout_secs))
+    .max_retries(config.max_retries)
+    .retry_interval(Duration::from_secs(config.retry_interval_secs))
+    .enable_transaction(matches!(config.transaction_mode, TransactionMode::V2))
+    .build();
+
+    let sdk_format = match config.format {
+        StarRocksFormat::Ipc => DataFormat::ARROW,
+        StarRocksFormat::Json => DataFormat::JSON,
+        StarRocksFormat::Csv => DataFormat::CSV,
+    };
+
+    let properties = StreamLoadTableProperties::builder()
+        .table(table)
+        .format(sdk_format)
+        .build();
+
+    let manager = StreamLoadManager::new(sdk_config, properties).map_err(|e| {
+        PipelineError::Internal(format!("Failed to initialise StarRocks manager: {e}"))
+    })?;
+
+    Ok(Arc::new(manager))
 }
 
 impl StarRocksSink {
@@ -357,15 +439,27 @@ impl StarRocksSink {
 
         Ok(Self {
             config,
-            manager,
+            logs_manager: Arc::clone(&manager),
+            metrics_manager: Arc::clone(&manager),
+            traces_manager: manager,
             sorter,
         })
     }
 
-    /// Returns a reference to the underlying [`StreamLoadManager`] connection pool.
+    /// Returns a reference to the underlying [`StreamLoadManager`] connection pool for logs.
     #[must_use]
     pub fn manager(&self) -> Arc<StreamLoadManager> {
-        Arc::clone(&self.manager)
+        Arc::clone(&self.logs_manager)
+    }
+
+    /// Returns the [`StreamLoadManager`] instance dedicated to the given signal type.
+    #[must_use]
+    pub fn manager_for(&self, signal_type: &str) -> Arc<StreamLoadManager> {
+        match signal_type {
+            "metrics" => Arc::clone(&self.metrics_manager),
+            "traces" => Arc::clone(&self.traces_manager),
+            _ => Arc::clone(&self.logs_manager),
+        }
     }
 
     /// Returns a reference to the sink's [`pipeline_core::sort::BatchSorter`].
@@ -396,36 +490,28 @@ impl StarRocksSink {
             pipeline_core::sort::BatchSorter::default()
         };
 
-        let sdk_config = StreamLoadConfig::builder(
-            config.frontend_urls.clone(),
-            config.database.clone(),
-            config.username.clone(),
-        )
-        .password(config.password.clone().unwrap_or_default())
-        .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-        .request_timeout(Duration::from_secs(config.request_timeout_secs))
-        .max_retries(config.max_retries)
-        .retry_interval(Duration::from_secs(config.retry_interval_secs))
-        .enable_transaction(matches!(config.transaction_mode, TransactionMode::V2))
-        .build();
-
-        let sdk_format = match config.format {
-            StarRocksFormat::Ipc => DataFormat::ARROW,
-            StarRocksFormat::Json => DataFormat::JSON,
-            StarRocksFormat::Csv => DataFormat::CSV,
+        let (logs_manager, metrics_manager, traces_manager) = match &config.table_mapping {
+            TableMapping::Unified { table, .. } => {
+                let mgr = build_manager(&config, table)?;
+                (Arc::clone(&mgr), Arc::clone(&mgr), mgr)
+            }
+            TableMapping::PerSignal {
+                logs,
+                metrics,
+                traces,
+            } => {
+                let logs_mgr = build_manager(&config, logs)?;
+                let metrics_mgr = build_manager(&config, metrics)?;
+                let traces_mgr = build_manager(&config, traces)?;
+                (logs_mgr, metrics_mgr, traces_mgr)
+            }
         };
-
-        let properties = StreamLoadTableProperties::builder()
-            .format(sdk_format)
-            .build();
-
-        let manager = StreamLoadManager::new(sdk_config, properties).map_err(|e| {
-            PipelineError::Internal(format!("Failed to initialise StarRocks manager: {e}"))
-        })?;
 
         Ok(Self {
             config,
-            manager: Arc::new(manager),
+            logs_manager,
+            metrics_manager,
+            traces_manager,
             sorter,
         })
     }
@@ -525,9 +611,14 @@ impl StarRocksSink {
     ///
     /// Returns [`PipelineError::DownstreamClosed`] if the SDK exhausts all
     /// retries, propagating backpressure to the OTLP receiver.
-    async fn send_v1(&self, table: &str, label: &str, payload: Bytes) -> Result<(), PipelineError> {
-        let response = self
-            .manager
+    async fn send_v1(
+        &self,
+        manager: &StreamLoadManager,
+        table: &str,
+        label: &str,
+        payload: Bytes,
+    ) -> Result<(), PipelineError> {
+        let response = manager
             .send_single_batch(label, payload)
             .await
             .map_err(|e| {
@@ -560,8 +651,14 @@ impl StarRocksSink {
     ///
     /// Returns [`PipelineError::DownstreamClosed`] on any SDK-level failure,
     /// propagating backpressure to the OTLP receiver.
-    async fn send_v2(&self, table: &str, label: &str, payload: Bytes) -> Result<(), PipelineError> {
-        let txn_id = self.manager.begin_transaction(label).await.map_err(|e| {
+    async fn send_v2(
+        &self,
+        manager: &StreamLoadManager,
+        table: &str,
+        label: &str,
+        payload: Bytes,
+    ) -> Result<(), PipelineError> {
+        let txn_id = manager.begin_transaction(label).await.map_err(|e| {
             error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
             PipelineError::DownstreamClosed
         })?;
@@ -572,32 +669,31 @@ impl StarRocksSink {
             "StarRocks V2 transaction begun"
         );
 
-        let load_result = self
-            .manager
+        let load_result = manager
             .load_transaction_data(label, &self.config.database, table, 0, payload)
             .await;
 
         if let Err(e) = load_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 load failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(PipelineError::DownstreamClosed);
         }
 
-        let prep_result = self.manager.prepare_transaction(label).await;
+        let prep_result = manager.prepare_transaction(label).await;
         if let Err(e) = prep_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 prepare failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(PipelineError::DownstreamClosed);
         }
 
-        let commit_result = self.manager.commit_transaction(label).await;
+        let commit_result = manager.commit_transaction(label).await;
         if let Err(e) = commit_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(
                     label = label,
                     error = %rb_err,
@@ -635,13 +731,14 @@ impl StarRocksSink {
             batch.clone()
         };
 
+        let manager = self.manager_for(signal_type);
         let table = self.config.table_mapping.table_for(signal_type).to_owned();
         let label = Self::make_label(signal_type);
         let payload = self.serialize_batch(&batch)?;
 
         match self.config.transaction_mode {
-            TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
-            TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+            TransactionMode::V1 => self.send_v1(&manager, &table, &label, payload).await?,
+            TransactionMode::V2 => self.send_v2(&manager, &table, &label, payload).await?,
         }
 
         Ok(())
@@ -1036,6 +1133,78 @@ mod tests {
             matches!(err2, PipelineError::Internal(ref msg) if msg.contains("database")),
             "Expected empty database error, got: {err2}"
         );
+    }
+
+    #[test]
+    fn test_starrocks_v1_table_name_resolution() {
+        let config = base_config();
+        let sink = StarRocksSink::try_new(config).unwrap();
+
+        assert_eq!(
+            sink.manager_for("logs").properties().table.as_deref(),
+            Some("otel_logs")
+        );
+        assert_eq!(
+            sink.manager_for("metrics").properties().table.as_deref(),
+            Some("otel_metrics")
+        );
+        assert_eq!(
+            sink.manager_for("traces").properties().table.as_deref(),
+            Some("otel_traces")
+        );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("logs"), &sink.manager_for("traces")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("logs"), &sink.manager_for("metrics")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
+    }
+
+    #[test]
+    fn test_unified_mapping_shares_single_manager_with_table_set() {
+        let mut config = base_config();
+        config.table_mapping = TableMapping::Unified {
+            table: "otel_all".to_string(),
+            signal_type_column: "signal_type".to_string(),
+        };
+        let sink = StarRocksSink::try_new(config).unwrap();
+
+        let logs_mgr = sink.manager_for("logs");
+        let metrics_mgr = sink.manager_for("metrics");
+        let traces_mgr = sink.manager_for("traces");
+
+        assert_eq!(logs_mgr.properties().table.as_deref(), Some("otel_all"));
+        assert!(
+            Arc::ptr_eq(&logs_mgr, &metrics_mgr) && Arc::ptr_eq(&logs_mgr, &traces_mgr),
+            "Unified mapping must share a single Arc<StreamLoadManager> across all signals"
+        );
+    }
+
+    #[test]
+    fn test_try_new_validates_empty_table_mapping_fields() {
+        let mut cfg_empty_logs = base_config();
+        cfg_empty_logs.table_mapping = TableMapping::PerSignal {
+            logs: "   ".to_string(),
+            metrics: "otel_metrics".to_string(),
+            traces: "otel_traces".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_logs).is_err());
+
+        let mut cfg_empty_unified_table = base_config();
+        cfg_empty_unified_table.table_mapping = TableMapping::Unified {
+            table: String::new(),
+            signal_type_column: "signal_type".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_unified_table).is_err());
+
+        let mut cfg_empty_unified_col = base_config();
+        cfg_empty_unified_col.table_mapping = TableMapping::Unified {
+            table: "otel_all".to_string(),
+            signal_type_column: " ".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_unified_col).is_err());
     }
 
     #[test]
