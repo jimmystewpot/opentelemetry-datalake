@@ -295,6 +295,49 @@ impl StarRocksSinkConfig {
                 "StarRocks configuration error: `database` must not be empty".to_string(),
             ));
         }
+        match &self.table_mapping {
+            TableMapping::PerSignal {
+                logs,
+                metrics,
+                traces,
+            } => {
+                if logs.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.logs` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if metrics.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.metrics` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if traces.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.traces` must not be empty"
+                            .to_string(),
+                    ));
+                }
+            }
+            TableMapping::Unified {
+                table,
+                signal_type_column,
+            } => {
+                if table.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.table` must not be empty"
+                            .to_string(),
+                    ));
+                }
+                if signal_type_column.trim().is_empty() {
+                    return Err(PipelineError::Internal(
+                        "StarRocks configuration error: `table_mapping.signal_type_column` must not be empty"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(ref sort_cfg) = self.order_by {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)?;
         }
@@ -317,7 +360,9 @@ use std::sync::Arc;
 
 pub struct StarRocksSink {
     config: StarRocksSinkConfig,
-    manager: Arc<StreamLoadManager>,
+    logs_manager: Arc<StreamLoadManager>,
+    metrics_manager: Arc<StreamLoadManager>,
+    traces_manager: Arc<StreamLoadManager>,
     sorter: pipeline_core::sort::BatchSorter,
 }
 
@@ -325,10 +370,47 @@ impl std::fmt::Debug for StarRocksSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StarRocksSink")
             .field("config", &self.config)
-            .field("manager", &"<StreamLoadManager>")
+            .field("logs_manager", &"<StreamLoadManager>")
+            .field("metrics_manager", &"<StreamLoadManager>")
+            .field("traces_manager", &"<StreamLoadManager>")
             .field("sorter", &self.sorter)
             .finish()
     }
+}
+
+fn build_manager(
+    config: &StarRocksSinkConfig,
+    table: &str,
+) -> Result<Arc<StreamLoadManager>, PipelineError> {
+    let sdk_config = StreamLoadConfig::builder(
+        config.frontend_urls.clone(),
+        config.database.clone(),
+        config.username.clone(),
+    )
+    .password(config.password.clone().unwrap_or_default())
+    .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+    .request_timeout(Duration::from_secs(config.request_timeout_secs))
+    .max_retries(config.max_retries)
+    .retry_interval(Duration::from_secs(config.retry_interval_secs))
+    .enable_transaction(matches!(config.transaction_mode, TransactionMode::V2))
+    .build();
+
+    let sdk_format = match config.format {
+        StarRocksFormat::Ipc => DataFormat::ARROW,
+        StarRocksFormat::Json => DataFormat::JSON,
+        StarRocksFormat::Csv => DataFormat::CSV,
+    };
+
+    let properties = StreamLoadTableProperties::builder()
+        .table(table)
+        .format(sdk_format)
+        .build();
+
+    let manager = StreamLoadManager::new(sdk_config, properties).map_err(|e| {
+        PipelineError::Internal(format!("Failed to initialise StarRocks manager: {e}"))
+    })?;
+
+    Ok(Arc::new(manager))
 }
 
 impl StarRocksSink {
@@ -357,15 +439,27 @@ impl StarRocksSink {
 
         Ok(Self {
             config,
-            manager,
+            logs_manager: Arc::clone(&manager),
+            metrics_manager: Arc::clone(&manager),
+            traces_manager: manager,
             sorter,
         })
     }
 
-    /// Returns a reference to the underlying [`StreamLoadManager`] connection pool.
+    /// Returns a reference to the underlying [`StreamLoadManager`] connection pool for logs.
     #[must_use]
     pub fn manager(&self) -> Arc<StreamLoadManager> {
-        Arc::clone(&self.manager)
+        Arc::clone(&self.logs_manager)
+    }
+
+    /// Returns the [`StreamLoadManager`] instance dedicated to the given signal type.
+    #[must_use]
+    pub fn manager_for(&self, signal_type: &str) -> Arc<StreamLoadManager> {
+        match signal_type {
+            "metrics" => Arc::clone(&self.metrics_manager),
+            "traces" => Arc::clone(&self.traces_manager),
+            _ => Arc::clone(&self.logs_manager),
+        }
     }
 
     /// Returns a reference to the sink's [`pipeline_core::sort::BatchSorter`].
@@ -396,36 +490,28 @@ impl StarRocksSink {
             pipeline_core::sort::BatchSorter::default()
         };
 
-        let sdk_config = StreamLoadConfig::builder(
-            config.frontend_urls.clone(),
-            config.database.clone(),
-            config.username.clone(),
-        )
-        .password(config.password.clone().unwrap_or_default())
-        .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-        .request_timeout(Duration::from_secs(config.request_timeout_secs))
-        .max_retries(config.max_retries)
-        .retry_interval(Duration::from_secs(config.retry_interval_secs))
-        .enable_transaction(matches!(config.transaction_mode, TransactionMode::V2))
-        .build();
-
-        let sdk_format = match config.format {
-            StarRocksFormat::Ipc => DataFormat::ARROW,
-            StarRocksFormat::Json => DataFormat::JSON,
-            StarRocksFormat::Csv => DataFormat::CSV,
+        let (logs_manager, metrics_manager, traces_manager) = match &config.table_mapping {
+            TableMapping::Unified { table, .. } => {
+                let mgr = build_manager(&config, table)?;
+                (Arc::clone(&mgr), Arc::clone(&mgr), mgr)
+            }
+            TableMapping::PerSignal {
+                logs,
+                metrics,
+                traces,
+            } => {
+                let logs_mgr = build_manager(&config, logs)?;
+                let metrics_mgr = build_manager(&config, metrics)?;
+                let traces_mgr = build_manager(&config, traces)?;
+                (logs_mgr, metrics_mgr, traces_mgr)
+            }
         };
-
-        let properties = StreamLoadTableProperties::builder()
-            .format(sdk_format)
-            .build();
-
-        let manager = StreamLoadManager::new(sdk_config, properties).map_err(|e| {
-            PipelineError::Internal(format!("Failed to initialise StarRocks manager: {e}"))
-        })?;
 
         Ok(Self {
             config,
-            manager: Arc::new(manager),
+            logs_manager,
+            metrics_manager,
+            traces_manager,
             sorter,
         })
     }
@@ -525,9 +611,14 @@ impl StarRocksSink {
     ///
     /// Returns [`PipelineError::DownstreamClosed`] if the SDK exhausts all
     /// retries, propagating backpressure to the OTLP receiver.
-    async fn send_v1(&self, table: &str, label: &str, payload: Bytes) -> Result<(), PipelineError> {
-        let response = self
-            .manager
+    async fn send_v1(
+        &self,
+        manager: &StreamLoadManager,
+        table: &str,
+        label: &str,
+        payload: Bytes,
+    ) -> Result<(), PipelineError> {
+        let response = manager
             .send_single_batch(label, payload)
             .await
             .map_err(|e| {
@@ -560,8 +651,14 @@ impl StarRocksSink {
     ///
     /// Returns [`PipelineError::DownstreamClosed`] on any SDK-level failure,
     /// propagating backpressure to the OTLP receiver.
-    async fn send_v2(&self, table: &str, label: &str, payload: Bytes) -> Result<(), PipelineError> {
-        let txn_id = self.manager.begin_transaction(label).await.map_err(|e| {
+    async fn send_v2(
+        &self,
+        manager: &StreamLoadManager,
+        table: &str,
+        label: &str,
+        payload: Bytes,
+    ) -> Result<(), PipelineError> {
+        let txn_id = manager.begin_transaction(label).await.map_err(|e| {
             error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
             PipelineError::DownstreamClosed
         })?;
@@ -572,32 +669,31 @@ impl StarRocksSink {
             "StarRocks V2 transaction begun"
         );
 
-        let load_result = self
-            .manager
+        let load_result = manager
             .load_transaction_data(label, &self.config.database, table, 0, payload)
             .await;
 
         if let Err(e) = load_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 load failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(PipelineError::DownstreamClosed);
         }
 
-        let prep_result = self.manager.prepare_transaction(label).await;
+        let prep_result = manager.prepare_transaction(label).await;
         if let Err(e) = prep_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 prepare failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(PipelineError::DownstreamClosed);
         }
 
-        let commit_result = self.manager.commit_transaction(label).await;
+        let commit_result = manager.commit_transaction(label).await;
         if let Err(e) = commit_result {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
-            if let Err(rb_err) = self.manager.rollback_transaction(label).await {
+            if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(
                     label = label,
                     error = %rb_err,
@@ -635,13 +731,14 @@ impl StarRocksSink {
             batch.clone()
         };
 
+        let manager = self.manager_for(signal_type);
         let table = self.config.table_mapping.table_for(signal_type).to_owned();
         let label = Self::make_label(signal_type);
         let payload = self.serialize_batch(&batch)?;
 
         match self.config.transaction_mode {
-            TransactionMode::V1 => self.send_v1(&table, &label, payload).await?,
-            TransactionMode::V2 => self.send_v2(&table, &label, payload).await?,
+            TransactionMode::V1 => self.send_v1(&manager, &table, &label, payload).await?,
+            TransactionMode::V2 => self.send_v2(&manager, &table, &label, payload).await?,
         }
 
         Ok(())
@@ -1036,6 +1133,82 @@ mod tests {
             matches!(err2, PipelineError::Internal(ref msg) if msg.contains("database")),
             "Expected empty database error, got: {err2}"
         );
+    }
+
+    #[test]
+    fn test_starrocks_v1_table_name_resolution() {
+        let config = base_config();
+        let sink = StarRocksSink::try_new(config).unwrap();
+
+        assert_eq!(
+            sink.manager_for("logs").properties().table.as_deref(),
+            Some("otel_logs")
+        );
+        assert_eq!(
+            sink.manager_for("metrics").properties().table.as_deref(),
+            Some("otel_metrics")
+        );
+        assert_eq!(
+            sink.manager_for("traces").properties().table.as_deref(),
+            Some("otel_traces")
+        );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("logs"), &sink.manager_for("traces")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("logs"), &sink.manager_for("metrics")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
+        assert!(
+            !Arc::ptr_eq(&sink.manager_for("metrics"), &sink.manager_for("traces")),
+            "PerSignal mapping must build distinct managers per signal table"
+        );
+    }
+
+    #[test]
+    fn test_unified_mapping_shares_single_manager_with_table_set() {
+        let mut config = base_config();
+        config.table_mapping = TableMapping::Unified {
+            table: "otel_all".to_string(),
+            signal_type_column: "signal_type".to_string(),
+        };
+        let sink = StarRocksSink::try_new(config).unwrap();
+
+        let logs_mgr = sink.manager_for("logs");
+        let metrics_mgr = sink.manager_for("metrics");
+        let traces_mgr = sink.manager_for("traces");
+
+        assert_eq!(logs_mgr.properties().table.as_deref(), Some("otel_all"));
+        assert!(
+            Arc::ptr_eq(&logs_mgr, &metrics_mgr) && Arc::ptr_eq(&logs_mgr, &traces_mgr),
+            "Unified mapping must share a single Arc<StreamLoadManager> across all signals"
+        );
+    }
+
+    #[test]
+    fn test_try_new_validates_empty_table_mapping_fields() {
+        let mut cfg_empty_logs = base_config();
+        cfg_empty_logs.table_mapping = TableMapping::PerSignal {
+            logs: "   ".to_string(),
+            metrics: "otel_metrics".to_string(),
+            traces: "otel_traces".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_logs).is_err());
+
+        let mut cfg_empty_unified_table = base_config();
+        cfg_empty_unified_table.table_mapping = TableMapping::Unified {
+            table: String::new(),
+            signal_type_column: "signal_type".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_unified_table).is_err());
+
+        let mut cfg_empty_unified_col = base_config();
+        cfg_empty_unified_col.table_mapping = TableMapping::Unified {
+            table: "otel_all".to_string(),
+            signal_type_column: " ".to_string(),
+        };
+        assert!(StarRocksSink::try_new(cfg_empty_unified_col).is_err());
     }
 
     #[test]
@@ -1472,5 +1645,230 @@ mod tests {
         let manager = sink.manager();
         let sink2 = StarRocksSink::with_manager(config, manager).unwrap();
         assert!(sink2.config.tls.ca_cert_path.is_some());
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockHttpRequest {
+        start_line: String,
+        path: String,
+        headers: std::collections::HashMap<String, String>,
+    }
+
+    async fn handle_mock_http_connection<F>(
+        mut stream: tokio::net::TcpStream,
+        response_fn: &F,
+        recorded: &std::sync::Arc<tokio::sync::Mutex<Vec<MockHttpRequest>>>,
+    ) -> std::io::Result<()>
+    where
+        F: Fn(&str, &str) -> (u16, &'static str) + Send + Sync,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+
+        let header_end = loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let header_str = String::from_utf8_lossy(&buf[..header_end]);
+        let mut lines = header_str.split("\r\n");
+        let start_line = lines.next().unwrap_or("").to_string();
+        let mut parts = start_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+
+        if headers.get("expect").map(String::as_str) == Some("100-continue") {
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        }
+
+        let content_length: usize = headers
+            .get("content-length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let already_read = buf.len() - (header_end + 4);
+        if already_read < content_length {
+            let to_read = content_length - already_read;
+            let mut remaining = vec![0u8; to_read];
+            stream.read_exact(&mut remaining).await?;
+        }
+
+        recorded.lock().await.push(MockHttpRequest {
+            start_line,
+            path: path.clone(),
+            headers,
+        });
+
+        let (status, body) = response_fn(&method, &path);
+        let resp = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(resp.as_bytes()).await?;
+        stream.flush().await?;
+        let _ = stream.shutdown().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_v1_per_signal_sinks_send_to_correct_table_url_paths() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn =
+                |_method: &str, _path: &str| (200, r#"{"Status":"Success","NumberLoadedRows":3}"#);
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V1;
+
+        let primary_sink = StarRocksSink::try_new(config.clone()).unwrap();
+        let traces_manager = primary_sink.manager_for("traces");
+        let metrics_manager = primary_sink.manager_for("metrics");
+
+        let mut logs_sink = primary_sink;
+        let mut traces_sink = StarRocksSink::with_manager(config.clone(), traces_manager).unwrap();
+        let mut metrics_sink = StarRocksSink::with_manager(config, metrics_manager).unwrap();
+
+        let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(1);
+        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
+        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(1);
+
+        let logs_handle = tokio::spawn(async move { logs_sink.run(logs_rx).await });
+        let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
+        let metrics_handle = tokio::spawn(async move { metrics_sink.run(metrics_rx).await });
+
+        logs_tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(logs_tx);
+        logs_handle.await.unwrap().unwrap();
+
+        traces_tx
+            .send(SignalBatch::Traces(make_batch()))
+            .await
+            .unwrap();
+        drop(traces_tx);
+        traces_handle.await.unwrap().unwrap();
+
+        metrics_tx
+            .send(SignalBatch::Metrics(make_batch()))
+            .await
+            .unwrap();
+        drop(metrics_tx);
+        metrics_handle.await.unwrap().unwrap();
+
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 3, "Expected 3 requests, got {}", reqs.len());
+        assert_eq!(reqs[0].path, "/api/otel/otel_logs/_stream_load");
+        assert_eq!(reqs[1].path, "/api/otel/otel_traces/_stream_load");
+        assert_eq!(reqs[2].path, "/api/otel/otel_metrics/_stream_load");
+        assert!(
+            reqs[0]
+                .start_line
+                .starts_with("PUT /api/otel/otel_logs/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[0].start_line
+        );
+        assert!(
+            reqs[1]
+                .start_line
+                .starts_with("PUT /api/otel/otel_traces/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[1].start_line
+        );
+        assert!(
+            reqs[2]
+                .start_line
+                .starts_with("PUT /api/otel/otel_metrics/_stream_load "),
+            "Unexpected start-line: {}",
+            reqs[2].start_line
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_per_signal_sends_matching_table_header_across_all_phases() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = |_method: &str, path: &str| {
+                if path == "/api/transaction/begin" {
+                    (200, r#"{"Status":"OK","TxnId":42}"#)
+                } else {
+                    (200, r#"{"Status":"OK"}"#)
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V2;
+
+        let primary_sink = StarRocksSink::try_new(config.clone()).unwrap();
+        let traces_manager = primary_sink.manager_for("traces");
+        let mut traces_sink = StarRocksSink::with_manager(config, traces_manager).unwrap();
+
+        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
+        let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
+
+        traces_tx
+            .send(SignalBatch::Traces(make_batch()))
+            .await
+            .unwrap();
+        drop(traces_tx);
+        traces_handle.await.unwrap().unwrap();
+
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(
+            reqs.len(),
+            4,
+            "Expected 4 requests in V2 transaction sequence, got {}",
+            reqs.len()
+        );
+        assert_eq!(reqs[0].path, "/api/transaction/begin");
+        assert_eq!(reqs[1].path, "/api/transaction/load");
+        assert_eq!(reqs[2].path, "/api/transaction/prepare");
+        assert_eq!(reqs[3].path, "/api/transaction/commit");
+
+        for (i, req) in reqs.iter().enumerate() {
+            assert_eq!(
+                req.headers.get("table").map(String::as_str),
+                Some("otel_traces"),
+                "Request {} ({}) missing or mismatched `table` header",
+                i,
+                req.path
+            );
+        }
     }
 }

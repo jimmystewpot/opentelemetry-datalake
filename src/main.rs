@@ -874,15 +874,14 @@ async fn main() -> anyhow::Result<()> {
         );
 
         let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())?;
-        let shared_manager = primary_sink.manager();
+        let traces_manager = primary_sink.manager_for("traces");
+        let metrics_manager = primary_sink.manager_for("metrics");
 
         let mut logs_sink = primary_sink;
-        let mut traces_sink = starrocks_sink::StarRocksSink::with_manager(
-            starrocks_cfg.clone(),
-            std::sync::Arc::clone(&shared_manager),
-        )?;
+        let mut traces_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg.clone(), traces_manager)?;
         let mut metrics_sink =
-            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, shared_manager)?;
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, metrics_manager)?;
 
         logs_sink_handle = tokio::spawn(async move {
             let res = logs_sink.run(logs_sink_rx).await;
@@ -1376,6 +1375,59 @@ mod tests {
             .expect("StarRocks config should deserialize");
 
         assert!(validate_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_starrocks_per_signal_sinks_wiring() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://localhost:8030"]
+        username = "root"
+        database = "telemetry"
+        [starrocks.table_mapping]
+        type = "per_signal"
+        logs = "telemetry_logs"
+        metrics = "telemetry_metrics"
+        traces = "telemetry_traces"
+        "#;
+        let config: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("StarRocks per-signal config should deserialize");
+
+        let starrocks_cfg = config
+            .starrocks
+            .expect("starrocks config should be present");
+
+        let primary_sink = starrocks_sink::StarRocksSink::try_new(starrocks_cfg.clone())
+            .expect("primary_sink try_new should succeed");
+        let traces_manager = primary_sink.manager_for("traces");
+        let metrics_manager = primary_sink.manager_for("metrics");
+
+        let logs_sink = primary_sink;
+        let traces_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg.clone(), traces_manager)
+                .expect("traces_sink with_manager should succeed");
+        let metrics_sink =
+            starrocks_sink::StarRocksSink::with_manager(starrocks_cfg, metrics_manager)
+                .expect("metrics_sink with_manager should succeed");
+
+        assert_eq!(
+            logs_sink.manager().properties().table.as_deref(),
+            Some("telemetry_logs")
+        );
+        assert_eq!(
+            traces_sink.manager().properties().table.as_deref(),
+            Some("telemetry_traces")
+        );
+        assert_eq!(
+            metrics_sink.manager().properties().table.as_deref(),
+            Some("telemetry_metrics")
+        );
     }
 
     #[test]
