@@ -1692,7 +1692,7 @@ mod tests {
             }
         }
 
-        if headers.get("expect").map(|v| v.as_str()) == Some("100-continue") {
+        if headers.get("expect").map(String::as_str) == Some("100-continue") {
             stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
         }
 
@@ -1765,11 +1765,17 @@ mod tests {
         drop(logs_tx);
         logs_handle.await.unwrap().unwrap();
 
-        traces_tx.send(SignalBatch::Traces(make_batch())).await.unwrap();
+        traces_tx
+            .send(SignalBatch::Traces(make_batch()))
+            .await
+            .unwrap();
         drop(traces_tx);
         traces_handle.await.unwrap().unwrap();
 
-        metrics_tx.send(SignalBatch::Metrics(make_batch())).await.unwrap();
+        metrics_tx
+            .send(SignalBatch::Metrics(make_batch()))
+            .await
+            .unwrap();
         drop(metrics_tx);
         metrics_handle.await.unwrap().unwrap();
 
@@ -1781,17 +1787,23 @@ mod tests {
         assert_eq!(reqs[1].path, "/api/otel/otel_traces/_stream_load");
         assert_eq!(reqs[2].path, "/api/otel/otel_metrics/_stream_load");
         assert!(
-            reqs[0].start_line.starts_with("PUT /api/otel/otel_logs/_stream_load "),
+            reqs[0]
+                .start_line
+                .starts_with("PUT /api/otel/otel_logs/_stream_load "),
             "Unexpected start-line: {}",
             reqs[0].start_line
         );
         assert!(
-            reqs[1].start_line.starts_with("PUT /api/otel/otel_traces/_stream_load "),
+            reqs[1]
+                .start_line
+                .starts_with("PUT /api/otel/otel_traces/_stream_load "),
             "Unexpected start-line: {}",
             reqs[1].start_line
         );
         assert!(
-            reqs[2].start_line.starts_with("PUT /api/otel/otel_metrics/_stream_load "),
+            reqs[2]
+                .start_line
+                .starts_with("PUT /api/otel/otel_metrics/_stream_load "),
             "Unexpected start-line: {}",
             reqs[2].start_line
         );
@@ -1828,7 +1840,10 @@ mod tests {
         let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
         let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
 
-        traces_tx.send(SignalBatch::Traces(make_batch())).await.unwrap();
+        traces_tx
+            .send(SignalBatch::Traces(make_batch()))
+            .await
+            .unwrap();
         drop(traces_tx);
         traces_handle.await.unwrap().unwrap();
 
@@ -1848,7 +1863,7 @@ mod tests {
 
         for (i, req) in reqs.iter().enumerate() {
             assert_eq!(
-                req.headers.get("table").map(|s| s.as_str()),
+                req.headers.get("table").map(String::as_str),
                 Some("otel_traces"),
                 "Request {} ({}) missing or mismatched `table` header",
                 i,
