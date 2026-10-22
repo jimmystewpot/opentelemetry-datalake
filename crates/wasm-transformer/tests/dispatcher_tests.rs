@@ -1063,3 +1063,159 @@ async fn test_dispatcher_zero_batch_success_marks_consumed_without_emitting_rows
         "zero-batch success must mark batch consumed and emit zero rows downstream"
     );
 }
+
+fn trap_with_init_metric_wat() -> &'static str {
+    r#"(module
+        (import "env" "datalake_host_metric_emit" (func $emit (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 100) "instantiations")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32)
+            (call $emit (i32.const 0) (i32.const 100) (i32.const 14) (i64.const 1))
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (unreachable)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_dispatcher_single_rejuvenation_on_trap() {
+    let cache = Arc::new(EngineCache::new_pooling(2, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_with_init_metric_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let mut cfg = test_config(OnErrorPolicy::Passthrough, OnRejectPolicy::Reroute, 1);
+    cfg.allow_unmasked_passthrough = true;
+
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let registry = test_registry();
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 1,
+        },
+        Arc::clone(&cache),
+        module,
+        cfg,
+        output_tx,
+        None,
+        None,
+        Arc::clone(&registry),
+    );
+
+    tokio::spawn(async move {
+        dispatcher.run(input_rx).await.expect("dispatcher run");
+    });
+
+    // Send 2 batches that trigger guest trap
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 1");
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send batch 2");
+    drop(input_tx);
+
+    let received1 = output_rx.recv().await;
+    assert!(received1.is_some(), "Batch 1 should pass through on error");
+    let received2 = output_rx.recv().await;
+    assert!(received2.is_some(), "Batch 2 should pass through on error");
+
+    // Instantiations: exactly 1 at worker start + 2 for the 2 trap rejuvenations = 3
+    assert_eq!(
+        registry.read_counter("instantiations"),
+        3,
+        "Worker must rejuvenate exactly once per guest trap"
+    );
+}
+
+fn trap_fail_on_rejuv_init_wat() -> &'static str {
+    r#"(module
+        (import "env" "datalake_host_metric_emit" (func $emit (param i32 i32 i32 i64)))
+        (memory (export "memory") 1)
+        (data (i32.const 100) "inits")
+        (func (export "datalake_abi_version") (result i32) (i32.const 1))
+        (func (export "datalake_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "datalake_dealloc") (param i32 i32))
+        (func (export "datalake_init") (param i32 i32) (result i32)
+            ;; emit "inits" metric
+            (call $emit (i32.const 0) (i32.const 100) (i32.const 5) (i64.const 1))
+            (i32.const 0)
+        )
+        (func (export "datalake_transform") (param i32 i32) (result i32)
+            (unreachable)
+        )
+    )"#
+}
+
+#[tokio::test]
+async fn test_dispatcher_rejuvenation_pool_exhaustion_terminates_worker_and_drains() {
+    // Pool capacity 1 means only 1 instance slot is available.
+    let cache = Arc::new(EngineCache::new_pooling(1, 64 * 1024 * 1024).expect("cache init"));
+    let module = cache
+        .compile_module(&wat::parse_str(trap_fail_on_rejuv_init_wat()).expect("valid wat"))
+        .expect("compile module");
+
+    let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 1);
+    let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (dlq_tx, mut dlq_rx) = mpsc::channel::<SignalBatch>(8);
+
+    let dispatcher = WasmDispatcher::new(
+        DispatcherConfig {
+            concurrency: 1,
+            worker_channel_capacity: 4,
+        },
+        Arc::clone(&cache),
+        Arc::clone(&module),
+        cfg,
+        output_tx,
+        Some(dlq_tx.into()),
+        None,
+        test_registry(),
+    );
+
+    let disp_handle = tokio::spawn(async move { dispatcher.run(input_rx).await });
+
+    // Occupy the spare pool slot by instantiating an external worker so rejuvenation fails
+    let _occupant = wasm_transformer::worker::WasmWorker::new(
+        99,
+        Arc::clone(&cache),
+        module,
+        test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 1),
+        test_registry(),
+    )
+    .expect("occupy pool slot");
+
+    // Send batch 1 which will trap
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send 1");
+
+    // Verify DLQ receives the trapped batch
+    let dlq_item = dlq_rx.recv().await;
+    assert!(dlq_item.is_some(), "Trapped batch must reach DLQ");
+
+    // Since the worker task terminated due to rejuvenation failure, subsequent sends
+    // cause the dispatcher to observe closed worker channels and shut down.
+    input_tx
+        .send(SignalBatch::Logs(logs_batch()))
+        .await
+        .expect("send 2 to closed worker");
+
+    let disp_res = disp_handle.await.expect("join dispatcher");
+    assert!(
+        disp_res.is_err(),
+        "Dispatcher should detect closed worker channel when worker task terminates"
+    );
+}

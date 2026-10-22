@@ -192,10 +192,14 @@ impl WasmDispatcher {
 
                 while let Some(batch) = wrx.recv().await {
                     let mut w = worker;
-                    let Ok((res, returned_worker)) = tokio::task::spawn_blocking(move || {
-                        // execute_batch is synchronous, so we can call it inside the blocking closure
+                    let Ok((res, rejuv_res, returned_worker)) = tokio::task::spawn_blocking(move || {
                         let res = w.execute_batch(batch);
-                        (res, w)
+                        let rejuv_res = if res.is_err() {
+                            Some(w.rejuvenate())
+                        } else {
+                            None
+                        };
+                        (res, rejuv_res, w)
                     })
                     .await
                     else {
@@ -233,7 +237,6 @@ impl WasmDispatcher {
                         }
                         Err((original_batch, e)) => {
                             warn!(worker_id, "Worker execution trap or error: {e}");
-                            let rejuv_res = worker.rejuvenate();
                             let errored_handled = Self::handle_errored(
                                 worker_id,
                                 e.to_string(),
@@ -243,7 +246,7 @@ impl WasmDispatcher {
                                 err_tx.as_ref(),
                             )
                             .await;
-                            if let Err(rejuv_err) = rejuv_res {
+                            if let Some(Err(rejuv_err)) = rejuv_res {
                                 error!(
                                     worker_id,
                                     "Failed to rejuvenate worker after trap; terminating worker task: {rejuv_err}"

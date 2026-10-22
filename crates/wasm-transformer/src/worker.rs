@@ -262,7 +262,6 @@ impl WasmWorker {
                 } else {
                     e.into()
                 };
-                let _ = self.rejuvenate();
                 return Err((batch, err));
             }
         };
@@ -340,7 +339,6 @@ impl WasmWorker {
                     } else {
                         e.into()
                     };
-                    let _ = self.rejuvenate();
                     return Err((batch, err));
                 }
             },
@@ -375,7 +373,6 @@ impl WasmWorker {
                     } else {
                         e.into()
                     };
-                    let _ = self.rejuvenate();
                     return Err((batch, err));
                 }
             },
@@ -440,7 +437,6 @@ impl WasmWorker {
         match outcome {
             Ok(outcome) => {
                 if let Some(err) = dealloc_err {
-                    let _ = self.rejuvenate();
                     Err((input_batch, WasmTransformError::Wasmtime(err)))
                 } else {
                     self.batches_processed = self.batches_processed.saturating_add(1);
@@ -454,10 +450,7 @@ impl WasmWorker {
                     Ok(outcome)
                 }
             }
-            Err((orig_batch, err)) => {
-                let _ = self.rejuvenate();
-                Err((orig_batch, err))
-            }
+            Err((orig_batch, err)) => Err((orig_batch, err)),
         }
     }
 
