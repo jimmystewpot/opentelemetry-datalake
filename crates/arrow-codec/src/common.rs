@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use pipeline_core::error::PipelineError;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::{Arc, LazyLock};
 
@@ -195,6 +196,11 @@ pub fn write_attributes_json(buf: &mut String, attrs: &[KeyValue]) {
     write_kvlist_json(buf, attrs);
 }
 
+/// Threshold up to which duplicate-key detection uses a zero-allocation linear lookahead scan.
+/// Slices larger than this threshold switch to a linear-time `HashSet` pass to prevent
+/// quadratic algorithmic complexity on pathological payloads.
+const LINEAR_SCAN_THRESHOLD: usize = 32;
+
 /// Serializes a slice of OTLP [`KeyValue`] attributes into `buf` as a JSON object without clearing `buf`.
 ///
 /// Attributes with `None` values are omitted, and duplicate keys adhere to
@@ -204,6 +210,24 @@ pub fn write_kvlist_json(buf: &mut String, attrs: &[KeyValue]) {
         buf.push_str("{}");
         return;
     }
+
+    // For slices larger than `LINEAR_SCAN_THRESHOLD`, precompute the winning (last non-None)
+    // index for each key in O(n) time so pathological payloads cannot trigger O(n^2) scans.
+    let keep_mask: Option<Vec<bool>> = if attrs.len() > LINEAR_SCAN_THRESHOLD {
+        let mut seen = HashSet::with_capacity(attrs.len());
+        let mut keep = vec![false; attrs.len()];
+        for (idx, attr) in attrs.iter().enumerate().rev() {
+            if attr.value.as_ref().is_some_and(|v| v.value.is_some())
+                && seen.insert(attr.key.as_str())
+                && let Some(slot) = keep.get_mut(idx)
+            {
+                *slot = true;
+            }
+        }
+        Some(keep)
+    } else {
+        None
+    };
 
     buf.push('{');
     let mut first = true;
@@ -215,11 +239,15 @@ pub fn write_kvlist_json(buf: &mut String, attrs: &[KeyValue]) {
             continue;
         }
         // Last-write-wins deduplication if duplicate keys exist in the slice
-        let is_overwritten = attrs.get(idx.saturating_add(1)..).is_some_and(|remaining| {
-            remaining.iter().any(|later| {
-                later.key == attr.key && later.value.as_ref().is_some_and(|v| v.value.is_some())
+        let is_overwritten = if let Some(ref keep) = keep_mask {
+            !keep.get(idx).copied().unwrap_or(false)
+        } else {
+            attrs.get(idx.saturating_add(1)..).is_some_and(|remaining| {
+                remaining.iter().any(|later| {
+                    later.key == attr.key && later.value.as_ref().is_some_and(|v| v.value.is_some())
+                })
             })
-        });
+        };
         if is_overwritten {
             continue;
         }
@@ -837,5 +865,49 @@ mod tests {
         assert_eq!(METRICS_SCHEMA.field(0).name(), "name");
         assert_eq!(METRICS_SCHEMA.field(1).name(), "description");
         assert_eq!(METRICS_SCHEMA.field(2).name(), "unit");
+    }
+
+    #[test]
+    fn test_write_kvlist_json_large_slice_linear_deduplication() {
+        // Construct > 32 attributes (LINEAR_SCAN_THRESHOLD) with duplicates and trailing None values
+        let mut attrs = Vec::with_capacity(100);
+        for i in 0_i64..64 {
+            attrs.push(KeyValue {
+                key: format!("key_{i}"),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::IntValue(i)),
+                }),
+                ..Default::default()
+            });
+        }
+        // Overwrite key_0 and key_33 with new values (last-write-wins)
+        attrs.push(KeyValue {
+            key: "key_0".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::IntValue(1000)),
+            }),
+            ..Default::default()
+        });
+        attrs.push(KeyValue {
+            key: "key_33".to_string(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::IntValue(2033)),
+            }),
+            ..Default::default()
+        });
+        // Append trailing None value for key_0 that must be ignored
+        attrs.push(KeyValue {
+            key: "key_0".to_string(),
+            value: None,
+            ..Default::default()
+        });
+
+        let json_str = convert_attributes(&attrs);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.len(), 64);
+        assert_eq!(obj.get("key_0"), Some(&serde_json::json!(1000)));
+        assert_eq!(obj.get("key_33"), Some(&serde_json::json!(2033)));
+        assert_eq!(obj.get("key_63"), Some(&serde_json::json!(63)));
     }
 }
