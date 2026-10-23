@@ -1,11 +1,13 @@
 use arrow::array::{Int32Builder, StringBuilder, TimestampNanosecondBuilder};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use pipeline_core::error::PipelineError;
 use std::sync::Arc;
 
-use crate::common::{convert_attributes, timestamp_to_i64, to_hex_string};
+use crate::common::{
+    TRACES_SCHEMA, append_hex_to_builder, extract_service_name, timestamp_to_i64,
+    write_attributes_json,
+};
 
 /// Decodes OTLP Trace requests into an Arrow `RecordBatch`.
 ///
@@ -14,40 +16,51 @@ use crate::common::{convert_attributes, timestamp_to_i64, to_hex_string};
 /// Returns `PipelineError::Internal` if schema matching or record creation fails.
 #[allow(clippy::too_many_lines)]
 pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, PipelineError> {
-    let mut total_records = 0;
+    let mut total_records: usize = 0;
     for r_span in &req.resource_spans {
         for s_span in &r_span.scope_spans {
-            total_records += s_span.spans.len();
+            total_records = total_records.saturating_add(s_span.spans.len());
         }
     }
 
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
-    let mut trace_state_builder = StringBuilder::new();
-    let mut parent_span_id_builder = StringBuilder::new();
-    let mut name_builder = StringBuilder::new();
+    let mut trace_id_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(32));
+    let mut span_id_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
+    let mut trace_state_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
+    let mut parent_span_id_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
+    let mut name_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(32));
     let mut kind_builder = Int32Builder::with_capacity(total_records);
     let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut end_time_builder = TimestampNanosecondBuilder::with_capacity(total_records);
-    let mut attributes_builder = StringBuilder::new();
-    let mut service_name_builder = StringBuilder::new();
-    let mut resource_attributes_builder = StringBuilder::new();
-    let mut scope_name_builder = StringBuilder::new();
-    let mut scope_version_builder = StringBuilder::new();
+    let mut attributes_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(128));
+    let mut service_name_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(24));
+    let mut resource_attributes_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(128));
+    let mut scope_name_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(24));
+    let mut scope_version_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
     let mut status_code_builder = Int32Builder::with_capacity(total_records);
-    let mut status_message_builder = StringBuilder::new();
+    let mut status_message_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
+
+    let mut resource_attrs_json = String::with_capacity(256);
+    let mut scratch = String::with_capacity(256);
 
     for r_span in &req.resource_spans {
-        let (resource_attrs_json, service_name) = if let Some(ref res) = r_span.resource {
-            let service_name = res
-                .attributes
-                .iter()
-                .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
-                .and_then(|kv| kv.value.as_ref())
-                .map_or_else(|| "unknown".to_string(), crate::common::any_value_to_string);
-            (convert_attributes(&res.attributes), service_name)
+        let service_name = if let Some(ref res) = r_span.resource {
+            write_attributes_json(&mut resource_attrs_json, &res.attributes);
+            extract_service_name(&res.attributes)
         } else {
-            ("{}".to_string(), "unknown".to_string())
+            resource_attrs_json.clear();
+            resource_attrs_json.push_str("{}");
+            std::borrow::Cow::Borrowed("unknown")
         };
 
         for s_span in &r_span.scope_spans {
@@ -58,19 +71,19 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
             };
 
             for span in &s_span.spans {
-                trace_id_builder.append_value(to_hex_string(&span.trace_id));
-                span_id_builder.append_value(to_hex_string(&span.span_id));
+                append_hex_to_builder(&mut trace_id_builder, &span.trace_id);
+                append_hex_to_builder(&mut span_id_builder, &span.span_id);
                 trace_state_builder.append_value(&span.trace_state);
-                parent_span_id_builder.append_value(to_hex_string(&span.parent_span_id));
+                append_hex_to_builder(&mut parent_span_id_builder, &span.parent_span_id);
                 name_builder.append_value(span.name.as_str());
                 kind_builder.append_value(span.kind);
                 timestamp_builder.append_value(timestamp_to_i64(span.start_time_unix_nano)?);
                 end_time_builder.append_value(timestamp_to_i64(span.end_time_unix_nano)?);
 
-                let span_attrs_json = convert_attributes(&span.attributes);
-                attributes_builder.append_value(&span_attrs_json);
+                write_attributes_json(&mut scratch, &span.attributes);
+                attributes_builder.append_value(&scratch);
 
-                service_name_builder.append_value(&service_name);
+                service_name_builder.append_value(service_name.as_ref());
                 resource_attributes_builder.append_value(&resource_attrs_json);
                 scope_name_builder.append_value(scope_name);
                 scope_version_builder.append_value(scope_version);
@@ -86,34 +99,8 @@ pub fn decode_traces(req: &ExportTraceServiceRequest) -> Result<RecordBatch, Pip
         }
     }
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("trace_id", DataType::Utf8, false),
-        Field::new("span_id", DataType::Utf8, false),
-        Field::new("trace_state", DataType::Utf8, false),
-        Field::new("parent_span_id", DataType::Utf8, false),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("kind", DataType::Int32, false),
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new(
-            "end_time",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("attributes", DataType::Utf8, false),
-        Field::new("service_name", DataType::Utf8, false),
-        Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new("scope_name", DataType::Utf8, false),
-        Field::new("scope_version", DataType::Utf8, false),
-        Field::new("status_code", DataType::Int32, false),
-        Field::new("status_message", DataType::Utf8, false),
-    ]));
-
     RecordBatch::try_new(
-        schema,
+        Arc::clone(&*TRACES_SCHEMA),
         vec![
             Arc::new(trace_id_builder.finish()),
             Arc::new(span_id_builder.finish()),
@@ -341,5 +328,12 @@ mod tests {
             result.is_err(),
             "Timestamp overflow must return an error, not silently wrap"
         );
+    }
+
+    #[test]
+    fn test_decode_traces_static_schema_identity() {
+        let b1 = decode_traces(&ExportTraceServiceRequest::default()).unwrap();
+        let b2 = decode_traces(&ExportTraceServiceRequest::default()).unwrap();
+        assert!(Arc::ptr_eq(&b1.schema(), &b2.schema()));
     }
 }

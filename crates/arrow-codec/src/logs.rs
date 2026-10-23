@@ -1,11 +1,13 @@
 use arrow::array::{Int32Builder, StringBuilder, TimestampNanosecondBuilder, UInt32Builder};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use pipeline_core::error::PipelineError;
 use std::sync::Arc;
 
-use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64, to_hex_string};
+use crate::common::{
+    LOGS_SCHEMA, append_any_value_to_builder, append_hex_to_builder, extract_service_name,
+    timestamp_to_i64, write_attributes_json,
+};
 
 /// Decodes OTLP Logs requests into an Arrow `RecordBatch`.
 ///
@@ -14,38 +16,47 @@ use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64, t
 /// Returns `PipelineError::Internal` if schema matching or record creation fails.
 #[allow(clippy::too_many_lines)]
 pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, PipelineError> {
-    let mut total_records = 0;
+    let mut total_records: usize = 0;
     for r_log in &req.resource_logs {
         for s_log in &r_log.scope_logs {
-            total_records += s_log.log_records.len();
+            total_records = total_records.saturating_add(s_log.log_records.len());
         }
     }
 
     let mut timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut observed_timestamp_builder = TimestampNanosecondBuilder::with_capacity(total_records);
     let mut severity_num_builder = Int32Builder::with_capacity(total_records);
-    let mut severity_text_builder = StringBuilder::new();
-    let mut body_builder = StringBuilder::new();
-    let mut trace_id_builder = StringBuilder::new();
-    let mut span_id_builder = StringBuilder::new();
+    let mut severity_text_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(8));
+    let mut body_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(64));
+    let mut trace_id_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(32));
+    let mut span_id_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
     let mut flags_builder = UInt32Builder::with_capacity(total_records);
-    let mut attributes_builder = StringBuilder::new();
-    let mut service_name_builder = StringBuilder::new();
-    let mut resource_attributes_builder = StringBuilder::new();
-    let mut scope_name_builder = StringBuilder::new();
-    let mut scope_version_builder = StringBuilder::new();
+    let mut attributes_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(128));
+    let mut service_name_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(24));
+    let mut resource_attributes_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(128));
+    let mut scope_name_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(24));
+    let mut scope_version_builder =
+        StringBuilder::with_capacity(total_records, total_records.saturating_mul(16));
+
+    let mut resource_attrs_json = String::with_capacity(256);
+    let mut scratch = String::with_capacity(256);
 
     for r_log in &req.resource_logs {
-        let (resource_attrs_json, service_name) = if let Some(ref res) = r_log.resource {
-            let service_name = res
-                .attributes
-                .iter()
-                .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
-                .and_then(|kv| kv.value.as_ref())
-                .map_or_else(|| "unknown".to_string(), any_value_to_string);
-            (convert_attributes(&res.attributes), service_name)
+        let service_name = if let Some(ref res) = r_log.resource {
+            write_attributes_json(&mut resource_attrs_json, &res.attributes);
+            extract_service_name(&res.attributes)
         } else {
-            ("{}".to_string(), "unknown".to_string())
+            resource_attrs_json.clear();
+            resource_attrs_json.push_str("{}");
+            std::borrow::Cow::Borrowed("unknown")
         };
 
         for s_log in &r_log.scope_logs {
@@ -62,21 +73,16 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
                 severity_num_builder.append_value(log.severity_number);
                 severity_text_builder.append_value(&log.severity_text);
 
-                let body_str = log
-                    .body
-                    .as_ref()
-                    .map(any_value_to_string)
-                    .unwrap_or_default();
-                body_builder.append_value(&body_str);
+                append_any_value_to_builder(&mut body_builder, &mut scratch, log.body.as_ref());
 
-                trace_id_builder.append_value(to_hex_string(&log.trace_id));
-                span_id_builder.append_value(to_hex_string(&log.span_id));
+                append_hex_to_builder(&mut trace_id_builder, &log.trace_id);
+                append_hex_to_builder(&mut span_id_builder, &log.span_id);
                 flags_builder.append_value(log.flags);
 
-                let log_attrs_json = convert_attributes(&log.attributes);
-                attributes_builder.append_value(&log_attrs_json);
+                write_attributes_json(&mut scratch, &log.attributes);
+                attributes_builder.append_value(&scratch);
 
-                service_name_builder.append_value(&service_name);
+                service_name_builder.append_value(service_name.as_ref());
                 resource_attributes_builder.append_value(&resource_attrs_json);
                 scope_name_builder.append_value(scope_name);
                 scope_version_builder.append_value(scope_version);
@@ -84,32 +90,8 @@ pub fn decode_logs(req: &ExportLogsServiceRequest) -> Result<RecordBatch, Pipeli
         }
     }
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new(
-            "observed_timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("severity_number", DataType::Int32, false),
-        Field::new("severity_text", DataType::Utf8, false),
-        Field::new("body", DataType::Utf8, false),
-        Field::new("trace_id", DataType::Utf8, false),
-        Field::new("span_id", DataType::Utf8, false),
-        Field::new("flags", DataType::UInt32, false),
-        Field::new("attributes", DataType::Utf8, false),
-        Field::new("service_name", DataType::Utf8, false),
-        Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new("scope_name", DataType::Utf8, false),
-        Field::new("scope_version", DataType::Utf8, false),
-    ]));
-
     RecordBatch::try_new(
-        schema,
+        Arc::clone(&*LOGS_SCHEMA),
         vec![
             Arc::new(timestamp_builder.finish()),
             Arc::new(observed_timestamp_builder.finish()),
@@ -340,5 +322,77 @@ mod tests {
             result.is_err(),
             "Timestamp overflow must return an error, not silently wrap"
         );
+    }
+
+    #[test]
+    fn test_decode_logs_static_schema_identity_and_resource_reset() {
+        use arrow::array::AsArray;
+        let b1 = decode_logs(&ExportLogsServiceRequest::default()).unwrap();
+        let b2 = decode_logs(&ExportLogsServiceRequest::default()).unwrap();
+        assert!(Arc::ptr_eq(&b1.schema(), &b2.schema()));
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![
+                ResourceLogs {
+                    resource: Some(Resource {
+                        attributes: vec![KeyValue {
+                            key: opentelemetry_semantic_conventions::resource::SERVICE_NAME
+                                .to_string(),
+                            value: Some(AnyValue {
+                                value: Some(any_value::Value::StringValue("svc-1".to_string())),
+                            }),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![LogRecord {
+                            time_unix_nano: 100,
+                            attributes: vec![KeyValue {
+                                key: "status".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::IntValue(200)),
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    resource: None,
+                    scope_logs: vec![ScopeLogs {
+                        log_records: vec![LogRecord {
+                            time_unix_nano: 200,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        let batch = decode_logs(&req).unwrap();
+        let attrs_col = batch
+            .column_by_name("attributes")
+            .unwrap()
+            .as_string::<i32>();
+        let res_attrs_col = batch
+            .column_by_name("resource_attributes")
+            .unwrap()
+            .as_string::<i32>();
+        let svc_col = batch
+            .column_by_name("service_name")
+            .unwrap()
+            .as_string::<i32>();
+
+        assert_eq!(attrs_col.value(0), r#"{"status":200}"#);
+        assert_eq!(attrs_col.value(1), "{}");
+        assert_eq!(res_attrs_col.value(0), r#"{"service.name":"svc-1"}"#);
+        assert_eq!(res_attrs_col.value(1), "{}");
+        assert_eq!(svc_col.value(0), "svc-1");
+        assert_eq!(svc_col.value(1), "unknown");
     }
 }
