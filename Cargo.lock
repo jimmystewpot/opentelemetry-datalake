@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "criterion",
+ "hex",
  "opentelemetry-proto",
  "opentelemetry-semantic-conventions",
  "pipeline-core",
