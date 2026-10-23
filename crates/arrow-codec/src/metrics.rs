@@ -1,11 +1,12 @@
 use arrow::array::{Float64Builder, StringBuilder, TimestampNanosecondBuilder};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use pipeline_core::error::PipelineError;
 use std::sync::Arc;
 
-use crate::common::{any_value_to_string, convert_attributes, timestamp_to_i64};
+use crate::common::{
+    METRICS_SCHEMA, extract_service_name, timestamp_to_i64, write_attributes_json,
+};
 
 /// Decodes OTLP Metrics requests into an Arrow `RecordBatch`.
 ///
@@ -47,16 +48,19 @@ struct MetricMeta<'a> {
 impl MetricsRecordBuilder {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            name: StringBuilder::new(),
-            desc: StringBuilder::new(),
-            unit: StringBuilder::new(),
+            name: StringBuilder::with_capacity(capacity, capacity.saturating_mul(32)),
+            desc: StringBuilder::with_capacity(capacity, capacity.saturating_mul(64)),
+            unit: StringBuilder::with_capacity(capacity, capacity.saturating_mul(8)),
             timestamp: TimestampNanosecondBuilder::with_capacity(capacity),
             value: Float64Builder::with_capacity(capacity),
-            attributes: StringBuilder::new(),
-            service_name: StringBuilder::new(),
-            resource_attributes: StringBuilder::new(),
-            scope_name: StringBuilder::new(),
-            scope_version: StringBuilder::new(),
+            attributes: StringBuilder::with_capacity(capacity, capacity.saturating_mul(128)),
+            service_name: StringBuilder::with_capacity(capacity, capacity.saturating_mul(24)),
+            resource_attributes: StringBuilder::with_capacity(
+                capacity,
+                capacity.saturating_mul(128),
+            ),
+            scope_name: StringBuilder::with_capacity(capacity, capacity.saturating_mul(24)),
+            scope_version: StringBuilder::with_capacity(capacity, capacity.saturating_mul(16)),
         }
     }
 
@@ -95,6 +99,7 @@ fn process_gauge(
     gauge: &opentelemetry_proto::tonic::metrics::v1::Gauge,
     meta: &MetricMeta<'_>,
     ctx: &MetricContext<'_>,
+    scratch: &mut String,
 ) -> Result<(), PipelineError> {
     for dp in &gauge.data_points {
         let val = match dp.value {
@@ -106,13 +111,14 @@ fn process_gauge(
             }
             None => 0.0,
         };
+        write_attributes_json(scratch, &dp.attributes);
         builder.append_record(
             meta.name,
             meta.desc,
             meta.unit,
             dp.time_unix_nano,
             val,
-            &convert_attributes(&dp.attributes),
+            scratch.as_str(),
             ctx.service_name,
             ctx.resource_attributes,
             ctx.scope_name,
@@ -128,6 +134,7 @@ fn process_sum(
     sum: &opentelemetry_proto::tonic::metrics::v1::Sum,
     meta: &MetricMeta<'_>,
     ctx: &MetricContext<'_>,
+    scratch: &mut String,
 ) -> Result<(), PipelineError> {
     for dp in &sum.data_points {
         let val = match dp.value {
@@ -139,13 +146,14 @@ fn process_sum(
             }
             None => 0.0,
         };
+        write_attributes_json(scratch, &dp.attributes);
         builder.append_record(
             meta.name,
             meta.desc,
             meta.unit,
             dp.time_unix_nano,
             val,
-            &convert_attributes(&dp.attributes),
+            scratch.as_str(),
             ctx.service_name,
             ctx.resource_attributes,
             ctx.scope_name,
@@ -160,17 +168,19 @@ fn process_histogram(
     hist: &opentelemetry_proto::tonic::metrics::v1::Histogram,
     meta: &MetricMeta<'_>,
     ctx: &MetricContext<'_>,
+    scratch: &mut String,
 ) -> Result<(), PipelineError> {
     for dp in &hist.data_points {
         #[allow(clippy::cast_precision_loss)]
         let val = dp.sum.unwrap_or(dp.count as f64);
+        write_attributes_json(scratch, &dp.attributes);
         builder.append_record(
             meta.name,
             meta.desc,
             meta.unit,
             dp.time_unix_nano,
             val,
-            &convert_attributes(&dp.attributes),
+            scratch.as_str(),
             ctx.service_name,
             ctx.resource_attributes,
             ctx.scope_name,
@@ -183,20 +193,20 @@ fn process_histogram(
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, PipelineError> {
     // Count total data points first to set builder capacity
-    let mut total_records = 0;
+    let mut total_records: usize = 0;
     for r_metric in &req.resource_metrics {
         for s_metric in &r_metric.scope_metrics {
             for metric in &s_metric.metrics {
                 if let Some(ref data) = metric.data {
                     match data {
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge) => {
-                            total_records += gauge.data_points.len();
+                            total_records = total_records.saturating_add(gauge.data_points.len());
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
-                            total_records += sum.data_points.len();
+                            total_records = total_records.saturating_add(sum.data_points.len());
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
-                            total_records += hist.data_points.len();
+                            total_records = total_records.saturating_add(hist.data_points.len());
                         }
                         _ => {}
                     }
@@ -206,18 +216,17 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
     }
 
     let mut builder = MetricsRecordBuilder::with_capacity(total_records);
+    let mut resource_attrs_json = String::with_capacity(256);
+    let mut scratch = String::with_capacity(256);
 
     for r_metric in &req.resource_metrics {
-        let (resource_attrs_json, service_name) = if let Some(ref res) = r_metric.resource {
-            let service_name = res
-                .attributes
-                .iter()
-                .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
-                .and_then(|kv| kv.value.as_ref())
-                .map_or_else(|| "unknown".to_string(), any_value_to_string);
-            (convert_attributes(&res.attributes), service_name)
+        let service_name = if let Some(ref res) = r_metric.resource {
+            write_attributes_json(&mut resource_attrs_json, &res.attributes);
+            extract_service_name(&res.attributes)
         } else {
-            ("{}".to_string(), "unknown".to_string())
+            resource_attrs_json.clear();
+            resource_attrs_json.push_str("{}");
+            std::borrow::Cow::Borrowed("unknown")
         };
 
         for s_metric in &r_metric.scope_metrics {
@@ -228,7 +237,7 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
             };
 
             let ctx = MetricContext {
-                service_name: &service_name,
+                service_name: service_name.as_ref(),
                 resource_attributes: &resource_attrs_json,
                 scope_name,
                 scope_version,
@@ -244,13 +253,13 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
                 if let Some(ref data) = metric.data {
                     match data {
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(gauge) => {
-                            process_gauge(&mut builder, gauge, &meta, &ctx)?;
+                            process_gauge(&mut builder, gauge, &meta, &ctx, &mut scratch)?;
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(sum) => {
-                            process_sum(&mut builder, sum, &meta, &ctx)?;
+                            process_sum(&mut builder, sum, &meta, &ctx, &mut scratch)?;
                         }
                         opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(hist) => {
-                            process_histogram(&mut builder, hist, &meta, &ctx)?;
+                            process_histogram(&mut builder, hist, &meta, &ctx, &mut scratch)?;
                         }
                         _ => {}
                     }
@@ -259,25 +268,8 @@ pub fn decode_metrics(req: &ExportMetricsServiceRequest) -> Result<RecordBatch, 
         }
     }
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("description", DataType::Utf8, false),
-        Field::new("unit", DataType::Utf8, false),
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Nanosecond, None),
-            false,
-        ),
-        Field::new("value", DataType::Float64, false),
-        Field::new("attributes", DataType::Utf8, false),
-        Field::new("service_name", DataType::Utf8, false),
-        Field::new("resource_attributes", DataType::Utf8, false),
-        Field::new("scope_name", DataType::Utf8, false),
-        Field::new("scope_version", DataType::Utf8, false),
-    ]));
-
     RecordBatch::try_new(
-        schema,
+        Arc::clone(&*METRICS_SCHEMA),
         vec![
             Arc::new(builder.name.finish()),
             Arc::new(builder.desc.finish()),
@@ -304,6 +296,51 @@ mod tests {
         Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
+
+    #[test]
+    fn test_decode_metrics_static_schema_identity_and_typed_attributes() {
+        let b1 = decode_metrics(&ExportMetricsServiceRequest::default()).unwrap();
+        let b2 = decode_metrics(&ExportMetricsServiceRequest::default()).unwrap();
+        assert!(Arc::ptr_eq(&b1.schema(), &b2.schema()));
+
+        let r_metric = ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "req_count".to_string(),
+                    data: Some(metric::Data::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: 1_000,
+                            value: Some(
+                                opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsInt(5),
+                            ),
+                            attributes: vec![KeyValue {
+                                key: "worker".to_string(),
+                                value: Some(AnyValue {
+                                    value: Some(any_value::Value::IntValue(3)),
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let batch = decode_metrics(&ExportMetricsServiceRequest {
+            resource_metrics: vec![r_metric],
+        })
+        .unwrap();
+        let attrs = batch
+            .column_by_name("attributes")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0);
+        assert_eq!(attrs, r#"{"worker":3}"#);
+    }
 
     #[test]
     fn test_decode_metrics_empty() {
