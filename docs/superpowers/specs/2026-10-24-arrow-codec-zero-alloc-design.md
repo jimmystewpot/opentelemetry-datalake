@@ -186,8 +186,8 @@ pub fn escape_json_str(s: &str, buf: &mut String) {
             '\t' => buf.push_str("\\t"),
             '\x08' => buf.push_str("\\b"),
             '\x0C' => buf.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(buf, "\\u{:04x}", c as u32);
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(buf, "\\u{:04x}", u32::from(c));
             }
             c => buf.push(c),
         }
@@ -251,7 +251,14 @@ fn write_any_value_json(buf: &mut String, val: &AnyValue) {
         }
         Some(any_value::Value::DoubleValue(d)) => {
             if d.is_finite() {
+                let start = buf.len();
                 let _ = write!(buf, "{d}");
+                if !buf.as_bytes()[start..]
+                    .iter()
+                    .any(|&b| b == b'.' || b == b'e' || b == b'E')
+                {
+                    buf.push_str(".0");
+                }
             } else {
                 buf.push_str("null");
             }
@@ -365,7 +372,7 @@ pub fn any_value_to_string(val: &AnyValue) -> String {
 #### Service Name Extraction
 ```rust
 #[must_use]
-pub fn extract_service_name<'a>(attributes: &'a [KeyValue]) -> std::borrow::Cow<'a, str> {
+pub fn extract_service_name(attributes: &[KeyValue]) -> std::borrow::Cow<'_, str> {
     let Some(val) = attributes
         .iter()
         .find(|kv| kv.key == opentelemetry_semantic_conventions::resource::SERVICE_NAME)
@@ -377,7 +384,7 @@ pub fn extract_service_name<'a>(attributes: &'a [KeyValue]) -> std::borrow::Cow<
     match &val.value {
         Some(any_value::Value::StringValue(s)) => std::borrow::Cow::Borrowed(s.as_str()),
         None => std::borrow::Cow::Borrowed("unknown"),
-        _ => std::borrow::Cow::Owned(any_value_to_string(val)),
+        Some(_) => std::borrow::Cow::Owned(any_value_to_string(val)),
     }
 }
 ```

@@ -43,7 +43,7 @@
   - `pub fn append_hex_to_builder(builder: &mut arrow::array::StringBuilder, bytes: &[u8])`
   - `pub fn write_hex_to_string(buf: &mut String, bytes: &[u8])`
   - `pub fn to_hex_string(bytes: &[u8]) -> String`
-  - `pub fn extract_service_name<'a>(attributes: &'a [KeyValue]) -> std::borrow::Cow<'a, str>`
+  - `pub fn extract_service_name(attributes: &[KeyValue]) -> std::borrow::Cow<'_, str>`
 
 - [ ] **Step 1: Add `hex` workspace dependency and write failing unit tests in `crates/arrow-codec/src/common.rs`**
 
@@ -194,11 +194,21 @@ Update `test_convert_attributes_mixed_types` in `crates/arrow-codec/src/common.r
                 }),
                 ..Default::default()
             },
+            KeyValue {
+                key: "whole_float".to_string(),
+                value: Some(AnyValue {
+                    value: Some(any_value::Value::DoubleValue(42.0)),
+                }),
+                ..Default::default()
+            },
         ];
         let json = convert_attributes(&attrs);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["count"], serde_json::json!(42));
+        assert!(parsed["count"].is_i64());
         assert_eq!(parsed["rate"], serde_json::json!(1.23));
+        assert!(parsed["rate"].is_f64());
+        assert!(parsed["whole_float"].is_f64());
         assert_eq!(parsed["enabled"], serde_json::json!(true));
         assert_eq!(parsed["str"], serde_json::json!("val"));
     }
@@ -451,11 +461,12 @@ Expected: FAIL (`Arc::ptr_eq` assertion fails in both `logs.rs` and `traces.rs` 
 - [ ] **Step 3: Refactor `decode_logs` in `crates/arrow-codec/src/logs.rs` and `decode_traces` in `crates/arrow-codec/src/traces.rs`**
 
 Update `logs.rs` and `traces.rs` per Section 3.2 of the spec:
-1. Pre-size all `StringBuilder`s with `StringBuilder::with_capacity(total_records, total_records.saturating_mul(...))`.
-2. Allocate `let mut resource_attrs_json = String::with_capacity(256);` and `let mut scratch = String::with_capacity(256);` before the resource loop.
-3. For each resource: if `Some(ref res)`, extract `service_name` via `extract_service_name(&res.attributes)` and populate `write_attributes_json(&mut resource_attrs_json, &res.attributes)`; if `None`, clear `resource_attrs_json` and push `"{}"`, and set `service_name` to `Cow::Borrowed("unknown")`.
-4. Use `append_hex_to_builder` for `trace_id`, `span_id`, and `parent_span_id`, `append_any_value_to_builder` for `log.body`, and `write_attributes_json(&mut scratch, ...)` for record/span attributes.
-5. Pass `Arc::clone(&*LOGS_SCHEMA)` and `Arc::clone(&*TRACES_SCHEMA)` to `RecordBatch::try_new`.
+1. Replace unused `arrow::datatypes::{DataType, Field, Schema, TimeUnit}` and old `crate::common` imports with `crate::common::{LOGS_SCHEMA, append_any_value_to_builder, append_hex_to_builder, extract_service_name, timestamp_to_i64, write_attributes_json}` in `logs.rs` and `crate::common::{TRACES_SCHEMA, append_hex_to_builder, extract_service_name, timestamp_to_i64, write_attributes_json}` in `traces.rs`.
+2. Pre-size all `StringBuilder`s with `StringBuilder::with_capacity(total_records, total_records.saturating_mul(...))`.
+3. Allocate `let mut resource_attrs_json = String::with_capacity(256);` and `let mut scratch = String::with_capacity(256);` before the resource loop.
+4. For each resource: if `Some(ref res)`, extract `service_name` via `extract_service_name(&res.attributes)` and populate `write_attributes_json(&mut resource_attrs_json, &res.attributes)`; if `None`, clear `resource_attrs_json` and push `"{}"`, and set `service_name` to `std::borrow::Cow::Borrowed("unknown")`.
+5. Use `append_hex_to_builder` for `trace_id`, `span_id`, and `parent_span_id`, `append_any_value_to_builder` for `log.body`, and `write_attributes_json(&mut scratch, ...)` for record/span attributes.
+6. Pass `Arc::clone(&*LOGS_SCHEMA)` and `Arc::clone(&*TRACES_SCHEMA)` to `RecordBatch::try_new`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -541,9 +552,10 @@ Expected: FAIL (`Arc::ptr_eq` assertion fails because `decode_metrics` allocates
 - [ ] **Step 3: Refactor `MetricsRecordBuilder`, `process_gauge`, `process_sum`, `process_histogram`, and `decode_metrics` in `crates/arrow-codec/src/metrics.rs`**
 
 Update `crates/arrow-codec/src/metrics.rs` per Section 3.2 of the spec:
-1. In `MetricsRecordBuilder::with_capacity(capacity)`, replace all `StringBuilder::new()` calls with `StringBuilder::with_capacity(capacity, capacity.saturating_mul(...))`.
-2. Add `scratch: &mut String` parameter to `process_gauge`, `process_sum`, and `process_histogram`, calling `write_attributes_json(scratch, &dp.attributes)` and passing `scratch.as_str()` to `builder.append_record`.
-3. In `decode_metrics`, reuse `resource_attrs_json` (`String::with_capacity(256)`) and `scratch` (`String::with_capacity(256)`), use `extract_service_name`, and pass `Arc::clone(&*METRICS_SCHEMA)` to `RecordBatch::try_new`.
+1. Replace unused `arrow::datatypes::{DataType, Field, Schema, TimeUnit}` and old `crate::common` imports with `crate::common::{METRICS_SCHEMA, extract_service_name, timestamp_to_i64, write_attributes_json}`.
+2. In `MetricsRecordBuilder::with_capacity(capacity)`, replace all `StringBuilder::new()` calls with `StringBuilder::with_capacity(capacity, capacity.saturating_mul(...))`.
+3. Add `scratch: &mut String` parameter to `process_gauge`, `process_sum`, and `process_histogram`, calling `write_attributes_json(scratch, &dp.attributes)` and passing `scratch.as_str()` to `builder.append_record`.
+4. In `decode_metrics`, reuse `resource_attrs_json` (`String::with_capacity(256)`) and `scratch` (`String::with_capacity(256)`), use `extract_service_name`, and pass `Arc::clone(&*METRICS_SCHEMA)` to `RecordBatch::try_new`.
 
 - [ ] **Step 4: Run crate tests, full workspace tests, clippy, formatting, and benchmarks**
 
