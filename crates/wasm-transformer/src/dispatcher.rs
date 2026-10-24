@@ -8,8 +8,9 @@ use crate::engine::EngineCache;
 use crate::error::WasmTransformError;
 use crate::host_calls::MetricRegistry;
 use crate::worker::{WasmWorker, WorkerOutcome};
+use pipeline_core::buffer::BufferSender;
 use pipeline_core::config::{OnErrorPolicy, OnRejectPolicy, WasmTransformerConfig};
-use pipeline_core::pipeline::{PipelineReceiver, PipelineSender, SignalBatch};
+use pipeline_core::pipeline::{PipelineReceiver, SignalBatch};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -36,7 +37,7 @@ pub struct WasmDispatcher {
     engine: Arc<EngineCache>,
     module: Arc<Module>,
     transformer_config: WasmTransformerConfig,
-    output: PipelineSender,
+    output: BufferSender,
     reroute_error: Option<crate::DlqOutput>,
     reroute_reject: Option<crate::DlqOutput>,
     registry: Arc<crate::host_calls::MetricRegistry>,
@@ -51,7 +52,7 @@ impl WasmDispatcher {
         engine: Arc<EngineCache>,
         module: Arc<Module>,
         transformer_config: WasmTransformerConfig,
-        output: PipelineSender,
+        output: BufferSender,
         reroute_error: Option<crate::DlqOutput>,
         reroute_reject: Option<crate::DlqOutput>,
         registry: Arc<crate::host_calls::MetricRegistry>,
@@ -304,7 +305,7 @@ impl WasmDispatcher {
         worker_id: usize,
         outcome: WorkerOutcome,
         tf_cfg: &WasmTransformerConfig,
-        output: &PipelineSender,
+        output: &BufferSender,
         err_tx: Option<&crate::DlqOutput>,
         rej_tx: Option<&crate::DlqOutput>,
     ) -> bool {
@@ -364,7 +365,7 @@ impl WasmDispatcher {
         reason: String,
         original: SignalBatch,
         tf_cfg: &WasmTransformerConfig,
-        output: &PipelineSender,
+        output: &BufferSender,
         err_tx: Option<&crate::DlqOutput>,
     ) -> bool {
         let mut healthy = true;

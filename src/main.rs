@@ -659,10 +659,26 @@ async fn main() -> anyhow::Result<()> {
     let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
     let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
 
-    // Channels between Transformers and Sinks
-    let (logs_sink_tx, logs_sink_rx) = tokio::sync::mpsc::channel(1000);
-    let (traces_sink_tx, traces_sink_rx) = tokio::sync::mpsc::channel(1000);
-    let (metrics_sink_tx, metrics_sink_rx) = tokio::sync::mpsc::channel(1000);
+    // Sink buffers between Transformers and Sinks
+    let active_sink_name = if config.iceberg.is_some() {
+        "iceberg"
+    } else if config.elasticsearch.is_some() {
+        "elasticsearch"
+    } else if config.starrocks.is_some() {
+        "starrocks"
+    } else if config.kafka.is_some() {
+        "kafka"
+    } else {
+        "parquet"
+    };
+    let [
+        (logs_sink_tx, logs_sink_rx),
+        (metrics_sink_tx, metrics_sink_rx),
+        (traces_sink_tx, traces_sink_rx),
+    ] = pipeline_core::buffer::SinkBuffer::new_signal_triad(
+        active_sink_name,
+        pipeline_core::buffer::BufferConfig::passthrough(),
+    )?;
 
     // Create shutdown watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

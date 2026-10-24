@@ -1,7 +1,8 @@
 use arrow::array::Array;
 use async_trait::async_trait;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::pipeline::{SignalBatch, Sink};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::collections::HashMap;
@@ -202,9 +203,9 @@ impl KafkaSink {
 
 #[async_trait]
 impl Sink for KafkaSink {
-    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
-        let mut buffer = Vec::with_capacity(8192);
-        while let Some(signal) = input.recv().await {
+    async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
+        let mut payload_buf = Vec::with_capacity(8192);
+        while let Some(signal) = buffer.recv_passthrough().await? {
             let signal_type = match &signal {
                 SignalBatch::Logs(_) => pipeline_core::sort::SignalType::Logs,
                 SignalBatch::Metrics(_) => pipeline_core::sort::SignalType::Metrics,
@@ -232,8 +233,8 @@ impl Sink for KafkaSink {
             };
 
             for (key_opt, sub_batch) in batches_to_send {
-                self.serialize_batch(&sub_batch, &mut buffer)?;
-                let mut record = FutureRecord::to(&self.topic).payload(&buffer);
+                self.serialize_batch(&sub_batch, &mut payload_buf)?;
+                let mut record = FutureRecord::to(&self.topic).payload(&payload_buf);
                 if let Some(ref k) = key_opt {
                     record = record.key(k.as_str());
                 }
@@ -590,7 +591,7 @@ mod tests {
         .unwrap()
         .with_flush_timeout(Duration::from_millis(50));
 
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         drop(tx);
         let res = sink_ok.run(rx).await;
         assert!(
@@ -613,7 +614,7 @@ mod tests {
             .producer
             .send_result(FutureRecord::to("test-topic").payload(b"payload").key("k"));
 
-        let (tx2, rx2) = tokio::sync::mpsc::channel(4);
+        let (tx2, rx2) = SinkBuffer::passthrough_pair();
         drop(tx2);
         let err = sink_fail
             .run(rx2)

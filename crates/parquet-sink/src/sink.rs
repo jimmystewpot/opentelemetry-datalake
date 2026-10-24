@@ -3,8 +3,9 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, Sink};
+use pipeline_core::pipeline::Sink;
 
 use crate::config::ParquetSinkConfig;
 use crate::partition::PartitionManager;
@@ -76,16 +77,16 @@ impl ParquetSink {
 
 #[async_trait]
 impl Sink for ParquetSink {
-    /// Runs the sink processing loop, consuming signal batches from `input` and sweeping idle writers.
+    /// Runs the sink processing loop, consuming signal batches from `buffer` and sweeping idle writers.
     ///
-    /// Periodically checks active writers and rolls idle partitions. When the input channel
+    /// Periodically checks active writers and rolls idle partitions. When the input buffer
     /// closes (EOF or graceful shutdown), all active partition writers are flushed and
     /// any in-flight background uploads are awaited before returning.
     ///
     /// # Errors
     /// Returns [`PipelineError`] if batch routing, flushing, or background uploading fails.
     #[allow(clippy::collapsible_if)]
-    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+    async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         let sweep_interval = if self.config.max_file_interval_sec > 0 {
             self.config.max_file_interval_sec.clamp(1, 5)
         } else {
@@ -99,28 +100,35 @@ impl Sink for ParquetSink {
 
         loop {
             tokio::select! {
-                maybe_batch = input.recv() => {
-                    if let Some(batch) = maybe_batch {
-                        let res = run_blocking(|| {
-                            let prepared = self.router.route_and_prepare(batch)?;
-                            self.manager.route_prepared_batch(&prepared)
-                        });
+                maybe_batch = buffer.recv_passthrough() => {
+                    match maybe_batch {
+                        Ok(Some(batch)) => {
+                            let res = run_blocking(|| {
+                                let prepared = self.router.route_and_prepare(batch)?;
+                                self.manager.route_prepared_batch(&prepared)
+                            });
 
-                        match res {
-                            Ok(Ok(())) => {},
-                            Err(e) => {
-                                final_res = Err(pipeline_core::error::PipelineError::Internal(e.to_string()));
-                                break;
-                            },
-                            Ok(Err(e)) => {
-                                tracing::error!("ParquetSink failed to route or write batch: {e}");
-                                final_res = Err(e.into());
-                                break;
+                            match res {
+                                Ok(Ok(())) => {},
+                                Err(e) => {
+                                    final_res = Err(pipeline_core::error::PipelineError::Internal(e.to_string()));
+                                    break;
+                                },
+                                Ok(Err(e)) => {
+                                    tracing::error!("ParquetSink failed to route or write batch: {e}");
+                                    final_res = Err(e.into());
+                                    break;
+                                }
                             }
                         }
-                    } else {
-                        tracing::debug!("ParquetSink input channel closed; draining all partition writers");
-                        break;
+                        Ok(None) => {
+                            tracing::debug!("ParquetSink input channel closed; draining all partition writers");
+                            break;
+                        }
+                        Err(e) => {
+                            final_res = Err(e);
+                            break;
+                        }
                     }
                 }
                 _ = ticker.tick() => {

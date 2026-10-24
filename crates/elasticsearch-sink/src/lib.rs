@@ -18,8 +18,9 @@ use std::sync::Arc;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::pipeline::{SignalBatch, Sink};
 use pipeline_core::sort::{BatchSorter, SignalType};
 
 pub use client::{BulkItem, BulkItemError, BulkItemWrapper, BulkResponse, HttpClient};
@@ -391,7 +392,7 @@ impl ElasticsearchSink {
 #[async_trait]
 impl Sink for ElasticsearchSink {
     #[allow(clippy::too_many_lines)]
-    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+    async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         tracing::info!(
             endpoints = ?self.config.endpoints,
             logs_stream = %self.config.data_streams.logs,
@@ -443,8 +444,15 @@ impl Sink for ElasticsearchSink {
                         return Err(e);
                     }
                 }
-                msg = input.recv() => {
-                    if let Some(signal) = msg {
+                msg = buffer.recv_passthrough() => {
+                    let maybe_signal = match msg {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = Self::drain_join_set(&mut join_set).await;
+                            return Err(e);
+                        }
+                    };
+                    if let Some(signal) = maybe_signal {
                         let (signal_type, batch) = match signal {
                             SignalBatch::Logs(b) => (SignalType::Logs, b),
                             SignalBatch::Metrics(b) => (SignalType::Metrics, b),
@@ -800,7 +808,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let batch = make_log_batch();
         tx.send(SignalBatch::Logs(batch)).await.unwrap();
         drop(tx);
@@ -849,7 +857,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         drop(tx);
 
@@ -881,7 +889,7 @@ mod tests {
         config.max_retries = 2;
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         drop(tx);
 
@@ -928,7 +936,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
@@ -973,7 +981,7 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         // Send batch 1 with 2 rows
         let b1 = make_log_batch_with_timestamps(vec![1_000_000_000, 2_000_000_000]);
@@ -1037,7 +1045,7 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         // Unordered timestamps: 3s, 1s, 2s
         let batch =
             make_log_batch_with_timestamps(vec![3_000_000_000, 1_000_000_000, 2_000_000_000]);
@@ -1082,7 +1090,7 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let run_handle = tokio::spawn(async move { sink.run(rx).await });
 
         // Send 1 batch (well below record limit of 1000)
@@ -1131,7 +1139,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(10);
+        let (_tx, rx) = SinkBuffer::passthrough_pair();
         let err = sink.run(rx).await.unwrap_err();
         assert!(
             matches!(err, PipelineError::Storage(_)),
@@ -1153,7 +1161,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (_tx, rx) = tokio::sync::mpsc::channel(10);
+        let (_tx, rx) = SinkBuffer::passthrough_pair();
         let err = sink.run(rx).await.unwrap_err();
         assert!(
             matches!(err, PipelineError::Storage(_)),
@@ -1210,7 +1218,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let run_handle = tokio::spawn(async move { sink.run(rx).await });
 
         // Drop sender immediately so run() completes cleanly after startup validation
@@ -1240,7 +1248,7 @@ mod tests {
         config.gzip_compression = true;
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         drop(tx);
 
@@ -1267,7 +1275,7 @@ mod tests {
         let config = make_test_config(server.uri(), true);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let empty_batch = make_log_batch().slice(0, 0);
         tx.send(SignalBatch::Logs(empty_batch)).await.unwrap();
         drop(tx);
@@ -1410,7 +1418,7 @@ mod tests {
         config.batching = None;
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let batch = make_log_batch();
         tx.send(SignalBatch::Logs(batch)).await.unwrap();
         drop(tx);
@@ -1484,7 +1492,7 @@ mod tests {
         config.max_retries = 0;
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch_with_service(
             "service-fail",
         )))
@@ -1529,7 +1537,7 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let batch1 = make_log_batch();
         tx.send(SignalBatch::Logs(batch1)).await.unwrap();
 
@@ -1541,9 +1549,7 @@ mod tests {
         tx.send(SignalBatch::Metrics(batch2)).await.unwrap();
         drop(tx);
 
-        let result = sink
-            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
-            .await;
+        let result = sink.run(rx).await;
         assert!(result.is_err(), "expected flush error to propagate");
         assert!(
             in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
@@ -1581,16 +1587,14 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
             .unwrap();
         drop(tx);
 
-        let result = sink
-            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
-            .await;
+        let result = sink.run(rx).await;
         assert!(
             result.is_err(),
             "expected shutdown flush error to propagate"
@@ -1631,11 +1635,8 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-        let run_handle = tokio::spawn(async move {
-            sink.run(pipeline_core::pipeline::PipelineReceiver::from(rx))
-                .await
-        });
+        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
 
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         tx.send(SignalBatch::Metrics(make_metric_batch()))
@@ -1850,14 +1851,12 @@ mod tests {
         let config = make_test_config_with_batching(mock_server.uri());
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let batch = make_test_log_batch(1); // below threshold
         tx.send(SignalBatch::Logs(batch)).await.unwrap();
         drop(tx);
 
-        let _ = sink
-            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
-            .await;
+        let _ = sink.run(rx).await;
 
         let msgs = events.lock().unwrap();
         assert!(
@@ -1955,7 +1954,7 @@ mod tests {
         });
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         // Batch 1: 1 record -> accumulated (below threshold)
         tx.send(SignalBatch::Logs(make_test_log_batch(1)))
             .await
@@ -1966,9 +1965,7 @@ mod tests {
             .unwrap();
         drop(tx);
 
-        let res = sink
-            .run(pipeline_core::pipeline::PipelineReceiver::from(rx))
-            .await;
+        let res = sink.run(rx).await;
         assert!(res.is_ok());
 
         let events = records.lock().unwrap();
@@ -2040,7 +2037,7 @@ mod tests {
         config.max_payload_bytes = 200; // Small limit to force chunking (2 rows = 176 bytes)
 
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         // Create a batch with 4 rows that will exceed 200 bytes
         let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 4]);
@@ -2091,7 +2088,7 @@ mod tests {
         config.max_payload_bytes = 200;
 
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 4]);
         let bodies = StringArray::from(vec!["hello-world-data"; 4]);
@@ -2154,7 +2151,7 @@ mod tests {
 
         let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
 
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         let batch = make_multi_row_log_batch(2); // 2 rows, each serialized NDJSON is ~150 bytes
         tx.send(SignalBatch::Logs(batch))
             .await

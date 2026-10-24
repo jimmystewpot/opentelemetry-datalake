@@ -34,7 +34,7 @@ pub trait Transform: Send + Sync {
     async fn transform(
         &mut self,
         input: PipelineReceiver,
-        output: PipelineSender,
+        output: crate::buffer::BufferSender,
     ) -> Result<(), PipelineError>;
 }
 
@@ -42,13 +42,13 @@ pub trait Transform: Send + Sync {
 #[async_trait]
 pub trait Sink: Send + Sync {
     /// Start the sink processing task.
-    async fn run(&mut self, input: PipelineReceiver) -> Result<(), PipelineError>;
+    async fn run(&mut self, buffer: crate::buffer::SinkBuffer) -> Result<(), PipelineError>;
 }
 
 /// Fanout structure handling routing to multiple downstreams.
 #[derive(Debug, Clone)]
 pub struct Fanout {
-    outputs: Vec<PipelineSender>,
+    outputs: Vec<crate::buffer::BufferSender>,
 }
 
 impl Fanout {
@@ -58,7 +58,7 @@ impl Fanout {
     ///
     /// Returns `PipelineError::Internal` if `outputs` is empty, since a
     /// fanout with zero sinks would silently drop all data.
-    pub fn try_new(outputs: Vec<PipelineSender>) -> Result<Self, PipelineError> {
+    pub fn try_new(outputs: Vec<crate::buffer::BufferSender>) -> Result<Self, PipelineError> {
         if outputs.is_empty() {
             return Err(PipelineError::Internal(
                 "Fanout requires at least one output".into(),
@@ -73,12 +73,18 @@ impl Fanout {
     ///
     /// Returns `PipelineError::DownstreamClosed` if any receiver has hung up.
     pub async fn send(&self, batch: SignalBatch) -> Result<(), PipelineError> {
-        for output in &self.outputs {
+        let Some((last, rest)) = self.outputs.split_last() else {
+            return Ok(());
+        };
+        for output in rest {
             output
                 .send(batch.clone())
                 .await
                 .map_err(|_| PipelineError::DownstreamClosed)?;
         }
+        last.send(batch)
+            .await
+            .map_err(|_| PipelineError::DownstreamClosed)?;
         Ok(())
     }
 }
@@ -86,15 +92,73 @@ impl Fanout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferConfig, BufferSender, SinkBuffer};
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
-    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn test_signal_triad_routes_each_signal_to_dedicated_sink_buffer() {
+        let [
+            (logs_tx, mut logs_buf),
+            (metrics_tx, mut metrics_buf),
+            (traces_tx, mut traces_buf),
+        ] = SinkBuffer::new_signal_triad("test", BufferConfig::passthrough()).unwrap();
+
+        let logs_fanout = Fanout::try_new(vec![logs_tx]).unwrap();
+        let metrics_fanout = Fanout::try_new(vec![metrics_tx]).unwrap();
+        let traces_fanout = Fanout::try_new(vec![traces_tx]).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let logs_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+                .unwrap();
+        let metrics_batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![2, 3]))])
+                .unwrap();
+        let traces_batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![4, 5, 6]))]).unwrap();
+
+        logs_fanout
+            .send(SignalBatch::Logs(logs_batch))
+            .await
+            .unwrap();
+        metrics_fanout
+            .send(SignalBatch::Metrics(metrics_batch))
+            .await
+            .unwrap();
+        traces_fanout
+            .send(SignalBatch::Traces(traces_batch))
+            .await
+            .unwrap();
+
+        drop(logs_fanout);
+        drop(metrics_fanout);
+        drop(traces_fanout);
+
+        match logs_buf.recv_passthrough().await.unwrap().unwrap() {
+            SignalBatch::Logs(b) => assert_eq!(b.num_rows(), 1),
+            other => panic!("Expected Logs, got {other:?}"),
+        }
+        assert!(logs_buf.recv_passthrough().await.unwrap().is_none());
+
+        match metrics_buf.recv_passthrough().await.unwrap().unwrap() {
+            SignalBatch::Metrics(b) => assert_eq!(b.num_rows(), 2),
+            other => panic!("Expected Metrics, got {other:?}"),
+        }
+        assert!(metrics_buf.recv_passthrough().await.unwrap().is_none());
+
+        match traces_buf.recv_passthrough().await.unwrap().unwrap() {
+            SignalBatch::Traces(b) => assert_eq!(b.num_rows(), 3),
+            other => panic!("Expected Traces, got {other:?}"),
+        }
+        assert!(traces_buf.recv_passthrough().await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn test_fanout_send() {
-        let (tx1, mut rx1) = mpsc::channel(10);
-        let (tx2, mut rx2) = mpsc::channel(10);
+        let (tx1, mut rx1) = SinkBuffer::passthrough_pair();
+        let (tx2, mut rx2) = SinkBuffer::passthrough_pair();
         let fanout = Fanout::try_new(vec![tx1, tx2]).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
@@ -104,14 +168,14 @@ mod tests {
 
         fanout.send(signal).await.unwrap();
 
-        assert!(rx1.recv().await.is_some());
-        assert!(rx2.recv().await.is_some());
+        assert!(rx1.recv_passthrough().await.unwrap().is_some());
+        assert!(rx2.recv_passthrough().await.unwrap().is_some());
     }
 
     /// Fanout with zero outputs must be rejected to prevent silent data loss.
     #[test]
     fn test_fanout_empty_outputs() {
-        let outputs: Vec<PipelineSender> = vec![];
+        let outputs: Vec<BufferSender> = vec![];
         let result = Fanout::try_new(outputs);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -125,8 +189,8 @@ mod tests {
     /// `DownstreamClosed` so the upstream can propagate backpressure.
     #[tokio::test]
     async fn test_fanout_downstream_closed() {
-        let (tx1, rx1) = mpsc::channel(10);
-        let (tx2, _rx2) = mpsc::channel(10);
+        let (tx1, rx1) = SinkBuffer::passthrough_pair();
+        let (tx2, _rx2) = SinkBuffer::passthrough_pair();
         let fanout = Fanout::try_new(vec![tx1, tx2]).unwrap();
 
         // Drop the first receiver to simulate a downstream failure.
@@ -149,14 +213,14 @@ mod tests {
     /// case and must not be rejected.
     #[tokio::test]
     async fn test_fanout_single_output() {
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, mut rx) = SinkBuffer::passthrough_pair();
         let fanout = Fanout::try_new(vec![tx]).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![99]))]).unwrap();
         fanout.send(SignalBatch::Logs(batch)).await.unwrap();
-        assert!(rx.recv().await.is_some());
+        assert!(rx.recv_passthrough().await.unwrap().is_some());
     }
 
     /// When a downstream channel is full, `send()` must block until the
@@ -164,16 +228,25 @@ mod tests {
     /// This validates bounded-channel backpressure semantics.
     #[tokio::test]
     async fn test_fanout_full_channel_backpressure() {
-        // Capacity 1: second send will block until receiver drains.
-        let (tx, mut rx) = mpsc::channel(1);
-        let fanout = Arc::new(Fanout::try_new(vec![tx]).unwrap());
-
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
         let batch1 =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
                 .unwrap();
         let batch2 =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+
+        // Capacity of 1 batch per signal: second send will block until receiver drains.
+        let batch_bytes = batch1.get_array_memory_size();
+        let (tx, mut rx) = SinkBuffer::new(
+            "test_bp",
+            BufferConfig {
+                max_buffer_bytes: (batch_bytes as u64) * 3,
+                max_batch_size_bytes: batch_bytes,
+                ..BufferConfig::passthrough()
+            },
+        )
+        .unwrap();
+        let fanout = Arc::new(Fanout::try_new(vec![tx]).unwrap());
 
         // Fill the channel
         fanout.send(SignalBatch::Metrics(batch1)).await.unwrap();
@@ -188,9 +261,9 @@ mod tests {
         });
 
         // Drain one item, unblocking the sender.
-        assert!(rx.recv().await.is_some());
+        assert!(rx.recv_passthrough().await.unwrap().is_some());
         send_task.await.unwrap();
-        assert!(rx.recv().await.is_some());
+        assert!(rx.recv_passthrough().await.unwrap().is_some());
     }
 
     /// Multiple concurrent senders writing to the same Fanout must not
@@ -198,7 +271,7 @@ mod tests {
     /// downstream without loss.
     #[tokio::test]
     async fn test_fanout_concurrent_senders() {
-        let (tx1, mut rx1) = mpsc::channel(32);
+        let (tx1, mut rx1) = SinkBuffer::passthrough_pair();
         let fanout = Arc::new(Fanout::try_new(vec![tx1]).unwrap());
 
         let schema = Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
@@ -222,9 +295,10 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+        drop(fanout);
 
         let mut received = 0;
-        while rx1.try_recv().is_ok() {
+        while rx1.recv_passthrough().await.unwrap().is_some() {
             received += 1;
         }
         assert_eq!(
@@ -260,9 +334,9 @@ mod tests {
     /// receiver gets its own copy of the data with correct row counts.
     #[tokio::test]
     async fn test_fanout_multi_receiver_data_integrity() {
-        let (tx1, mut rx1) = mpsc::channel(10);
-        let (tx2, mut rx2) = mpsc::channel(10);
-        let (tx3, mut rx3) = mpsc::channel(10);
+        let (tx1, mut rx1) = SinkBuffer::passthrough_pair();
+        let (tx2, mut rx2) = SinkBuffer::passthrough_pair();
+        let (tx3, mut rx3) = SinkBuffer::passthrough_pair();
         let fanout = Fanout::try_new(vec![tx1, tx2, tx3]).unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -276,7 +350,11 @@ mod tests {
         fanout.send(signal).await.unwrap();
 
         for rx in [&mut rx1, &mut rx2, &mut rx3] {
-            let received = rx.recv().await.expect("receiver should get a batch");
+            let received = rx
+                .recv_passthrough()
+                .await
+                .unwrap()
+                .expect("receiver should get a batch");
             match received {
                 SignalBatch::Traces(b) => assert_eq!(b.num_rows(), 4),
                 _ => panic!("Expected Traces signal variant"),

@@ -15,8 +15,9 @@ use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(feature = "aws")]
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::pipeline::{SignalBatch, Sink};
 use pipeline_core::sort::{
     BatchSorter, MissingColumnAction, SignalType, SortColumnDef, SortConfig,
 };
@@ -580,7 +581,7 @@ impl IcebergSink {
 
 #[async_trait]
 impl Sink for IcebergSink {
-    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+    async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         info!(
             "Starting IcebergSink task connected to catalog: {:?}, Table: {}",
             self.config.catalog_type, self.config.table_identifier
@@ -640,8 +641,8 @@ impl Sink for IcebergSink {
 
         loop {
             tokio::select! {
-                maybe_signal = input.recv() => {
-                    match maybe_signal {
+                maybe_signal = buffer.recv_passthrough() => {
+                    match maybe_signal? {
                         Some(signal) => {
                             let signal_type = match &signal {
                                 SignalBatch::Logs(_) => "logs",
@@ -649,14 +650,14 @@ impl Sink for IcebergSink {
                                 SignalBatch::Traces(_) => "traces",
                             };
 
-                            let buffer = self.buffers.entry(table_name.clone()).or_insert_with(|| TableBuffer::new(signal_type));
+                            let table_buf = self.buffers.entry(table_name.clone()).or_insert_with(|| TableBuffer::new(signal_type));
                             let batch = match signal {
                                 SignalBatch::Logs(b) | SignalBatch::Metrics(b) | SignalBatch::Traces(b) => b,
                             };
 
-                            buffer.total_rows += batch.num_rows();
-                            buffer.total_bytes += batch.get_array_memory_size();
-                            buffer.batches.push(batch);
+                            table_buf.total_rows += batch.num_rows();
+                            table_buf.total_bytes += batch.get_array_memory_size();
+                            table_buf.batches.push(batch);
 
                             if self.should_flush(&table_name) {
                                 self.flush_table(&table_name, catalog.as_ref()).await?;
@@ -689,7 +690,6 @@ mod tests {
     use arrow::array::{AsArray, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     fn make_test_logs_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -878,7 +878,7 @@ mod tests {
     #[tokio::test]
     async fn test_iceberg_sink_run() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         let batch = make_test_logs_batch();
         tx.send(SignalBatch::Logs(batch)).await.unwrap();
@@ -1246,7 +1246,7 @@ mod tests {
     #[tokio::test]
     async fn test_iceberg_sink_multi_batch_accumulation() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         // Send multiple batches
         for _ in 0..3 {
@@ -1450,7 +1450,7 @@ mod tests {
     #[tokio::test]
     async fn test_iceberg_sink_run_with_metrics_batch() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Metrics(make_test_metrics_batch()))
             .await
             .unwrap();
@@ -1466,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn test_iceberg_sink_run_with_traces_batch() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
         tx.send(SignalBatch::Traces(make_test_traces_batch()))
             .await
             .unwrap();

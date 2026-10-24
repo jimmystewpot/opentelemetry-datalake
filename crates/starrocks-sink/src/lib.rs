@@ -31,8 +31,9 @@ use arrow::json::LineDelimitedWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
+use pipeline_core::pipeline::{SignalBatch, Sink};
 use serde::{Deserialize, Serialize};
 use starrocks_stream_load::{
     DataFormat, StreamLoadConfig, StreamLoadManager, StreamLoadTableProperties,
@@ -784,7 +785,7 @@ impl Sink for StarRocksSink {
     /// On serialization or network errors the sink propagates
     /// [`PipelineError::DownstreamClosed`] so upstream OTLP receivers can apply
     /// backpressure (returning `503 Service Unavailable` to producers).
-    async fn run(&mut self, mut input: PipelineReceiver) -> Result<(), PipelineError> {
+    async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         info!(
             database = %self.config.database,
             format = %self.config.format,
@@ -816,8 +817,8 @@ impl Sink for StarRocksSink {
                     self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
                     self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
                 }
-                msg = input.recv() => {
-                    if let Some(signal) = msg {
+                msg = buffer.recv_passthrough() => {
+                    if let Some(signal) = msg? {
                         let (signal_type, batch) = match signal {
                             SignalBatch::Logs(b) => (pipeline_core::sort::SignalType::Logs, b),
                             SignalBatch::Metrics(b) => (pipeline_core::sort::SignalType::Metrics, b),
@@ -1559,7 +1560,7 @@ mod tests {
         });
 
         let mut sink = StarRocksSink::try_new(config).unwrap();
-        let (sender, receiver) = tokio::sync::mpsc::channel(100);
+        let (sender, receiver) = SinkBuffer::passthrough_pair();
 
         let handle = tokio::spawn(async move { sink.run(receiver).await });
 
@@ -1753,9 +1754,9 @@ mod tests {
         let mut traces_sink = StarRocksSink::with_manager(config.clone(), traces_manager).unwrap();
         let mut metrics_sink = StarRocksSink::with_manager(config, metrics_manager).unwrap();
 
-        let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(1);
-        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
-        let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(1);
+        let (logs_tx, logs_rx) = SinkBuffer::passthrough_pair();
+        let (traces_tx, traces_rx) = SinkBuffer::passthrough_pair();
+        let (metrics_tx, metrics_rx) = SinkBuffer::passthrough_pair();
 
         let logs_handle = tokio::spawn(async move { logs_sink.run(logs_rx).await });
         let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
@@ -1837,7 +1838,7 @@ mod tests {
         let traces_manager = primary_sink.manager_for("traces");
         let mut traces_sink = StarRocksSink::with_manager(config, traces_manager).unwrap();
 
-        let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1);
+        let (traces_tx, traces_rx) = SinkBuffer::passthrough_pair();
         let traces_handle = tokio::spawn(async move { traces_sink.run(traces_rx).await });
 
         traces_tx
