@@ -1,6 +1,6 @@
 //! `StarRocks` Stream Load sink for the `opentelemetry-datalake` pipeline.
 //!
-//! Receives [`SignalBatch`] events from the internal pipeline channel, serializes
+//! Receives [`pipeline_core::pipeline::SignalBatch`] events via [`SinkBuffer`], serializes
 //! Arrow [`RecordBatch`] data into the configured format, and writes to a `StarRocks`
 //! cluster via the [`starrocks_stream_load`] SDK.
 //!
@@ -31,16 +31,178 @@ use arrow::json::LineDelimitedWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
-use pipeline_core::buffer::SinkBuffer;
+use pipeline_core::buffer::{
+    BufferConfig, FailureClass, LeaseId, LegacyBatchingConfig, SinkBuffer,
+};
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{SignalBatch, Sink};
+use pipeline_core::pipeline::Sink;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use starrocks_stream_load::{
     DataFormat, StreamLoadConfig, StreamLoadManager, StreamLoadTableProperties,
 };
 use std::time::Duration;
 use tracing::{error, info, warn};
-use uuid::Uuid;
+
+/// Type alias for the underlying `StarRocks` Stream Load SDK error.
+pub type StreamLoadError = starrocks_stream_load::Error;
+
+const MAX_STREAM_LOAD_LABEL_LEN: usize = 128;
+
+/// Formats a deterministic `StarRocks` Stream Load transaction label from a table name
+/// and [`LeaseId`] (`dl_{table}_{signal}_{first_seq}_{last_seq}`).
+///
+/// If the formatted label exceeds `StarRocks`'s 128-character limit or `table` contains
+/// characters outside `[A-Za-z0-9_-]`, the table segment is sanitized and truncated with
+/// a 16-character SHA-256 hex digest so retries of the same lease remain deterministic
+/// and collision-resistant within `<= 128` ASCII characters.
+#[must_use]
+pub fn format_lease_label(table: &str, id: LeaseId) -> String {
+    let suffix = format!("_{}_{}_{}", id.signal.as_str(), id.first_seq, id.last_seq);
+    let sanitized_table: String = table
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let candidate = format!("dl_{sanitized_table}{suffix}");
+    if candidate.len() <= MAX_STREAM_LOAD_LABEL_LEN && sanitized_table == table {
+        return candidate;
+    }
+
+    let digest = Sha256::digest(table.as_bytes());
+    let mut hex_buf = [0u8; 64];
+    let hex_str = hex::encode_to_slice(digest, &mut hex_buf)
+        .ok()
+        .and_then(|()| std::str::from_utf8(&hex_buf[..16]).ok())
+        .unwrap_or("0000000000000000");
+
+    let overhead = 3usize
+        .saturating_add(1)
+        .saturating_add(16)
+        .saturating_add(suffix.len());
+    let max_prefix_len = MAX_STREAM_LOAD_LABEL_LEN.saturating_sub(overhead);
+    let prefix_len = sanitized_table.len().min(max_prefix_len);
+    let table_prefix = &sanitized_table[..prefix_len];
+
+    format!("dl_{table_prefix}_{hex_str}{suffix}")
+}
+
+/// Returns `true` if the `StarRocks` Stream Load error indicates that the transaction label
+/// was already committed (`Label Already Exists`), which is treated as an idempotent success.
+#[must_use]
+pub fn is_label_already_exists(err: &StreamLoadError) -> bool {
+    match err {
+        StreamLoadError::StarRocksFailure {
+            status, message, ..
+        } => {
+            status.trim().eq_ignore_ascii_case("Label Already Exists")
+                || status.trim().eq_ignore_ascii_case("LABEL_ALREADY_EXISTS")
+                || message
+                    .to_ascii_lowercase()
+                    .contains("label already exists")
+        }
+        StreamLoadError::Transaction(msg) => {
+            msg.to_ascii_lowercase().contains("label already exists")
+        }
+        _ => false,
+    }
+}
+
+/// Classifies a [`StreamLoadError`] into a [`FailureClass`] for [`SinkBuffer`] lease handling.
+#[must_use]
+pub fn classify_stream_load_error(err: &StreamLoadError) -> FailureClass {
+    match err {
+        StreamLoadError::Network(_) | StreamLoadError::Io(_) | StreamLoadError::Json(_) => {
+            FailureClass::Transient
+        }
+        StreamLoadError::UrlParse(_) => FailureClass::Fatal {
+            reason: err.to_string(),
+        },
+        StreamLoadError::Transaction(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("access denied")
+                || lower.contains("unauthorized")
+                || lower.contains("authentication")
+                || lower.contains("https scheme requires")
+                || lower.contains("no configured load urls")
+            {
+                FailureClass::Fatal {
+                    reason: err.to_string(),
+                }
+            } else if lower.contains("invalid ") {
+                FailureClass::Rejected {
+                    reason: err.to_string(),
+                }
+            } else {
+                FailureClass::Transient
+            }
+        }
+        StreamLoadError::StarRocksFailure {
+            status, message, ..
+        } => {
+            let status_trimmed = status.trim();
+            let http_code = status_trimmed
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<u16>().ok());
+
+            if let Some(code) = http_code {
+                return match code {
+                    401 | 403 => FailureClass::Fatal {
+                        reason: err.to_string(),
+                    },
+                    408 | 429 | 500..=599 => FailureClass::Transient,
+                    400..=499 => FailureClass::Rejected {
+                        reason: err.to_string(),
+                    },
+                    _ => FailureClass::Transient,
+                };
+            }
+
+            let status_lower = status_trimmed.to_ascii_lowercase();
+            let msg_lower = message.to_ascii_lowercase();
+
+            if msg_lower.contains("access denied")
+                || msg_lower.contains("authentication failed")
+                || msg_lower.contains("permission denied")
+                || msg_lower.contains("unauthorized")
+            {
+                return FailureClass::Fatal {
+                    reason: err.to_string(),
+                };
+            }
+
+            if status_lower == "publish timeout"
+                || status_lower == "internal error"
+                || msg_lower.contains("timeout")
+                || msg_lower.contains("timed out")
+                || msg_lower.contains("service unavailable")
+                || msg_lower.contains("too many versions")
+                || msg_lower.contains("too manyversions")
+                || msg_lower.contains("memory limit exceeded")
+                || msg_lower.contains("mem limit exceeded")
+                || msg_lower.contains("no alive backend")
+                || msg_lower.contains("backend not found")
+                || msg_lower.contains("system busy")
+                || msg_lower.contains("overload")
+                || msg_lower.contains("try again")
+                || msg_lower.contains("rpc failed")
+                || msg_lower.contains("connection")
+            {
+                return FailureClass::Transient;
+            }
+
+            FailureClass::Rejected {
+                reason: err.to_string(),
+            }
+        }
+    }
+}
 
 // ─── Data format ────────────────────────────────────────────────────────────
 
@@ -260,7 +422,11 @@ pub struct StarRocksSinkConfig {
     #[serde(default)]
     pub order_by: Option<pipeline_core::sort::SortConfig>,
 
-    /// Optional batch buffering configuration for accumulating records.
+    /// Optional unified sink buffer configuration (`[starrocks.buffer]`).
+    #[serde(default)]
+    pub buffer: Option<BufferConfig>,
+
+    /// Legacy batch buffering configuration (`[starrocks.batching]`).
     #[serde(default)]
     pub batching: Option<StarRocksBatchingConfig>,
 
@@ -270,6 +436,21 @@ pub struct StarRocksSinkConfig {
 }
 
 impl StarRocksSinkConfig {
+    /// Resolves the effective [`BufferConfig`] for this sink, mapping legacy `[starrocks.batching]`
+    /// onto [`BufferConfig`] triggers and enforcing startup validation rules V1–V5.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::Configuration`] if both `buffer` and `batching` are set (V4)
+    /// or if any buffer invariant V1–V5 is violated.
+    pub fn resolved_buffer_config(&self) -> Result<BufferConfig, PipelineError> {
+        let legacy = self.batching.as_ref().map(|b| LegacyBatchingConfig {
+            max_batch_size_bytes: b.max_batch_size_bytes,
+            max_batch_records: b.max_batch_records,
+            max_batch_interval_sec: b.max_batch_interval_sec,
+        });
+        BufferConfig::resolve("starrocks", self.buffer.clone(), legacy, true)
+    }
+
     /// Validates `StarRocks` sink configuration parameters including TLS, URLs, and authentication.
     ///
     /// # Errors
@@ -278,6 +459,7 @@ impl StarRocksSinkConfig {
     /// - `frontend_urls` is empty.
     /// - `username` or `database` is blank.
     /// - `order_by` configuration fails to parse.
+    /// - `[starrocks.buffer]` / `[starrocks.batching]` fails validation (V1–V5).
     pub fn validate(&self) -> Result<(), PipelineError> {
         self.tls.validate()?;
         if self.frontend_urls.is_empty() {
@@ -342,6 +524,7 @@ impl StarRocksSinkConfig {
         if let Some(ref sort_cfg) = self.order_by {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)?;
         }
+        self.resolved_buffer_config()?;
         Ok(())
     }
 }
@@ -517,20 +700,18 @@ impl StarRocksSink {
         })
     }
 
-    /// Serializes a [`RecordBatch`] into [`Bytes`] using the configured format.
-    ///
-    /// Serialization happens into a pre-allocated `Vec<u8>` to avoid repeated
-    /// small allocations. The resulting bytes are checked against
-    /// `max_payload_bytes` before being returned.
+    /// Serializes a [`RecordBatch`] into [`Bytes`] using the given [`StarRocksFormat`].
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] if serialization fails or if the
-    /// serialized payload exceeds `max_payload_bytes`.
-    pub fn serialize_batch(&self, batch: &RecordBatch) -> Result<Bytes, PipelineError> {
+    /// Returns [`PipelineError::Internal`] if serialization fails.
+    pub fn serialize_record_batch(
+        batch: &RecordBatch,
+        format: StarRocksFormat,
+    ) -> Result<Bytes, PipelineError> {
         let mut buf = Vec::with_capacity(batch.get_array_memory_size());
 
-        match self.config.format {
+        match format {
             StarRocksFormat::Ipc => {
                 let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
                     .map_err(|e| PipelineError::Internal(format!("IPC writer init failed: {e}")))?;
@@ -555,7 +736,22 @@ impl StarRocksSink {
             }
         }
 
-        let n = buf.len();
+        Ok(Bytes::from(buf))
+    }
+
+    /// Serializes a [`RecordBatch`] into [`Bytes`] using the configured format.
+    ///
+    /// Serialization happens into a pre-allocated `Vec<u8>` to avoid repeated
+    /// small allocations. The resulting bytes are checked against
+    /// `max_payload_bytes` before being returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Internal`] if serialization fails or if the
+    /// serialized payload exceeds `max_payload_bytes`.
+    pub fn serialize_batch(&self, batch: &RecordBatch) -> Result<Bytes, PipelineError> {
+        let bytes = Self::serialize_record_batch(batch, self.config.format)?;
+        let n = bytes.len();
         let max = self.config.max_payload_bytes;
         if n > max {
             return Err(PipelineError::Internal(format!(
@@ -564,7 +760,7 @@ impl StarRocksSink {
             )));
         }
 
-        Ok(Bytes::from(buf))
+        Ok(bytes)
     }
 
     /// Injects a literal string column into a [`RecordBatch`] for unified table mapping.
@@ -599,47 +795,42 @@ impl StarRocksSink {
         RecordBatch::try_new(new_schema, columns).map_err(PipelineError::Arrow)
     }
 
-    /// Generates a unique V1/V2 transaction label.
-    ///
-    /// Labels use `UUIDv7` (time-ordered) to make them monotonic and debuggable.
-    fn make_label(signal_type: &str) -> String {
-        format!("otel-{signal_type}-{}", Uuid::now_v7())
-    }
-
     /// Processes one batch via the V1 (at-least-once) path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipelineError::DownstreamClosed`] if the SDK exhausts all
-    /// retries, propagating backpressure to the OTLP receiver.
     async fn send_v1(
-        &self,
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
         payload: Bytes,
-    ) -> Result<(), PipelineError> {
-        let response = manager
-            .send_single_batch(label, payload)
-            .await
-            .map_err(|e| {
+    ) -> Result<(), StreamLoadError> {
+        match manager.send_single_batch(label, payload).await {
+            Ok(response) => {
+                info!(
+                    label = label,
+                    table = table,
+                    status = %response.status,
+                    rows = ?response.number_loaded_rows,
+                    "StarRocks V1 load committed"
+                );
+                Ok(())
+            }
+            Err(e) if is_label_already_exists(&e) => {
+                info!(
+                    label = label,
+                    table = table,
+                    "StarRocks V1 stream load returned Label Already Exists; treating as idempotent success"
+                );
+                Ok(())
+            }
+            Err(e) => {
                 error!(
                     label = label,
                     table = table,
                     error = %e,
-                    "StarRocks V1 stream load failed after retries; propagating backpressure"
+                    "StarRocks V1 stream load failed"
                 );
-                PipelineError::DownstreamClosed
-            })?;
-
-        info!(
-            label = label,
-            table = table,
-            status = %response.status,
-            rows = ?response.number_loaded_rows,
-            "StarRocks V1 load committed"
-        );
-        Ok(())
+                Err(e)
+            }
+        }
     }
 
     /// Processes one batch via the V2 (exactly-once, 2PC) path.
@@ -647,22 +838,28 @@ impl StarRocksSink {
     /// Steps: `begin` → `load` → `prepare` → `commit`.
     /// Any failure after `begin` triggers a best-effort `rollback`; the rollback
     /// error is logged but not returned (the original error is propagated).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PipelineError::DownstreamClosed`] on any SDK-level failure,
-    /// propagating backpressure to the OTLP receiver.
     async fn send_v2(
         &self,
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
         payload: Bytes,
-    ) -> Result<(), PipelineError> {
-        let txn_id = manager.begin_transaction(label).await.map_err(|e| {
-            error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
-            PipelineError::DownstreamClosed
-        })?;
+    ) -> Result<(), StreamLoadError> {
+        let txn_id = match manager.begin_transaction(label).await {
+            Ok(id) => id,
+            Err(e) if is_label_already_exists(&e) => {
+                info!(
+                    label = label,
+                    table = table,
+                    "StarRocks V2 begin_transaction returned Label Already Exists; treating as idempotent success"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
+                return Err(e);
+            }
+        };
 
         info!(
             label = label,
@@ -670,40 +867,48 @@ impl StarRocksSink {
             "StarRocks V2 transaction begun"
         );
 
-        let load_result = manager
+        if let Err(e) = manager
             .load_transaction_data(label, &self.config.database, table, 0, payload)
-            .await;
-
-        if let Err(e) = load_result {
+            .await
+        {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 load failed; attempting rollback");
             if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
-            return Err(PipelineError::DownstreamClosed);
+            return Err(e);
         }
 
-        let prep_result = manager.prepare_transaction(label).await;
-        if let Err(e) = prep_result {
+        if let Err(e) = manager.prepare_transaction(label).await {
             error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 prepare failed; attempting rollback");
             if let Err(rb_err) = manager.rollback_transaction(label).await {
                 warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
-            return Err(PipelineError::DownstreamClosed);
+            return Err(e);
         }
 
-        let commit_result = manager.commit_transaction(label).await;
-        if let Err(e) = commit_result {
-            error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
-            if let Err(rb_err) = manager.rollback_transaction(label).await {
-                warn!(
+        let commit_response = match manager.commit_transaction(label).await {
+            Ok(resp) => resp,
+            Err(e) if is_label_already_exists(&e) => {
+                info!(
                     label = label,
-                    error = %rb_err,
-                    "StarRocks V2 rollback after commit failure also failed — transaction {txn_id} may require manual resolution"
+                    txn_id = txn_id,
+                    table = table,
+                    "StarRocks V2 commit_transaction returned Label Already Exists; treating as idempotent success"
                 );
+                return Ok(());
             }
-            return Err(PipelineError::DownstreamClosed);
-        }
-        let commit_response = commit_result.map_err(|_| PipelineError::DownstreamClosed)?;
+            Err(e) => {
+                error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
+                if let Err(rb_err) = manager.rollback_transaction(label).await {
+                    warn!(
+                        label = label,
+                        error = %rb_err,
+                        "StarRocks V2 rollback after commit failure also failed — transaction {txn_id} may require manual resolution"
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         info!(
             label = label,
@@ -714,77 +919,13 @@ impl StarRocksSink {
         );
         Ok(())
     }
-    async fn send_batch(
-        &self,
-        batch: &arrow::record_batch::RecordBatch,
-        signal_type_enum: pipeline_core::sort::SignalType,
-    ) -> Result<(), PipelineError> {
-        let signal_type = match signal_type_enum {
-            pipeline_core::sort::SignalType::Logs => "logs",
-            pipeline_core::sort::SignalType::Metrics => "metrics",
-            pipeline_core::sort::SignalType::Traces => "traces",
-        };
-
-        // For Unified mapping, inject the discriminator column before serialization.
-        let batch = if let Some(col_name) = self.config.table_mapping.signal_type_column() {
-            Self::inject_signal_type_column(batch, col_name, signal_type)?
-        } else {
-            batch.clone()
-        };
-
-        let manager = self.manager_for(signal_type);
-        let table = self.config.table_mapping.table_for(signal_type).to_owned();
-        let label = Self::make_label(signal_type);
-        let payload = self.serialize_batch(&batch)?;
-
-        match self.config.transaction_mode {
-            TransactionMode::V1 => self.send_v1(&manager, &table, &label, payload).await?,
-            TransactionMode::V2 => self.send_v2(&manager, &table, &label, payload).await?,
-        }
-
-        Ok(())
-    }
-
-    async fn flush_buffer(
-        &self,
-        batches: &mut Vec<arrow::record_batch::RecordBatch>,
-        bytes: &mut usize,
-        records: &mut usize,
-        signal_type: pipeline_core::sort::SignalType,
-    ) -> Result<(), PipelineError> {
-        if batches.is_empty() {
-            return Ok(());
-        }
-
-        let schema = batches[0].schema();
-        let refs: Vec<&arrow::record_batch::RecordBatch> = batches.iter().collect();
-        let combined =
-            arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?;
-
-        let sorted = self.sorter.sort(&combined, signal_type)?;
-        self.send_batch(&sorted, signal_type).await?;
-
-        batches.clear();
-        *bytes = 0;
-        *records = 0;
-        Ok(())
-    }
-}
-
-#[derive(Default)]
-struct BufferState {
-    batches: Vec<arrow::record_batch::RecordBatch>,
-    bytes: usize,
-    records: usize,
 }
 
 #[async_trait]
 impl Sink for StarRocksSink {
-    /// Runs the sink loop, processing [`SignalBatch`] events until the channel closes.
-    ///
-    /// On serialization or network errors the sink propagates
-    /// [`PipelineError::DownstreamClosed`] so upstream OTLP receivers can apply
-    /// backpressure (returning `503 Service Unavailable` to producers).
+    /// Runs the sink loop, acquiring transactional [`pipeline_core::buffer::Lease`]s from
+    /// [`SinkBuffer`], offloading sorting and serialization via [`pipeline_core::buffer::Lease::prepare`],
+    /// and acknowledging or nacking each lease according to the `StarRocks` Stream Load outcome.
     async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         info!(
             database = %self.config.database,
@@ -793,67 +934,92 @@ impl Sink for StarRocksSink {
             "StarRocksSink started"
         );
 
-        let batching = self.config.batching.clone();
-        let max_bytes = batching.as_ref().map_or(0, |b| b.max_batch_size_bytes);
-        let max_interval = batching
-            .as_ref()
-            .map_or(86400, |b| b.max_batch_interval_sec);
-        let max_records = batching
-            .as_ref()
-            .and_then(|b| b.max_batch_records)
-            .unwrap_or(usize::MAX);
+        while let Some(lease) = buffer.next_lease().await? {
+            if lease.num_rows() == 0 {
+                lease.ack().await?;
+                continue;
+            }
 
-        let mut logs_buf = BufferState::default();
-        let mut metrics_buf = BufferState::default();
-        let mut traces_buf = BufferState::default();
+            let signal = lease.signal();
+            let sorter = self.sorter.clone();
+            let format = self.config.format;
+            let max_payload_bytes = self.config.max_payload_bytes;
+            let signal_col_opt = self
+                .config
+                .table_mapping
+                .signal_type_column()
+                .map(str::to_owned);
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(max_interval));
-        interval.tick().await;
-
-        loop {
-            tokio::select! {
-                _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
-                    self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
-                    self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
-                    self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
-                }
-                msg = buffer.recv_passthrough() => {
-                    if let Some(signal) = msg? {
-                        let (signal_type, batch) = match signal {
-                            SignalBatch::Logs(b) => (pipeline_core::sort::SignalType::Logs, b),
-                            SignalBatch::Metrics(b) => (pipeline_core::sort::SignalType::Metrics, b),
-                            SignalBatch::Traces(b) => (pipeline_core::sort::SignalType::Traces, b),
-                        };
-
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-
-                        if batching.is_none() {
-                            let sorted = self.sorter.sort(&batch, signal_type)?;
-                            self.send_batch(&sorted, signal_type).await?;
-                        } else {
-                            let buf = match signal_type {
-                                pipeline_core::sort::SignalType::Logs => &mut logs_buf,
-                                pipeline_core::sort::SignalType::Metrics => &mut metrics_buf,
-                                pipeline_core::sort::SignalType::Traces => &mut traces_buf,
-                            };
-
-                            buf.bytes += batch.get_array_memory_size();
-                            buf.records += batch.num_rows();
-                            buf.batches.push(batch);
-
-                            if buf.bytes >= max_bytes || buf.records >= max_records {
-                                self.flush_buffer(&mut buf.batches, &mut buf.bytes, &mut buf.records, signal_type).await?;
-                                interval.reset();
-                            }
-                        }
-                    } else {
-                        self.flush_buffer(&mut logs_buf.batches, &mut logs_buf.bytes, &mut logs_buf.records, pipeline_core::sort::SignalType::Logs).await?;
-                        self.flush_buffer(&mut metrics_buf.batches, &mut metrics_buf.bytes, &mut metrics_buf.records, pipeline_core::sort::SignalType::Metrics).await?;
-                        self.flush_buffer(&mut traces_buf.batches, &mut traces_buf.bytes, &mut traces_buf.records, pipeline_core::sort::SignalType::Traces).await?;
-                        break;
+            let prep_res = lease
+                .prepare(move |batch| {
+                    if batch.num_rows() == 0 {
+                        return Ok(None);
                     }
+                    let sorted_batch = sorter.sort(&batch, signal)?;
+                    let final_batch = if let Some(ref col_name) = signal_col_opt {
+                        Self::inject_signal_type_column(&sorted_batch, col_name, signal.as_str())?
+                    } else {
+                        sorted_batch
+                    };
+                    let payload = Self::serialize_record_batch(&final_batch, format)?;
+                    let n = payload.len();
+                    if n > max_payload_bytes {
+                        return Err(PipelineError::Internal(format!(
+                            "Serialized payload {n} bytes exceeds max_payload_bytes {max_payload_bytes}; \
+                             reduce upstream batch size or increase the limit in config"
+                        )));
+                    }
+                    Ok(Some(payload))
+                })
+                .await;
+
+            let payload = match prep_res {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    lease.ack().await?;
+                    continue;
+                }
+                Err(PipelineError::Storage(e)) => {
+                    return Err(PipelineError::Storage(e));
+                }
+                Err(err) if err.to_string().starts_with("Lease::prepare join error") => {
+                    return Err(err);
+                }
+                Err(err) => {
+                    warn!(
+                        signal = signal.as_str(),
+                        first_seq = lease.id().first_seq,
+                        last_seq = lease.id().last_seq,
+                        attempt = lease.attempt(),
+                        error = %err,
+                        "StarRocks lease preparation failed; nacking as Rejected"
+                    );
+                    lease
+                        .nack(FailureClass::Rejected {
+                            reason: err.to_string(),
+                        })
+                        .await?;
+                    continue;
+                }
+            };
+
+            let signal_str = signal.as_str();
+            let manager = self.manager_for(signal_str);
+            let table = self.config.table_mapping.table_for(signal_str).to_owned();
+            let label = format_lease_label(&table, lease.id());
+
+            let send_res = match self.config.transaction_mode {
+                TransactionMode::V1 => Self::send_v1(&manager, &table, &label, payload).await,
+                TransactionMode::V2 => self.send_v2(&manager, &table, &label, payload).await,
+            };
+
+            match send_res {
+                Ok(()) => {
+                    lease.ack().await?;
+                }
+                Err(err) => {
+                    let class = classify_stream_load_error(&err);
+                    lease.nack(class).await?;
                 }
             }
         }
@@ -870,6 +1036,7 @@ mod tests {
     use arrow::array::{Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use pipeline_core::pipeline::SignalBatch;
     use std::sync::Arc;
 
     fn make_schema() -> Arc<Schema> {
@@ -912,6 +1079,7 @@ mod tests {
             max_retries: default_max_retries(),
             retry_interval_secs: default_retry_interval_secs(),
             order_by: None,
+            buffer: None,
             batching: None,
             tls: pipeline_core::tls::TlsConfig::default(),
         }
@@ -1095,12 +1263,28 @@ mod tests {
 
     #[test]
     fn test_make_label_is_unique_across_calls() {
-        let a = StarRocksSink::make_label("traces");
-        let b = StarRocksSink::make_label("traces");
-        assert_ne!(a, b, "Labels must be unique per call");
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        let a = format_lease_label(
+            "otel_traces",
+            LeaseId {
+                signal: SignalKind::Traces,
+                first_seq: 1,
+                last_seq: 1,
+            },
+        );
+        let b = format_lease_label(
+            "otel_traces",
+            LeaseId {
+                signal: SignalKind::Traces,
+                first_seq: 2,
+                last_seq: 2,
+            },
+        );
+        assert_ne!(a, b, "Labels must be distinct across lease sequence ranges");
         assert!(
-            a.starts_with("otel-traces-"),
-            "Label must include signal type prefix"
+            a.starts_with("dl_otel_traces_traces_"),
+            "Label must include table and signal type prefix"
         );
     }
 
@@ -1238,16 +1422,39 @@ mod tests {
         assert_eq!(StarRocksFormat::Csv.to_string(), "csv");
     }
 
-    /// `make_label` must produce distinct labels for all three signal type prefixes.
+    /// `format_lease_label` must produce distinct labels for all three signal type prefixes.
     #[test]
     fn test_make_label_for_all_signal_types() {
-        let logs_label = StarRocksSink::make_label("logs");
-        let metrics_label = StarRocksSink::make_label("metrics");
-        let traces_label = StarRocksSink::make_label("traces");
+        use pipeline_core::buffer::{LeaseId, SignalKind};
 
-        assert!(logs_label.starts_with("otel-logs-"));
-        assert!(metrics_label.starts_with("otel-metrics-"));
-        assert!(traces_label.starts_with("otel-traces-"));
+        let logs_label = format_lease_label(
+            "otel_logs",
+            LeaseId {
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 1,
+            },
+        );
+        let metrics_label = format_lease_label(
+            "otel_metrics",
+            LeaseId {
+                signal: SignalKind::Metrics,
+                first_seq: 1,
+                last_seq: 1,
+            },
+        );
+        let traces_label = format_lease_label(
+            "otel_traces",
+            LeaseId {
+                signal: SignalKind::Traces,
+                first_seq: 1,
+                last_seq: 1,
+            },
+        );
+
+        assert!(logs_label.starts_with("dl_otel_logs_logs_"));
+        assert!(metrics_label.starts_with("dl_otel_metrics_metrics_"));
+        assert!(traces_label.starts_with("dl_otel_traces_traces_"));
 
         // All labels must be unique
         assert_ne!(logs_label, metrics_label);
@@ -1547,43 +1754,144 @@ mod tests {
 
     #[tokio::test]
     async fn test_starrocks_batch_accumulation_flush() {
-        let mut config = base_config();
-        config.connect_timeout_secs = 0;
-        config.request_timeout_secs = 0;
-        config.max_retries = 0;
-        config.retry_interval_secs = 0;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
 
+        let server_task = tokio::spawn(async move {
+            let response_fn =
+                |_method: &str, _path: &str| (200, r#"{"Status":"Success","NumberLoadedRows":6}"#);
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.max_retries = 0;
         config.batching = Some(StarRocksBatchingConfig {
             max_batch_size_bytes: 1024 * 1024,
             max_batch_interval_sec: 10,
-            max_batch_records: Some(4),
+            max_batch_records: Some(6),
         });
 
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = StarRocksSink::try_new(config).unwrap();
-        let (sender, receiver) = SinkBuffer::passthrough_pair();
+        let (sender, receiver) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+
+        // Enqueue two 3-row batches (total 6 rows <= max_batch_records = 6) before the sink drains
+        sender.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        sender.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(sender);
 
         let handle = tokio::spawn(async move { sink.run(receiver).await });
+        handle.await.unwrap().unwrap();
+        server_task.abort();
 
-        // send 3 rows
-        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
-
-        // wait a little bit
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // task should still be running because it's only 3 records < 4
-        assert!(!handle.is_finished(), "Task should still be buffering");
-
-        // send 3 more rows, bringing total to 6 > 4 (max_batch_records)
-        // This should trigger flush_buffer, which hits SDK, which fails because fast timeouts + 127.0.0.1
-        let _ = sender.send(SignalBatch::Logs(make_batch())).await;
-
-        // Wait for task to finish due to network error from flush
-        let result = handle.await.unwrap();
-
-        assert!(
-            matches!(result, Err(PipelineError::DownstreamClosed)),
-            "Task should have failed on flush attempt, got: {result:?}"
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 1, "Expected a single coalesced flush");
+        assert_eq!(
+            reqs[0].headers.get("label").map(String::as_str),
+            Some("dl_otel_logs_logs_1_2"),
+            "Coalesced lease must carry sequence range 1..=2"
         );
+    }
+
+    #[test]
+    fn test_starrocks_resolved_buffer_config_handles_buffer_and_legacy_batching() {
+        use pipeline_core::buffer::BufferConfig;
+
+        // Default (neither set)
+        let cfg_default = base_config();
+        let resolved_default = cfg_default.resolved_buffer_config().unwrap();
+        assert_eq!(
+            resolved_default.max_batch_size_bytes,
+            BufferConfig::default().max_batch_size_bytes
+        );
+
+        // Legacy [batching] set
+        let mut cfg_legacy = base_config();
+        cfg_legacy.batching = Some(StarRocksBatchingConfig {
+            max_batch_size_bytes: 2_097_152,
+            max_batch_interval_sec: 15,
+            max_batch_records: Some(500),
+        });
+        let resolved_legacy = cfg_legacy.resolved_buffer_config().unwrap();
+        assert_eq!(resolved_legacy.max_batch_size_bytes, 2_097_152);
+        assert_eq!(resolved_legacy.max_batch_interval_sec, 15);
+        assert_eq!(resolved_legacy.max_batch_records, Some(500));
+
+        // Both [buffer] and [batching] set -> V4 error naming both sections
+        let mut cfg_both = cfg_legacy;
+        cfg_both.buffer = Some(BufferConfig::default());
+        let err = cfg_both.resolved_buffer_config().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[starrocks.buffer]"), "Got: {msg}");
+        assert!(msg.contains("[starrocks.batching]"), "Got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_stream_load_error_variants() {
+        let label_exists = StreamLoadError::StarRocksFailure {
+            status: "Label Already Exists".to_string(),
+            message: "Label [dl_otel_logs_logs_1_1] has already been used".to_string(),
+            error_log_url: None,
+        };
+        assert!(is_label_already_exists(&label_exists));
+
+        let http_503 = StreamLoadError::StarRocksFailure {
+            status: "503 Service Unavailable".to_string(),
+            message: "Backend overloaded".to_string(),
+            error_log_url: None,
+        };
+        assert!(matches!(
+            classify_stream_load_error(&http_503),
+            FailureClass::Transient
+        ));
+
+        let publish_timeout = StreamLoadError::StarRocksFailure {
+            status: "Publish Timeout".to_string(),
+            message: "Publish version timeout".to_string(),
+            error_log_url: None,
+        };
+        assert!(matches!(
+            classify_stream_load_error(&publish_timeout),
+            FailureClass::Transient
+        ));
+
+        let filtered_rows = StreamLoadError::StarRocksFailure {
+            status: "Fail".to_string(),
+            message: "too many filtered rows".to_string(),
+            error_log_url: Some("http://fe:8030/api/_load_error_log?file=err1".to_string()),
+        };
+        assert!(matches!(
+            classify_stream_load_error(&filtered_rows),
+            FailureClass::Rejected { ref reason } if reason.contains("err1")
+        ));
+
+        let auth_fail = StreamLoadError::StarRocksFailure {
+            status: "401 Unauthorized".to_string(),
+            message: "Access denied for user 'root'".to_string(),
+            error_log_url: None,
+        };
+        assert!(matches!(
+            classify_stream_load_error(&auth_fail),
+            FailureClass::Fatal { .. }
+        ));
+
+        let txn_fatal =
+            StreamLoadError::Transaction("HTTPS scheme requires TLS feature".to_string());
+        assert!(matches!(
+            classify_stream_load_error(&txn_fatal),
+            FailureClass::Fatal { .. }
+        ));
+
+        let io_err = StreamLoadError::Io(std::io::Error::other("broken pipe"));
+        assert!(matches!(
+            classify_stream_load_error(&io_err),
+            FailureClass::Transient
+        ));
     }
 
     #[test]
@@ -1871,5 +2179,313 @@ mod tests {
                 req.path
             );
         }
+    }
+
+    #[test]
+    fn test_format_lease_label_is_deterministic_across_retries() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        let id = LeaseId {
+            signal: SignalKind::Logs,
+            first_seq: 10,
+            last_seq: 25,
+        };
+        let label1 = format_lease_label("otel_logs", id);
+        let label2 = format_lease_label("otel_logs", id);
+        assert_eq!(label1, "dl_otel_logs_logs_10_25");
+        assert_eq!(label1, label2);
+        assert!(label1.len() <= 128);
+        assert!(label1.is_ascii());
+    }
+
+    #[test]
+    fn test_format_lease_label_truncates_or_hashes_when_exceeding_128_chars() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        let id = LeaseId {
+            signal: SignalKind::Traces,
+            first_seq: 100,
+            last_seq: 200,
+        };
+        let long_table_a = format!("very_long_table_{}_alpha", "x".repeat(140));
+        let long_table_b = format!("very_long_table_{}_bravo", "x".repeat(140));
+
+        let label_a1 = format_lease_label(&long_table_a, id);
+        let label_a2 = format_lease_label(&long_table_a, id);
+        let label_b = format_lease_label(&long_table_b, id);
+
+        assert_eq!(label_a1, label_a2, "Long table label must be deterministic");
+        assert_ne!(
+            label_a1, label_b,
+            "Distinct long table names sharing a prefix must produce distinct hashed labels"
+        );
+        assert!(
+            label_a1.len() <= 128,
+            "Label length {} must not exceed 128 chars",
+            label_a1.len()
+        );
+        assert!(label_a1.starts_with("dl_"));
+        assert!(label_a1.ends_with("_traces_100_200"));
+        assert!(
+            label_a1
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_sink_retains_lease_on_transient_503_and_acks_on_label_already_exists() {
+        use pipeline_core::buffer::{BufferConfig, SignalKind};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+        let attempt_counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let attempt_counter_clone = std::sync::Arc::clone(&attempt_counter);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = move |_method: &str, _path: &str| {
+                let n = attempt_counter_clone.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    (503, r#"{"Status":"Fail","Message":"Service Unavailable"}"#)
+                } else {
+                    (
+                        200,
+                        r#"{"Status":"Label Already Exists","ExistingJobStatus":"FINISHED","Message":"Label already exists"}"#,
+                    )
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            initial_backoff_ms: 10,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let ctrl = rx.controller();
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        sink_handle.await.unwrap().unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 2, "Expected 2 attempts (503 then 200)");
+        assert_eq!(
+            reqs[0].headers.get("label").map(String::as_str),
+            Some("dl_otel_logs_logs_1_1")
+        );
+        assert_eq!(
+            reqs[1].headers.get("label").map(String::as_str),
+            Some("dl_otel_logs_logs_1_1"),
+            "Retry must reuse the exact deterministic lease label"
+        );
+        assert!(ctrl.is_ready());
+        let _ = SignalKind::Logs;
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_sink_acks_on_label_already_exists_and_retries_transient_with_identical_label()
+     {
+        use pipeline_core::buffer::BufferConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+        let attempt_counter = std::sync::Arc::new(AtomicUsize::new(0));
+        let attempt_counter_clone = std::sync::Arc::clone(&attempt_counter);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = move |_method: &str, _path: &str| {
+                let n = attempt_counter_clone.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    (
+                        503,
+                        r#"{"Status":"Fail","Message":"BE temporarily overloaded"}"#,
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"Status":"Label Already Exists","ExistingJobStatus":"FINISHED","Message":"Label already exists"}"#,
+                    )
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            initial_backoff_ms: 10,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        sink_handle.await.unwrap().unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(
+            reqs[0].headers.get("label").map(String::as_str),
+            Some("dl_otel_logs_logs_1_1")
+        );
+        assert_eq!(
+            reqs[1].headers.get("label").map(String::as_str),
+            Some("dl_otel_logs_logs_1_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_sink_routes_data_quality_fail_to_rejected_dlq() {
+        use pipeline_core::buffer::{BufferConfig, DeadLetterManifest, SignalKind};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = |_method: &str, _path: &str| {
+                (
+                    200,
+                    r#"{"Status":"Fail","Message":"too many filtered rows","ErrorLogUrl":"http://127.0.0.1:8040/api/_load_error_log?file=err_1"}"#,
+                )
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let dlq_dir =
+            std::env::temp_dir().join(format!("otel-sr-dlq-test-{}-{}", std::process::id(), port));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            max_attempts: 2,
+            dead_letter_path: Some(dlq_dir.clone()),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        sink_handle.await.unwrap().unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(reqs.len(), 2, "Expected 2 attempts before DLQ quarantine");
+
+        let sr_dlq = dlq_dir.join("starrocks");
+        assert!(sr_dlq.exists(), "Expected starrocks DLQ directory to exist");
+        let mut json_files = Vec::new();
+        let mut arrow_files = Vec::new();
+        for entry in std::fs::read_dir(&sr_dlq).unwrap() {
+            let p = entry.unwrap().path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("json") => json_files.push(p),
+                Some("arrow") => arrow_files.push(p),
+                _ => {}
+            }
+        }
+        assert_eq!(arrow_files.len(), 1);
+        assert_eq!(json_files.len(), 1);
+
+        let manifest: DeadLetterManifest =
+            serde_json::from_slice(&std::fs::read(&json_files[0]).unwrap()).unwrap();
+        assert_eq!(manifest.sink, "starrocks");
+        assert_eq!(manifest.signal, SignalKind::Logs);
+        assert_eq!(manifest.row_count, 3);
+        assert_eq!(manifest.attempts, 2);
+        assert!(manifest.reason.contains("too many filtered rows"));
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_sink_routes_rejected_payload_to_dead_letter_after_max_attempts() {
+        use pipeline_core::buffer::{BufferConfig, DeadLetterManifest, SignalKind};
+
+        let dlq_dir =
+            std::env::temp_dir().join(format!("otel-sr-dlq-oversize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        let mut config = base_config();
+        config.max_payload_bytes = 1; // Guarantee oversized payload rejection in prepare
+        config.buffer = Some(BufferConfig {
+            max_attempts: 2,
+            dead_letter_path: Some(dlq_dir.clone()),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        sink_handle.await.unwrap().unwrap();
+
+        let sr_dlq = dlq_dir.join("starrocks");
+        assert!(sr_dlq.exists(), "Expected starrocks DLQ directory to exist");
+        let mut json_files = Vec::new();
+        for entry in std::fs::read_dir(&sr_dlq).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                json_files.push(p);
+            }
+        }
+        assert_eq!(json_files.len(), 1);
+        let manifest: DeadLetterManifest =
+            serde_json::from_slice(&std::fs::read(&json_files[0]).unwrap()).unwrap();
+        assert_eq!(manifest.sink, "starrocks");
+        assert_eq!(manifest.signal, SignalKind::Logs);
+        assert_eq!(manifest.attempts, 2);
+        assert!(manifest.reason.contains("max_payload_bytes"));
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
     }
 }

@@ -685,25 +685,31 @@ async fn main() -> anyhow::Result<()> {
     let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
 
     // Sink buffers between Transformers and Sinks
-    let active_sink_name = if config.iceberg.is_some() {
-        "iceberg"
+    let (active_sink_name, sink_buffer_config) = if config.iceberg.is_some() {
+        (
+            "iceberg",
+            pipeline_core::buffer::BufferConfig::passthrough(),
+        )
     } else if config.elasticsearch.is_some() {
-        "elasticsearch"
-    } else if config.starrocks.is_some() {
-        "starrocks"
+        (
+            "elasticsearch",
+            pipeline_core::buffer::BufferConfig::passthrough(),
+        )
+    } else if let Some(ref sr_cfg) = config.starrocks {
+        ("starrocks", sr_cfg.resolved_buffer_config()?)
     } else if config.kafka.is_some() {
-        "kafka"
+        ("kafka", pipeline_core::buffer::BufferConfig::passthrough())
     } else {
-        "parquet"
+        (
+            "parquet",
+            pipeline_core::buffer::BufferConfig::passthrough(),
+        )
     };
     let [
         (logs_sink_tx, logs_sink_rx),
         (metrics_sink_tx, metrics_sink_rx),
         (traces_sink_tx, traces_sink_rx),
-    ] = pipeline_core::buffer::SinkBuffer::new_signal_triad(
-        active_sink_name,
-        pipeline_core::buffer::BufferConfig::passthrough(),
-    )?;
+    ] = pipeline_core::buffer::SinkBuffer::new_signal_triad(active_sink_name, sink_buffer_config)?;
     let buffer_controller = logs_sink_rx.controller();
 
     // Create shutdown watch channel
@@ -2948,6 +2954,48 @@ mod tests {
         assert_eq!(
             not_ready_resp.status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_validate_config_starrocks_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://127.0.0.1:8030"]
+        database = "otel"
+        username = "root"
+
+        [starrocks.table_mapping]
+        type = "per_signal"
+        logs = "otel_logs"
+        metrics = "otel_metrics"
+        traces = "otel_traces"
+
+        [starrocks.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml =
+            format!("{valid_buffer_toml}\n[starrocks.batching]\nmax_batch_size_bytes = 2097152\n");
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[starrocks.buffer]"), "Got: {err}");
+        assert!(
+            err.to_string().contains("[starrocks.batching]"),
+            "Got: {err}"
         );
     }
 }

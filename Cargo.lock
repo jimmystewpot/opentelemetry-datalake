@@ -5728,15 +5728,16 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "hex",
  "pipeline-core",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "starrocks-stream-load",
  "thiserror 2.0.21",
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
- "uuid",
 ]
 
 [[package]]

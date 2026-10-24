@@ -106,17 +106,18 @@ Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.m
 | `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
 | `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds. |
-| `batching` | Map | `null` | Optional micro-batch accumulation settings (see below). |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy micro-batch alias for `[starrocks.buffer]`. Cannot be combined with `[starrocks.buffer]`. |
 | `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `tls` | Map | `{}` | Standard TLS configuration (`ca_cert_path`, `verification`). |
 
-### StarRocks Batching (`[starrocks.batching]`)
+### StarRocks Buffering (`[starrocks.buffer]` and legacy `[starrocks.batching]`)
 
-When omitted (`null`), `StarRocksSink` flushes each incoming batch immediately. When configured, batches are accumulated until any threshold is met:
+Prefer `[starrocks.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). Legacy `[starrocks.batching]` remains supported as a deprecated alias, but specifying both `[starrocks.buffer]` and `[starrocks.batching]` is rejected at startup:
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `52428800` | Max accumulated Arrow byte size before flushing (50 MiB). |
+| `max_batch_size_bytes` | Integer | `52428800` | Max accumulated Arrow byte size per lease before flushing (50 MiB in `[starrocks.batching]`; 64 MiB default in `[starrocks.buffer]`). |
 | `max_batch_interval_sec` | Integer | `30` | Max time in seconds between flushes. |
 | `max_batch_records` | Integer | `null` | Optional max accumulated records before flushing. |
 
