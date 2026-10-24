@@ -17,7 +17,7 @@ This document specifies the architectural remediation for both defects.
 ### 2.1 Arrow Null Guarding and Strongly-Typed Partition Keys
 
 #### Signature Update
-The function signature in [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs#L41-L79) is updated to distinguish missing keys from empty keys:
+The function signature in [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs#L41-L79) is updated to distinguish missing keys (`None`) from empty string keys (`Some("")`):
 
 ```rust
 pub fn extract_partition_slices(
@@ -29,7 +29,7 @@ pub fn extract_partition_slices(
 #### Slicing Algorithm
 1. Locate `key_column` in `batch` and downcast to `arrow::array::StringArray` via `.as_any().downcast_ref::<StringArray>()`. Propagate `PipelineError::Internal` if column is missing or not UTF-8.
 2. If `num_rows == 0`, return `Ok(Vec::new())`.
-3. Read row keys safely without unnecessary heap allocations during scanning:
+3. Read row keys safely without heap allocations during scanning:
    ```rust
    let get_key = |i: usize| -> Option<&str> {
        if str_arr.is_null(i) {
@@ -39,18 +39,18 @@ pub fn extract_partition_slices(
        }
    };
    ```
-4. If `num_rows == 1`, return `vec![(get_key(0).map(ToString::to_string), batch.clone())]`.
-5. For `num_rows > 1`, initialize `current_val = get_key(0)` and `start = 0`. Iterate `i in 1..num_rows`:
-   - If `get_key(i) != current_val`:
-     - Push `(current_val.map(ToString::to_string), batch.slice(start, i - start))` to `slices`.
-     - Update `start = i` and `current_val = get_key(i)`.
-   - After the loop, push the trailing slice `(current_val.map(ToString::to_string), batch.slice(start, num_rows - start))`.
-6. Zero heap string allocations occur inside the iteration loop; allocations only occur once per contiguous slice when pushing to the result vector.
+4. Initialize `current_val = get_key(0)` and `start = 0`. Iterate `i in 1..num_rows` (note: no special-case branch is needed for `num_rows == 1` as `1..1` is empty and `batch.slice(0, 1)` is a zero-copy `Arc` slice):
+   - Let `val = get_key(i)`.
+   - If `val != current_val`:
+     - Push `(current_val.map(str::to_owned), batch.slice(start, i - start))` to `slices`.
+     - Update `start = i` and `current_val = val`.
+   - After the loop, push the trailing slice `(current_val.map(str::to_owned), batch.slice(start, num_rows - start))`.
+5. Zero heap string allocations occur inside the comparison loop; allocations only occur once per contiguous slice when pushing to the result vector.
 
 #### Kafka Record Construction
 In [`KafkaSink::run`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs#L164-L207):
 * When `self.partition_key` is `None`: produce `vec![(None, sorted_batch)]`.
-* When `self.partition_key` is `Some(key)`: invoke `extract_partition_slices(&sorted_batch, key)?`.
+* When `self.partition_key` is `Some(ref p_key)`: invoke `extract_partition_slices(&sorted_batch, p_key)?`.
 * For each `(key_opt, sub_batch)`:
   ```rust
   self.serialize_batch(&sub_batch, &mut buffer)?;
@@ -59,19 +59,21 @@ In [`KafkaSink::run`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentel
       record = record.key(k.as_str());
   }
   ```
-* When `key_opt` is `None`, the record is unkeyed, allowing Kafka to distribute messages across all partitions via the sticky/round-robin partitioner.
+* When `key_opt` is `None`, `record.key` remains `None` (`FutureRecord<'_, str, Vec<u8>>`), allowing `librdkafka` to distribute unkeyed messages across all partitions via its configured partitioner (sticky/round-robin) rather than hashing `b""` to a single partition.
 
 ---
 
 ### 2.2 Sink Lifecycle and Graceful Producer Flush
 
-#### Struct and Builder Additions
+#### Struct, Timeout Precedence, and Builder Additions
 In [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs#L32-L38):
-1. Add `flush_timeout: std::time::Duration` to `KafkaSink`.
-2. In `KafkaSink::try_new`:
-   - Initialize `flush_timeout` with a 10-second default (`Duration::from_secs(10)`).
-   - If `options` contains `"message.timeout.ms"` or `"delivery.timeout.ms"`, parse that value into `flush_timeout` if valid.
-3. Provide builder method:
+1. Define constant `pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 10_000;`.
+2. Add `flush_timeout: std::time::Duration` to `KafkaSink`.
+3. In `KafkaSink::try_new`, resolve the initial `flush_timeout` using strict precedence:
+   - Check `options.get("delivery.timeout.ms")`, falling back to `options.get("message.timeout.ms")`.
+   - Parse as `u64` and apply **only if `ms > 0`**. (In `librdkafka`, `0` denotes an infinite timeout; converting `0` to `Duration::from_millis(0)` would cause `producer.flush` to time out instantaneously without waiting for in-flight messages. When `0` or unparseable, fall back to `DEFAULT_FLUSH_TIMEOUT_MS`).
+   - Otherwise, use `Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS)` (10 seconds).
+4. Provide builder method (which overrides the default or `options`-derived timeout):
    ```rust
    #[must_use]
    pub fn with_flush_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -83,25 +85,28 @@ In [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmys
 #### Graceful Shutdown Drain
 In [`KafkaSink::run`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs#L164-L207):
 * When `input.recv().await` yields `None`, upstream components have finished draining.
-* Execute `Producer::flush` inside `tokio::task::spawn_blocking` to avoid blocking Tokio's runtime:
+* Execute `Producer::flush` inside `tokio::task::spawn_blocking` to isolate synchronous C polling (`rd_kafka_flush`) from the Tokio async executor:
   ```rust
   let producer = self.producer.clone();
   let timeout = self.flush_timeout;
   tokio::task::spawn_blocking(move || {
       use rdkafka::producer::Producer;
-      producer.flush(timeout)
+      producer
+          .flush(timeout)
           .map_err(|e| PipelineError::Storage(Box::new(e)))
   })
   .await
-  .map_err(|e| PipelineError::Internal(format!("Kafka flush join error: {e}")))??;
+  .map_err(|e| PipelineError::Internal(format!("Kafka flush task panicked: {e}")))??;
   ```
 * Return `Ok(())`.
 
-#### Application Configuration Integration
+#### Application Configuration and Validation Integration
 In [`src/main.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/src/main.rs#L36-L53):
-1. Add `flush_timeout_ms: Option<u64>` to `KafkaConfig`.
-2. When creating `logs_sink`, `traces_sink`, and `metrics_sink`, call `.with_flush_timeout(Duration::from_millis(timeout))` if `flush_timeout_ms` is configured.
-3. Update [`docs/buffer.md`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/buffer.md#L72) removing the gap item for issue #130.
+1. Add `#[serde(default)] flush_timeout_ms: Option<u64>` to `KafkaConfig`.
+2. In [`validate_config`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/src/main.rs#L140-L145), validate that `if kafka_cfg.flush_timeout_ms == Some(0)` an error is returned (`"Configuration validation failed: kafka.flush_timeout_ms must be greater than 0"`).
+3. When initializing `logs_sink`, `traces_sink`, and `metrics_sink` in `src/main.rs`, apply `.with_flush_timeout( std::time::Duration::from_millis(ms))` when `kafka_cfg.flush_timeout_ms` is `Some(ms)`.
+4. Update [`docs/buffer.md`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/buffer.md#L72) removing the gap item for issue #130.
+5. Update [`docs/configuration.md`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/configuration.md#L70-L88) to document `flush_timeout_ms` under the `[kafka]` section.
 
 ---
 
@@ -111,9 +116,9 @@ All unit tests must be written first (RED), verified to fail, and then made to p
 
 ### 3.1 Partition Key Slicing Tests (`crates/kafka-sink/src/lib.rs`)
 1. `test_extract_partition_slices_with_null_keys`:
-   - Schema with nullable `service_name` column.
+   - Schema with nullable `service_name` column (`DataType::Utf8, true`).
    - Rows: `[Some("svc-a"), None, Some("svc-b")]`.
-   - Assert: 3 slices returned; keys are `Some("svc-a")`, `None`, and `Some("svc-b")`.
+   - Assert: 3 slices returned; keys are `Some("svc-a")`, `None`, and `Some("svc-b")`, each with 1 row.
 2. `test_extract_partition_slices_all_nulls`:
    - Rows: `[None, None, None]`.
    - Assert: 1 slice returned; key is `None`, row count is 3.
@@ -129,66 +134,52 @@ All unit tests must be written first (RED), verified to fail, and then made to p
 
 ### 3.2 End-to-End Sorting & Slicing (`tests/sink_pre_sorting_e2e.rs`)
 - Update existing test assertions in `test_kafka_partition_extraction_edge_cases` and `test_e2e_kafka_sink_presorting` to inspect `Option<String>` (`slice.0.as_deref() == Some(...)`).
-- Add test case verifying that a batch with null partition keys pre-sorted with `BatchSorter` slices correctly into `None` groups.
+- Add test case verifying that a batch with null, empty-string, and non-empty partition keys pre-sorted with `BatchSorter` places nulls last (`nulls_last = true`) and slices cleanly into distinct `Some(...)` and `None` groups.
 
-### 3.3 Producer Flush Configuration & Lifecycle Tests (`crates/kafka-sink/src/lib.rs`)
-1. `test_kafka_sink_flush_timeout_builder`:
-   - Verify default timeout is 10 seconds.
-   - Verify `with_flush_timeout(Duration::from_millis(500))` overrides it.
-   - Verify parsing from `options.get("message.timeout.ms")`.
-2. `test_kafka_sink_shutdown_flush`:
-   - Test channel drain and shutdown invocation where sender is dropped after writing a batch.
+### 3.3 Producer Flush Configuration & Deterministic Lifecycle Tests (`crates/kafka-sink/src/lib.rs`)
+Because `FutureProducer::send(...).await` waits on broker acknowledgement up to `message.timeout.ms` (default 300s), unit tests must not call `FutureProducer::send().await` against a non-existent broker. Instead, we test the shutdown flush deterministically in <100ms via two tests:
+1. `test_kafka_sink_flush_timeout_resolution`:
+   - Verify default `flush_timeout` is 10s.
+   - Verify `options` with `"message.timeout.ms" = "3000"` sets `flush_timeout` to 3s.
+   - Verify `"delivery.timeout.ms"` takes precedence over `"message.timeout.ms"`.
+   - Verify `"message.timeout.ms" = "0"` falls back to 10s (preventing 0ms instant timeout).
+   - Verify `.with_flush_timeout(Duration::from_millis(250))` overrides all defaults.
+2. `test_kafka_sink_run_flushes_on_channel_close`:
+   - **Case A (Clean empty queue drain)**: Send a 0-row batch (or drop `tx` immediately) and verify `sink.run(rx).await` completes `Ok(())` via `spawn_blocking` flush.
+   - **Case B (In-flight C queue flush failure propagation)**: Enqueue a record into `librdkafka`'s internal C buffer using synchronous `sink.producer.send_result(FutureRecord::to("test-topic").payload("data").key("k"))` against an unreachable broker (`127.0.0.1:1`), configure `with_flush_timeout(Duration::from_millis(50))`, drop `tx`, and await `sink.run(rx).await`. Because the message remains trapped in `librdkafka`'s C queue past the 50ms flush deadline, `producer.flush` must fail with `OperationTimedOut` and `sink.run` must return `Err(PipelineError::Storage(_))`. This proves `producer.flush` is genuinely executed on channel EOF and its errors are propagated.
 
 ---
 
-## 4. Parallel Subagent Task Decomposition
+## 4. Optimized Task Decomposition & Subagent Execution Strategy
 
-The implementation tasks have cleanly separated file boundaries and responsibilities, enabling parallel execution via subagents:
+### Avoiding File Contention
+Putting two parallel subagents on [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs) simultaneously would cause write conflicts in `KafkaSink::run` and `mod tests`, Cargo build lock contention, or 3-way git merge conflicts.
+
+Instead, the work is structured as a **2-stage DAG** where every task owns strictly disjoint files:
 
 ```mermaid
 flowchart TD
-    subgraph SubagentA["Subagent A: Partition Key & Arrow Null Guarding"]
-        A1["1. [RED] Write unit tests in crates/kafka-sink/src/lib.rs for null & empty keys"]
-        A2["2. [GREEN] Refactor extract_partition_slices to Option&lt;String&gt; + null guard"]
-        A3["3. [GREEN] Update FutureRecord key construction in KafkaSink::run"]
-        A4["4. [VERIFY] Update tests in tests/sink_pre_sorting_e2e.rs"]
-        A1 --> A2 --> A3 --> A4
-    end
+    T1["Task 1: Core kafka-sink Crate Remediation<br/>(crates/kafka-sink/src/lib.rs)"]
+    T2["Task 2: E2E Pre-Sorting & Null Partition Tests<br/>(tests/sink_pre_sorting_e2e.rs)"]
+    T3["Task 3: AppConfig Wiring, Validation & Docs<br/>(src/main.rs, docs/buffer.md, docs/configuration.md)"]
+    T4["Final Verification: Workspace Test & Clippy Gate"]
 
-    subgraph SubagentB["Subagent B: Producer Flush & Lifecycle Integration"]
-        B1["1. [RED] Add unit test for flush_timeout config in crates/kafka-sink/src/lib.rs"]
-        B2["2. [GREEN] Add flush_timeout field, builder, and spawn_blocking flush in run()"]
-        B3["3. [GREEN] Update KafkaConfig and sink construction in src/main.rs"]
-        B4["4. [DOCS] Remove gap #130 from docs/buffer.md"]
-        B1 --> B2 --> B3 --> B4
-    end
-
-    SubagentA --> IntegrationCheck["Integration Verification: cargo test -p kafka-sink && cargo test --test sink_pre_sorting_e2e"]
-    SubagentB --> IntegrationCheck
+    T1 --> T2
+    T1 --> T3
+    T2 --> T4
+    T3 --> T4
 ```
 
-### Subagent A Work Scope
-* **Files**: [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs), [`tests/sink_pre_sorting_e2e.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/tests/sink_pre_sorting_e2e.rs).
-* **Responsibilities**:
-  1. Add unit tests for null and empty string partition slicing.
-  2. Implement safe null checks in `extract_partition_slices` and update return type to `Vec<(Option<String>, RecordBatch)>`.
-  3. Update `KafkaSink::run` key assignment logic.
-  4. Update `tests/sink_pre_sorting_e2e.rs` callers and assertions.
-
-### Subagent B Work Scope
-* **Files**: [`crates/kafka-sink/src/lib.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/crates/kafka-sink/src/lib.rs), [`src/main.rs`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/src/main.rs), [`docs/buffer.md`](file:///Users/jlamb/go/src/github.com/jimmystewpot/opentelemetry-datalake/docs/buffer.md).
-* **Responsibilities**:
-  1. Add unit tests for `flush_timeout` builder and options parsing.
-  2. Add `flush_timeout` field, builder method, and `spawn_blocking` `producer.flush()` invocation in `KafkaSink::run`.
-  3. Add `flush_timeout_ms` to `KafkaConfig` in `src/main.rs` and apply `.with_flush_timeout(...)` during sink creation.
-  4. Update `docs/buffer.md` to remove the #130 gap item.
+1. **Task 1 (`crates/kafka-sink/src/lib.rs`)**: Implements both the null-safe `extract_partition_slices` (`Option<String>`) and the `flush_timeout` + `spawn_blocking` `producer.flush()` in `KafkaSink`, along with all `kafka-sink` unit tests.
+2. **Task 2 (`tests/sink_pre_sorting_e2e.rs`) & Task 3 (`src/main.rs`, `docs/buffer.md`, `docs/configuration.md`)**: Touch completely disjoint files and depend only on Task 1's public API (`extract_partition_slices` and `KafkaSink::with_flush_timeout`). They can execute sequentially via `subagent-driven-development` or in parallel without any file overlap.
 
 ---
 
 ## 5. Verification Checklist
 
-- [ ] All new and modified tests pass via `cargo test -p kafka-sink`.
+- [ ] All unit tests pass via `cargo test -p kafka-sink`.
 - [ ] Integration tests pass via `cargo test --test sink_pre_sorting_e2e`.
+- [ ] Binary configuration validation tests pass via `cargo test --bin opentelemetry-datalake`.
 - [ ] No compilation warnings or clippy warnings across workspace: `cargo clippy --workspace --all-targets -- -D warnings`.
 - [ ] Zero unchecked `.value(i)` calls remain in `extract_partition_slices`.
 - [ ] Producer queue is flushed within `spawn_blocking` before `KafkaSink::run` exits.
