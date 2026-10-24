@@ -51,6 +51,7 @@ pub struct Lease {
     pub(crate) num_rows: usize,
     pub(crate) byte_size: usize,
     pub(crate) attempt: u32,
+    pub(crate) leased_at: Instant,
     pub(crate) completed: bool,
 }
 
@@ -172,9 +173,16 @@ impl Lease {
     /// Commits the lease, freeing its byte budget and advancing the contiguous watermark.
     pub async fn ack(mut self) -> Result<(), PipelineError> {
         self.completed = true;
+        let flush_duration = self.leased_at.elapsed();
         self.inner
             .ack_lease(self.id.signal, &self.meta, self.byte_size, self.num_rows)
-            .await
+            .await?;
+        self.inner.metrics.record_committed(
+            self.id.signal,
+            u64::try_from(self.num_rows).unwrap_or(u64::MAX),
+            flush_duration,
+        );
+        Ok(())
     }
 
     /// Rejects the lease with the given [`FailureClass`], either scheduling a backoff retry,
@@ -189,9 +197,30 @@ impl Lease {
 
         match class {
             FailureClass::Transient => {
+                self.inner.metrics.record_nack(signal, "transient");
+                let now_ms = current_unix_ms().max(1);
+                let ring_state = &self.inner.rings[signal.as_u8() as usize];
+                let _ = ring_state.first_transient_failure_unix_ms.compare_exchange(
+                    0,
+                    now_ms,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+
                 if self.inner.config.max_transient_duration_sec > 0 {
                     let max_dur = Duration::from_secs(self.inner.config.max_transient_duration_sec);
-                    let expired = meta.iter().any(|m| m.enqueued_at.elapsed() >= max_dur);
+                    let first_fail_ms = ring_state
+                        .first_transient_failure_unix_ms
+                        .load(Ordering::Acquire);
+                    let streak_expired = first_fail_ms > 0
+                        && now_ms.saturating_sub(first_fail_ms)
+                            >= self
+                                .inner
+                                .config
+                                .max_transient_duration_sec
+                                .saturating_mul(1_000);
+                    let expired =
+                        streak_expired || meta.iter().any(|m| m.enqueued_at.elapsed() >= max_dur);
                     if expired {
                         let reason = format!(
                             "transient retry duration exceeded {}s on sink '{}'",
@@ -220,6 +249,7 @@ impl Lease {
                     .requeue_lease(signal, payloads, meta, next_attempt, ready_at);
             }
             FailureClass::Rejected { reason } => {
+                self.inner.metrics.record_nack(signal, "rejected");
                 if next_attempt < self.inner.config.max_attempts {
                     self.inner
                         .requeue_lease(signal, payloads, meta, next_attempt, None);
@@ -229,6 +259,7 @@ impl Lease {
                 }
             }
             FailureClass::Fatal { reason } => {
+                self.inner.metrics.record_nack(signal, "fatal");
                 self.inner.fail_lease(signal, payloads, meta, reason);
             }
         }
@@ -307,12 +338,13 @@ impl Lease {
             }
         }
 
+        let dropped_rows = u64::try_from(self.num_rows).unwrap_or(u64::MAX);
         self.inner.rings[signal.as_u8() as usize]
             .dead_letter_drops
-            .fetch_add(
-                u64::try_from(self.num_rows).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            .fetch_add(dropped_rows, Ordering::Relaxed);
+        self.inner
+            .metrics
+            .record_dropped(signal, dropped_rows, "dead_letter");
 
         tracing::error!(
             sink = %self.inner.sink_name,

@@ -199,6 +199,19 @@ impl SignalRing {
         self.inflight_leases = self.inflight_leases.saturating_sub(1);
         self.advance_watermark(committed_seq);
     }
+
+    /// Returns the approximate Unix epoch millisecond timestamp of the oldest queued batch,
+    /// or `0` if the queue is empty.
+    #[must_use]
+    pub fn oldest_enqueued_unix_ms(&self) -> u64 {
+        let Some(front) = self.queue.front() else {
+            return 0;
+        };
+        let elapsed_ms = u64::try_from(front.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        crate::buffer::dead_letter::current_unix_ms()
+            .saturating_sub(elapsed_ms)
+            .max(1)
+    }
 }
 
 /// Synchronized state and notifications for one signal ring.
@@ -220,6 +233,14 @@ pub struct SignalRingState {
     pub replayed_records: AtomicU64,
     /// Cumulative number of records quarantined or dropped after exhausting rejected retries.
     pub dead_letter_drops: AtomicU64,
+    /// Cumulative number of records discarded on shutdown drain timeout (`DrainTimeoutPolicy::Discard`).
+    pub shutdown_timeout_drops: AtomicU64,
+    /// Number of `BufferSender::send` futures currently blocked waiting for ring capacity.
+    pub blocked_senders: AtomicU64,
+    /// Unix epoch timestamp in milliseconds when the ring first entered a continuous blocked-send state (`0` when unblocked).
+    pub blocked_since_unix_ms: AtomicU64,
+    /// Unix epoch timestamp in milliseconds when the current continuous `Transient` retry streak started (`0` when healthy).
+    pub first_transient_failure_unix_ms: AtomicU64,
 }
 
 impl Default for SignalRingState {
@@ -241,6 +262,10 @@ impl SignalRingState {
             corruption_drops: AtomicU64::new(0),
             replayed_records: AtomicU64::new(0),
             dead_letter_drops: AtomicU64::new(0),
+            shutdown_timeout_drops: AtomicU64::new(0),
+            blocked_senders: AtomicU64::new(0),
+            blocked_since_unix_ms: AtomicU64::new(0),
+            first_transient_failure_unix_ms: AtomicU64::new(0),
         }
     }
 }

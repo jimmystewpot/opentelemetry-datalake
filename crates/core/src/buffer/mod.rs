@@ -3,6 +3,7 @@ pub mod dead_letter;
 pub mod disk;
 pub mod lease;
 pub mod memory;
+pub mod metrics;
 
 pub use crate::buffer::config::{
     BufferConfig, BufferMode, DrainTimeoutPolicy, LegacyBatchingConfig, OverflowPolicy, SignalKind,
@@ -15,6 +16,7 @@ pub use crate::buffer::disk::{
     decode_frame, encode_frame,
 };
 pub use crate::buffer::lease::{FailureClass, Lease, LeaseId};
+pub use crate::buffer::metrics::{BufferGaugeState, BufferMetrics, SignalMetricsState};
 
 use crate::buffer::disk::DiskBackend;
 use crate::buffer::memory::{
@@ -41,6 +43,7 @@ pub(crate) struct BufferInner {
     pub(crate) rings: [SignalRingState; 3],
     pub(crate) disk: Option<DiskBackend>,
     pub(crate) dead_letter: Option<Arc<DeadLetterStore>>,
+    pub(crate) metrics: BufferMetrics,
     pub(crate) any_data_ready_notify: Notify,
     pub(crate) fatal_error: Mutex<Option<String>>,
 }
@@ -65,21 +68,44 @@ impl BufferInner {
         } else {
             None
         };
+        let metrics = BufferMetrics::new(sink_name, &config);
+        for sig in ALL_SIGNALS {
+            let ring_state = &rings[sig.as_u8() as usize];
+            let replayed = ring_state.replayed_records.load(Ordering::Acquire);
+            if replayed > 0 {
+                metrics.record_replayed(sig, replayed);
+            }
+            let corrupted = ring_state.corruption_drops.load(Ordering::Acquire);
+            if corrupted > 0 {
+                metrics.record_dropped(sig, corrupted, "corruption");
+            }
+            let ring = lock_unpoisoned(&ring_state.ring);
+            metrics.update_gauges(
+                sig,
+                ring.rows_in_flight,
+                ring.bytes_in_flight,
+                ring.inflight_leases,
+                ring.oldest_enqueued_unix_ms(),
+            );
+        }
         Ok(Arc::new(Self {
             sink_name: sink_name.to_string(),
             config,
             rings,
             disk,
             dead_letter,
+            metrics,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
         }))
     }
 
     fn new_passthrough() -> Arc<Self> {
+        let config = BufferConfig::passthrough();
+        let metrics = BufferMetrics::new("passthrough", &config);
         Arc::new(Self {
             sink_name: "passthrough".to_string(),
-            config: BufferConfig::passthrough(),
+            config,
             rings: [
                 SignalRingState::new(),
                 SignalRingState::new(),
@@ -87,13 +113,108 @@ impl BufferInner {
             ],
             disk: None,
             dead_letter: None,
+            metrics,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
         })
     }
 
+    pub(crate) fn sync_ring_metrics(&self, signal: SignalKind, ring: &SignalRing) {
+        self.metrics.update_gauges(
+            signal,
+            ring.rows_in_flight,
+            ring.bytes_in_flight,
+            ring.inflight_leases,
+            ring.oldest_enqueued_unix_ms(),
+        );
+    }
+
     pub(crate) fn fatal_reason(&self) -> Option<String> {
         lock_unpoisoned(&self.fatal_error).clone()
+    }
+
+    pub(crate) fn is_ready(&self) -> bool {
+        if self.fatal_reason().is_some() {
+            return false;
+        }
+        let now_ms = crate::buffer::dead_letter::current_unix_ms();
+        let stall_threshold_ms = self.config.readiness_stall_sec.saturating_mul(1_000);
+        let transient_threshold_ms = self.config.max_transient_duration_sec.saturating_mul(1_000);
+
+        for sig in ALL_SIGNALS {
+            let ring_state = &self.rings[sig.as_u8() as usize];
+            if stall_threshold_ms > 0 {
+                let blocked_since = ring_state.blocked_since_unix_ms.load(Ordering::Acquire);
+                if blocked_since > 0 && now_ms.saturating_sub(blocked_since) >= stall_threshold_ms {
+                    return false;
+                }
+            }
+            if transient_threshold_ms > 0 {
+                let transient_since = ring_state
+                    .first_transient_failure_unix_ms
+                    .load(Ordering::Acquire);
+                if transient_since > 0
+                    && now_ms.saturating_sub(transient_since) >= transient_threshold_ms
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
+        match self.config.effective_drain_policy() {
+            DrainTimeoutPolicy::Persist => {
+                if let Some(disk) = &self.disk {
+                    let wm = DiskWatermark::from_rings(&self.rings);
+                    disk.flush_and_sync_watermark(wm)?;
+                }
+                Ok(())
+            }
+            DrainTimeoutPolicy::Discard => {
+                let mut total_dropped: u64 = 0;
+                for sig in ALL_SIGNALS {
+                    let ring_state = &self.rings[sig.as_u8() as usize];
+                    let dropped_rows = {
+                        let mut ring = lock_unpoisoned(&ring_state.ring);
+                        let rows = u64::try_from(ring.rows_in_flight).unwrap_or(u64::MAX);
+                        ring.queue.clear();
+                        ring.bytes_in_flight = 0;
+                        ring.rows_in_flight = 0;
+                        ring.inflight_leases = 0;
+                        ring.slots.clear();
+                        self.sync_ring_metrics(sig, &ring);
+                        rows
+                    };
+                    if dropped_rows > 0 {
+                        ring_state
+                            .shutdown_timeout_drops
+                            .fetch_add(dropped_rows, Ordering::Release);
+                        self.metrics
+                            .record_dropped(sig, dropped_rows, "shutdown_timeout");
+                        total_dropped = total_dropped.saturating_add(dropped_rows);
+                    }
+                    ring_state.space_available_notify.notify_waiters();
+                    ring_state.data_ready_notify.notify_waiters();
+                }
+                self.any_data_ready_notify.notify_waiters();
+
+                tracing::error!(
+                    sink = %self.sink_name,
+                    dropped_records = total_dropped,
+                    "Graceful shutdown drain timed out under DrainTimeoutPolicy::Discard; discarded remaining unacknowledged records"
+                );
+
+                Err(PipelineError::Storage(
+                    format!(
+                        "sink '{}' shutdown drain timed out under Discard policy ({total_dropped} records dropped)",
+                        self.sink_name
+                    )
+                    .into(),
+                ))
+            }
+        }
     }
 
     pub(crate) fn notify_data_ready(&self, signal: SignalKind) {
@@ -111,9 +232,13 @@ impl BufferInner {
         num_rows: usize,
     ) -> Result<(), PipelineError> {
         let ring_state = &self.rings[signal.as_u8() as usize];
+        ring_state
+            .first_transient_failure_unix_ms
+            .store(0, Ordering::Release);
         {
             let mut ring = lock_unpoisoned(&ring_state.ring);
             ring.ack_entries(meta, byte_size, num_rows, &ring_state.committed_seq);
+            self.sync_ring_metrics(signal, &ring);
         }
         ring_state.space_available_notify.notify_waiters();
         self.notify_data_ready(signal);
@@ -137,6 +262,7 @@ impl BufferInner {
         {
             let mut ring = lock_unpoisoned(&ring_state.ring);
             ring.requeue_at_head(payloads, meta, next_attempt, ready_at);
+            self.sync_ring_metrics(signal, &ring);
         }
         self.notify_data_ready(signal);
     }
@@ -161,6 +287,7 @@ impl BufferInner {
             if ring.fatal_error.is_none() {
                 ring.fatal_error = Some(reason);
             }
+            self.sync_ring_metrics(signal, &ring);
         }
         for sig in ALL_SIGNALS {
             self.rings[sig.as_u8() as usize]
@@ -236,12 +363,12 @@ impl BufferInner {
             None
         };
 
+        let dropped_rows = u64::try_from(row_count).unwrap_or(u64::MAX);
         self.rings[signal.as_u8() as usize]
             .dead_letter_drops
-            .fetch_add(
-                u64::try_from(row_count).unwrap_or(u64::MAX),
-                Ordering::Relaxed,
-            );
+            .fetch_add(dropped_rows, Ordering::Relaxed);
+        self.metrics
+            .record_dropped(signal, dropped_rows, "dead_letter");
 
         tracing::error!(
             sink = %self.sink_name,
@@ -382,6 +509,7 @@ impl BufferInner {
         }
 
         ring.inflight_leases = ring.inflight_leases.saturating_add(1);
+        self.sync_ring_metrics(signal, &ring);
         let lease = Lease {
             inner: Arc::clone(self),
             id: LeaseId {
@@ -395,9 +523,77 @@ impl BufferInner {
             num_rows: total_rows,
             byte_size: total_bytes,
             attempt,
+            leased_at: now,
             completed: false,
         };
         (Some(lease), None, false)
+    }
+}
+
+struct BlockedSendGuard<'a> {
+    ring_state: &'a SignalRingState,
+    active: bool,
+}
+
+impl<'a> BlockedSendGuard<'a> {
+    const fn new(ring_state: &'a SignalRingState) -> Self {
+        Self {
+            ring_state,
+            active: false,
+        }
+    }
+
+    fn mark_blocked(&mut self) {
+        if !self.active {
+            let prev = self
+                .ring_state
+                .blocked_senders
+                .fetch_add(1, Ordering::AcqRel);
+            if prev == 0 {
+                let now_ms = crate::buffer::dead_letter::current_unix_ms().max(1);
+                self.ring_state
+                    .blocked_since_unix_ms
+                    .store(now_ms, Ordering::Release);
+            }
+            self.active = true;
+        }
+    }
+
+    fn mark_admitted(&mut self) {
+        if self.active {
+            let prev = self
+                .ring_state
+                .blocked_senders
+                .fetch_sub(1, Ordering::AcqRel);
+            if prev <= 1 {
+                self.ring_state
+                    .blocked_since_unix_ms
+                    .store(0, Ordering::Release);
+            } else {
+                let now_ms = crate::buffer::dead_letter::current_unix_ms().max(1);
+                self.ring_state
+                    .blocked_since_unix_ms
+                    .store(now_ms, Ordering::Release);
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for BlockedSendGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let prev = self
+                .ring_state
+                .blocked_senders
+                .fetch_sub(1, Ordering::AcqRel);
+            if prev <= 1 {
+                self.ring_state
+                    .blocked_since_unix_ms
+                    .store(0, Ordering::Release);
+            }
+            self.active = false;
+        }
     }
 }
 
@@ -430,6 +626,7 @@ impl BufferSender {
         let batch_rows = record_batch.num_rows();
         let budget = self.inner.config.per_signal_budget();
         let ring_state = &self.inner.rings[signal.as_u8() as usize];
+        let mut blocked_guard = BlockedSendGuard::new(ring_state);
 
         let reserved_seq_id = loop {
             if let Some(reason) = self.inner.fatal_reason() {
@@ -449,7 +646,7 @@ impl BufferSender {
                     return Err(PipelineError::DownstreamClosed);
                 }
 
-                let mut evicted_any = false;
+                let mut evicted_rows: u64 = 0;
                 if self.inner.config.overflow_policy == OverflowPolicy::DropOldest {
                     while !Self::can_admit(&ring, batch_bytes, budget) {
                         let Some(evicted) = ring.queue.pop_front() else {
@@ -458,17 +655,23 @@ impl BufferSender {
                         ring.bytes_in_flight =
                             ring.bytes_in_flight.saturating_sub(evicted.byte_size);
                         ring.rows_in_flight = ring.rows_in_flight.saturating_sub(evicted.row_count);
-                        ring.evicted_records = ring
-                            .evicted_records
-                            .saturating_add(u64::try_from(evicted.row_count).unwrap_or(u64::MAX));
+                        let rows = u64::try_from(evicted.row_count).unwrap_or(u64::MAX);
+                        ring.evicted_records = ring.evicted_records.saturating_add(rows);
+                        evicted_rows = evicted_rows.saturating_add(rows);
                         ring.slots.insert(evicted.seq_id, LeaseSlotState::Acked);
                         ring.advance_watermark(&ring_state.committed_seq);
-                        evicted_any = true;
                     }
                 }
 
-                if evicted_any && let Some(disk) = &self.inner.disk {
-                    disk.update_watermark_nonblocking(DiskWatermark::from_rings(&self.inner.rings));
+                if evicted_rows > 0 {
+                    self.inner
+                        .metrics
+                        .record_dropped(signal, evicted_rows, "overflow");
+                    if let Some(disk) = &self.inner.disk {
+                        disk.update_watermark_nonblocking(DiskWatermark::from_rings(
+                            &self.inner.rings,
+                        ));
+                    }
                 }
 
                 if Self::can_admit(&ring, batch_bytes, budget) {
@@ -488,15 +691,20 @@ impl BufferSender {
                             attempt: 0,
                             ready_at: None,
                         });
+                        self.inner.sync_ring_metrics(signal, &ring);
                         drop(ring);
+                        blocked_guard.mark_admitted();
                         self.inner.notify_data_ready(signal);
                         return Ok(());
                     }
 
+                    self.inner.sync_ring_metrics(signal, &ring);
+                    blocked_guard.mark_admitted();
                     break seq_id;
                 }
             }
 
+            blocked_guard.mark_blocked();
             notified.await;
         };
 
@@ -552,6 +760,7 @@ impl BufferSender {
                         attempt: 0,
                         ready_at: None,
                     });
+                    self.inner.sync_ring_metrics(signal, &ring);
                 }
                 if actual_bytes < batch_bytes {
                     ring_state.space_available_notify.notify_waiters();
@@ -565,6 +774,7 @@ impl BufferSender {
                     ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(batch_bytes);
                     ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
                     ring.slots.remove(&reserved_seq_id);
+                    self.inner.sync_ring_metrics(signal, &ring);
                 }
                 self.inner.record_storage_failure(signal, err.to_string());
                 Err(err)
@@ -591,6 +801,34 @@ impl Clone for BufferSender {
 impl Drop for BufferSender {
     fn drop(&mut self) {
         self.inner.decrement_senders(self.signal_scope);
+    }
+}
+
+/// Cloneable administrative handle for inspecting readiness and finalizing bounded shutdown drains
+/// on a [`SinkBuffer`] without holding a consumer receiver handle.
+#[derive(Debug, Clone)]
+pub struct BufferController {
+    inner: Arc<BufferInner>,
+}
+
+impl BufferController {
+    /// Returns `true` if the buffer is healthy and not stalled beyond `readiness_stall_sec`
+    /// or `max_transient_duration_sec`.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// Returns the configured graceful shutdown drain timeout in seconds.
+    #[must_use]
+    pub fn drain_timeout_sec(&self) -> u64 {
+        self.inner.config.drain_timeout_sec
+    }
+
+    /// Executes the configured [`DrainTimeoutPolicy`] (`Persist` or `Discard`) when graceful
+    /// shutdown exceeds `drain_timeout_sec`.
+    pub fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
+        self.inner.finalize_shutdown_timeout()
     }
 }
 
@@ -655,6 +893,85 @@ impl SinkBuffer {
                 },
             )
         }))
+    }
+
+    /// Returns a cloneable [`BufferController`] handle for readiness probes and shutdown drain orchestration.
+    #[must_use]
+    pub fn controller(&self) -> BufferController {
+        BufferController {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Returns `true` if the buffer is healthy and not stalled beyond `readiness_stall_sec`
+    /// or `max_transient_duration_sec`.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// Returns the configured graceful shutdown drain timeout in seconds.
+    #[must_use]
+    pub fn drain_timeout_sec(&self) -> u64 {
+        self.inner.config.drain_timeout_sec
+    }
+
+    /// Executes the configured [`DrainTimeoutPolicy`] (`Persist` or `Discard`) when graceful
+    /// shutdown exceeds `drain_timeout_sec`.
+    pub fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
+        self.inner.finalize_shutdown_timeout()
+    }
+
+    /// Returns a reference to the buffer's [`BufferMetrics`] instruments and state.
+    #[must_use]
+    pub fn metrics(&self) -> &BufferMetrics {
+        &self.inner.metrics
+    }
+
+    /// Returns the cumulative number of dropped records for `reason`
+    /// (`"overflow"`, `"dead_letter"`, `"corruption"`, or `"shutdown_timeout"`).
+    #[must_use]
+    pub fn dropped_records(&self, reason: &str) -> u64 {
+        self.inner
+            .metrics
+            .dropped_records(self.signal_scope, reason)
+    }
+
+    /// Returns the cumulative number of records discarded on shutdown drain timeout (`DrainTimeoutPolicy::Discard`).
+    #[must_use]
+    pub fn shutdown_timeout_drops(&self) -> u64 {
+        match self.signal_scope {
+            Some(sig) => self.inner.rings[sig.as_u8() as usize]
+                .shutdown_timeout_drops
+                .load(Ordering::Acquire),
+            None => ALL_SIGNALS.iter().fold(0u64, |acc, &sig| {
+                acc.saturating_add(
+                    self.inner.rings[sig.as_u8() as usize]
+                        .shutdown_timeout_drops
+                        .load(Ordering::Acquire),
+                )
+            }),
+        }
+    }
+
+    /// Returns the cumulative number of records dropped due to `OverflowPolicy::DropOldest`.
+    #[must_use]
+    pub fn overflow_drops(&self) -> u64 {
+        self.dropped_records("overflow")
+    }
+
+    /// Returns the cumulative number of records committed via [`Lease::ack`].
+    #[must_use]
+    pub fn committed_records(&self) -> u64 {
+        self.inner.metrics.committed_records(self.signal_scope)
+    }
+
+    /// Returns the cumulative number of lease nacks for `failure_class` (`"transient"`, `"rejected"`, `"fatal"`).
+    #[must_use]
+    pub fn lease_nacks(&self, failure_class: &str) -> u64 {
+        self.inner
+            .metrics
+            .lease_nacks(self.signal_scope, failure_class)
     }
 
     /// Waits for the next coalesced [`Lease`] to become ready, or returns `Ok(None)` when
@@ -1262,5 +1579,212 @@ mod tests {
             Some(SignalBatch::Traces(_))
         ));
         assert!(traces_buf.recv_passthrough().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_buffer_is_not_ready_when_send_stalled_beyond_readiness_stall_sec() {
+        let sample = make_batch(&[1, 2, 3, 4]);
+        let batch_bytes = sample.get_array_memory_size();
+        let config = BufferConfig {
+            max_buffer_bytes: (batch_bytes as u64) * 3,
+            max_batch_size_bytes: batch_bytes,
+            max_batch_interval_sec: 0,
+            overflow_policy: OverflowPolicy::Block,
+            readiness_stall_sec: 1,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_ready_stall", config).unwrap();
+        assert!(buf.is_ready());
+
+        // Fill Logs ring to capacity
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        assert!(buf.is_ready());
+
+        // Spawn a blocked send
+        let tx2 = tx.clone();
+        let sample2 = sample.clone();
+        let blocked_send = tokio::spawn(async move { tx2.send(SignalBatch::Logs(sample2)).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!blocked_send.is_finished());
+        assert!(
+            buf.is_ready(),
+            "Buffer should still be ready before readiness_stall_sec elapses"
+        );
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            !buf.is_ready(),
+            "Buffer must report not-ready once send has been blocked beyond readiness_stall_sec"
+        );
+
+        // Ack the first batch to unblock send and restore readiness
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        lease.ack().await.unwrap();
+        blocked_send.await.unwrap().unwrap();
+        assert!(
+            buf.is_ready(),
+            "Buffer must return to ready once blocked send completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_ready_returns_false_when_transient_retry_exceeds_max_transient_duration_sec() {
+        let config = BufferConfig {
+            initial_backoff_ms: 10,
+            max_backoff_sec: 1,
+            max_transient_duration_sec: 1,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_transient_ready", config).unwrap();
+        assert!(buf.is_ready());
+
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        lease1.nack(FailureClass::Transient).await.unwrap();
+        assert!(buf.is_ready());
+
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            !buf.is_ready(),
+            "Buffer must report not-ready when transient retry streak exceeds max_transient_duration_sec"
+        );
+
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+        lease2.nack(FailureClass::Transient).await.unwrap();
+        assert!(!buf.is_ready());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drain_timeout_discard_drops_remaining_and_increments_metric() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            on_drain_timeout: Some(DrainTimeoutPolicy::Discard),
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, buf) = SinkBuffer::new("test_discard_timeout", config).unwrap();
+
+        tx.send(SignalBatch::Logs(make_batch(&[10, 20, 30])))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Metrics(make_batch(&[40, 50])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let err = buf.finalize_shutdown_timeout().unwrap_err();
+        assert!(matches!(err, PipelineError::Storage(_)));
+        assert_eq!(buf.dropped_records("shutdown_timeout"), 5);
+        assert_eq!(buf.shutdown_timeout_drops(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drain_timeout_persist_flushes_disk_writer_and_preserves_segments() {
+        let pid = std::process::id();
+        let disk_dir = std::env::temp_dir().join(format!("otel-dl-persist-timeout-{pid}"));
+        let _ = std::fs::remove_dir_all(&disk_dir);
+
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(disk_dir.clone()),
+            on_drain_timeout: Some(DrainTimeoutPolicy::Persist),
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        {
+            let (tx, mut buf) = SinkBuffer::new("test_persist_timeout", config.clone()).unwrap();
+            tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+                .await
+                .unwrap();
+            tx.send(SignalBatch::Logs(make_batch(&[3, 4, 5])))
+                .await
+                .unwrap();
+            drop(tx);
+
+            // Ack batch 1, leave batch 2 unacked when drain timeout fires
+            let lease1 = buf.next_lease().await.unwrap().unwrap();
+            assert_eq!(lease1.id().first_seq, 1);
+            lease1.ack().await.unwrap();
+
+            buf.finalize_shutdown_timeout().unwrap();
+        }
+
+        {
+            let (tx, mut reopened) =
+                SinkBuffer::new("test_persist_timeout", config.clone()).unwrap();
+            drop(tx);
+            assert_eq!(reopened.replayed_records(), 3);
+
+            let lease2 = reopened.next_lease().await.unwrap().unwrap();
+            assert_eq!(lease2.id().first_seq, 2);
+            let batch2 = lease2.prepare(Ok).await.unwrap();
+            assert_eq!(batch2, make_batch(&[3, 4, 5]));
+            lease2.ack().await.unwrap();
+            assert!(reopened.next_lease().await.unwrap().is_none());
+        }
+
+        let _ = std::fs::remove_dir_all(&disk_dir);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_drain_timeout_discard_and_persist_policies() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, buf) = SinkBuffer::new("test_both_policies", config).unwrap();
+        tx.send(SignalBatch::Traces(make_batch(&[7, 8, 9, 10])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        assert!(buf.finalize_shutdown_timeout().is_err());
+        assert_eq!(buf.dropped_records("shutdown_timeout"), 4);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_metrics_gauges_counters_and_drop_reasons() {
+        let sample = make_batch(&[1, 2, 3]);
+        let batch_bytes = sample.get_array_memory_size() as u64;
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_buffer_bytes: batch_bytes * 3,
+            max_batch_size_bytes: batch_bytes as usize,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            overflow_policy: OverflowPolicy::DropOldest,
+            initial_backoff_ms: 1,
+            max_backoff_sec: 1,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_metrics_sink", config).unwrap();
+
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        // Trigger DropOldest eviction of the first batch (3 rows)
+        tx.send(SignalBatch::Logs(sample)).await.unwrap();
+        assert_eq!(buf.overflow_drops(), 3);
+        assert_eq!(buf.dropped_records("overflow"), 3);
+
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(
+            buf.metrics()
+                .lease_nacks(Some(SignalKind::Logs), "transient"),
+            0
+        );
+        lease.nack(FailureClass::Transient).await.unwrap();
+        assert_eq!(buf.lease_nacks("transient"), 1);
+
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+        lease2.ack().await.unwrap();
+        assert_eq!(buf.committed_records(), 3);
     }
 }

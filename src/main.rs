@@ -584,6 +584,31 @@ fn supervise_sink_exit(
     }
 }
 
+/// Attaches `GET /healthz` and `GET /readyz` probe endpoints to the admin HTTP [`axum::Router`].
+fn attach_admin_probe_routes(
+    router: axum::Router,
+    buffer_controller: pipeline_core::buffer::BufferController,
+) -> axum::Router {
+    router
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let ctrl = buffer_controller.clone();
+                async move {
+                    if ctrl.is_ready() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -679,6 +704,7 @@ async fn main() -> anyhow::Result<()> {
         active_sink_name,
         pipeline_core::buffer::BufferConfig::passthrough(),
     )?;
+    let buffer_controller = logs_sink_rx.controller();
 
     // Create shutdown watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -699,7 +725,7 @@ async fn main() -> anyhow::Result<()> {
         initialize_transformers(&config, &mut metric_bridges)?;
 
     let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
-        let admin_router =
+        let base_admin_router =
             if let (Some(wasm_cfg), Some(engine)) = (&config.wasm_transformer, &shared_engine) {
                 wasm_transformer::reload::build_admin_router_with_sha(
                     std::sync::Arc::clone(engine),
@@ -709,6 +735,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 axum::Router::new()
             };
+        let admin_router = attach_admin_probe_routes(base_admin_router, buffer_controller.clone());
         let listener = tokio::net::TcpListener::bind(admin_addr)
             .await
             .map_err(|e| {
@@ -1051,6 +1078,12 @@ async fn main() -> anyhow::Result<()> {
     let mut source_handle = tokio::spawn(async move { source.run().await });
 
     let mut exit_err: Option<anyhow::Error> = None;
+    let mut logs_trans_done = false;
+    let mut traces_trans_done = false;
+    let mut metrics_trans_done = false;
+    let mut logs_sink_done = false;
+    let mut traces_sink_done = false;
+    let mut metrics_sink_done = false;
 
     // Handle shutdown
     tokio::select! {
@@ -1081,6 +1114,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut logs_trans_handle => {
+            logs_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Logs transformer failed: {e}");
@@ -1098,6 +1132,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut traces_trans_handle => {
+            traces_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Traces transformer failed: {e}");
@@ -1115,6 +1150,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut metrics_trans_handle => {
+            metrics_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Metrics transformer failed: {e}");
@@ -1132,81 +1168,133 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut logs_sink_handle => {
+            logs_sink_done = true;
             exit_err = Some(supervise_sink_exit("Logs", res));
             let _ = shutdown_tx.send(true);
         }
         res = &mut traces_sink_handle => {
+            traces_sink_done = true;
             exit_err = Some(supervise_sink_exit("Traces", res));
             let _ = shutdown_tx.send(true);
         }
         res = &mut metrics_sink_handle => {
+            metrics_sink_done = true;
             exit_err = Some(supervise_sink_exit("Metrics", res));
             let _ = shutdown_tx.send(true);
         }
     }
 
-    // Wait for pipeline to drain
-    let ((), (), (), logs_drain_res, traces_drain_res, metrics_drain_res) = tokio::join!(
-        async {
-            if !logs_trans_handle.is_finished() {
-                let _ = logs_trans_handle.await;
+    // Wait for pipeline to drain within bounded drain_timeout_sec
+    let drain_timeout = std::time::Duration::from_secs(buffer_controller.drain_timeout_sec());
+    let drain_outcome = tokio::time::timeout(drain_timeout, async {
+        tokio::join!(
+            async {
+                if !logs_trans_done {
+                    let _ = (&mut logs_trans_handle).await;
+                    logs_trans_done = true;
+                }
+            },
+            async {
+                if !traces_trans_done {
+                    let _ = (&mut traces_trans_handle).await;
+                    traces_trans_done = true;
+                }
+            },
+            async {
+                if !metrics_trans_done {
+                    let _ = (&mut metrics_trans_handle).await;
+                    metrics_trans_done = true;
+                }
+            },
+            async {
+                if logs_sink_done {
+                    None
+                } else {
+                    let res = (&mut logs_sink_handle).await;
+                    logs_sink_done = true;
+                    Some(res)
+                }
+            },
+            async {
+                if traces_sink_done {
+                    None
+                } else {
+                    let res = (&mut traces_sink_handle).await;
+                    traces_sink_done = true;
+                    Some(res)
+                }
+            },
+            async {
+                if metrics_sink_done {
+                    None
+                } else {
+                    let res = (&mut metrics_sink_handle).await;
+                    metrics_sink_done = true;
+                    Some(res)
+                }
             }
-        },
-        async {
-            if !traces_trans_handle.is_finished() {
-                let _ = traces_trans_handle.await;
-            }
-        },
-        async {
-            if !metrics_trans_handle.is_finished() {
-                let _ = metrics_trans_handle.await;
-            }
-        },
-        async {
-            if logs_sink_handle.is_finished() {
-                None
-            } else {
-                Some(logs_sink_handle.await)
-            }
-        },
-        async {
-            if traces_sink_handle.is_finished() {
-                None
-            } else {
-                Some(traces_sink_handle.await)
-            }
-        },
-        async {
-            if metrics_sink_handle.is_finished() {
-                None
-            } else {
-                Some(metrics_sink_handle.await)
+        )
+    })
+    .await;
+
+    if let Ok(((), (), (), logs_drain_res, traces_drain_res, metrics_drain_res)) = drain_outcome {
+        for (signal_name, drain_res) in [
+            ("Logs", logs_drain_res),
+            ("Traces", traces_drain_res),
+            ("Metrics", metrics_drain_res),
+        ] {
+            match drain_res {
+                Some(Ok(Err(e))) => {
+                    if exit_err.is_none() {
+                        exit_err = Some(anyhow::anyhow!(
+                            "{signal_name} sink failed during drain: {e}"
+                        ));
+                    }
+                }
+                Some(Err(join_err)) => {
+                    tracing::error!("{signal_name} sink task panicked during drain: {join_err}");
+                    if exit_err.is_none() {
+                        exit_err = Some(anyhow::anyhow!(
+                            "{signal_name} sink task panicked during drain: {join_err}"
+                        ));
+                    }
+                }
+                Some(Ok(Ok(()))) | None => {}
             }
         }
-    );
-
-    for (signal_name, drain_res) in [
-        ("Logs", logs_drain_res),
-        ("Traces", traces_drain_res),
-        ("Metrics", metrics_drain_res),
-    ] {
-        match drain_res {
-            Some(Ok(Err(e))) => {
-                if exit_err.is_none() {
-                    exit_err = Some(anyhow::anyhow!(
-                        "{signal_name} sink failed during drain: {e}"
-                    ));
-                }
-            }
-            Some(Err(join_err)) => {
-                tracing::error!("{signal_name} sink task panicked during drain: {join_err}");
-                if exit_err.is_none() {
-                    exit_err = Some(anyhow::anyhow!(
-                        "{signal_name} sink task panicked during drain: {join_err}"
-                    ));
-                }
-            }
-            Some(Ok(Ok(()))) | None => {}
+    } else {
+        tracing::warn!(
+            timeout_sec = buffer_controller.drain_timeout_sec(),
+            "Graceful shutdown drain timed out; aborting remaining tasks and finalizing buffer policy"
+        );
+        if !logs_trans_done {
+            logs_trans_handle.abort();
+            let _ = logs_trans_handle.await;
+        }
+        if !traces_trans_done {
+            traces_trans_handle.abort();
+            let _ = traces_trans_handle.await;
+        }
+        if !metrics_trans_done {
+            metrics_trans_handle.abort();
+            let _ = metrics_trans_handle.await;
+        }
+        if !logs_sink_done {
+            logs_sink_handle.abort();
+            let _ = logs_sink_handle.await;
+        }
+        if !traces_sink_done {
+            traces_sink_handle.abort();
+            let _ = traces_sink_handle.await;
+        }
+        if !metrics_sink_done {
+            metrics_sink_handle.abort();
+            let _ = metrics_sink_handle.await;
+        }
+        if let Err(e) = buffer_controller.finalize_shutdown_timeout()
+            && exit_err.is_none()
+        {
+            exit_err = Some(anyhow::anyhow!("Shutdown drain timed out: {e}"));
         }
     }
 
@@ -2790,5 +2878,76 @@ mod tests {
 
         let _ = std::fs::remove_file(&tmp_path);
         assert!(!invalid_status.success());
+    }
+
+    #[tokio::test]
+    async fn test_admin_probe_routes_healthz_and_readyz_reflect_buffer_readiness() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use tower::ServiceExt;
+
+        let config = pipeline_core::buffer::BufferConfig {
+            max_batch_interval_sec: 0,
+            ..pipeline_core::buffer::BufferConfig::default()
+        };
+        let (tx, mut buf) = pipeline_core::buffer::SinkBuffer::new("probe_test", config).unwrap();
+        let router = attach_admin_probe_routes(axum::Router::new(), buf.controller());
+
+        let health_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), axum::http::StatusCode::OK);
+
+        let ready_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_resp.status(), axum::http::StatusCode::OK);
+
+        // Nack with Fatal to transition buffer to not-ready
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        tx.send(pipeline_core::pipeline::SignalBatch::Logs(batch))
+            .await
+            .unwrap();
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        let _ = lease
+            .nack(pipeline_core::buffer::FailureClass::Fatal {
+                reason: "auth failure".to_string(),
+            })
+            .await;
+
+        let not_ready_resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ready_resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
