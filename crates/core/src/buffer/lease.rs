@@ -1,6 +1,6 @@
 use crate::buffer::BufferInner;
 use crate::buffer::config::SignalKind;
-use crate::buffer::memory::LeasedBatchMeta;
+use crate::buffer::memory::{BatchPayload, LeasedBatchMeta};
 use crate::error::PipelineError;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
@@ -43,6 +43,7 @@ pub struct Lease {
     pub(crate) inner: Arc<BufferInner>,
     pub(crate) id: LeaseId,
     pub(crate) batches: Vec<RecordBatch>,
+    pub(crate) payloads: Vec<BatchPayload>,
     pub(crate) meta: Vec<LeasedBatchMeta>,
     pub(crate) num_rows: usize,
     pub(crate) byte_size: usize,
@@ -63,7 +64,7 @@ impl Lease {
         self.id.signal
     }
 
-    /// Returns a slice of the raw `RecordBatch`es belonging to this lease.
+    /// Returns a slice of the in-memory `RecordBatch`es belonging to this lease.
     #[must_use]
     pub fn batches(&self) -> &[RecordBatch] {
         &self.batches
@@ -75,7 +76,7 @@ impl Lease {
         self.num_rows
     }
 
-    /// Returns the total in-memory byte size charged for this lease.
+    /// Returns the total byte size charged for this lease.
     #[must_use]
     pub const fn byte_size(&self) -> usize {
         self.byte_size
@@ -87,28 +88,58 @@ impl Lease {
         self.attempt
     }
 
-    /// Offloads batch concatenation (bypassed when the lease holds a single batch) and
-    /// sink-specific preparation work `f` onto a single `tokio::task::spawn_blocking` call.
+    /// Offloads on-disk frame decoding (when in `Disk` mode), batch concatenation (bypassed
+    /// when the lease holds a single batch), and sink-specific preparation work `f` onto a
+    /// single `tokio::task::spawn_blocking` call.
     pub async fn prepare<F, T>(&self, f: F) -> Result<T, PipelineError>
     where
         F: FnOnce(RecordBatch) -> Result<T, PipelineError> + Send + 'static,
         T: Send + 'static,
     {
-        if self.batches.is_empty() {
+        if self.payloads.is_empty() {
             return Err(PipelineError::Internal(
                 "Lease::prepare invoked on empty lease".into(),
             ));
         }
-        let batches = self.batches.clone();
+        let payloads = self.payloads.clone();
+        let disk_path = self.inner.config.disk_path.clone();
+        let max_payload_len = u32::try_from(self.inner.config.segment_size_bytes.saturating_mul(2))
+            .unwrap_or(u32::MAX);
         tokio::task::spawn_blocking(move || {
-            let combined = if batches.len() == 1 {
-                batches
+            let mut decoded = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                match payload {
+                    BatchPayload::InMemory(batch) => decoded.push(batch),
+                    BatchPayload::OnDisk {
+                        segment_id,
+                        offset,
+                        len,
+                        ..
+                    } => {
+                        let base_dir = disk_path.as_ref().ok_or_else(|| {
+                            PipelineError::Storage(
+                                "OnDisk payload encountered without configured disk_path".into(),
+                            )
+                        })?;
+                        let batch = crate::buffer::disk::read_frame_at(
+                            base_dir,
+                            segment_id,
+                            offset,
+                            len,
+                            max_payload_len,
+                        )?;
+                        decoded.push(batch);
+                    }
+                }
+            }
+            let combined = if decoded.len() == 1 {
+                decoded
                     .into_iter()
                     .next()
                     .ok_or_else(|| PipelineError::Internal("empty lease batches".into()))?
             } else {
-                let schema = batches[0].schema();
-                arrow::compute::concat_batches(&schema, &batches).map_err(PipelineError::Arrow)?
+                let schema = decoded[0].schema();
+                arrow::compute::concat_batches(&schema, &decoded).map_err(PipelineError::Arrow)?
             };
             f(combined)
         })
@@ -117,22 +148,21 @@ impl Lease {
     }
 
     /// Commits the lease, freeing its byte budget and advancing the contiguous watermark.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn ack(mut self) -> Result<(), PipelineError> {
         self.completed = true;
         self.inner
-            .ack_lease(self.id.signal, &self.meta, self.byte_size, self.num_rows);
-        Ok(())
+            .ack_lease(self.id.signal, &self.meta, self.byte_size, self.num_rows)
+            .await
     }
 
     /// Rejects the lease with the given [`FailureClass`], either scheduling a backoff retry,
     /// quarantining after `max_attempts`, or failing the buffer on `Fatal`.
-    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn nack(mut self, class: FailureClass) -> Result<(), PipelineError> {
         self.completed = true;
         let signal = self.id.signal;
         let next_attempt = self.attempt.saturating_add(1);
-        let batches = std::mem::take(&mut self.batches);
+        self.batches.clear();
+        let payloads = std::mem::take(&mut self.payloads);
         let meta = std::mem::take(&mut self.meta);
 
         match class {
@@ -145,7 +175,7 @@ impl Lease {
                             "transient retry duration exceeded {}s on sink '{}'",
                             self.inner.config.max_transient_duration_sec, self.inner.sink_name
                         );
-                        self.inner.fail_lease(signal, batches, meta, reason);
+                        self.inner.fail_lease(signal, payloads, meta, reason);
                         return Ok(());
                     }
                 }
@@ -165,12 +195,12 @@ impl Lease {
                     None
                 };
                 self.inner
-                    .requeue_lease(signal, batches, meta, next_attempt, ready_at);
+                    .requeue_lease(signal, payloads, meta, next_attempt, ready_at);
             }
             FailureClass::Rejected { reason } => {
                 if next_attempt < self.inner.config.max_attempts {
                     self.inner
-                        .requeue_lease(signal, batches, meta, next_attempt, None);
+                        .requeue_lease(signal, payloads, meta, next_attempt, None);
                 } else {
                     tracing::error!(
                         sink = %self.inner.sink_name,
@@ -182,11 +212,12 @@ impl Lease {
                         "Rejected lease exhausted max_attempts; dropping and advancing watermark"
                     );
                     self.inner
-                        .ack_lease(signal, &meta, self.byte_size, self.num_rows);
+                        .ack_lease(signal, &meta, self.byte_size, self.num_rows)
+                        .await?;
                 }
             }
             FailureClass::Fatal { reason } => {
-                self.inner.fail_lease(signal, batches, meta, reason);
+                self.inner.fail_lease(signal, payloads, meta, reason);
             }
         }
         Ok(())
@@ -196,7 +227,8 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if !self.completed {
-            let batches = std::mem::take(&mut self.batches);
+            self.batches.clear();
+            let payloads = std::mem::take(&mut self.payloads);
             let meta = std::mem::take(&mut self.meta);
             let next_attempt = self.attempt.saturating_add(1);
             tracing::warn!(
@@ -208,7 +240,7 @@ impl Drop for Lease {
                 "Lease dropped without ack or nack; synchronously requeuing batches at head"
             );
             self.inner
-                .requeue_lease(self.id.signal, batches, meta, next_attempt, None);
+                .requeue_lease(self.id.signal, payloads, meta, next_attempt, None);
         }
     }
 }

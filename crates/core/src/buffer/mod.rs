@@ -1,18 +1,23 @@
 pub mod config;
+pub mod disk;
 pub mod lease;
 pub mod memory;
 
 pub use crate::buffer::config::{
     BufferConfig, BufferMode, DrainTimeoutPolicy, LegacyBatchingConfig, OverflowPolicy, SignalKind,
 };
+pub use crate::buffer::disk::{
+    DiskWatermark, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, FrameDecodeError, FrameHeader,
+    decode_frame, encode_frame,
+};
 pub use crate::buffer::lease::{FailureClass, Lease, LeaseId};
 
+use crate::buffer::disk::DiskBackend;
 use crate::buffer::memory::{
-    LeaseSlotState, LeasedBatchMeta, QueuedBatch, SignalRing, SignalRingState,
+    BatchPayload, LeaseSlotState, LeasedBatchMeta, QueuedBatch, SignalRing, SignalRingState,
 };
 use crate::error::PipelineError;
 use crate::pipeline::SignalBatch;
-use arrow::record_batch::RecordBatch;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -30,20 +35,43 @@ pub(crate) struct BufferInner {
     pub(crate) sink_name: String,
     pub(crate) config: BufferConfig,
     pub(crate) rings: [SignalRingState; 3],
+    pub(crate) disk: Option<DiskBackend>,
     pub(crate) any_data_ready_notify: Notify,
     pub(crate) fatal_error: Mutex<Option<String>>,
 }
 
 impl BufferInner {
-    fn new(sink_name: &str, config: BufferConfig) -> Arc<Self> {
-        Arc::new(Self {
+    fn new(sink_name: &str, config: BufferConfig) -> Result<Arc<Self>, PipelineError> {
+        let rings = [
+            SignalRingState::new(),
+            SignalRingState::new(),
+            SignalRingState::new(),
+        ];
+        let disk = if config.mode == BufferMode::Disk {
+            Some(DiskBackend::open_and_recover(sink_name, &config, &rings)?)
+        } else {
+            None
+        };
+        Ok(Arc::new(Self {
             sink_name: sink_name.to_string(),
             config,
+            rings,
+            disk,
+            any_data_ready_notify: Notify::new(),
+            fatal_error: Mutex::new(None),
+        }))
+    }
+
+    fn new_passthrough() -> Arc<Self> {
+        Arc::new(Self {
+            sink_name: "passthrough".to_string(),
+            config: BufferConfig::passthrough(),
             rings: [
                 SignalRingState::new(),
                 SignalRingState::new(),
                 SignalRingState::new(),
             ],
+            disk: None,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
         })
@@ -60,13 +88,13 @@ impl BufferInner {
         self.any_data_ready_notify.notify_waiters();
     }
 
-    pub(crate) fn ack_lease(
+    pub(crate) async fn ack_lease(
         &self,
         signal: SignalKind,
         meta: &[LeasedBatchMeta],
         byte_size: usize,
         num_rows: usize,
-    ) {
+    ) -> Result<(), PipelineError> {
         let ring_state = &self.rings[signal.as_u8() as usize];
         {
             let mut ring = lock_unpoisoned(&ring_state.ring);
@@ -74,12 +102,18 @@ impl BufferInner {
         }
         ring_state.space_available_notify.notify_waiters();
         self.notify_data_ready(signal);
+
+        if let Some(disk) = &self.disk {
+            let wm = DiskWatermark::from_rings(&self.rings);
+            disk.update_watermark(wm).await?;
+        }
+        Ok(())
     }
 
     pub(crate) fn requeue_lease(
         &self,
         signal: SignalKind,
-        batches: Vec<RecordBatch>,
+        payloads: Vec<BatchPayload>,
         meta: Vec<LeasedBatchMeta>,
         next_attempt: u32,
         ready_at: Option<Instant>,
@@ -87,7 +121,7 @@ impl BufferInner {
         let ring_state = &self.rings[signal.as_u8() as usize];
         {
             let mut ring = lock_unpoisoned(&ring_state.ring);
-            ring.requeue_at_head(batches, meta, next_attempt, ready_at);
+            ring.requeue_at_head(payloads, meta, next_attempt, ready_at);
         }
         self.notify_data_ready(signal);
     }
@@ -95,7 +129,7 @@ impl BufferInner {
     pub(crate) fn fail_lease(
         &self,
         signal: SignalKind,
-        batches: Vec<RecordBatch>,
+        payloads: Vec<BatchPayload>,
         meta: Vec<LeasedBatchMeta>,
         reason: String,
     ) {
@@ -108,7 +142,31 @@ impl BufferInner {
         let ring_state = &self.rings[signal.as_u8() as usize];
         {
             let mut ring = lock_unpoisoned(&ring_state.ring);
-            ring.requeue_at_head(batches, meta, 0, None);
+            ring.requeue_at_head(payloads, meta, 0, None);
+            if ring.fatal_error.is_none() {
+                ring.fatal_error = Some(reason);
+            }
+        }
+        for sig in ALL_SIGNALS {
+            self.rings[sig.as_u8() as usize]
+                .space_available_notify
+                .notify_waiters();
+            self.rings[sig.as_u8() as usize]
+                .data_ready_notify
+                .notify_waiters();
+        }
+        self.any_data_ready_notify.notify_waiters();
+    }
+
+    pub(crate) fn record_storage_failure(&self, signal: SignalKind, reason: String) {
+        {
+            let mut fatal = lock_unpoisoned(&self.fatal_error);
+            if fatal.is_none() {
+                *fatal = Some(reason.clone());
+            }
+        }
+        {
+            let mut ring = lock_unpoisoned(&self.rings[signal.as_u8() as usize].ring);
             if ring.fatal_error.is_none() {
                 ring.fatal_error = Some(reason);
             }
@@ -192,10 +250,14 @@ impl BufferInner {
         let first_seq = first.seq_id;
         let mut last_seq = first.seq_id;
         let attempt = first.attempt;
-        let first_schema = first.batch.schema();
+        let first_schema = first.payload.schema();
         let mut total_bytes = first.byte_size;
         let mut total_rows = first.row_count;
-        let mut batches = vec![first.batch];
+        let mut batches = Vec::new();
+        if let BatchPayload::InMemory(ref b) = first.payload {
+            batches.push(b.clone());
+        }
+        let mut payloads = vec![first.payload];
         let mut meta = vec![LeasedBatchMeta {
             seq_id: first.seq_id,
             byte_size: first.byte_size,
@@ -213,7 +275,7 @@ impl BufferInner {
             if next.seq_id != last_seq.saturating_add(1) {
                 break;
             }
-            if next.batch.schema() != first_schema {
+            if next.payload.schema() != first_schema {
                 break;
             }
             if total_bytes.saturating_add(next.byte_size) > self.config.max_batch_size_bytes {
@@ -232,7 +294,10 @@ impl BufferInner {
             last_seq = popped.seq_id;
             total_bytes = total_bytes.saturating_add(popped.byte_size);
             total_rows = total_rows.saturating_add(popped.row_count);
-            batches.push(popped.batch);
+            if let BatchPayload::InMemory(ref b) = popped.payload {
+                batches.push(b.clone());
+            }
+            payloads.push(popped.payload);
             meta.push(LeasedBatchMeta {
                 seq_id: popped.seq_id,
                 byte_size: popped.byte_size,
@@ -250,6 +315,7 @@ impl BufferInner {
                 last_seq,
             },
             batches,
+            payloads,
             meta,
             num_rows: total_rows,
             byte_size: total_bytes,
@@ -290,7 +356,7 @@ impl BufferSender {
         let budget = self.inner.config.per_signal_budget();
         let ring_state = &self.inner.rings[signal.as_u8() as usize];
 
-        loop {
+        let reserved_seq_id = loop {
             if let Some(reason) = self.inner.fatal_reason() {
                 return Err(PipelineError::Storage(reason.into()));
             }
@@ -308,6 +374,7 @@ impl BufferSender {
                     return Err(PipelineError::DownstreamClosed);
                 }
 
+                let mut evicted_any = false;
                 if self.inner.config.overflow_policy == OverflowPolicy::DropOldest {
                     while !Self::can_admit(&ring, batch_bytes, budget) {
                         let Some(evicted) = ring.queue.pop_front() else {
@@ -321,7 +388,12 @@ impl BufferSender {
                             .saturating_add(u64::try_from(evicted.row_count).unwrap_or(u64::MAX));
                         ring.slots.insert(evicted.seq_id, LeaseSlotState::Acked);
                         ring.advance_watermark(&ring_state.committed_seq);
+                        evicted_any = true;
                     }
+                }
+
+                if evicted_any && let Some(disk) = &self.inner.disk {
+                    disk.update_watermark_nonblocking(DiskWatermark::from_rings(&self.inner.rings));
                 }
 
                 if Self::can_admit(&ring, batch_bytes, budget) {
@@ -330,22 +402,98 @@ impl BufferSender {
                     ring.bytes_in_flight = ring.bytes_in_flight.saturating_add(batch_bytes);
                     ring.rows_in_flight = ring.rows_in_flight.saturating_add(batch_rows);
                     ring.slots.insert(seq_id, LeaseSlotState::Queued);
-                    ring.queue.push_back(QueuedBatch {
-                        seq_id,
-                        batch: record_batch,
-                        byte_size: batch_bytes,
+
+                    if self.inner.disk.is_none() {
+                        ring.queue.push_back(QueuedBatch {
+                            seq_id,
+                            payload: BatchPayload::InMemory(record_batch),
+                            byte_size: batch_bytes,
+                            row_count: batch_rows,
+                            enqueued_at: Instant::now(),
+                            attempt: 0,
+                            ready_at: None,
+                        });
+                        drop(ring);
+                        self.inner.notify_data_ready(signal);
+                        return Ok(());
+                    }
+
+                    break seq_id;
+                }
+            }
+
+            notified.await;
+        };
+
+        self.finish_disk_send(
+            signal,
+            reserved_seq_id,
+            record_batch,
+            batch_bytes,
+            batch_rows,
+        )
+        .await
+    }
+
+    async fn finish_disk_send(
+        &self,
+        signal: SignalKind,
+        reserved_seq_id: u64,
+        record_batch: arrow::record_batch::RecordBatch,
+        batch_bytes: usize,
+        batch_rows: usize,
+    ) -> Result<(), PipelineError> {
+        let ring_state = &self.inner.rings[signal.as_u8() as usize];
+        let Some(disk) = &self.inner.disk else {
+            return Err(PipelineError::Internal(
+                "disk backend missing on disk send path".into(),
+            ));
+        };
+        let schema = record_batch.schema();
+        match disk
+            .append_frame(signal, reserved_seq_id, record_batch)
+            .await
+        {
+            Ok(written) => {
+                let actual_bytes = written.len as usize;
+                {
+                    let mut ring = lock_unpoisoned(&ring_state.ring);
+                    ring.bytes_in_flight = ring
+                        .bytes_in_flight
+                        .saturating_sub(batch_bytes)
+                        .saturating_add(actual_bytes);
+                    ring.enqueue_ordered(QueuedBatch {
+                        seq_id: reserved_seq_id,
+                        payload: BatchPayload::OnDisk {
+                            segment_id: written.segment_id,
+                            offset: written.offset,
+                            len: written.len,
+                            rows: u32::try_from(batch_rows).unwrap_or(u32::MAX),
+                            schema,
+                        },
+                        byte_size: actual_bytes,
                         row_count: batch_rows,
                         enqueued_at: Instant::now(),
                         attempt: 0,
                         ready_at: None,
                     });
-                    drop(ring);
-                    self.inner.notify_data_ready(signal);
-                    return Ok(());
                 }
+                if actual_bytes < batch_bytes {
+                    ring_state.space_available_notify.notify_waiters();
+                }
+                self.inner.notify_data_ready(signal);
+                Ok(())
             }
-
-            notified.await;
+            Err(err) => {
+                {
+                    let mut ring = lock_unpoisoned(&ring_state.ring);
+                    ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(batch_bytes);
+                    ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
+                    ring.slots.remove(&reserved_seq_id);
+                }
+                self.inner.record_storage_failure(signal, err.to_string());
+                Err(err)
+            }
         }
     }
 
@@ -386,7 +534,7 @@ impl SinkBuffer {
         config: BufferConfig,
     ) -> Result<(BufferSender, Self), PipelineError> {
         config.validate(sink_name)?;
-        let inner = BufferInner::new(sink_name, config);
+        let inner = BufferInner::new(sink_name, config)?;
         let sender = BufferSender::new(Arc::clone(&inner), None);
         Ok((
             sender,
@@ -401,7 +549,7 @@ impl SinkBuffer {
     /// Creates an infallible in-memory passthrough `(BufferSender, SinkBuffer)` pair.
     #[must_use]
     pub fn passthrough_pair() -> (BufferSender, Self) {
-        let inner = BufferInner::new("passthrough", BufferConfig::passthrough());
+        let inner = BufferInner::new_passthrough();
         let sender = BufferSender::new(Arc::clone(&inner), None);
         (
             sender,
@@ -420,7 +568,7 @@ impl SinkBuffer {
         config: BufferConfig,
     ) -> Result<[(BufferSender, Self); 3], PipelineError> {
         config.validate(sink_name)?;
-        let inner = BufferInner::new(sink_name, config);
+        let inner = BufferInner::new(sink_name, config)?;
         Ok(ALL_SIGNALS.map(|sig| {
             let sender = BufferSender::new(Arc::clone(&inner), Some(sig));
             (
@@ -526,14 +674,12 @@ impl SinkBuffer {
         let signal = lease.signal();
         let batch = if lease.batches().len() == 1 {
             lease.batches()[0].clone()
-        } else if lease.batches().is_empty() {
-            return Err(PipelineError::Internal(
-                "passthrough lease contained zero batches".into(),
-            ));
-        } else {
+        } else if !lease.batches().is_empty() {
             let schema = lease.batches()[0].schema();
             arrow::compute::concat_batches(&schema, lease.batches())
                 .map_err(PipelineError::Arrow)?
+        } else {
+            lease.prepare(Ok).await?
         };
         lease.ack().await?;
         let signal_batch = match signal {
@@ -550,6 +696,49 @@ impl SinkBuffer {
         self.inner.rings[signal.as_u8() as usize]
             .committed_seq
             .load(Ordering::Acquire)
+    }
+
+    /// Returns the cumulative number of records dropped due to disk frame corruption during recovery.
+    #[must_use]
+    pub fn corruption_drops(&self) -> u64 {
+        match self.signal_scope {
+            Some(sig) => self.inner.rings[sig.as_u8() as usize]
+                .corruption_drops
+                .load(Ordering::Acquire),
+            None => ALL_SIGNALS.iter().fold(0u64, |acc, &sig| {
+                acc.saturating_add(
+                    self.inner.rings[sig.as_u8() as usize]
+                        .corruption_drops
+                        .load(Ordering::Acquire),
+                )
+            }),
+        }
+    }
+
+    /// Returns the cumulative number of records replayed from disk during startup recovery.
+    #[must_use]
+    pub fn replayed_records(&self) -> u64 {
+        match self.signal_scope {
+            Some(sig) => self.inner.rings[sig.as_u8() as usize]
+                .replayed_records
+                .load(Ordering::Acquire),
+            None => ALL_SIGNALS.iter().fold(0u64, |acc, &sig| {
+                acc.saturating_add(
+                    self.inner.rings[sig.as_u8() as usize]
+                        .replayed_records
+                        .load(Ordering::Acquire),
+                )
+            }),
+        }
+    }
+
+    /// Flushes pending disk writes and durably syncs `watermark.json` (`BufferMode::Disk`).
+    pub fn flush_and_sync_watermark(&self) -> Result<(), PipelineError> {
+        if let Some(disk) = &self.inner.disk {
+            let wm = DiskWatermark::from_rings(&self.inner.rings);
+            disk.flush_and_sync_watermark(wm)?;
+        }
+        Ok(())
     }
 }
 

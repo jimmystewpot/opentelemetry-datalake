@@ -1,7 +1,8 @@
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
@@ -16,16 +17,47 @@ pub enum LeaseSlotState {
     Acked,
 }
 
+/// Storage payload for a queued or leased batch inside a [`SignalRing`].
+#[derive(Debug, Clone)]
+pub enum BatchPayload {
+    /// In-memory Arrow `RecordBatch` (`BufferMode::Memory`).
+    InMemory(RecordBatch),
+    /// On-disk frame pointer (`BufferMode::Disk`).
+    OnDisk {
+        /// Segment file identifier (`segment-<segment_id:020>.bin`).
+        segment_id: u64,
+        /// Byte offset of the 28-byte `OTLB` frame header within the segment file.
+        offset: u64,
+        /// Total frame length in bytes (`28 + payload_len`).
+        len: u32,
+        /// Number of rows in the encoded `RecordBatch`.
+        rows: u32,
+        /// Cached Arrow schema used for lease coalescing homogeneity checks.
+        schema: SchemaRef,
+    },
+}
+
+impl BatchPayload {
+    /// Returns the Arrow [`SchemaRef`] of this payload.
+    #[must_use]
+    pub fn schema(&self) -> SchemaRef {
+        match self {
+            Self::InMemory(batch) => batch.schema(),
+            Self::OnDisk { schema, .. } => Arc::clone(schema),
+        }
+    }
+}
+
 /// Metadata and payload for a queued Arrow `RecordBatch` inside a [`SignalRing`].
 #[derive(Debug, Clone)]
 pub struct QueuedBatch {
     /// Monotonically increasing per-signal sequence number (`>= 1`).
     pub seq_id: u64,
-    /// In-memory Arrow `RecordBatch`.
-    pub batch: RecordBatch,
-    /// Approximate memory footprint from `RecordBatch::get_array_memory_size()`.
+    /// In-memory or on-disk batch payload.
+    pub payload: BatchPayload,
+    /// Memory footprint or on-disk frame size charged to the signal ring budget.
     pub byte_size: usize,
-    /// Number of rows in `batch`.
+    /// Number of rows in the batch.
     pub row_count: usize,
     /// Timestamp when the batch first entered the buffer.
     pub enqueued_at: Instant,
@@ -97,6 +129,24 @@ impl SignalRing {
         }
     }
 
+    /// Inserts a [`QueuedBatch`] into `queue` preserving ascending `seq_id` order.
+    pub fn enqueue_ordered(&mut self, item: QueuedBatch) {
+        if self
+            .queue
+            .back()
+            .is_none_or(|back| back.seq_id < item.seq_id)
+        {
+            self.queue.push_back(item);
+        } else {
+            let pos = self
+                .queue
+                .iter()
+                .position(|existing| existing.seq_id > item.seq_id)
+                .unwrap_or(self.queue.len());
+            self.queue.insert(pos, item);
+        }
+    }
+
     /// Pops all leading [`LeaseSlotState::Acked`] entries from `slots` and advances `committed_seq`.
     pub fn advance_watermark(&mut self, committed_seq: &AtomicU64) {
         while let Some((&seq, &state)) = self.slots.first_key_value() {
@@ -109,19 +159,19 @@ impl SignalRing {
         }
     }
 
-    /// Requeues leased batches at the front of `queue` in their original sequence order.
+    /// Requeues leased batch payloads at the front of `queue` in their original sequence order.
     pub fn requeue_at_head(
         &mut self,
-        batches: Vec<RecordBatch>,
+        payloads: Vec<BatchPayload>,
         meta: Vec<LeasedBatchMeta>,
         next_attempt: u32,
         ready_at: Option<Instant>,
     ) {
-        for (batch, item) in batches.into_iter().zip(meta).rev() {
+        for (payload, item) in payloads.into_iter().zip(meta).rev() {
             self.slots.insert(item.seq_id, LeaseSlotState::Queued);
             self.queue.push_front(QueuedBatch {
                 seq_id: item.seq_id,
-                batch,
+                payload,
                 byte_size: item.byte_size,
                 row_count: item.row_count,
                 enqueued_at: item.enqueued_at,
@@ -164,6 +214,10 @@ pub struct SignalRingState {
     pub committed_seq: AtomicU64,
     /// Number of active `BufferSender` handles capable of sending to this signal ring.
     pub active_senders: AtomicU64,
+    /// Cumulative number of records dropped due to on-disk frame corruption during recovery.
+    pub corruption_drops: AtomicU64,
+    /// Cumulative number of records replayed from disk during startup recovery.
+    pub replayed_records: AtomicU64,
 }
 
 impl Default for SignalRingState {
@@ -182,6 +236,8 @@ impl SignalRingState {
             data_ready_notify: Notify::new(),
             committed_seq: AtomicU64::new(0),
             active_senders: AtomicU64::new(0),
+            corruption_drops: AtomicU64::new(0),
+            replayed_records: AtomicU64::new(0),
         }
     }
 }

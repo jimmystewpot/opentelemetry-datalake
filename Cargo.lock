@@ -4385,6 +4385,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "async-trait",
+ "crc32fast",
  "criterion",
  "figment",
  "opentelemetry",

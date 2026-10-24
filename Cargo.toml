@@ -118,9 +118,10 @@ wasmtime-wasi = { version = "50.0.0", default-features = false }
 # Concurrent Collections
 dashmap = { version = "6.0", default-features = false }
 
-# Cryptography (SHA-256 module integrity)
+# Cryptography (SHA-256 module integrity & CRC32 framing)
 sha2 = { version = "0.11", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
+crc32fast = "1.5"
 
 # Codec & OTLP Parsing
 prost = { version = "0.14.4", default-features = false, features = ["std", "derive"] }
