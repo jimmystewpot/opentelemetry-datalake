@@ -24,6 +24,9 @@ updates:
       wasmtime:
         patterns:
           - "wasmtime*"
+      aws:
+        patterns:
+          - "aws-*"
     ignore:
       - dependency-name: "arrow"
         versions: [">= 60.0.0"]
