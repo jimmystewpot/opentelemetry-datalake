@@ -131,3 +131,43 @@ fn test_pipeline_error_topological_sink_missing() {
     let err = PipelineError::TopologicalSinkMissing("dlq_sink".to_string());
     assert_eq!(err.to_string(), "Topological DLQ sink missing: dlq_sink");
 }
+
+fn workspace_dep_version<'a>(manifest: &'a toml::Value, dep_name: &str) -> &'a str {
+    let dep = &manifest["workspace"]["dependencies"][dep_name];
+    dep.as_str()
+        .or_else(|| dep.get("version").and_then(toml::Value::as_str))
+        .unwrap_or_else(|| panic!("missing version for workspace dependency `{dep_name}`"))
+}
+
+#[test]
+fn test_workspace_lockstep_dependencies_match_versions() {
+    let manifest_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let manifest_str =
+        std::fs::read_to_string(&manifest_path).expect("failed to read workspace Cargo.toml");
+    let manifest: toml::Value =
+        toml::from_str(&manifest_str).expect("failed to parse workspace Cargo.toml");
+
+    assert_eq!(
+        workspace_dep_version(&manifest, "wasmtime"),
+        workspace_dep_version(&manifest, "wasmtime-wasi"),
+        "wasmtime and wasmtime-wasi must have identical workspace versions"
+    );
+    assert_eq!(
+        workspace_dep_version(&manifest, "arrow"),
+        workspace_dep_version(&manifest, "parquet"),
+        "arrow and parquet must have identical workspace versions"
+    );
+    let otel_version = workspace_dep_version(&manifest, "opentelemetry");
+    for crate_name in [
+        "opentelemetry_sdk",
+        "opentelemetry-otlp",
+        "opentelemetry-proto",
+        "opentelemetry-semantic-conventions",
+    ] {
+        assert_eq!(
+            otel_version,
+            workspace_dep_version(&manifest, crate_name),
+            "opentelemetry and {crate_name} must have identical workspace versions"
+        );
+    }
+}
