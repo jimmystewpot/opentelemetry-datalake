@@ -89,7 +89,13 @@ Configures the Kafka sink.
 | `metrics_partition_key` | String | `null` | Optional column name used to partition and key metric batches. |
 | `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `flush_timeout_ms` | Integer | `10000` | Maximum time in milliseconds to wait for in-flight messages in `librdkafka` to flush during graceful shutdown (must be > 0). |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy batching alias for `[kafka.buffer]`. Cannot be combined with `[kafka.buffer]`. |
 | `options` | Map | `{}` | Additional `librdkafka` configuration options. |
+
+### Kafka Buffering (`[kafka.buffer]` and legacy `[kafka.batching]`)
+
+When neither `[kafka.buffer]` nor `[kafka.batching]` is specified, `KafkaSink` defaults to [`BufferConfig::passthrough()`](buffer.md) (`max_batch_records = 1`, `max_batch_interval_sec = 0`) so each incoming batch is leased, sorted, partition-sliced, and serialized via `Lease::prepare` on the Tokio blocking pool without artificial coalescing latency. Configure `[kafka.buffer]` to enable multi-batch coalescing, NVMe `disk` buffering, retry backoff, or dead-letter quarantine. Specifying both `[kafka.buffer]` and `[kafka.batching]` is rejected at startup.
 
 ---
 

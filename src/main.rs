@@ -7,7 +7,6 @@ use pipeline_core::pipeline::Sink;
 use pipeline_core::pipeline::Source;
 use pipeline_core::pipeline::Transform;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,25 +32,7 @@ struct ServerConfig {
     admin_addr: Option<SocketAddr>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct KafkaConfig {
-    brokers: String,
-    logs_topic: String,
-    traces_topic: String,
-    metrics_topic: String,
-    logs_format: String,
-    traces_format: String,
-    metrics_format: String,
-    logs_partition_key: Option<String>,
-    metrics_partition_key: Option<String>,
-    traces_partition_key: Option<String>,
-    #[serde(default)]
-    order_by: Option<pipeline_core::sort::SortConfig>,
-    #[serde(default)]
-    flush_timeout_ms: Option<u64>,
-    #[serde(default)]
-    options: HashMap<String, String>,
-}
+type KafkaConfig = kafka_sink::KafkaSinkConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "opentelemetry-datalake")]
@@ -143,15 +124,9 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref kafka_cfg) = config.kafka {
-        if kafka_cfg.flush_timeout_ms == Some(0) {
-            anyhow::bail!(
-                "Configuration validation failed: kafka.flush_timeout_ms must be greater than 0"
-            );
-        }
-        if let Some(sort_cfg) = kafka_cfg.order_by.as_ref() {
-            pipeline_core::sort::BatchSorter::from_config(sort_cfg)
-                .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-        }
+        kafka_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref parquet_cfg) = config.parquet {
         parquet_cfg
             .validate()
@@ -694,8 +669,8 @@ async fn main() -> anyhow::Result<()> {
         ("elasticsearch", es_cfg.resolved_buffer_config()?)
     } else if let Some(ref sr_cfg) = config.starrocks {
         ("starrocks", sr_cfg.resolved_buffer_config()?)
-    } else if config.kafka.is_some() {
-        ("kafka", pipeline_core::buffer::BufferConfig::passthrough())
+    } else if let Some(ref kafka_cfg) = config.kafka {
+        ("kafka", kafka_cfg.resolved_buffer_config()?)
     } else {
         (
             "parquet",
@@ -3074,5 +3049,43 @@ mod tests {
         let err = validate_config(&cfg_conflict).unwrap_err();
         assert!(err.to_string().contains("[iceberg.buffer]"), "Got: {err}");
         assert!(err.to_string().contains("[iceberg.batching]"), "Got: {err}");
+    }
+
+    #[test]
+    fn test_validate_config_kafka_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+
+        [kafka.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml = format!(
+            "{valid_buffer_toml}\n[kafka.batching]\nmax_batch_size_bytes = 2097152\nmax_batch_interval_sec = 5\n"
+        );
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[kafka.buffer]"), "Got: {err}");
+        assert!(err.to_string().contains("[kafka.batching]"), "Got: {err}");
     }
 }
