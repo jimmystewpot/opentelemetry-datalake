@@ -131,6 +131,9 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
+        iceberg_cfg
+            .resolved_buffer_config()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref es_cfg) = config.elasticsearch {
         es_cfg
             .validate()
@@ -685,11 +688,8 @@ async fn main() -> anyhow::Result<()> {
     let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
 
     // Sink buffers between Transformers and Sinks
-    let (active_sink_name, sink_buffer_config) = if config.iceberg.is_some() {
-        (
-            "iceberg",
-            pipeline_core::buffer::BufferConfig::passthrough(),
-        )
+    let (active_sink_name, sink_buffer_config) = if let Some(ref iceberg_cfg) = config.iceberg {
+        ("iceberg", iceberg_cfg.resolved_buffer_config()?)
     } else if let Some(ref es_cfg) = config.elasticsearch {
         ("elasticsearch", es_cfg.resolved_buffer_config()?)
     } else if let Some(ref sr_cfg) = config.starrocks {
@@ -3037,5 +3037,42 @@ mod tests {
             err.to_string().contains("[elasticsearch.batching]"),
             "Got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_config_iceberg_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "otel.default"
+        logs_table_identifier = "otel.logs"
+        traces_table_identifier = "otel.traces"
+        metrics_table_identifier = "otel.metrics"
+
+        [iceberg.buffer]
+        max_batch_size_bytes = 134217728
+        max_batch_interval_sec = 60
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml =
+            format!("{valid_buffer_toml}\n[iceberg.batching]\nmax_batch_size_bytes = 67108864\n");
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[iceberg.buffer]"), "Got: {err}");
+        assert!(err.to_string().contains("[iceberg.batching]"), "Got: {err}");
     }
 }

@@ -54,14 +54,18 @@ Configures the Apache Iceberg sink. This sink converts OTLP data into Apache Arr
 | `schema_mode` | String | `"fixed"` | How to handle schema validation. Options: `fixed`, `auto`, `catalog`. |
 | `partition_granularity`| String | `"hourly"` | Time-based partitioning. Options: `hourly`, `daily`. |
 | `log_dropped_fields` | Boolean | `true` | Whether to log warnings when fields are dropped due to schema mismatch. |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy commit-batching alias for `[iceberg.buffer]`. Cannot be combined with `[iceberg.buffer]`. |
 | `dry_run` | Boolean | `false` | If true, simulates commits without talking to a live catalog. |
 | `properties` | Map | `{}` | Additional catalog-specific properties (e.g., S3 endpoint, credentials). |
 
-### Iceberg Batching (`[iceberg.batching]`)
+### Iceberg Buffering (`[iceberg.buffer]` and legacy `[iceberg.batching]`)
+
+Prefer `[iceberg.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). Legacy `[iceberg.batching]` remains supported as a deprecated alias, but specifying both `[iceberg.buffer]` and `[iceberg.batching]` is rejected at startup:
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128 MiB). |
+| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128 MiB when neither `[iceberg.buffer]` nor `[iceberg.batching]` overrides it). |
 | `max_batch_interval_sec`| Integer | `60` | Max time in seconds between flushes. |
 | `max_batch_records` | Integer | `null` | Optional maximum accumulated records before triggering a flush. |
 
@@ -290,7 +294,7 @@ partition_granularity = "hourly"
 "s3.region" = "us-east-1"
 "s3.path.style.access" = "true"
 
-[iceberg.batching]
+[iceberg.buffer]
 max_batch_size_bytes = 67108864
 max_batch_interval_sec = 30
 ```

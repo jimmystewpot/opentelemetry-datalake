@@ -1,7 +1,7 @@
 use crate::{CatalogType, PartitionGranularity, SchemaMode};
 #[cfg(test)]
 use arrow::array::ArrayRef;
-use arrow::array::{Array, AsArray};
+use arrow::array::{Array, TimestampMicrosecondArray, TimestampNanosecondArray};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -15,16 +15,165 @@ use iceberg_catalog_glue::GlueCatalogBuilder;
 use iceberg_catalog_rest::RestCatalogBuilder;
 #[cfg(feature = "aws")]
 use iceberg_catalog_s3tables::S3TablesCatalogBuilder;
-use pipeline_core::buffer::SinkBuffer;
+use pipeline_core::buffer::{
+    BufferConfig, FailureClass, Lease, LeaseId, LegacyBatchingConfig, SignalKind, SinkBuffer,
+};
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{SignalBatch, Sink};
+#[cfg(test)]
+use pipeline_core::pipeline::SignalBatch;
+use pipeline_core::pipeline::Sink;
 use pipeline_core::sort::{
     BatchSorter, MissingColumnAction, SignalType, SortColumnDef, SortConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Returns the Iceberg snapshot summary property key used to record the last committed
+/// [`LeaseId`] for a given [`SignalKind`].
+#[must_use]
+pub const fn snapshot_property_key(signal: SignalKind) -> &'static str {
+    match signal {
+        SignalKind::Logs => "datalake.lease.logs",
+        SignalKind::Metrics => "datalake.lease.metrics",
+        SignalKind::Traces => "datalake.lease.traces",
+    }
+}
+
+/// Alias for [`snapshot_property_key`] returning the Iceberg snapshot summary property key
+/// for the given [`SignalKind`].
+#[must_use]
+pub const fn lease_snapshot_property_key(signal: SignalKind) -> &'static str {
+    snapshot_property_key(signal)
+}
+
+/// Formats a [`LeaseId`] sequence range into a snapshot delivery token (`"{first_seq}:{last_seq}"`).
+#[must_use]
+pub fn format_lease_token(id: LeaseId) -> String {
+    format!("{}:{}", id.first_seq, id.last_seq)
+}
+
+/// Formats a [`LeaseId`] sequence range (`"{first_seq}-{last_seq}"`).
+#[must_use]
+pub fn format_lease_range(id: LeaseId) -> String {
+    format!("{}-{}", id.first_seq, id.last_seq)
+}
+
+/// Parses a snapshot delivery token (`"{first_seq}:{last_seq}"` or `"{first_seq}-{last_seq}"`)
+/// into `(first_seq, last_seq)` when `first_seq <= last_seq`.
+#[must_use]
+pub fn parse_lease_token(token: &str) -> Option<(u64, u64)> {
+    let (first_str, last_str) = token.split_once(':').or_else(|| token.split_once('-'))?;
+    let first_seq = first_str.parse::<u64>().ok()?;
+    let last_seq = last_str.parse::<u64>().ok()?;
+    if first_seq <= last_seq {
+        Some((first_seq, last_seq))
+    } else {
+        None
+    }
+}
+
+/// Abstraction over an Iceberg [`iceberg::table::Table`], [`iceberg::spec::TableMetadata`],
+/// [`iceberg::spec::Snapshot`], or snapshot summary property [`HashMap`] for lease deduplication.
+pub trait SnapshotPropertiesSource {
+    /// Looks up a snapshot summary property by key.
+    fn lease_property(&self, key: &str) -> Option<&str>;
+}
+
+impl SnapshotPropertiesSource for iceberg::table::Table {
+    fn lease_property(&self, key: &str) -> Option<&str> {
+        self.metadata()
+            .current_snapshot()?
+            .summary()
+            .additional_properties
+            .get(key)
+            .map(String::as_str)
+    }
+}
+
+impl SnapshotPropertiesSource for iceberg::spec::TableMetadata {
+    fn lease_property(&self, key: &str) -> Option<&str> {
+        self.current_snapshot()?
+            .summary()
+            .additional_properties
+            .get(key)
+            .map(String::as_str)
+    }
+}
+
+impl SnapshotPropertiesSource for iceberg::spec::Snapshot {
+    fn lease_property(&self, key: &str) -> Option<&str> {
+        self.summary()
+            .additional_properties
+            .get(key)
+            .map(String::as_str)
+    }
+}
+
+impl<S: std::hash::BuildHasher> SnapshotPropertiesSource for HashMap<String, String, S> {
+    fn lease_property(&self, key: &str) -> Option<&str> {
+        self.get(key).map(String::as_str)
+    }
+}
+
+impl<T: SnapshotPropertiesSource + ?Sized> SnapshotPropertiesSource for &T {
+    fn lease_property(&self, key: &str) -> Option<&str> {
+        (*self).lease_property(key)
+    }
+}
+
+/// Returns `true` if the target table's current snapshot summary properties already record
+/// a committed sequence range for `id.signal` with `committed_last_seq >= id.last_seq`.
+#[must_use]
+pub fn is_lease_already_committed<S: SnapshotPropertiesSource + ?Sized>(
+    source: &S,
+    id: LeaseId,
+) -> bool {
+    let Some(raw) = source.lease_property(snapshot_property_key(id.signal)) else {
+        return false;
+    };
+    let Some((_committed_first_seq, committed_last_seq)) = parse_lease_token(raw) else {
+        return false;
+    };
+    committed_last_seq >= id.last_seq
+}
+
+/// Classifies an Iceberg [`PipelineError`] into a [`FailureClass`] for [`SinkBuffer`] lease handling.
+#[must_use]
+pub fn classify_iceberg_error(err: &PipelineError) -> FailureClass {
+    match err {
+        PipelineError::Internal(msg) => FailureClass::Rejected {
+            reason: msg.clone(),
+        },
+        PipelineError::Arrow(e) => FailureClass::Rejected {
+            reason: e.to_string(),
+        },
+        PipelineError::Configuration(e) => FailureClass::Fatal {
+            reason: e.to_string(),
+        },
+        _ => {
+            let msg = err.to_string();
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("401")
+                || lower.contains("403")
+                || lower.contains("unauthorized")
+                || lower.contains("forbidden")
+                || lower.contains("access denied")
+                || lower.contains("authentication")
+                || lower.contains("tablenotfound")
+                || lower.contains("namespacenotfound")
+                || lower.contains("featureunsupported")
+            {
+                FailureClass::Fatal { reason: msg }
+            } else if lower.contains("datainvalid") {
+                FailureClass::Rejected { reason: msg }
+            } else {
+                FailureClass::Transient
+            }
+        }
+    }
+}
 
 /// Configuration for commit batching.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -47,11 +196,11 @@ impl Default for BatchingConfig {
     }
 }
 
-fn default_max_batch_size_bytes() -> usize {
+const fn default_max_batch_size_bytes() -> usize {
     134_217_728 // 128MB
 }
 
-fn default_max_batch_interval_sec() -> u64 {
+const fn default_max_batch_interval_sec() -> u64 {
     60 // 60 seconds
 }
 
@@ -74,6 +223,10 @@ pub struct IcebergSinkConfig {
     pub partition_granularity: PartitionGranularity,
     #[serde(default = "default_log_dropped_fields")]
     pub log_dropped_fields: bool,
+    /// Optional unified sink buffer configuration (`[iceberg.buffer]`).
+    #[serde(default)]
+    pub buffer: Option<BufferConfig>,
+    /// Legacy commit batching configuration (`[iceberg.batching]`).
     #[serde(default)]
     pub batching: Option<BatchingConfig>,
     #[serde(default)]
@@ -100,6 +253,7 @@ impl Default for IcebergSinkConfig {
             schema_mode: default_schema_mode(),
             partition_granularity: default_partition_granularity(),
             log_dropped_fields: default_log_dropped_fields(),
+            buffer: None,
             batching: None,
             properties: HashMap::new(),
             dry_run: false,
@@ -108,43 +262,47 @@ impl Default for IcebergSinkConfig {
     }
 }
 
-fn default_schema_mode() -> SchemaMode {
+impl IcebergSinkConfig {
+    /// Resolves the effective [`BufferConfig`] for this sink, mapping legacy `[iceberg.batching]`
+    /// onto [`BufferConfig`] triggers (defaulting to 128 MiB / 60s when neither is set) and
+    /// enforcing startup validation rules V1–V5.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::Configuration`] if both `buffer` and `batching` are set (V4)
+    /// or if any buffer invariant V1–V5 is violated.
+    pub fn resolved_buffer_config(&self) -> Result<BufferConfig, PipelineError> {
+        let legacy = self.batching.as_ref().map(|b| LegacyBatchingConfig {
+            max_batch_size_bytes: b.max_batch_size_bytes,
+            max_batch_records: b.max_batch_records,
+            max_batch_interval_sec: b.max_batch_interval_sec,
+        });
+        let mut resolved = BufferConfig::resolve("iceberg", self.buffer.clone(), legacy, false)?;
+        if self.buffer.is_none() && self.batching.is_none() {
+            resolved.max_batch_size_bytes = default_max_batch_size_bytes();
+            resolved.max_batch_interval_sec = default_max_batch_interval_sec();
+            resolved.validate("iceberg")?;
+        }
+        Ok(resolved)
+    }
+}
+
+const fn default_schema_mode() -> SchemaMode {
     SchemaMode::Fixed
 }
 
-fn default_partition_granularity() -> PartitionGranularity {
+const fn default_partition_granularity() -> PartitionGranularity {
     PartitionGranularity::Hourly
 }
 
-fn default_log_dropped_fields() -> bool {
+const fn default_log_dropped_fields() -> bool {
     true
-}
-
-struct TableBuffer {
-    signal_type: &'static str,
-    batches: Vec<RecordBatch>,
-    total_rows: usize,
-    total_bytes: usize,
-    last_flush: std::time::Instant,
-}
-
-impl TableBuffer {
-    fn new(signal_type: &'static str) -> Self {
-        Self {
-            signal_type,
-            batches: Vec::new(),
-            total_rows: 0,
-            total_bytes: 0,
-            last_flush: std::time::Instant::now(),
-        }
-    }
 }
 
 /// Apache Iceberg storage sink.
 pub struct IcebergSink {
     config: IcebergSinkConfig,
-    buffers: std::collections::HashMap<String, TableBuffer>,
     sorter: BatchSorter,
+    catalog_override: Option<Arc<dyn Catalog>>,
 }
 
 impl IcebergSink {
@@ -184,8 +342,26 @@ impl IcebergSink {
 
         Self {
             config,
-            buffers: std::collections::HashMap::new(),
             sorter,
+            catalog_override: None,
+        }
+    }
+
+    /// Creates a new `IcebergSink` using a pre-constructed [`Catalog`] implementation.
+    #[must_use]
+    pub fn with_catalog(config: IcebergSinkConfig, catalog: Arc<dyn Catalog>) -> Self {
+        let mut sink = Self::new(config);
+        sink.catalog_override = Some(catalog);
+        sink
+    }
+
+    /// Returns the default [`BufferConfig`] for `IcebergSink` (128 MiB / 60s flush triggers).
+    #[must_use]
+    pub fn default_buffer_config() -> BufferConfig {
+        BufferConfig {
+            max_batch_size_bytes: default_max_batch_size_bytes(),
+            max_batch_interval_sec: default_max_batch_interval_sec(),
+            ..BufferConfig::default()
         }
     }
 
@@ -213,82 +389,120 @@ impl IcebergSink {
         batch: RecordBatch,
         table: Option<&iceberg::table::Table>,
     ) -> Result<RecordBatch, PipelineError> {
-        match self.config.schema_mode {
-            SchemaMode::Fixed => Ok(batch),
-            SchemaMode::Auto => {
-                let Some(table) = table else {
-                    return Ok(batch);
-                };
-                let schema = table.current_schema_ref();
-                let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
-                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+        apply_schema_mode_with_config(
+            batch,
+            self.config.schema_mode,
+            self.config.log_dropped_fields,
+            table,
+        )
+    }
+}
 
-                for field in batch.schema().fields() {
-                    match arrow_schema.field_with_name(field.name()) {
-                        Ok(table_field) => {
-                            if field.data_type() != table_field.data_type() {
-                                return Err(PipelineError::Internal(format!(
-                                    "Schema mismatch for field '{}': batch type {:?} is incompatible with table type {:?}",
-                                    field.name(),
-                                    field.data_type(),
-                                    table_field.data_type()
-                                )));
-                            }
-                        }
-                        Err(_) => {
+fn apply_schema_mode_with_config(
+    batch: RecordBatch,
+    schema_mode: SchemaMode,
+    log_dropped_fields: bool,
+    table: Option<&iceberg::table::Table>,
+) -> Result<RecordBatch, PipelineError> {
+    match schema_mode {
+        SchemaMode::Fixed => Ok(batch),
+        SchemaMode::Auto => {
+            let Some(table) = table else {
+                return Ok(batch);
+            };
+            let schema = table.current_schema_ref();
+            let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
+                .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+
+            for field in batch.schema().fields() {
+                match arrow_schema.field_with_name(field.name()) {
+                    Ok(table_field) => {
+                        if field.data_type() != table_field.data_type() {
                             return Err(PipelineError::Internal(format!(
-                                "Additive schema evolution failed: new column '{}' detected but schema evolution is not supported by the client library",
-                                field.name()
+                                "Schema mismatch for field '{}': batch type {:?} is incompatible with table type {:?}",
+                                field.name(),
+                                field.data_type(),
+                                table_field.data_type()
                             )));
                         }
                     }
-                }
-                Ok(batch)
-            }
-            SchemaMode::Catalog => {
-                let Some(table) = table else {
-                    return Ok(batch);
-                };
-                let schema = table.current_schema_ref();
-                let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
-                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                let mut final_columns = Vec::new();
-                let mut final_fields = Vec::new();
-                let mut dropped_fields = Vec::new();
-
-                for field in batch.schema().fields() {
-                    if let Ok(table_field) = arrow_schema.field_with_name(field.name()) {
-                        let col = batch.column_by_name(field.name()).ok_or_else(|| {
-                            PipelineError::Internal(format!(
-                                "Column {} missing from batch",
-                                field.name()
-                            ))
-                        })?;
-                        let casted_col = if col.data_type() == table_field.data_type() {
-                            col.clone()
-                        } else {
-                            arrow::compute::cast(col, table_field.data_type())
-                                .map_err(PipelineError::Arrow)?
-                        };
-                        final_columns.push(casted_col);
-                        final_fields.push(table_field.clone());
-                    } else {
-                        dropped_fields.push(field.name().clone());
+                    Err(_) => {
+                        return Err(PipelineError::Internal(format!(
+                            "Additive schema evolution failed: new column '{}' detected but schema evolution is not supported by the client library",
+                            field.name()
+                        )));
                     }
                 }
-
-                if !dropped_fields.is_empty() && self.config.log_dropped_fields {
-                    tracing::warn!(
-                        "Dropped fields not present in catalog schema: {:?}",
-                        dropped_fields
-                    );
-                }
-
-                let new_schema = Arc::new(arrow::datatypes::Schema::new(final_fields));
-                RecordBatch::try_new(new_schema, final_columns).map_err(PipelineError::Arrow)
             }
+            Ok(batch)
+        }
+        SchemaMode::Catalog => {
+            let Some(table) = table else {
+                return Ok(batch);
+            };
+            let schema = table.current_schema_ref();
+            let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&schema)
+                .map_err(|e| PipelineError::Storage(Box::new(e)))?;
+            let mut final_columns = Vec::new();
+            let mut final_fields = Vec::new();
+            let mut dropped_fields = Vec::new();
+
+            for field in batch.schema().fields() {
+                if let Ok(table_field) = arrow_schema.field_with_name(field.name()) {
+                    let col = batch.column_by_name(field.name()).ok_or_else(|| {
+                        PipelineError::Internal(format!(
+                            "Column {} missing from batch",
+                            field.name()
+                        ))
+                    })?;
+                    let casted_col = if col.data_type() == table_field.data_type() {
+                        col.clone()
+                    } else {
+                        arrow::compute::cast(col, table_field.data_type())
+                            .map_err(PipelineError::Arrow)?
+                    };
+                    final_columns.push(casted_col);
+                    final_fields.push(table_field.clone());
+                } else {
+                    dropped_fields.push(field.name().clone());
+                }
+            }
+
+            if !dropped_fields.is_empty() && log_dropped_fields {
+                tracing::warn!(
+                    "Dropped fields not present in catalog schema: {:?}",
+                    dropped_fields
+                );
+            }
+
+            let new_schema = Arc::new(arrow::datatypes::Schema::new(final_fields));
+            RecordBatch::try_new(new_schema, final_columns).map_err(PipelineError::Arrow)
         }
     }
+}
+
+/// Applies [`SchemaMode`] validation/casting, signal-specific sorting via [`BatchSorter`],
+/// and timestamp partitioning inside a [`Lease::prepare`] blocking closure.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] if schema validation fails, a required sort column is missing,
+/// or timestamp partitioning encounters an invalid/missing timestamp column.
+pub fn prepare_iceberg_batches(
+    batch: RecordBatch,
+    signal: SignalKind,
+    schema_mode: SchemaMode,
+    log_dropped_fields: bool,
+    table: Option<&iceberg::table::Table>,
+    sorter: &BatchSorter,
+    granularity: PartitionGranularity,
+) -> Result<Vec<(String, RecordBatch)>, PipelineError> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let final_batch = apply_schema_mode_with_config(batch, schema_mode, log_dropped_fields, table)?;
+    let sorted_batch = sorter.sort(&final_batch, signal)?;
+    partition_batch(&sorted_batch, "timestamp", granularity)
 }
 
 /// Computes partition paths according to ISO-8601 derived timestamp rules.
@@ -337,15 +551,39 @@ pub fn partition_batch(
     let mut timestamps_nanos = Vec::with_capacity(batch.num_rows());
     match ts_col.data_type() {
         arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _) => {
-            let ts_array = ts_col.as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+            let ts_array = ts_col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| {
+                    PipelineError::Internal("Invalid TimestampNanosecondArray".to_string())
+                })?;
             for i in 0..batch.num_rows() {
+                if ts_array.is_null(i) {
+                    return Err(PipelineError::Internal(
+                        "Null timestamp in partition column".to_string(),
+                    ));
+                }
                 timestamps_nanos.push(ts_array.value(i));
             }
         }
         arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, _) => {
-            let ts_array = ts_col.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
+            let ts_array = ts_col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    PipelineError::Internal("Invalid TimestampMicrosecondArray".to_string())
+                })?;
             for i in 0..batch.num_rows() {
-                timestamps_nanos.push(ts_array.value(i) * 1000);
+                if ts_array.is_null(i) {
+                    return Err(PipelineError::Internal(
+                        "Null timestamp in partition column".to_string(),
+                    ));
+                }
+                let nanos = ts_array
+                    .value(i)
+                    .checked_mul(1_000)
+                    .ok_or_else(|| PipelineError::Internal("Timestamp overflow".to_string()))?;
+                timestamps_nanos.push(nanos);
             }
         }
         other => {
@@ -400,86 +638,208 @@ impl IcebergSink {
         Ok(Some(table))
     }
 
-    /// Flushes the buffered data for the specified table.
-    async fn flush_table(
-        &mut self,
-        table_name: &str,
+    /// Processes and commits a single [`Lease`] to the configured Iceberg table.
+    #[allow(clippy::too_many_lines)]
+    async fn commit_lease(
+        &self,
+        lease: Lease,
         catalog: Option<&Arc<dyn Catalog>>,
     ) -> Result<(), PipelineError> {
-        let Some(buffer) = self.buffers.get_mut(table_name) else {
-            return Ok(());
-        };
-
-        if buffer.batches.is_empty() {
-            buffer.last_flush = std::time::Instant::now();
+        if lease.num_rows() == 0 {
+            lease.ack().await?;
             return Ok(());
         }
 
-        let batches_to_flush = std::mem::take(&mut buffer.batches);
-        let signal_type = buffer.signal_type;
-        buffer.total_rows = 0;
-        buffer.total_bytes = 0;
-        buffer.last_flush = std::time::Instant::now();
+        let table_name = &self.config.table_identifier;
+        let signal = lease.signal();
 
-        // Concatenate batches
-        let schema = batches_to_flush[0].schema();
-        let combined_batch = arrow::compute::concat_batches(&schema, &batches_to_flush)
-            .map_err(PipelineError::Arrow)?;
+        let loaded_table = match self.load_table(catalog, table_name).await {
+            Ok(t) => t,
+            Err(err) => {
+                let class = classify_iceberg_error(&err);
+                let is_fatal = matches!(class, FailureClass::Fatal { .. });
+                warn!(
+                    signal = signal.as_str(),
+                    first_seq = lease.id().first_seq,
+                    last_seq = lease.id().last_seq,
+                    attempt = lease.attempt(),
+                    table = %table_name,
+                    error = %err,
+                    "Iceberg load_table failed; nacking lease"
+                );
+                lease.nack(class).await?;
+                if is_fatal {
+                    return Err(err);
+                }
+                return Ok(());
+            }
+        };
+
+        if let Some(ref table) = loaded_table
+            && is_lease_already_committed(table, lease.id())
+        {
+            info!(
+                signal = signal.as_str(),
+                first_seq = lease.id().first_seq,
+                last_seq = lease.id().last_seq,
+                attempt = lease.attempt(),
+                table = %table_name,
+                "Iceberg snapshot already contains delivery token for lease; skipping duplicate Parquet write and acknowledging"
+            );
+            lease.ack().await?;
+            return Ok(());
+        }
 
         info!(
             "Flushing {} accumulated records for {} to table {}",
-            combined_batch.num_rows(),
-            signal_type,
+            lease.num_rows(),
+            signal.as_str(),
             table_name
         );
 
-        let loaded_table = self.load_table(catalog, table_name).await?;
-        let final_batch = self.apply_schema_mode(combined_batch, loaded_table.as_ref())?;
+        let schema_mode = self.config.schema_mode;
+        let log_dropped_fields = self.config.log_dropped_fields;
+        let granularity = self.config.partition_granularity;
+        let sorter = self.sorter.clone();
+        let table_for_prep = loaded_table.clone();
 
-        // Sort batch based on signal type
-        let sorted_batch = match signal_type {
-            "logs" => self.sort_logs(&final_batch)?,
-            "metrics" => self.sort_metrics(&final_batch)?,
-            "traces" => self.sort_traces(&final_batch)?,
-            _ => final_batch,
+        let prep_res = lease
+            .prepare(move |batch| {
+                prepare_iceberg_batches(
+                    batch,
+                    signal,
+                    schema_mode,
+                    log_dropped_fields,
+                    table_for_prep.as_ref(),
+                    &sorter,
+                    granularity,
+                )
+            })
+            .await;
+
+        let sub_batches = match prep_res {
+            Ok(batches) => batches,
+            Err(PipelineError::Storage(e)) => {
+                return Err(PipelineError::Storage(e));
+            }
+            Err(err) if err.to_string().starts_with("Lease::prepare join error") => {
+                return Err(err);
+            }
+            Err(err) => {
+                warn!(
+                    signal = signal.as_str(),
+                    first_seq = lease.id().first_seq,
+                    last_seq = lease.id().last_seq,
+                    attempt = lease.attempt(),
+                    table = %table_name,
+                    error = %err,
+                    "Iceberg lease preparation failed; nacking as Rejected"
+                );
+                lease
+                    .nack(FailureClass::Rejected {
+                        reason: err.to_string(),
+                    })
+                    .await?;
+                return Ok(());
+            }
         };
-
-        let timestamp_col = "timestamp";
-
-        // Partition the batch
-        let sub_batches = partition_batch(
-            &sorted_batch,
-            timestamp_col,
-            self.config.partition_granularity,
-        )?;
 
         if let Some(ref table) = loaded_table {
             let mut all_data_files = Vec::new();
             for (path, sub_batch) in sub_batches {
                 info!(
                     "Writing sorted {} batch (rows: {}) to Iceberg partition: {}{}",
-                    signal_type,
+                    signal.as_str(),
                     sub_batch.num_rows(),
                     self.config.warehouse,
                     path
                 );
-                let data_files = write_batch_to_table(table, sub_batch).await?;
-                all_data_files.extend(data_files);
+                match write_batch_to_table(table, sub_batch).await {
+                    Ok(data_files) => all_data_files.extend(data_files),
+                    Err(err) => {
+                        let class = classify_iceberg_error(&err);
+                        let is_fatal = matches!(class, FailureClass::Fatal { .. });
+                        warn!(
+                            signal = signal.as_str(),
+                            first_seq = lease.id().first_seq,
+                            last_seq = lease.id().last_seq,
+                            attempt = lease.attempt(),
+                            table = %table_name,
+                            error = %err,
+                            "Iceberg Parquet data file write failed; nacking lease"
+                        );
+                        lease.nack(class).await?;
+                        if is_fatal {
+                            return Err(err);
+                        }
+                        return Ok(());
+                    }
+                }
             }
 
             if let (Some(cat), false) = (catalog, all_data_files.is_empty()) {
                 let tx = Transaction::new(table);
-                let action = tx.fast_append().add_data_files(all_data_files);
-                let tx = action
-                    .apply(tx)
-                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                tx.commit(cat.as_ref())
-                    .await
-                    .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                info!(
-                    "Committed ACID transaction with data files for table: {}",
-                    table_name
-                );
+                let snapshot_props = HashMap::from([(
+                    snapshot_property_key(signal).to_string(),
+                    format_lease_token(lease.id()),
+                )]);
+                let action = tx
+                    .fast_append()
+                    .set_snapshot_properties(snapshot_props)
+                    .add_data_files(all_data_files);
+                let tx = match action.apply(tx) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let err = PipelineError::Storage(Box::new(e));
+                        let class = classify_iceberg_error(&err);
+                        let is_fatal = matches!(class, FailureClass::Fatal { .. });
+                        lease.nack(class).await?;
+                        if is_fatal {
+                            return Err(err);
+                        }
+                        return Ok(());
+                    }
+                };
+                match tx.commit(cat.as_ref()).await {
+                    Ok(_) => {
+                        info!(
+                            "Committed ACID transaction with data files for table: {}",
+                            table_name
+                        );
+                    }
+                    Err(commit_err) => {
+                        if let Ok(Some(refreshed)) = self.load_table(catalog, table_name).await
+                            && is_lease_already_committed(&refreshed, lease.id())
+                        {
+                            info!(
+                                signal = signal.as_str(),
+                                first_seq = lease.id().first_seq,
+                                last_seq = lease.id().last_seq,
+                                table = %table_name,
+                                "Iceberg commit returned error but refreshed table snapshot contains lease token; acknowledging as committed"
+                            );
+                            lease.ack().await?;
+                            return Ok(());
+                        }
+                        let err = PipelineError::Storage(Box::new(commit_err));
+                        let class = classify_iceberg_error(&err);
+                        let is_fatal = matches!(class, FailureClass::Fatal { .. });
+                        warn!(
+                            signal = signal.as_str(),
+                            first_seq = lease.id().first_seq,
+                            last_seq = lease.id().last_seq,
+                            attempt = lease.attempt(),
+                            table = %table_name,
+                            error = %err,
+                            "Iceberg transaction commit failed; nacking lease"
+                        );
+                        lease.nack(class).await?;
+                        if is_fatal {
+                            return Err(err);
+                        }
+                        return Ok(());
+                    }
+                }
             }
         } else {
             for (path, sub_batch) in sub_batches {
@@ -495,6 +855,7 @@ impl IcebergSink {
             );
         }
 
+        lease.ack().await?;
         Ok(())
     }
 }
@@ -519,9 +880,10 @@ async fn write_batch_to_table(
     let file_name_generator =
         DefaultFileNameGenerator::new(file_prefix, None, iceberg::spec::DataFileFormat::Parquet);
 
-    let parquet_writer_builder = ParquetWriterBuilder::new(
+    let parquet_writer_builder = ParquetWriterBuilder::new_with_match_mode(
         WriterProperties::default(),
         table.current_schema_ref().clone(),
+        iceberg::arrow::FieldMatchMode::Name,
     );
 
     let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
@@ -551,34 +913,6 @@ async fn write_batch_to_table(
     Ok(data_files)
 }
 
-impl IcebergSink {
-    fn should_flush(&self, table_name: &str) -> bool {
-        let Some(buffer) = self.buffers.get(table_name) else {
-            return false;
-        };
-        if buffer.batches.is_empty() {
-            return false;
-        }
-        let batching = self.config.batching.as_ref();
-        let max_records = batching.and_then(|b| b.max_batch_records);
-        let max_size =
-            batching.map_or_else(default_max_batch_size_bytes, |b| b.max_batch_size_bytes);
-        let max_interval =
-            batching.map_or_else(default_max_batch_interval_sec, |b| b.max_batch_interval_sec);
-
-        if max_records.is_some_and(|m| buffer.total_rows >= m) {
-            return true;
-        }
-        if buffer.total_bytes >= max_size {
-            return true;
-        }
-        if buffer.last_flush.elapsed().as_secs() >= max_interval {
-            return true;
-        }
-        false
-    }
-}
-
 #[async_trait]
 impl Sink for IcebergSink {
     async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
@@ -587,9 +921,9 @@ impl Sink for IcebergSink {
             self.config.catalog_type, self.config.table_identifier
         );
 
-        let mut catalog: Option<Arc<dyn Catalog>> = None;
-
-        if !self.config.dry_run {
+        let catalog: Option<Arc<dyn Catalog>> = if let Some(ref cat) = self.catalog_override {
+            Some(Arc::clone(cat))
+        } else if !self.config.dry_run {
             match self.config.catalog_type {
                 CatalogType::Rest => {
                     let mut props = HashMap::new();
@@ -606,7 +940,7 @@ impl Sink for IcebergSink {
                         .load(&self.config.table_identifier, props)
                         .await
                         .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                    catalog = Some(Arc::new(cat) as Arc<dyn Catalog>);
+                    Some(Arc::new(cat) as Arc<dyn Catalog>)
                 }
                 #[cfg(feature = "aws")]
                 CatalogType::Glue => {
@@ -619,7 +953,7 @@ impl Sink for IcebergSink {
                         .load(&self.config.table_identifier, props)
                         .await
                         .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                    catalog = Some(Arc::new(cat) as Arc<dyn Catalog>);
+                    Some(Arc::new(cat) as Arc<dyn Catalog>)
                 }
                 #[cfg(feature = "aws")]
                 CatalogType::S3Tables => {
@@ -631,53 +965,16 @@ impl Sink for IcebergSink {
                         .load(&self.config.table_identifier, props)
                         .await
                         .map_err(|e| PipelineError::Storage(Box::new(e)))?;
-                    catalog = Some(Arc::new(cat) as Arc<dyn Catalog>);
+                    Some(Arc::new(cat) as Arc<dyn Catalog>)
                 }
             }
+        } else {
+            None
+        };
+
+        while let Some(lease) = buffer.next_lease().await? {
+            self.commit_lease(lease, catalog.as_ref()).await?;
         }
-
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-        let table_name = self.config.table_identifier.clone();
-
-        loop {
-            tokio::select! {
-                maybe_signal = buffer.recv_passthrough() => {
-                    match maybe_signal? {
-                        Some(signal) => {
-                            let signal_type = match &signal {
-                                SignalBatch::Logs(_) => "logs",
-                                SignalBatch::Metrics(_) => "metrics",
-                                SignalBatch::Traces(_) => "traces",
-                            };
-
-                            let table_buf = self.buffers.entry(table_name.clone()).or_insert_with(|| TableBuffer::new(signal_type));
-                            let batch = match signal {
-                                SignalBatch::Logs(b) | SignalBatch::Metrics(b) | SignalBatch::Traces(b) => b,
-                            };
-
-                            table_buf.total_rows += batch.num_rows();
-                            table_buf.total_bytes += batch.get_array_memory_size();
-                            table_buf.batches.push(batch);
-
-                            if self.should_flush(&table_name) {
-                                self.flush_table(&table_name, catalog.as_ref()).await?;
-                            }
-                        }
-                        None => {
-                            break;
-                        }
-                    }
-                }
-                _ = interval.tick() => {
-                    if self.should_flush(&table_name) {
-                        self.flush_table(&table_name, catalog.as_ref()).await?;
-                    }
-                }
-            }
-        }
-
-        info!("Performing final flush of buffered data before termination...");
-        self.flush_table(&table_name, catalog.as_ref()).await?;
 
         info!("IcebergSink task terminated gracefully.");
         Ok(())
@@ -1191,85 +1488,86 @@ mod tests {
         );
     }
 
-    /// Flushing an empty buffer in `dry_run` mode must succeed without
-    /// panicking or producing errors.
+    /// Running the sink on an empty buffer or zero-row batch in `dry_run` mode
+    /// must succeed without panicking or producing errors.
     #[tokio::test]
     async fn test_iceberg_sink_empty_flush() {
         let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        // Flush without any buffered data should be a no-op
-        let result = sink.flush_table("db.tbl", None).await;
+        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let empty_batch = RecordBatch::new_empty(make_test_logs_batch().schema());
+        tx.send(SignalBatch::Logs(empty_batch)).await.unwrap();
+        drop(tx);
+        let result = sink.run(rx).await;
         assert!(result.is_ok(), "Empty flush should succeed gracefully");
     }
 
-    /// `should_flush` must return false when the buffer is empty,
-    /// even if other thresholds are exceeded.
-    #[test]
-    fn test_should_flush_empty_buffer() {
-        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+    /// An empty `SinkBuffer` must yield `Ok(None)` when closed without data.
+    #[tokio::test]
+    async fn test_should_flush_empty_buffer() {
+        let config = make_dry_run_config(SchemaMode::Fixed);
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let [(logs_tx, mut logs_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+        drop(logs_tx);
+        let lease = logs_rx.next_lease().await.unwrap();
         assert!(
-            !sink.should_flush("db.tbl"),
-            "should_flush on non-existent buffer must return false"
+            lease.is_none(),
+            "Closed empty SinkBuffer must not produce a lease"
         );
     }
 
-    /// `should_flush` must trigger when the record count exceeds the
-    /// configured `max_batch_records` threshold.
-    #[test]
-    fn test_should_flush_record_threshold() {
+    /// `SinkBuffer` configured from `IcebergSinkConfig::resolved_buffer_config`
+    /// must flush when the record count reaches `max_batch_records`.
+    #[tokio::test]
+    async fn test_should_flush_record_threshold() {
         let mut config = make_dry_run_config(SchemaMode::Fixed);
         config.batching = Some(BatchingConfig {
             max_batch_records: Some(2),
-            max_batch_size_bytes: usize::MAX,
-            max_batch_interval_sec: u64::MAX,
+            max_batch_size_bytes: 134_217_728,
+            max_batch_interval_sec: 3600,
         });
 
-        let mut sink = IcebergSink::new(config);
-        let batch = make_test_logs_batch(); // 3 rows
-        let table_name = "db.tbl".to_string();
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        assert_eq!(buf_cfg.max_batch_records, Some(2));
 
-        let buffer = sink
-            .buffers
-            .entry(table_name.clone())
-            .or_insert_with(|| TableBuffer::new("logs"));
-        buffer.total_rows = batch.num_rows();
-        buffer.total_bytes = batch.get_array_memory_size();
-        buffer.batches.push(batch);
+        let [(logs_tx, mut logs_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+        let batch = make_test_logs_batch(); // 3 rows >= max_batch_records (2)
+        logs_tx.send(SignalBatch::Logs(batch)).await.unwrap();
 
-        assert!(
-            sink.should_flush(&table_name),
-            "should_flush must trigger when total_rows >= max_batch_records"
-        );
+        let lease = logs_rx
+            .next_lease()
+            .await
+            .unwrap()
+            .expect("lease must flush when record threshold is reached");
+        assert_eq!(lease.num_rows(), 3);
+        lease.ack().await.unwrap();
     }
 
-    /// Multiple batches accumulating in the buffer must all be flushed
-    /// together and the buffer must be empty afterwards in `dry_run` mode.
+    /// Multiple batches accumulating in `SinkBuffer` must all be flushed
+    /// together and drained cleanly in `dry_run` mode.
     #[tokio::test]
     async fn test_iceberg_sink_multi_batch_accumulation() {
-        let mut sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let mut config = make_dry_run_config(SchemaMode::Fixed);
+        config.buffer = Some(BufferConfig {
+            max_batch_records: Some(9),
+            ..IcebergSink::default_buffer_config()
+        });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let mut sink = IcebergSink::new(config);
+        let [(logs_tx, logs_rx), _, _] = SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
 
-        // Send multiple batches
+        // Send 3 batches (3 rows each = 9 rows total)
         for _ in 0..3 {
-            tx.send(SignalBatch::Logs(make_test_logs_batch()))
+            logs_tx
+                .send(SignalBatch::Logs(make_test_logs_batch()))
                 .await
                 .unwrap();
         }
-        drop(tx);
+        drop(logs_tx);
 
-        let result = sink.run(rx).await;
+        let result = sink.run(logs_rx).await;
         assert!(result.is_ok(), "Multi-batch dry_run should succeed");
-
-        // After run completes, all buffers should have been flushed
-        for buffer in sink.buffers.values() {
-            assert!(
-                buffer.batches.is_empty(),
-                "Buffer should be empty after final flush"
-            );
-            assert_eq!(
-                buffer.total_rows, 0,
-                "total_rows should be zero after flush"
-            );
-        }
     }
 
     // ── Sorting ────────────────────────────────────────────────────────────────
@@ -1419,30 +1717,45 @@ mod tests {
     }
 
     /// `should_flush` must trigger when `total_bytes` exceeds `max_batch_size_bytes`.
-    #[test]
-    fn test_should_flush_byte_threshold() {
+    #[tokio::test]
+    async fn test_should_flush_byte_threshold() {
         let mut config = make_dry_run_config(SchemaMode::Fixed);
         config.batching = Some(BatchingConfig {
             max_batch_records: None,
-            max_batch_size_bytes: 1, // 1 byte — any real data will exceed this
-            max_batch_interval_sec: u64::MAX,
+            max_batch_size_bytes: 1,
+            max_batch_interval_sec: 3600,
         });
 
-        let mut sink = IcebergSink::new(config);
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        assert_eq!(buf_cfg.max_batch_size_bytes, 1);
+
+        let [(logs_tx, mut logs_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
         let batch = make_test_logs_batch();
-        let table_name = "db.tbl".to_string();
+        logs_tx.send(SignalBatch::Logs(batch)).await.unwrap();
 
-        let buffer = sink
-            .buffers
-            .entry(table_name.clone())
-            .or_insert_with(|| TableBuffer::new("logs"));
-        buffer.total_bytes = batch.get_array_memory_size();
-        buffer.total_rows = batch.num_rows();
-        buffer.batches.push(batch);
+        let lease = logs_rx
+            .next_lease()
+            .await
+            .unwrap()
+            .expect("lease must flush when byte threshold is reached");
+        assert!(lease.byte_size() >= 1);
+        lease.ack().await.unwrap();
+    }
 
+    #[test]
+    fn test_iceberg_resolved_buffer_config_prefers_buffer_and_rejects_both() {
+        let config = make_dry_run_config(SchemaMode::Fixed);
+        let default_buf = config.resolved_buffer_config().unwrap();
+        assert_eq!(default_buf, IcebergSink::default_buffer_config());
+
+        let mut both_cfg = make_dry_run_config(SchemaMode::Fixed);
+        both_cfg.buffer = Some(BufferConfig::default());
+        both_cfg.batching = Some(BatchingConfig::default());
+        let err = both_cfg.resolved_buffer_config().unwrap_err().to_string();
         assert!(
-            sink.should_flush(&table_name),
-            "should_flush must trigger when total_bytes >= max_batch_size_bytes"
+            err.contains("[iceberg.buffer]") && err.contains("[iceberg.batching]"),
+            "Expected V4 conflict error, got: {err}"
         );
     }
 
@@ -1475,6 +1788,517 @@ mod tests {
         assert!(
             result.is_ok(),
             "dry_run with Traces must succeed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_and_parse_lease_token_roundtrip() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        assert_eq!(
+            snapshot_property_key(SignalKind::Logs),
+            "datalake.lease.logs"
+        );
+        assert_eq!(
+            snapshot_property_key(SignalKind::Metrics),
+            "datalake.lease.metrics"
+        );
+        assert_eq!(
+            snapshot_property_key(SignalKind::Traces),
+            "datalake.lease.traces"
+        );
+        assert_eq!(
+            lease_snapshot_property_key(SignalKind::Logs),
+            "datalake.lease.logs"
+        );
+
+        let id = LeaseId {
+            signal: SignalKind::Logs,
+            first_seq: 12,
+            last_seq: 34,
+        };
+        let token = format_lease_token(id);
+        assert_eq!(token, "12:34");
+        assert_eq!(parse_lease_token(&token), Some((12, 34)));
+
+        let range = format_lease_range(id);
+        assert_eq!(range, "12-34");
+        assert_eq!(parse_lease_token(&range), Some((12, 34)));
+
+        assert_eq!(parse_lease_token(""), None);
+        assert_eq!(parse_lease_token("abc"), None);
+        assert_eq!(parse_lease_token("20:10"), None);
+    }
+
+    #[test]
+    fn test_iceberg_lease_already_committed_recognizes_matching_or_newer_last_seq() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        let metadata_json = r#"{
+          "format-version": 3,
+          "table-uuid": "9c12d441-03fe-4693-9a96-a0705ddf69c1",
+          "location": "memory:///bucket/test/location",
+          "last-sequence-number": 1,
+          "last-updated-ms": 1602638573000,
+          "last-column-id": 4,
+          "current-schema-id": 0,
+          "next-row-id": 10,
+          "schemas": [
+            {
+              "type": "struct",
+              "schema-id": 0,
+              "fields": [
+                { "id": 1, "name": "timestamp", "required": true, "type": "timestamp_ns" },
+                { "id": 2, "name": "severity_text", "required": false, "type": "string" },
+                { "id": 4, "name": "service_name", "required": false, "type": "string" },
+                { "id": 3, "name": "resource_attributes", "required": false, "type": "string" }
+              ]
+            }
+          ],
+          "default-spec-id": 0,
+          "partition-specs": [{ "spec-id": 0, "fields": [] }],
+          "last-partition-id": 999,
+          "default-sort-order-id": 0,
+          "sort-orders": [{ "order-id": 0, "fields": [] }],
+          "properties": {},
+          "current-snapshot-id": 101,
+          "snapshots": [
+            {
+              "snapshot-id": 101,
+              "sequence-number": 1,
+              "timestamp-ms": 1602638573000,
+              "manifest-list": "memory:///bucket/test/location/metadata/snap-101.avro",
+              "summary": {
+                "operation": "append",
+                "datalake.lease.logs": "1:5"
+              },
+              "schema-id": 0,
+              "first-row-id": 0,
+              "added-rows": 10
+            }
+          ],
+          "snapshot-log": [],
+          "metadata-log": []
+        }"#;
+
+        let metadata: iceberg::spec::TableMetadata = serde_json::from_str(metadata_json).unwrap();
+        let tokio_rt = tokio::runtime::Runtime::new().unwrap();
+        let iceberg_rt = iceberg::Runtime::new(&tokio_rt);
+        let table = iceberg::table::Table::builder()
+            .metadata(metadata)
+            .metadata_location("memory:///bucket/test/location/metadata/v1.json".to_string())
+            .identifier(iceberg::TableIdent::from_strs(["ns1", "test1"]).unwrap())
+            .file_io(iceberg::io::FileIO::new_with_memory())
+            .runtime(iceberg_rt)
+            .build()
+            .unwrap();
+
+        assert!(is_lease_already_committed(
+            &table,
+            LeaseId {
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 5,
+            }
+        ));
+        assert!(is_lease_already_committed(
+            &table,
+            LeaseId {
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 3,
+            }
+        ));
+        assert!(!is_lease_already_committed(
+            &table,
+            LeaseId {
+                signal: SignalKind::Logs,
+                first_seq: 6,
+                last_seq: 6,
+            }
+        ));
+        assert!(!is_lease_already_committed(
+            &table,
+            LeaseId {
+                signal: SignalKind::Metrics,
+                first_seq: 1,
+                last_seq: 5,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_prepare_runs_schema_mode_sort_and_partition_in_spawn_blocking() {
+        use pipeline_core::buffer::{BufferConfig, SignalKind};
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let buf_cfg = BufferConfig {
+            max_batch_size_bytes: 1_048_576,
+            max_batch_records: Some(10),
+            max_batch_interval_sec: 60,
+            ..BufferConfig::default()
+        };
+        let [(logs_tx, mut logs_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+
+        logs_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        logs_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        drop(logs_tx);
+
+        let lease = logs_rx.next_lease().await.unwrap().expect("expected lease");
+        assert_eq!(lease.batches().len(), 2);
+        assert_eq!(lease.num_rows(), 6);
+
+        let sorter = sink.sorter.clone();
+        let granularity = sink.config.partition_granularity;
+        let schema_mode = sink.config.schema_mode;
+        let log_dropped_fields = sink.config.log_dropped_fields;
+
+        let sub_batches = lease
+            .prepare(move |batch| {
+                prepare_iceberg_batches(
+                    batch,
+                    SignalKind::Logs,
+                    schema_mode,
+                    log_dropped_fields,
+                    None,
+                    &sorter,
+                    granularity,
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(sub_batches.len(), 2);
+        let total_rows: usize = sub_batches.iter().map(|(_, b)| b.num_rows()).sum();
+        assert_eq!(total_rows, 6);
+        lease.ack().await.unwrap();
+    }
+
+    #[derive(Debug)]
+    struct MockIcebergCatalog {
+        inner: iceberg::memory::MemoryCatalog,
+        update_calls: std::sync::atomic::AtomicUsize,
+        fail_first_update_before_commit: bool,
+        fail_first_update_after_commit: bool,
+    }
+
+    #[async_trait]
+    impl Catalog for MockIcebergCatalog {
+        async fn list_namespaces(
+            &self,
+            parent: Option<&iceberg::NamespaceIdent>,
+        ) -> iceberg::Result<Vec<iceberg::NamespaceIdent>> {
+            self.inner.list_namespaces(parent).await
+        }
+
+        async fn create_namespace(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.create_namespace(namespace, properties).await
+        }
+
+        async fn get_namespace(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<iceberg::Namespace> {
+            self.inner.get_namespace(namespace).await
+        }
+
+        async fn namespace_exists(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<bool> {
+            self.inner.namespace_exists(namespace).await
+        }
+
+        async fn update_namespace(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+            properties: HashMap<String, String>,
+        ) -> iceberg::Result<()> {
+            self.inner.update_namespace(namespace, properties).await
+        }
+
+        async fn drop_namespace(&self, namespace: &iceberg::NamespaceIdent) -> iceberg::Result<()> {
+            self.inner.drop_namespace(namespace).await
+        }
+
+        async fn list_tables(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+        ) -> iceberg::Result<Vec<iceberg::TableIdent>> {
+            self.inner.list_tables(namespace).await
+        }
+
+        async fn create_table(
+            &self,
+            namespace: &iceberg::NamespaceIdent,
+            creation: iceberg::TableCreation,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.create_table(namespace, creation).await
+        }
+
+        async fn load_table(
+            &self,
+            table: &iceberg::TableIdent,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.load_table(table).await
+        }
+
+        async fn drop_table(&self, table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            self.inner.drop_table(table).await
+        }
+
+        async fn purge_table(&self, table: &iceberg::TableIdent) -> iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+
+        async fn table_exists(&self, table: &iceberg::TableIdent) -> iceberg::Result<bool> {
+            self.inner.table_exists(table).await
+        }
+
+        async fn rename_table(
+            &self,
+            src: &iceberg::TableIdent,
+            dest: &iceberg::TableIdent,
+        ) -> iceberg::Result<()> {
+            self.inner.rename_table(src, dest).await
+        }
+
+        async fn register_table(
+            &self,
+            table: &iceberg::TableIdent,
+            metadata_location: String,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            self.inner.register_table(table, metadata_location).await
+        }
+
+        async fn update_table(
+            &self,
+            commit: iceberg::TableCommit,
+        ) -> iceberg::Result<iceberg::table::Table> {
+            let call_idx = self
+                .update_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_idx == 0 && self.fail_first_update_before_commit {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::CatalogCommitConflicts,
+                    "simulated transient catalog commit conflict",
+                ));
+            }
+            let updated = self.inner.update_table(commit).await?;
+            if call_idx == 0 && self.fail_first_update_after_commit {
+                return Err(iceberg::Error::new(
+                    iceberg::ErrorKind::Unexpected,
+                    "simulated network disconnect after catalog persisted snapshot",
+                ));
+            }
+            Ok(updated)
+        }
+    }
+
+    async fn make_mock_logs_catalog(
+        fail_first_update_before_commit: bool,
+        fail_first_update_after_commit: bool,
+    ) -> Arc<MockIcebergCatalog> {
+        use iceberg::CatalogBuilder;
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+        use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
+
+        let inner = MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    "memory:///warehouse".to_string(),
+                )]),
+            )
+            .await
+            .unwrap();
+
+        let ns = iceberg::NamespaceIdent::new("otel".to_string());
+        inner.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "timestamp", Type::Primitive(PrimitiveType::Timestamp))
+                    .into(),
+                NestedField::optional(2, "severity_text", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::optional(3, "service_name", Type::Primitive(PrimitiveType::String))
+                    .into(),
+                NestedField::optional(
+                    4,
+                    "resource_attributes",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let creation = iceberg::TableCreation::builder()
+            .name("logs".to_string())
+            .schema(schema)
+            .properties(HashMap::from([(
+                "commit.retry.num-retries".to_string(),
+                "0".to_string(),
+            )]))
+            .build();
+        inner.create_table(&ns, creation).await.unwrap();
+
+        Arc::new(MockIcebergCatalog {
+            inner,
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_first_update_before_commit,
+            fail_first_update_after_commit,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_snapshot_token_skips_already_committed_lease_on_retry() {
+        use pipeline_core::buffer::{BufferConfig, LeaseId, SignalKind};
+
+        let snapshot_summary_props =
+            HashMap::from([("datalake.lease.logs".to_string(), "1-5".to_string())]);
+        assert!(is_lease_already_committed(
+            &snapshot_summary_props,
+            LeaseId {
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 5,
+            }
+        ));
+
+        // Also verify against a live catalog where the first commit persists the
+        // snapshot token in the catalog before the client receives a disconnect error,
+        // and where a subsequent retry lease with the same sequence range is skipped
+        // without a duplicate `update_table` call.
+        let catalog = make_mock_logs_catalog(false, true).await;
+        let mut config = make_dry_run_config(SchemaMode::Catalog);
+        config.dry_run = false;
+        config.table_identifier = "otel.logs".to_string();
+
+        let mut sink = IcebergSink::with_catalog(config, catalog.clone());
+        let buf_cfg = BufferConfig {
+            max_batch_size_bytes: 1_048_576,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 60,
+            initial_backoff_ms: 5,
+            max_backoff_sec: 1,
+            ..BufferConfig::default()
+        };
+        let [(logs_tx, logs_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg.clone()).unwrap();
+        logs_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        drop(logs_tx);
+
+        sink.run(logs_rx).await.unwrap();
+
+        // Only 1 update_table call was needed because the post-error table reload
+        // detected `"datalake.lease.logs" = "1:1"` in the current snapshot summary.
+        assert_eq!(
+            catalog
+                .update_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let table = catalog
+            .load_table(&iceberg::TableIdent::from_strs(["otel", "logs"]).unwrap())
+            .await
+            .unwrap();
+        let snap = table.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            snap.summary()
+                .additional_properties
+                .get("datalake.lease.logs")
+                .map(String::as_str),
+            Some("1:1")
+        );
+
+        // Now send a fresh buffer whose first lease ALSO has seq 1:1 against the same
+        // catalog; `commit_lease` must detect `is_lease_already_committed` upfront and
+        // ack without calling `update_table` a second time.
+        let [(retry_tx, retry_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+        retry_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        drop(retry_tx);
+
+        sink.run(retry_rx).await.unwrap();
+        assert_eq!(
+            catalog
+                .update_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "Duplicate lease 1:1 must be skipped without calling update_table again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_iceberg_catalog_commit_failure_nacks_transient_and_retains_lease() {
+        use pipeline_core::buffer::BufferConfig;
+
+        let catalog = make_mock_logs_catalog(true, false).await;
+        let mut config = make_dry_run_config(SchemaMode::Catalog);
+        config.dry_run = false;
+        config.table_identifier = "otel.logs".to_string();
+
+        let mut sink = IcebergSink::with_catalog(config, catalog.clone());
+        let buf_cfg = BufferConfig {
+            max_batch_size_bytes: 1_048_576,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 60,
+            initial_backoff_ms: 5,
+            max_backoff_sec: 1,
+            ..BufferConfig::default()
+        };
+        let [(logs_tx, logs_rx), _, _] = SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+        logs_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        drop(logs_tx);
+
+        sink.run(logs_rx).await.unwrap();
+
+        // First attempt failed with CatalogCommitConflicts -> nack(Transient) retained
+        // the lease -> second attempt succeeded.
+        assert_eq!(
+            catalog
+                .update_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "Transient commit failure must nack and retry the retained lease"
+        );
+
+        let table = catalog
+            .load_table(&iceberg::TableIdent::from_strs(["otel", "logs"]).unwrap())
+            .await
+            .unwrap();
+        let snap = table.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            snap.summary()
+                .additional_properties
+                .get("datalake.lease.logs")
+                .map(String::as_str),
+            Some("1:1")
         );
     }
 }
