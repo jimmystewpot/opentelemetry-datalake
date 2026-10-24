@@ -112,7 +112,7 @@ arrow = { version = "59", default-features = false, features = ["json", "ipc"] }
 parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2-rust_backend", "lz4"] }
 
 # WebAssembly Runtime (Wasmtime 49, Rust 1.98+ required)
-wasmtime = { version = "49.0.3", default-features = false, features = ["cranelift", "pooling-allocator"] }
+wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "pooling-allocator"] }
 wasmtime-wasi = { version = "49.0.3", default-features = false }
 
 # Concurrent Collections
