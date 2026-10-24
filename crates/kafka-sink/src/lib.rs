@@ -1,9 +1,14 @@
+use arrow::array::Array;
 use async_trait::async_trait;
 use pipeline_core::error::PipelineError;
 use pipeline_core::pipeline::{PipelineReceiver, SignalBatch, Sink};
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// Default timeout in milliseconds when flushing the Kafka producer on shutdown.
+pub const DEFAULT_FLUSH_TIMEOUT_MS: u64 = 10_000;
 
 /// Kafka message serialization format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,13 +40,14 @@ pub struct KafkaSink {
     format: SerializationFormat,
     sorter: pipeline_core::sort::BatchSorter,
     partition_key: Option<String>,
+    flush_timeout: Duration,
 }
 
 /// Scans a contiguous sorted partition key column and slices the batch into sub-batches.
 pub fn extract_partition_slices(
     batch: &arrow::record_batch::RecordBatch,
     key_column: &str,
-) -> Result<Vec<(String, arrow::record_batch::RecordBatch)>, PipelineError> {
+) -> Result<Vec<(Option<String>, arrow::record_batch::RecordBatch)>, PipelineError> {
     let col = batch.column_by_name(key_column).ok_or_else(|| {
         PipelineError::Internal(format!("Missing partition key column '{key_column}'"))
     })?;
@@ -58,22 +64,33 @@ pub fn extract_partition_slices(
     if num_rows == 0 {
         return Ok(slices);
     }
-    if num_rows == 1 {
-        return Ok(vec![(str_arr.value(0).to_string(), batch.clone())]);
-    }
+
+    let get_key = |i: usize| -> Option<&str> {
+        if str_arr.is_null(i) {
+            None
+        } else {
+            Some(str_arr.value(i))
+        }
+    };
 
     let mut start = 0;
-    let mut current_val = str_arr.value(0).to_string();
+    let mut current_val = get_key(0);
 
     for i in 1..num_rows {
-        let val = str_arr.value(i);
+        let val = get_key(i);
         if val != current_val {
-            slices.push((current_val, batch.slice(start, i - start)));
+            slices.push((
+                current_val.map(str::to_owned),
+                batch.slice(start, i - start),
+            ));
             start = i;
-            current_val = val.to_string();
+            current_val = val;
         }
     }
-    slices.push((current_val, batch.slice(start, num_rows - start)));
+    slices.push((
+        current_val.map(str::to_owned),
+        batch.slice(start, num_rows - start),
+    ));
 
     Ok(slices)
 }
@@ -100,12 +117,23 @@ impl KafkaSink {
             PipelineError::Internal(format!("Failed to create Kafka producer: {e}"))
         })?;
 
+        let flush_timeout = options
+            .get("delivery.timeout.ms")
+            .or_else(|| options.get("message.timeout.ms"))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map_or_else(
+                || Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS),
+                Duration::from_millis,
+            );
+
         Ok(Self {
             producer,
             topic: topic.to_string(),
             format,
             sorter: pipeline_core::sort::BatchSorter::default(),
             partition_key: None,
+            flush_timeout,
         })
     }
 
@@ -118,6 +146,19 @@ impl KafkaSink {
         self.sorter = sorter;
         self.partition_key = partition_key;
         self
+    }
+
+    /// Overrides the shutdown flush timeout.
+    #[must_use]
+    pub fn with_flush_timeout(mut self, timeout: Duration) -> Self {
+        self.flush_timeout = timeout;
+        self
+    }
+
+    /// Returns the configured shutdown flush timeout.
+    #[must_use]
+    pub fn flush_timeout(&self) -> Duration {
+        self.flush_timeout
     }
 
     /// Serializes an Arrow `RecordBatch` to the configured format.
@@ -187,12 +228,15 @@ impl Sink for KafkaSink {
             let batches_to_send = if let Some(ref p_key) = self.partition_key {
                 extract_partition_slices(&sorted_batch, p_key)?
             } else {
-                vec![(String::new(), sorted_batch)]
+                vec![(None, sorted_batch)]
             };
 
-            for (key_str, sub_batch) in batches_to_send {
+            for (key_opt, sub_batch) in batches_to_send {
                 self.serialize_batch(&sub_batch, &mut buffer)?;
-                let record = FutureRecord::to(&self.topic).payload(&buffer).key(&key_str);
+                let mut record = FutureRecord::to(&self.topic).payload(&buffer);
+                if let Some(ref k) = key_opt {
+                    record = record.key(k.as_str());
+                }
                 if let Err((e, _)) = self
                     .producer
                     .send(record, tokio::time::Duration::from_secs(5))
@@ -203,6 +247,17 @@ impl Sink for KafkaSink {
                 }
             }
         }
+
+        let producer = self.producer.clone();
+        let timeout = self.flush_timeout;
+        tokio::task::spawn_blocking(move || Producer::flush(&producer, timeout))
+            .await
+            .map_err(|e| PipelineError::Internal(format!("Kafka flush task join error: {e}")))?
+            .map_err(|e| {
+                tracing::error!("Failed to flush Kafka producer during shutdown: {e}");
+                PipelineError::Storage(Box::new(e))
+            })?;
+
         Ok(())
     }
 }
@@ -345,11 +400,11 @@ mod tests {
 
         let slices = extract_partition_slices(&batch, "service_name").expect("slices");
         assert_eq!(slices.len(), 3);
-        assert_eq!(slices[0].0, "auth");
+        assert_eq!(slices[0].0, Some("auth".to_string()));
         assert_eq!(slices[0].1.num_rows(), 2);
-        assert_eq!(slices[1].0, "billing");
+        assert_eq!(slices[1].0, Some("billing".to_string()));
         assert_eq!(slices[1].1.num_rows(), 1);
-        assert_eq!(slices[2].0, "gateway");
+        assert_eq!(slices[2].0, Some("gateway".to_string()));
         assert_eq!(slices[2].1.num_rows(), 1);
 
         // Test empty batch
@@ -376,7 +431,197 @@ mod tests {
         let single_slices =
             extract_partition_slices(&single_batch, "service_name").expect("slices");
         assert_eq!(single_slices.len(), 1);
-        assert_eq!(single_slices[0].0, "auth");
+        assert_eq!(single_slices[0].0, Some("auth".to_string()));
         assert_eq!(single_slices[0].1.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_extract_partition_slices_with_null_keys() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "service_name",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                Some("svc-a"),
+                None,
+                Some("svc-b"),
+            ]))],
+        )
+        .unwrap();
+
+        let slices = extract_partition_slices(&batch, "service_name").unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0].0.as_deref(), Some("svc-a"));
+        assert_eq!(slices[0].1.num_rows(), 1);
+        assert_eq!(slices[1].0, None);
+        assert_eq!(slices[1].1.num_rows(), 1);
+        assert_eq!(slices[2].0.as_deref(), Some("svc-b"));
+        assert_eq!(slices[2].1.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_extract_partition_slices_all_nulls_and_single_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "service_name",
+            DataType::Utf8,
+            true,
+        )]));
+
+        let single_null = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                None::<&str>,
+            ]))],
+        )
+        .unwrap();
+        let slices = extract_partition_slices(&single_null, "service_name").unwrap();
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].0, None);
+        assert_eq!(slices[0].1.num_rows(), 1);
+
+        let all_nulls = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                None::<&str>,
+                None::<&str>,
+                None::<&str>,
+            ]))],
+        )
+        .unwrap();
+        let slices = extract_partition_slices(&all_nulls, "service_name").unwrap();
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0].0, None);
+        assert_eq!(slices[0].1.num_rows(), 3);
+    }
+
+    #[test]
+    fn test_extract_partition_slices_distinct_empty_and_null() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "service_name",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec![
+                None,
+                Some(""),
+                None,
+                Some("auth"),
+                Some("auth"),
+                None,
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        let slices = extract_partition_slices(&batch, "service_name").unwrap();
+        assert_eq!(slices.len(), 5);
+        assert_eq!(slices[0].0, None);
+        assert_eq!(slices[0].1.num_rows(), 1);
+        assert_eq!(slices[1].0.as_deref(), Some(""));
+        assert_eq!(slices[1].1.num_rows(), 1);
+        assert_eq!(slices[2].0, None);
+        assert_eq!(slices[2].1.num_rows(), 1);
+        assert_eq!(slices[3].0.as_deref(), Some("auth"));
+        assert_eq!(slices[3].1.num_rows(), 2);
+        assert_eq!(slices[4].0, None);
+        assert_eq!(slices[4].1.num_rows(), 2);
+    }
+
+    #[test]
+    fn test_kafka_sink_flush_timeout_resolution() {
+        use std::time::Duration;
+
+        // 1. Default 10s
+        let options = HashMap::new();
+        let sink =
+            KafkaSink::try_new("localhost:9092", "t", SerializationFormat::Json, &options).unwrap();
+        assert_eq!(
+            sink.flush_timeout(),
+            Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS)
+        );
+
+        // 2. From message.timeout.ms
+        let mut opts_msg = HashMap::new();
+        opts_msg.insert("message.timeout.ms".to_string(), "3000".to_string());
+        let sink = KafkaSink::try_new("localhost:9092", "t", SerializationFormat::Json, &opts_msg)
+            .unwrap();
+        assert_eq!(sink.flush_timeout(), Duration::from_millis(3000));
+
+        // 3. delivery.timeout.ms takes precedence over message.timeout.ms
+        let mut opts_both = HashMap::new();
+        opts_both.insert("message.timeout.ms".to_string(), "3000".to_string());
+        opts_both.insert("delivery.timeout.ms".to_string(), "4500".to_string());
+        let sink = KafkaSink::try_new("localhost:9092", "t", SerializationFormat::Json, &opts_both)
+            .unwrap();
+        assert_eq!(sink.flush_timeout(), Duration::from_millis(4500));
+
+        // 4. Zero ("0") falls back to default 10s
+        let mut opts_zero = HashMap::new();
+        opts_zero.insert("message.timeout.ms".to_string(), "0".to_string());
+        let sink = KafkaSink::try_new("localhost:9092", "t", SerializationFormat::Json, &opts_zero)
+            .unwrap();
+        assert_eq!(
+            sink.flush_timeout(),
+            Duration::from_millis(DEFAULT_FLUSH_TIMEOUT_MS)
+        );
+
+        // 5. Builder override wins
+        let sink = sink.with_flush_timeout(Duration::from_millis(250));
+        assert_eq!(sink.flush_timeout(), Duration::from_millis(250));
+    }
+
+    #[tokio::test]
+    async fn test_kafka_sink_run_flushes_on_channel_close() {
+        use std::time::Duration;
+        let options = HashMap::new();
+
+        // Case A: Clean empty-queue shutdown flush succeeds
+        let mut sink_ok = KafkaSink::try_new(
+            "127.0.0.1:1",
+            "test-topic",
+            SerializationFormat::Json,
+            &options,
+        )
+        .unwrap()
+        .with_flush_timeout(Duration::from_millis(50));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        drop(tx);
+        let res = sink_ok.run(rx).await;
+        assert!(
+            res.is_ok(),
+            "Empty producer queue flush on EOF should succeed: {res:?}"
+        );
+
+        // Case B: Enqueued message to unreachable broker fails flush on EOF with PipelineError::Storage
+        let mut sink_fail = KafkaSink::try_new(
+            "127.0.0.1:1",
+            "test-topic",
+            SerializationFormat::Json,
+            &options,
+        )
+        .unwrap()
+        .with_flush_timeout(Duration::from_millis(50));
+
+        // Enqueue directly into librdkafka C queue without awaiting delivery
+        let _ = sink_fail
+            .producer
+            .send_result(FutureRecord::to("test-topic").payload(b"payload").key("k"));
+
+        let (tx2, rx2) = tokio::sync::mpsc::channel(4);
+        drop(tx2);
+        let err = sink_fail
+            .run(rx2)
+            .await
+            .expect_err("Flush with undelivered message to 127.0.0.1:1 must time out");
+        assert!(
+            matches!(err, PipelineError::Storage(_)),
+            "Expected PipelineError::Storage from failed flush, got: {err:?}"
+        );
     }
 }
