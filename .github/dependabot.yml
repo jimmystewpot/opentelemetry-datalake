@@ -21,6 +21,9 @@ updates:
           - "tracing-opentelemetry*"
         exclude-patterns:
           - "opentelemetry-datalake*"
+      wasmtime:
+        patterns:
+          - "wasmtime*"
     ignore:
       - dependency-name: "arrow"
         versions: [">= 60.0.0"]
