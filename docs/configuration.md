@@ -61,8 +61,9 @@ Configures the Apache Iceberg sink. This sink converts OTLP data into Apache Arr
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128MB). |
+| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128 MiB). |
 | `max_batch_interval_sec`| Integer | `60` | Max time in seconds between flushes. |
+| `max_batch_records` | Integer | `null` | Optional maximum accumulated records before triggering a flush. |
 
 ---
 
@@ -76,9 +77,13 @@ Configures the Kafka sink.
 | `logs_topic` | String | `"telemetry-logs"` | Kafka topic for logs. |
 | `traces_topic` | String | `"telemetry-traces"`| Kafka topic for traces. |
 | `metrics_topic` | String | `"telemetry-metrics"`| Kafka topic for metrics. |
-| `logs_format` | String | `"json"` | Serialization format for logs (`json` or `protobuf`). |
-| `traces_format` | String | `"json"` | Serialization format for traces (`json` or `protobuf`). |
-| `metrics_format` | String | `"json"` | Serialization format for metrics (`json` or `protobuf`). |
+| `logs_format` | String | `"json"` | Serialization format for logs (`"json"` or `"ipc"`). |
+| `traces_format` | String | `"json"` | Serialization format for traces (`"json"` or `"ipc"`). |
+| `metrics_format` | String | `"json"` | Serialization format for metrics (`"json"` or `"ipc"`). |
+| `logs_partition_key` | String | `null` | Optional column name used to partition and key log batches. |
+| `traces_partition_key` | String | `null` | Optional column name used to partition and key trace batches. |
+| `metrics_partition_key` | String | `null` | Optional column name used to partition and key metric batches. |
+| `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `flush_timeout_ms` | Integer | `10000` | Maximum time in milliseconds to wait for in-flight messages in `librdkafka` to flush during graceful shutdown (must be > 0). |
 | `options` | Map | `{}` | Additional `librdkafka` configuration options. |
 
@@ -101,7 +106,19 @@ Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.m
 | `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
 | `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds. |
+| `batching` | Map | `null` | Optional micro-batch accumulation settings (see below). |
+| `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `tls` | Map | `{}` | Standard TLS configuration (`ca_cert_path`, `verification`). |
+
+### StarRocks Batching (`[starrocks.batching]`)
+
+When omitted (`null`), `StarRocksSink` flushes each incoming batch immediately. When configured, batches are accumulated until any threshold is met:
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `max_batch_size_bytes` | Integer | `52428800` | Max accumulated Arrow byte size before flushing (50 MiB). |
+| `max_batch_interval_sec` | Integer | `30` | Max time in seconds between flushes. |
+| `max_batch_records` | Integer | `null` | Optional max accumulated records before flushing. |
 
 ### StarRocks Table Mapping (`[starrocks.table_mapping]`)
 

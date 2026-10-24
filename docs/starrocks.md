@@ -69,9 +69,9 @@ format = "ipc"
 # V2 requires StarRocks transaction support to be enabled cluster-wide.
 transaction_mode = "v1"
 
-# Hard limit on serialized payload size in bytes. Default: 128 MiB.
+# Hard limit on serialized payload size in bytes. Default: 100 MiB (104857600).
 # If a batch exceeds this limit the sink returns an error and applies backpressure.
-max_payload_bytes = 134217728
+max_payload_bytes = 104857600
 
 # TCP connection timeout in seconds. Default: 10.
 connect_timeout_secs = 10
@@ -84,6 +84,19 @@ max_retries = 3
 
 # Delay between retries in seconds. Default: 1.
 retry_interval_secs = 1
+
+# Optional micro-batch accumulation before Stream Load submission.
+[starrocks.batching]
+max_batch_size_bytes   = 52428800 # Default: 50 MiB
+max_batch_interval_sec = 30       # Default: 30 seconds
+# max_batch_records    = 100000   # Optional record count trigger
+
+# Optional pre-sorting configuration per signal type.
+[starrocks.order_by]
+logs    = ["timestamp ASC", "service_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
+traces  = ["timestamp ASC", "service_name ASC"]
+on_missing_column = "skip"
 ```
 
 ### Table mapping — `per_signal` (recommended)
@@ -181,7 +194,7 @@ For most telemetry use-cases, V1 is sufficient. Use V2 when duplicate rows in St
 
 ## Payload Size Limits
 
-The `max_payload_bytes` field (default 128 MiB) enforces a hard upper bound on the serialized size of each batch.
+The `max_payload_bytes` field (default 100 MiB / `104857600`) enforces a hard upper bound on the serialized size of each batch.
 
 StarRocks BEs also impose a server-side limit controlled by the `stream_load_max_mb` BE configuration variable (default 100 MiB). Set `max_payload_bytes` **below** the BE limit to catch oversized batches before the network round-trip.
 
