@@ -88,6 +88,11 @@ struct Cli {
 
 /// Validates that required sink configuration constraints are satisfied.
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
+    config
+        .pipeline
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
@@ -615,7 +620,9 @@ async fn main() -> anyhow::Result<()> {
         figment = figment.merge(Toml::file("config.toml"));
     }
 
-    let mut config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
+    let mut config: AppConfig = figment
+        .merge(Env::prefixed("OTEL_DATALAKE_").split("__"))
+        .extract()?;
 
     // Apply CLI overrides to configuration
     if let Some(grpc_addr) = cli_args.grpc_addr {
@@ -648,9 +655,9 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting opentelemetry-datalake service");
 
     // Channels for the OTLP source demultiplexer
-    let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(1000);
-    let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1000);
-    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(1000);
+    let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
+    let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
+    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
 
     // Channels between Transformers and Sinks
     let (logs_sink_tx, logs_sink_rx) = tokio::sync::mpsc::channel(1000);
@@ -2697,5 +2704,75 @@ mod tests {
                 .contains("flush_timeout_ms must be greater than 0"),
             "Unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn test_cli_check_supports_nested_double_underscore_env_override() {
+        let temp_dir = std::env::temp_dir();
+        let tmp_path = temp_dir.join(format!("test_cli_env_override_{}.toml", std::process::id()));
+        let toml_content = r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [starrocks]
+            frontend_urls = ["http://127.0.0.1:8030"]
+            database = "telemetry"
+            username = "writer"
+
+            [starrocks.table_mapping]
+            type = "per_signal"
+            logs = "otel_logs"
+            metrics = "otel_metrics"
+            traces = "otel_traces"
+        "#;
+        std::fs::write(&tmp_path, toml_content).expect("write temp toml");
+
+        let bin_path = option_env!("CARGO_BIN_EXE_opentelemetry-datalake")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_BIN_EXE_opentelemetry-datalake")
+                    .map(std::path::PathBuf::from)
+            })
+            .unwrap_or_else(|| {
+                let mut path = std::env::current_exe().expect("current exe");
+                path.pop();
+                if path.ends_with("deps") {
+                    path.pop();
+                }
+                path.join(format!(
+                    "opentelemetry-datalake{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
+            });
+
+        if !bin_path.exists() {
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--bin", "opentelemetry-datalake"])
+                .status()
+                .expect("build opentelemetry-datalake binary");
+            assert!(status.success(), "failed to build binary for test");
+        }
+
+        let status = std::process::Command::new(&bin_path)
+            .args(["--check", "--config"])
+            .arg(&tmp_path)
+            .env("OTEL_DATALAKE_STARROCKS__PASSWORD", "env-secret")
+            .env("OTEL_DATALAKE_CHANNEL_CAPACITY", "32")
+            .status()
+            .expect("execute cli check");
+
+        assert!(status.success());
+
+        let invalid_status = std::process::Command::new(&bin_path)
+            .args(["--check", "--config"])
+            .arg(&tmp_path)
+            .env("OTEL_DATALAKE_STARROCKS__PASSWORD", "env-secret")
+            .env("OTEL_DATALAKE_CHANNEL_CAPACITY", "0")
+            .status()
+            .expect("execute cli check with invalid capacity");
+
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(!invalid_status.success());
     }
 }

@@ -7,9 +7,17 @@ use serde::Deserialize;
 
 pub use crate::tls::{TlsConfig, TlsVerificationMode};
 
+const fn default_channel_capacity() -> usize {
+    64
+}
+
 /// Top-level configuration object.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PipelineConfig {
+    /// Bounded channel capacity for pipeline queues.
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+
     /// Local telemetry configuration.
     #[serde(default)]
     pub telemetry: crate::telemetry::TelemetryConfig,
@@ -24,9 +32,23 @@ impl PipelineConfig {
     pub fn load(path: &str) -> Result<Self, PipelineError> {
         Figment::new()
             .merge(Toml::file(path))
-            .merge(Env::prefixed("DATALAKE_").split("_"))
+            .merge(Env::prefixed("OTEL_DATALAKE_").split("__"))
             .extract()
             .map_err(|e| PipelineError::Configuration(Box::new(e)))
+    }
+
+    /// Validates the pipeline configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Configuration` if `channel_capacity` is zero.
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        if self.channel_capacity == 0 {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from("channel_capacity must be >= 1"),
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -223,5 +245,25 @@ mod tests {
         let cfg = PipelineConfig::load("/nonexistent-defaults-test.toml").unwrap();
         assert_eq!(cfg.telemetry.otlp_endpoint, "http://localhost:4317");
         assert_eq!(cfg.telemetry.service_name, "otel-datalake");
+    }
+
+    #[test]
+    fn test_pipeline_config_channel_capacity_default_is_64() {
+        let cfg = PipelineConfig::load("/tmp/nonexistent-otel-datalake-cap.toml").unwrap();
+        assert_eq!(cfg.channel_capacity, 64);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pipeline_config_rejects_zero_channel_capacity() {
+        let toml_str = "channel_capacity = 0\n";
+        let cfg: PipelineConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
     }
 }
