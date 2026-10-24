@@ -1,0 +1,187 @@
+use arrow::record_batch::RecordBatch;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+use tokio::sync::Notify;
+
+/// State of a sequence number slot in a signal ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseSlotState {
+    /// Batch is waiting in the ring queue to be leased.
+    Queued,
+    /// Batch is currently leased to a sink task.
+    InFlight,
+    /// Batch has been acknowledged (or evicted) and is eligible to advance the watermark.
+    Acked,
+}
+
+/// Metadata and payload for a queued Arrow `RecordBatch` inside a [`SignalRing`].
+#[derive(Debug, Clone)]
+pub struct QueuedBatch {
+    /// Monotonically increasing per-signal sequence number (`>= 1`).
+    pub seq_id: u64,
+    /// In-memory Arrow `RecordBatch`.
+    pub batch: RecordBatch,
+    /// Approximate memory footprint from `RecordBatch::get_array_memory_size()`.
+    pub byte_size: usize,
+    /// Number of rows in `batch`.
+    pub row_count: usize,
+    /// Timestamp when the batch first entered the buffer.
+    pub enqueued_at: Instant,
+    /// Number of previous delivery attempts (`0` on initial enqueue).
+    pub attempt: u32,
+    /// Optional backoff deadline before which this batch cannot be leased.
+    pub ready_at: Option<Instant>,
+}
+
+/// Per-batch metadata retained inside an active [`crate::buffer::Lease`] for requeue or ack.
+#[derive(Debug, Clone)]
+pub struct LeasedBatchMeta {
+    /// Sequence number of the batch.
+    pub seq_id: u64,
+    /// Byte size charged to the signal ring for this batch.
+    pub byte_size: usize,
+    /// Number of rows in this batch.
+    pub row_count: usize,
+    /// Original enqueue timestamp of the batch.
+    pub enqueued_at: Instant,
+}
+
+/// Mutable state for a single telemetry signal ring (`Logs`, `Metrics`, or `Traces`).
+#[derive(Debug)]
+pub struct SignalRing {
+    /// FIFO queue of unleased batches.
+    pub queue: VecDeque<QueuedBatch>,
+    /// Sequence tracking table for out-of-order watermark progression.
+    pub slots: BTreeMap<u64, LeaseSlotState>,
+    /// Next sequence number to assign on `send()` (starts at `1`).
+    pub next_seq: u64,
+    /// Total bytes currently held in `Queued` and `InFlight` batches.
+    pub bytes_in_flight: usize,
+    /// Total rows currently held in `Queued` and `InFlight` batches.
+    pub rows_in_flight: usize,
+    /// Number of currently active `InFlight` leases for this signal.
+    pub inflight_leases: usize,
+    /// Cumulative number of rows evicted under `OverflowPolicy::DropOldest`.
+    pub evicted_records: u64,
+    /// Whether all `BufferSender`s for this signal have been dropped.
+    pub closed: bool,
+    /// Whether the `SinkBuffer` consumer for this signal has been dropped.
+    pub receiver_dropped: bool,
+    /// Fatal error message if the ring has transitioned to `Failed`.
+    pub fatal_error: Option<String>,
+}
+
+impl Default for SignalRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SignalRing {
+    /// Creates an empty [`SignalRing`] starting at sequence number `1`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            slots: BTreeMap::new(),
+            next_seq: 1,
+            bytes_in_flight: 0,
+            rows_in_flight: 0,
+            inflight_leases: 0,
+            evicted_records: 0,
+            closed: false,
+            receiver_dropped: false,
+            fatal_error: None,
+        }
+    }
+
+    /// Pops all leading [`LeaseSlotState::Acked`] entries from `slots` and advances `committed_seq`.
+    pub fn advance_watermark(&mut self, committed_seq: &AtomicU64) {
+        while let Some((&seq, &state)) = self.slots.first_key_value() {
+            if state == LeaseSlotState::Acked {
+                self.slots.pop_first();
+                committed_seq.store(seq, Ordering::Release);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Requeues leased batches at the front of `queue` in their original sequence order.
+    pub fn requeue_at_head(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        meta: Vec<LeasedBatchMeta>,
+        next_attempt: u32,
+        ready_at: Option<Instant>,
+    ) {
+        for (batch, item) in batches.into_iter().zip(meta).rev() {
+            self.slots.insert(item.seq_id, LeaseSlotState::Queued);
+            self.queue.push_front(QueuedBatch {
+                seq_id: item.seq_id,
+                batch,
+                byte_size: item.byte_size,
+                row_count: item.row_count,
+                enqueued_at: item.enqueued_at,
+                attempt: next_attempt,
+                ready_at,
+            });
+        }
+        self.inflight_leases = self.inflight_leases.saturating_sub(1);
+    }
+
+    /// Marks all batch sequence numbers in `meta` as [`LeaseSlotState::Acked`], releases
+    /// their byte/row budget, and advances the contiguous watermark.
+    pub fn ack_entries(
+        &mut self,
+        meta: &[LeasedBatchMeta],
+        byte_size: usize,
+        num_rows: usize,
+        committed_seq: &AtomicU64,
+    ) {
+        for item in meta {
+            self.slots.insert(item.seq_id, LeaseSlotState::Acked);
+        }
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(byte_size);
+        self.rows_in_flight = self.rows_in_flight.saturating_sub(num_rows);
+        self.inflight_leases = self.inflight_leases.saturating_sub(1);
+        self.advance_watermark(committed_seq);
+    }
+}
+
+/// Synchronized state and notifications for one signal ring.
+#[derive(Debug)]
+pub struct SignalRingState {
+    /// Mutex-protected signal ring queue and lease slot map.
+    pub ring: Mutex<SignalRing>,
+    /// Notifies blocked `BufferSender::send` calls when byte budget is freed or state changes.
+    pub space_available_notify: Notify,
+    /// Notifies waiting `SinkBuffer::next_lease` calls when batches arrive or lease slots free.
+    pub data_ready_notify: Notify,
+    /// Contiguous low-watermark sequence number committed for this signal.
+    pub committed_seq: AtomicU64,
+    /// Number of active `BufferSender` handles capable of sending to this signal ring.
+    pub active_senders: AtomicU64,
+}
+
+impl Default for SignalRingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SignalRingState {
+    /// Creates a new [`SignalRingState`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            ring: Mutex::new(SignalRing::new()),
+            space_available_notify: Notify::new(),
+            data_ready_notify: Notify::new(),
+            committed_seq: AtomicU64::new(0),
+            active_senders: AtomicU64::new(0),
+        }
+    }
+}
