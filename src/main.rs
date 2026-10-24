@@ -690,11 +690,8 @@ async fn main() -> anyhow::Result<()> {
             "iceberg",
             pipeline_core::buffer::BufferConfig::passthrough(),
         )
-    } else if config.elasticsearch.is_some() {
-        (
-            "elasticsearch",
-            pipeline_core::buffer::BufferConfig::passthrough(),
-        )
+    } else if let Some(ref es_cfg) = config.elasticsearch {
+        ("elasticsearch", es_cfg.resolved_buffer_config()?)
     } else if let Some(ref sr_cfg) = config.starrocks {
         ("starrocks", sr_cfg.resolved_buffer_config()?)
     } else if config.kafka.is_some() {
@@ -2995,6 +2992,49 @@ mod tests {
         assert!(err.to_string().contains("[starrocks.buffer]"), "Got: {err}");
         assert!(
             err.to_string().contains("[starrocks.batching]"),
+            "Got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_elasticsearch_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = ["http://127.0.0.1:9200"]
+
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+
+        [elasticsearch.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml = format!(
+            "{valid_buffer_toml}\n[elasticsearch.batching]\nmax_batch_size_bytes = 2097152\n"
+        );
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(
+            err.to_string().contains("[elasticsearch.buffer]"),
+            "Got: {err}"
+        );
+        assert!(
+            err.to_string().contains("[elasticsearch.batching]"),
             "Got: {err}"
         );
     }

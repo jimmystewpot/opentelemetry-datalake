@@ -17,10 +17,9 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use bytes::Bytes;
-use pipeline_core::buffer::SinkBuffer;
+use pipeline_core::buffer::{FailureClass, Lease, SignalKind, SinkBuffer};
 use pipeline_core::error::PipelineError;
-use pipeline_core::pipeline::{SignalBatch, Sink};
+use pipeline_core::pipeline::Sink;
 use pipeline_core::sort::{BatchSorter, SignalType};
 
 pub use client::{BulkItem, BulkItemError, BulkItemWrapper, BulkResponse, HttpClient};
@@ -29,30 +28,29 @@ pub use config::{
     ElasticsearchSinkConfig,
 };
 pub use error::ElasticsearchError;
-pub use serializer::{serialize_batch, serialize_batch_chunks};
+pub use serializer::{
+    BulkChunk, serialize_batch, serialize_batch_chunks, serialize_batch_chunks_with_ranges,
+};
 pub use tls::TlsConfig;
 
-/// Internal accumulator for micro-batch buffering per signal type.
-#[derive(Debug, Default)]
-struct BufferState {
-    batches: Vec<RecordBatch>,
-    bytes: usize,
-    records: usize,
-}
+/// Result of a single dispatched [`BulkChunk`] task: `(start_row, row_count, response)`.
+type ChunkTaskOutput = (usize, usize, Result<BulkResponse, ElasticsearchError>);
 
 /// Elasticsearch and `OpenSearch` sink for the `opentelemetry-datalake` pipeline.
 ///
-/// Ingests [`SignalBatch`] events (Logs, Metrics, Traces), accumulates them in micro-buffers
-/// per signal type, sorts them chronologically using [`BatchSorter`], serializes them into
-/// NDJSON bulk format via [`serialize_batch`], and streams them concurrently into
-/// Elasticsearch/`OpenSearch` Data Streams via HTTP/2 using [`HttpClient`].
+/// Acquires coalesced [`Lease`]s from [`SinkBuffer`], offloads chronological sorting
+/// ([`BatchSorter`]) and NDJSON chunk serialization ([`serialize_batch_chunks_with_ranges`])
+/// onto [`Lease::prepare`], and streams all chunks concurrently into Elasticsearch/`OpenSearch`
+/// Data Streams via HTTP/2 using [`HttpClient`].
 ///
-/// # Concurrency
+/// # Concurrency & Delivery Guarantees
 ///
-/// Implements [`Sink`], processing incoming batches on an asynchronous Tokio runtime.
-/// HTTP bulk requests are dispatched asynchronously into a [`tokio::task::JoinSet`], bounded
-/// by a [`tokio::sync::Semaphore`] enforcing `max_concurrent_requests`.
-/// The sink is [`Send`] and [`Sync`].
+/// Implements [`Sink`], driving up to `max_inflight_leases` concurrent lease tasks in a
+/// [`tokio::task::JoinSet`]. Within each lease, bulk chunks are bounded by the shared
+/// [`tokio::sync::Semaphore`] enforcing `max_concurrent_requests`. A lease is acknowledged
+/// (`lease.ack()`) only after all of its bulk chunks succeed; unrecoverable per-item errors
+/// (e.g. HTTP `400`) are sliced by exact row index and quarantined via
+/// [`Lease::quarantine_batches`].
 #[derive(Debug)]
 pub struct ElasticsearchSink {
     config: ElasticsearchSinkConfig,
@@ -180,21 +178,56 @@ impl ElasticsearchSink {
         Ok(())
     }
 
-    /// Records the result of an in-flight bulk task into the first encountered error accumulator.
+    /// Classifies an [`ElasticsearchError`] into a [`FailureClass`] for [`Lease::nack`].
+    fn classify_elasticsearch_error(err: &ElasticsearchError) -> FailureClass {
+        match err {
+            ElasticsearchError::AuthenticationFailed(_) => FailureClass::Fatal {
+                reason: err.to_string(),
+            },
+            ElasticsearchError::Http(_) => FailureClass::Transient,
+            ElasticsearchError::BulkFailed { message, .. } => {
+                if message.starts_with("HTTP 429")
+                    || message.starts_with("HTTP 500")
+                    || message.starts_with("HTTP 502")
+                    || message.starts_with("HTTP 503")
+                    || message.starts_with("HTTP 504")
+                    || message.starts_with("network error")
+                    || message.contains("recoverable status (429/500/503)")
+                {
+                    FailureClass::Transient
+                } else {
+                    FailureClass::Rejected {
+                        reason: err.to_string(),
+                    }
+                }
+            }
+            ElasticsearchError::Serialization(_)
+            | ElasticsearchError::PayloadTooLarge { .. }
+            | ElasticsearchError::StartupValidation(_) => FailureClass::Rejected {
+                reason: err.to_string(),
+            },
+        }
+    }
+
+    /// Records the result of an in-flight chunk task into the outcomes or error accumulators.
     fn record_task_result(
-        res: Result<Result<BulkResponse, ElasticsearchError>, tokio::task::JoinError>,
-        first_err: &mut Option<PipelineError>,
+        res: Result<ChunkTaskOutput, tokio::task::JoinError>,
+        outcomes: &mut Vec<(usize, usize, BulkResponse)>,
+        first_es_err: &mut Option<ElasticsearchError>,
+        first_join_err: &mut Option<PipelineError>,
     ) {
         match res {
-            Ok(Ok(_resp)) => {}
-            Ok(Err(es_err)) => {
-                if first_err.is_none() {
-                    *first_err = Some(es_err.into());
+            Ok((start_row, row_count, Ok(resp))) => {
+                outcomes.push((start_row, row_count, resp));
+            }
+            Ok((_start_row, _row_count, Err(es_err))) => {
+                if first_es_err.is_none() {
+                    *first_es_err = Some(es_err);
                 }
             }
             Err(join_err) => {
-                if first_err.is_none() {
-                    *first_err = Some(PipelineError::Internal(format!(
+                if first_join_err.is_none() {
+                    *first_join_err = Some(PipelineError::Internal(format!(
                         "Bulk dispatch task failed: {join_err}"
                     )));
                 }
@@ -202,32 +235,33 @@ impl ElasticsearchSink {
         }
     }
 
-    /// Dispatches a single bulk payload chunk under the concurrency semaphore.
+    /// Dispatches a single [`BulkChunk`] under the concurrency semaphore.
     ///
     /// If permits are exhausted, awaits the next completed task in `join_set`. Any error
-    /// from previously dispatched tasks is retained in `first_err` without aborting the
-    /// submission of the current chunk once a permit is freed.
+    /// from previously dispatched tasks is retained in `first_es_err` / `first_join_err`
+    /// without aborting the submission of the current chunk once a permit is freed.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         client: Arc<HttpClient>,
         semaphore: Arc<tokio::sync::Semaphore>,
-        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+        join_set: &mut tokio::task::JoinSet<ChunkTaskOutput>,
         data_stream: String,
-        payload: Bytes,
-        first_err: &mut Option<PipelineError>,
+        chunk: BulkChunk,
+        outcomes: &mut Vec<(usize, usize, BulkResponse)>,
+        first_es_err: &mut Option<ElasticsearchError>,
+        first_join_err: &mut Option<PipelineError>,
     ) -> Result<(), PipelineError> {
-        if payload.is_empty() {
+        if chunk.payload.is_empty() || chunk.row_count == 0 {
             return Ok(());
         }
 
-        // Drain any already completed tasks in join_set to detect completed tasks
         while let Some(res) = join_set.try_join_next() {
-            Self::record_task_result(res, first_err);
+            Self::record_task_result(res, outcomes, first_es_err, first_join_err);
         }
 
-        // If semaphore permits are exhausted, await until at least one task completes
         while semaphore.available_permits() == 0 && !join_set.is_empty() {
             if let Some(res) = join_set.join_next().await {
-                Self::record_task_result(res, first_err);
+                Self::record_task_result(res, outcomes, first_es_err, first_join_err);
             }
         }
 
@@ -237,22 +271,54 @@ impl ElasticsearchSink {
 
         join_set.spawn(async move {
             let _permit = permit;
-            client.send_bulk(&data_stream, payload).await
+            let res = client.send_bulk(&data_stream, chunk.payload).await;
+            (chunk.start_row, chunk.row_count, res)
         });
 
         Ok(())
     }
 
-    /// Awaits all remaining in-flight tasks in the join set.
+    /// Awaits all remaining in-flight chunk tasks in `join_set`.
     ///
     /// Drains all tasks to completion before returning to ensure no in-flight requests are
-    /// abruptly aborted on the first failure. Retains the first encountered error.
+    /// abruptly aborted on the first failure.
     async fn drain_join_set(
-        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
-    ) -> Result<(), PipelineError> {
-        let mut first_err = None;
+        join_set: &mut tokio::task::JoinSet<ChunkTaskOutput>,
+        outcomes: &mut Vec<(usize, usize, BulkResponse)>,
+        first_es_err: &mut Option<ElasticsearchError>,
+        first_join_err: &mut Option<PipelineError>,
+    ) {
         while let Some(res) = join_set.join_next().await {
-            Self::record_task_result(res, &mut first_err);
+            Self::record_task_result(res, outcomes, first_es_err, first_join_err);
+        }
+    }
+
+    /// Drains all remaining in-flight lease tasks in `lease_tasks` without overwriting an existing error.
+    async fn drain_lease_tasks(lease_tasks: &mut tokio::task::JoinSet<Result<(), PipelineError>>) {
+        while lease_tasks.join_next().await.is_some() {}
+    }
+
+    /// Drains all remaining in-flight lease tasks in `lease_tasks`, propagating the first error encountered.
+    async fn drain_lease_tasks_propagating(
+        lease_tasks: &mut tokio::task::JoinSet<Result<(), PipelineError>>,
+    ) -> Result<(), PipelineError> {
+        let mut first_err: Option<PipelineError> = None;
+        while let Some(join_res) = lease_tasks.join_next().await {
+            match join_res {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(PipelineError::Internal(format!(
+                            "Bulk dispatch task failed: {join_err}"
+                        )));
+                    }
+                }
+            }
         }
         if let Some(err) = first_err {
             Err(err)
@@ -261,137 +327,167 @@ impl ElasticsearchSink {
         }
     }
 
-    /// Concatenates accumulated batches, sorts them, serializes to NDJSON chunks, and dispatches.
-    async fn flush_buffer(
-        &self,
-        buf: &mut BufferState,
+    /// Processes a single [`Lease`]: sorts and serializes chunks via [`Lease::prepare`],
+    /// dispatches all chunks under `semaphore`, joins all chunk tasks, quarantines any
+    /// unrecoverable item-level `400` rows, and acknowledges or nacks the lease.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn process_lease(
+        lease: Lease,
         signal_type: SignalType,
-        target_data_stream: &str,
-        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
+        data_stream: String,
+        client: Arc<HttpClient>,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        sorter: BatchSorter,
+        unpack_attributes: bool,
+        max_payload_bytes: usize,
     ) -> Result<(), PipelineError> {
-        if buf.batches.is_empty() {
+        if lease.num_rows() == 0 {
+            lease.ack().await?;
             return Ok(());
         }
 
-        let signal_label = match signal_type {
-            SignalType::Logs => "logs",
-            SignalType::Metrics => "metrics",
-            SignalType::Traces => "traces",
+        let prep_res = lease
+            .prepare(move |batch| {
+                if batch.num_rows() == 0 {
+                    return Ok((batch, Vec::new()));
+                }
+                let sorted_batch = sorter.sort(&batch, signal_type)?;
+                let chunks = crate::serializer::serialize_batch_chunks_with_ranges(
+                    &sorted_batch,
+                    unpack_attributes,
+                    max_payload_bytes,
+                )?;
+                Ok((sorted_batch, chunks))
+            })
+            .await;
+
+        let (sorted_batch, chunks) = match prep_res {
+            Ok(pair) => pair,
+            Err(err) => {
+                let _ = lease
+                    .nack(FailureClass::Fatal {
+                        reason: err.to_string(),
+                    })
+                    .await;
+                return Err(err);
+            }
         };
 
-        tracing::debug!(
-            signal = signal_label,
-            bytes = buf.bytes,
-            records = buf.records,
-            data_stream = target_data_stream,
-            "Flushing buffer"
-        );
+        if chunks.is_empty() {
+            lease.ack().await?;
+            return Ok(());
+        }
 
-        let mut batches = std::mem::take(&mut buf.batches);
-        buf.bytes = 0;
-        buf.records = 0;
+        let mut join_set: tokio::task::JoinSet<ChunkTaskOutput> = tokio::task::JoinSet::new();
+        let mut outcomes: Vec<(usize, usize, BulkResponse)> = Vec::with_capacity(chunks.len());
+        let mut first_es_err: Option<ElasticsearchError> = None;
+        let mut first_join_err: Option<PipelineError> = None;
 
-        let sorter = self.sorter.clone();
-        let unpack_attributes = self.config.unpack_attributes;
-        let max_payload_bytes = self.config.max_payload_bytes;
-
-        let chunks = tokio::task::spawn_blocking(move || -> Result<Vec<Bytes>, PipelineError> {
-            let combined = if batches.len() == 1 {
-                match batches.pop() {
-                    Some(b) => b,
-                    None => return Ok(Vec::new()),
-                }
-            } else {
-                let schema = match batches.first() {
-                    Some(b) => b.schema(),
-                    None => return Ok(Vec::new()),
-                };
-                let refs: Vec<&RecordBatch> = batches.iter().collect();
-                arrow::compute::concat_batches(&schema, refs).map_err(PipelineError::Arrow)?
-            };
-
-            if combined.num_rows() == 0 {
-                return Ok(Vec::new());
-            }
-
-            let sorted_batch = sorter.sort(&combined, signal_type)?;
-            let chunks = crate::serializer::serialize_batch_chunks(
-                &sorted_batch,
-                unpack_attributes,
-                max_payload_bytes,
-            )?;
-            Ok(chunks)
-        })
-        .await
-        .map_err(|e| PipelineError::Internal(format!("Serialization task panicked: {e}")))??;
-
-        let stream_name = target_data_stream.to_string();
-        let mut first_dispatch_error: Option<PipelineError> = None;
         for chunk in chunks {
-            Self::dispatch(
-                Arc::clone(&self.client),
-                Arc::clone(&self.semaphore),
-                join_set,
-                stream_name.clone(),
+            if let Err(dispatch_err) = Self::dispatch(
+                Arc::clone(&client),
+                Arc::clone(&semaphore),
+                &mut join_set,
+                data_stream.clone(),
                 chunk,
-                &mut first_dispatch_error,
+                &mut outcomes,
+                &mut first_es_err,
+                &mut first_join_err,
             )
-            .await?;
+            .await
+            {
+                Self::drain_join_set(
+                    &mut join_set,
+                    &mut outcomes,
+                    &mut first_es_err,
+                    &mut first_join_err,
+                )
+                .await;
+                let _ = lease
+                    .nack(FailureClass::Fatal {
+                        reason: dispatch_err.to_string(),
+                    })
+                    .await;
+                return Err(dispatch_err);
+            }
         }
 
-        if let Some(err) = first_dispatch_error {
-            let _ = Self::drain_join_set(join_set).await;
-            return Err(err);
+        Self::drain_join_set(
+            &mut join_set,
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        )
+        .await;
+
+        if let Some(join_err) = first_join_err {
+            let _ = lease
+                .nack(FailureClass::Fatal {
+                    reason: join_err.to_string(),
+                })
+                .await;
+            return Err(join_err);
         }
 
-        tracing::debug!(
-            signal = signal_label,
-            data_stream = target_data_stream,
-            "Buffer flushed and reset"
-        );
+        if let Some(es_err) = first_es_err {
+            let class = Self::classify_elasticsearch_error(&es_err);
+            let is_fatal = matches!(class, FailureClass::Fatal { .. });
+            lease.nack(class).await?;
+            if is_fatal {
+                return Err(es_err.into());
+            }
+            return Ok(());
+        }
 
-        Ok(())
-    }
+        outcomes.sort_unstable_by_key(|(start_row, _, _)| *start_row);
 
-    /// Flushes all active buffers across logs, metrics, and traces.
-    async fn flush_all_buffers(
-        &self,
-        logs_buf: &mut BufferState,
-        metrics_buf: &mut BufferState,
-        traces_buf: &mut BufferState,
-        join_set: &mut tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>>,
-    ) -> Result<(), PipelineError> {
-        self.flush_buffer(
-            logs_buf,
-            SignalType::Logs,
-            self.data_stream_for(SignalType::Logs),
-            join_set,
-        )
-        .await?;
+        if outcomes
+            .iter()
+            .any(|(_, _, resp)| resp.recoverable_count() > 0)
+        {
+            lease.nack(FailureClass::Transient).await?;
+            return Ok(());
+        }
 
-        self.flush_buffer(
-            metrics_buf,
-            SignalType::Metrics,
-            self.data_stream_for(SignalType::Metrics),
-            join_set,
-        )
-        .await?;
+        let mut rejected_slices: Vec<RecordBatch> = Vec::new();
+        let mut first_reason: Option<String> = None;
 
-        self.flush_buffer(
-            traces_buf,
-            SignalType::Traces,
-            self.data_stream_for(SignalType::Traces),
-            join_set,
-        )
-        .await?;
+        for (start_row, row_count, resp) in &outcomes {
+            for (item_idx, item_wrapper) in resp.items.iter().enumerate() {
+                if item_wrapper.is_unrecoverable() {
+                    let status = item_wrapper.status().unwrap_or(400);
+                    let err_type = item_wrapper
+                        .error()
+                        .map_or("unknown", |e| e.error_type.as_str());
+                    let err_reason = item_wrapper
+                        .error()
+                        .map_or("unrecoverable bulk item error", |e| e.reason.as_str());
+                    if first_reason.is_none() {
+                        first_reason = Some(format!("item {status}: {err_type}: {err_reason}"));
+                    }
+                    if item_idx < *row_count {
+                        let row_idx = start_row.saturating_add(item_idx);
+                        if row_idx < sorted_batch.num_rows() {
+                            rejected_slices.push(sorted_batch.slice(row_idx, 1));
+                        }
+                    }
+                }
+            }
+        }
 
+        if !rejected_slices.is_empty() {
+            let reason = first_reason
+                .unwrap_or_else(|| "item 400: unrecoverable bulk item error".to_string());
+            lease.quarantine_batches(reason, rejected_slices).await?;
+        }
+
+        lease.ack().await?;
         Ok(())
     }
 }
 
 #[async_trait]
 impl Sink for ElasticsearchSink {
-    #[allow(clippy::too_many_lines)]
     async fn run(&mut self, mut buffer: SinkBuffer) -> Result<(), PipelineError> {
         tracing::info!(
             endpoints = ?self.config.endpoints,
@@ -404,140 +500,63 @@ impl Sink for ElasticsearchSink {
         // 1. Startup validation
         self.validate_startup().await?;
 
-        let batching = self.config.batching.clone();
-        let max_interval = batching
-            .as_ref()
-            .map_or(86_400, |b| b.max_batch_interval_sec);
-
-        let mut logs_buf = BufferState::default();
-        let mut metrics_buf = BufferState::default();
-        let mut traces_buf = BufferState::default();
-
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(max_interval.max(1)));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
-
-        let mut join_set: tokio::task::JoinSet<Result<BulkResponse, ElasticsearchError>> =
+        let mut lease_tasks: tokio::task::JoinSet<Result<(), PipelineError>> =
             tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
-                Some(res) = join_set.join_next(), if !join_set.is_empty() => {
-                    match res {
-                        Ok(Ok(_resp)) => {}
-                        Ok(Err(es_err)) => {
-                            let _ = Self::drain_join_set(&mut join_set).await;
-                            return Err(es_err.into());
+                Some(join_res) = lease_tasks.join_next(), if !lease_tasks.is_empty() => {
+                    match join_res {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            Self::drain_lease_tasks(&mut lease_tasks).await;
+                            return Err(err);
                         }
                         Err(join_err) => {
-                            let _ = Self::drain_join_set(&mut join_set).await;
+                            Self::drain_lease_tasks(&mut lease_tasks).await;
                             return Err(PipelineError::Internal(format!(
                                 "Bulk dispatch task failed: {join_err}"
                             )));
                         }
                     }
                 }
-                _ = interval.tick(), if batching.is_some() && (!logs_buf.batches.is_empty() || !metrics_buf.batches.is_empty() || !traces_buf.batches.is_empty()) => {
-                    if let Err(e) = self.flush_all_buffers(&mut logs_buf, &mut metrics_buf, &mut traces_buf, &mut join_set).await {
-                        let _ = Self::drain_join_set(&mut join_set).await;
-                        return Err(e);
-                    }
-                }
-                msg = buffer.recv_passthrough() => {
-                    let maybe_signal = match msg {
-                        Ok(s) => s,
-                        Err(e) => {
-                            let _ = Self::drain_join_set(&mut join_set).await;
-                            return Err(e);
-                        }
-                    };
-                    if let Some(signal) = maybe_signal {
-                        let (signal_type, batch) = match signal {
-                            SignalBatch::Logs(b) => (SignalType::Logs, b),
-                            SignalBatch::Metrics(b) => (SignalType::Metrics, b),
-                            SignalBatch::Traces(b) => (SignalType::Traces, b),
-                        };
+                next = buffer.next_lease() => {
+                    match next {
+                        Ok(Some(lease)) => {
+                            let client = Arc::clone(&self.client);
+                            let semaphore = Arc::clone(&self.semaphore);
+                            let sorter = self.sorter.clone();
+                            let unpack_attributes = self.config.unpack_attributes;
+                            let max_payload_bytes = self.config.max_payload_bytes;
+                            let signal_type = match lease.signal() {
+                                SignalKind::Logs => SignalType::Logs,
+                                SignalKind::Metrics => SignalType::Metrics,
+                                SignalKind::Traces => SignalType::Traces,
+                            };
+                            let data_stream = self.data_stream_for(signal_type).to_string();
 
-                        if batch.num_rows() == 0 {
-                            continue;
-                        }
-
-                        let buf = match signal_type {
-                            SignalType::Logs => &mut logs_buf,
-                            SignalType::Metrics => &mut metrics_buf,
-                            SignalType::Traces => &mut traces_buf,
-                        };
-
-                        let signal_label = match signal_type {
-                            SignalType::Logs => "logs",
-                            SignalType::Metrics => "metrics",
-                            SignalType::Traces => "traces",
-                        };
-
-                        let batch_bytes = batch.get_array_memory_size();
-                        let batch_rows = batch.num_rows();
-
-                        buf.bytes = buf.bytes.saturating_add(batch_bytes);
-                        buf.records = buf.records.saturating_add(batch_rows);
-                        buf.batches.push(batch);
-
-                        tracing::debug!(
-                            signal = signal_label,
-                            bytes = buf.bytes,
-                            records = buf.records,
-                            data_stream = self.data_stream_for(signal_type),
-                            "Buffer accumulated batch"
-                        );
-
-                        let should_flush = match batching.as_ref() {
-                            Some(cfg) => {
-                                buf.bytes >= cfg.max_batch_size_bytes
-                                    || buf.records >= cfg.max_batch_records
-                            }
-                            None => true,
-                        };
-
-                        if should_flush {
-                            if batching.is_some() {
-                                tracing::debug!(
-                                    signal = signal_label,
-                                    bytes = buf.bytes,
-                                    records = buf.records,
-                                    data_stream = self.data_stream_for(signal_type),
-                                    reason = "threshold",
-                                    "Buffer threshold reached, flushing"
-                                );
-                            }
-                            if let Err(e) = self
-                                .flush_buffer(
-                                    buf,
+                            lease_tasks.spawn(async move {
+                                Self::process_lease(
+                                    lease,
                                     signal_type,
-                                    self.data_stream_for(signal_type),
-                                    &mut join_set,
+                                    data_stream,
+                                    client,
+                                    semaphore,
+                                    sorter,
+                                    unpack_attributes,
+                                    max_payload_bytes,
                                 )
                                 .await
-                            {
-                                let _ = Self::drain_join_set(&mut join_set).await;
-                                return Err(e);
-                            }
+                            });
                         }
-                    } else {
-                        if let Err(e) = self
-                            .flush_all_buffers(
-                                &mut logs_buf,
-                                &mut metrics_buf,
-                                &mut traces_buf,
-                                &mut join_set,
-                            )
-                            .await
-                        {
-                            let _ = Self::drain_join_set(&mut join_set).await;
-                            return Err(e);
+                        Ok(None) => {
+                            Self::drain_lease_tasks_propagating(&mut lease_tasks).await?;
+                            break;
                         }
-
-                        Self::drain_join_set(&mut join_set).await?;
-                        break;
+                        Err(err) => {
+                            Self::drain_lease_tasks(&mut lease_tasks).await;
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -554,6 +573,8 @@ mod tests {
     use arrow::array::{Int32Array, StringArray, TimestampNanosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use flate2::read::GzDecoder;
+    use pipeline_core::buffer::{BufferConfig, DeadLetterManifest};
+    use pipeline_core::pipeline::SignalBatch;
     use std::io::Read;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -577,6 +598,7 @@ mod tests {
             max_retries: 2,
             retry_interval_secs: 0,
             validate_on_startup,
+            buffer: None,
             batching: None,
             order_by: None,
         }
@@ -757,9 +779,13 @@ mod tests {
             vec![
                 Arc::new(TimestampNanosecondArray::from(vec![
                     1_726_500_000_000_000_000,
+                    1_726_500_000_000_000_001,
                 ])),
-                Arc::new(StringArray::from(vec!["system.cpu.utilization"])),
-                Arc::new(arrow::array::Float64Array::from(vec![0.42])),
+                Arc::new(StringArray::from(vec![
+                    "system.cpu.utilization",
+                    "system.memory.usage",
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.42, 0.73])),
             ],
         )
         .unwrap()
@@ -886,19 +912,28 @@ mod tests {
             .await;
 
         let mut config = make_test_config(server.uri(), true);
-        config.max_retries = 2;
+        config.max_retries = 1;
+        config.buffer = Some(BufferConfig {
+            max_transient_duration_sec: 1,
+            initial_backoff_ms: 5,
+            ..BufferConfig::passthrough()
+        });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
         drop(tx);
 
         let err = sink.run(rx).await.unwrap_err();
         assert!(
             matches!(err, PipelineError::Storage(_)),
-            "Exhausted 429 retries must produce PipelineError::Storage, got: {err:?}"
+            "Exhausted transient 429 retries must produce PipelineError::Storage, got: {err:?}"
         );
-        assert!(err.to_string().contains("HTTP 429"));
+        assert!(
+            err.to_string()
+                .contains("transient retry duration exceeded")
+        );
     }
 
     #[tokio::test]
@@ -974,14 +1009,16 @@ mod tests {
             .await;
 
         let mut config = make_test_config(server.uri(), true);
+        config.max_concurrent_requests = 1;
         config.batching = Some(ElasticsearchBatchingConfig {
             max_batch_size_bytes: 10_485_760,
             max_batch_interval_sec: 60,
             max_batch_records: 4,
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
 
         // Send batch 1 with 2 rows
         let b1 = make_log_batch_with_timestamps(vec![1_000_000_000, 2_000_000_000]);
@@ -1088,9 +1125,10 @@ mod tests {
             max_batch_interval_sec: 1, // 1 second interval
             max_batch_records: 1000,
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         let run_handle = tokio::spawn(async move { sink.run(rx).await });
 
         // Send 1 batch (well below record limit of 1000)
@@ -1314,9 +1352,13 @@ mod tests {
 
         // Task 1: Fails immediately
         join_set.spawn(async move {
-            Err(ElasticsearchError::StartupValidation(
-                "task 1 failed".to_string(),
-            ))
+            (
+                0usize,
+                1usize,
+                Err(ElasticsearchError::StartupValidation(
+                    "task 1 failed".to_string(),
+                )),
+            )
         });
 
         // Task 2: Sleeps a bit then succeeds, recording completion
@@ -1324,11 +1366,15 @@ mod tests {
         join_set.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             counter2.fetch_add(1, Ordering::SeqCst);
-            Ok(BulkResponse {
-                took: 1,
-                errors: false,
-                items: vec![],
-            })
+            (
+                1usize,
+                1usize,
+                Ok(BulkResponse {
+                    took: 1,
+                    errors: false,
+                    items: vec![],
+                }),
+            )
         });
 
         // Task 3: Sleeps a bit then succeeds, recording completion
@@ -1336,18 +1382,31 @@ mod tests {
         join_set.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             counter3.fetch_add(1, Ordering::SeqCst);
-            Ok(BulkResponse {
-                took: 1,
-                errors: false,
-                items: vec![],
-            })
+            (
+                2usize,
+                1usize,
+                Ok(BulkResponse {
+                    took: 1,
+                    errors: false,
+                    items: vec![],
+                }),
+            )
         });
 
-        let err = ElasticsearchSink::drain_join_set(&mut join_set)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, PipelineError::Storage(_)));
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
+        ElasticsearchSink::drain_join_set(
+            &mut join_set,
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        )
+        .await;
+        assert!(first_join_err.is_none());
+        let err = first_es_err.expect("expected error from task 1");
         assert!(err.to_string().contains("task 1 failed"));
+        assert_eq!(outcomes.len(), 2);
         assert_eq!(
             completed_tasks.load(Ordering::SeqCst),
             2,
@@ -1454,21 +1513,18 @@ mod tests {
         let server = MockServer::start().await;
         setup_startup_validation_mocks(&server).await;
 
-        // Mock 1: Fails immediately with 400 Bad Request
+        // Mock 1: Fails after 20ms with 401 Unauthorized (fatal)
         Mock::given(method("POST"))
             .and(path("/logs-otel-default/_bulk"))
             .and(|req: &wiremock::Request| {
                 let body_str = String::from_utf8_lossy(&req.body);
                 body_str.contains("service-fail")
             })
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": {
-                    "root_cause": [{"type": "illegal_argument_exception", "reason": "bad payload"}],
-                    "type": "illegal_argument_exception",
-                    "reason": "bad payload"
-                },
-                "status": 400
-            })))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(std::time::Duration::from_millis(20))
+                    .set_body_string("Unauthorized"),
+            )
             .mount(&server)
             .await;
 
@@ -1490,9 +1546,11 @@ mod tests {
         let mut config = make_test_config(server.uri(), true);
         config.batching = None;
         config.max_retries = 0;
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(1);
         let mut sink = ElasticsearchSink::try_new(config).unwrap();
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         tx.send(SignalBatch::Logs(make_log_batch_with_service(
             "service-fail",
         )))
@@ -1503,6 +1561,7 @@ mod tests {
         )))
         .await
         .unwrap();
+        drop(tx);
 
         let res = sink.run(rx).await;
         assert!(res.is_err(), "sink.run should return error on task failure");
@@ -1527,6 +1586,11 @@ mod tests {
             .await;
 
         let mut config = make_test_config_with_batching(server.uri());
+        config.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 10_485_760,
+            max_batch_interval_sec: 60,
+            max_batch_records: 1,
+        });
         config.order_by = Some(pipeline_core::sort::SortConfig {
             on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
             logs: vec![],
@@ -1535,25 +1599,28 @@ mod tests {
             )],
             traces: vec![],
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
+
         let batch1 = make_log_batch();
         tx.send(SignalBatch::Logs(batch1)).await.unwrap();
 
-        // Allow batch 1 to be dispatched into join_set and reach wiremock
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Allow batch 1 lease to be dispatched into lease_tasks and reach wiremock
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-        // Batch 2 causes flush_buffer to error due to missing required sort column
+        // Batch 2 causes lease preparation to error due to missing required sort column
         let batch2 = make_metric_batch();
         tx.send(SignalBatch::Metrics(batch2)).await.unwrap();
         drop(tx);
 
-        let result = sink.run(rx).await;
+        let result = run_handle.await.unwrap();
         assert!(result.is_err(), "expected flush error to propagate");
         assert!(
             in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "In-flight task must be drained and allowed to complete when flush_buffer fails"
+            "In-flight task must be drained and allowed to complete when another lease fails"
         );
     }
 
@@ -1585,23 +1652,27 @@ mod tests {
             )],
             traces: vec![],
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+        let run_handle = tokio::spawn(async move { sink.run(rx).await });
+
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
             .unwrap();
         drop(tx);
 
-        let result = sink.run(rx).await;
+        let result = run_handle.await.unwrap();
         assert!(
             result.is_err(),
             "expected shutdown flush error to propagate"
         );
         assert!(
             in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "In-flight task from earlier buffer must be drained when shutdown flush_all_buffers fails"
+            "In-flight task from earlier buffer must be drained when shutdown lease preparation fails"
         );
     }
 
@@ -1633,12 +1704,14 @@ mod tests {
             )],
             traces: vec![],
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction failed");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         let run_handle = tokio::spawn(async move { sink.run(rx).await });
 
         tx.send(SignalBatch::Logs(make_log_batch())).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx.send(SignalBatch::Metrics(make_metric_batch()))
             .await
             .unwrap();
@@ -1650,7 +1723,7 @@ mod tests {
         );
         assert!(
             in_flight_completed.load(std::sync::atomic::Ordering::SeqCst),
-            "In-flight task from earlier buffer must be drained when interval tick flush_all_buffers fails"
+            "In-flight task from earlier buffer must be drained when interval tick lease preparation fails"
         );
     }
 
@@ -1666,9 +1739,13 @@ mod tests {
 
         // In-flight task 1: fails immediately
         join_set.spawn(async move {
-            Err(ElasticsearchError::StartupValidation(
-                "fast failure".to_string(),
-            ))
+            (
+                0usize,
+                1usize,
+                Err(ElasticsearchError::StartupValidation(
+                    "fast failure".to_string(),
+                )),
+            )
         });
 
         // In-flight task 2: slow task
@@ -1676,24 +1753,36 @@ mod tests {
         join_set.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(BulkResponse {
-                took: 1,
-                errors: false,
-                items: vec![],
-            })
+            (
+                1usize,
+                1usize,
+                Ok(BulkResponse {
+                    took: 1,
+                    errors: false,
+                    items: vec![],
+                }),
+            )
         });
 
         // Yield so task 1 finishes and task 2 starts sleeping
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let mut first_err = None;
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             semaphore,
             &mut join_set,
             "logs-otel-default".to_string(),
-            bytes::Bytes::from_static(b"dummy payload"),
-            &mut first_err,
+            BulkChunk {
+                start_row: 2,
+                row_count: 1,
+                payload: bytes::Bytes::from_static(b"dummy payload"),
+            },
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         )
         .await;
 
@@ -1702,12 +1791,18 @@ mod tests {
             "dispatch should succeed without aborting chunk submission"
         );
         assert!(
-            first_err.is_some(),
-            "first_err should capture the earlier failure"
+            first_es_err.is_some(),
+            "first_es_err should capture the earlier failure"
         );
 
         // Sinks drain remaining tasks after all chunks are dispatched
-        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
+        ElasticsearchSink::drain_join_set(
+            &mut join_set,
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        )
+        .await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
             "drain_join_set must drain all remaining in-flight tasks"
@@ -1730,9 +1825,13 @@ mod tests {
         join_set.spawn(async move {
             let _permit = permit;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            Err(ElasticsearchError::StartupValidation(
-                "failure while waiting for permit".to_string(),
-            ))
+            (
+                0usize,
+                1usize,
+                Err(ElasticsearchError::StartupValidation(
+                    "failure while waiting for permit".to_string(),
+                )),
+            )
         });
 
         // Task 2: slow task finishes after 50ms
@@ -1740,21 +1839,33 @@ mod tests {
         join_set.spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(BulkResponse {
-                took: 1,
-                errors: false,
-                items: vec![],
-            })
+            (
+                1usize,
+                1usize,
+                Ok(BulkResponse {
+                    took: 1,
+                    errors: false,
+                    items: vec![],
+                }),
+            )
         });
 
-        let mut first_err = None;
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             Arc::clone(&semaphore),
             &mut join_set,
             "logs-otel-default".to_string(),
-            bytes::Bytes::from_static(b"dummy payload"),
-            &mut first_err,
+            BulkChunk {
+                start_row: 2,
+                row_count: 1,
+                payload: bytes::Bytes::from_static(b"dummy payload"),
+            },
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         )
         .await;
 
@@ -1763,12 +1874,18 @@ mod tests {
             "dispatch should succeed once permit is freed by failed task"
         );
         assert!(
-            first_err.is_some(),
-            "first_err should capture the failure from task 1"
+            first_es_err.is_some(),
+            "first_es_err should capture the failure from task 1"
         );
 
         // Sinks drain remaining tasks after all chunks are dispatched
-        let _ = ElasticsearchSink::drain_join_set(&mut join_set).await;
+        ElasticsearchSink::drain_join_set(
+            &mut join_set,
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        )
+        .await;
         assert!(
             slow_task_completed.load(std::sync::atomic::Ordering::SeqCst),
             "drain_join_set must drain all remaining in-flight tasks"
@@ -1794,49 +1911,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_buffer_accumulation_emits_debug_event() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default, Clone)]
-        struct EventCapture(Arc<Mutex<Vec<String>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Visitor(String);
-                impl tracing::field::Visit for Visitor {
-                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                        if field.name() == "message" {
-                            self.0 = value.to_string();
-                        }
-                    }
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        if field.name() == "message" {
-                            self.0 = format!("{value:?}");
-                        }
-                    }
-                }
-                let mut v = Visitor(String::new());
-                event.record(&mut v);
-                if !v.0.is_empty() {
-                    self.0.lock().unwrap().push(v.0);
-                }
-            }
-        }
-
-        let captured = EventCapture::default();
-        let events = Arc::clone(&captured.0);
-        let subscriber = tracing_subscriber::registry().with(captured);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
+    async fn test_buffer_accumulation_and_shutdown_flush_via_sink_buffer() {
         let mock_server = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/logs-otel-default/_bulk"))
@@ -1849,92 +1924,21 @@ mod tests {
             .await;
 
         let config = make_test_config_with_batching(mock_server.uri());
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
-        let batch = make_test_log_batch(1); // below threshold
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+        let batch = make_test_log_batch(1); // below threshold, flushed on shutdown
         tx.send(SignalBatch::Logs(batch)).await.unwrap();
         drop(tx);
 
-        let _ = sink.run(rx).await;
-
-        let msgs = events.lock().unwrap();
-        assert!(
-            msgs.iter().any(|m| m.contains("Buffer accumulated batch")),
-            "expected 'Buffer accumulated batch' debug event; got: {msgs:?}"
-        );
+        sink.run(rx).await.unwrap();
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn test_buffer_all_telemetry_events_and_fields() {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default, Clone, Debug)]
-        struct EventRecord {
-            message: String,
-            signal: String,
-            bytes: u64,
-            records: u64,
-            data_stream: String,
-            reason: String,
-        }
-
-        #[derive(Default, Clone)]
-        struct EventCapture(Arc<Mutex<Vec<EventRecord>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Visitor(EventRecord);
-                impl tracing::field::Visit for Visitor {
-                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                        match field.name() {
-                            "message" => self.0.message = value.to_string(),
-                            "signal" => self.0.signal = value.to_string(),
-                            "data_stream" => self.0.data_stream = value.to_string(),
-                            "reason" => self.0.reason = value.to_string(),
-                            _ => {}
-                        }
-                    }
-                    fn record_debug(
-                        &mut self,
-                        field: &tracing::field::Field,
-                        value: &dyn std::fmt::Debug,
-                    ) {
-                        match field.name() {
-                            "message" => self.0.message = format!("{value:?}"),
-                            "signal" => self.0.signal = format!("{value:?}"),
-                            "data_stream" => self.0.data_stream = format!("{value:?}"),
-                            "reason" => self.0.reason = format!("{value:?}"),
-                            _ => {}
-                        }
-                    }
-                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-                        match field.name() {
-                            "bytes" => self.0.bytes = value,
-                            "records" => self.0.records = value,
-                            _ => {}
-                        }
-                    }
-                }
-                let mut v = Visitor(EventRecord::default());
-                event.record(&mut v);
-                if !v.0.message.is_empty() {
-                    self.0.lock().unwrap().push(v.0);
-                }
-            }
-        }
-
-        let captured = EventCapture::default();
-        let records = Arc::clone(&captured.0);
-        let subscriber = tracing_subscriber::registry().with(captured);
-        let _guard = tracing::subscriber::set_default(subscriber);
-
+    async fn test_buffer_record_threshold_coalesces_batches_via_sink_buffer() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/logs-otel-default/_bulk"))
@@ -1943,6 +1947,7 @@ mod tests {
                 "errors": false,
                 "items": []
             })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
@@ -1952,14 +1957,13 @@ mod tests {
             max_batch_interval_sec: 60,
             max_batch_records: 2,
         });
+        let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = ElasticsearchSink::try_new(config).expect("sink construction");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
-        // Batch 1: 1 record -> accumulated (below threshold)
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         tx.send(SignalBatch::Logs(make_test_log_batch(1)))
             .await
             .unwrap();
-        // Batch 2: 1 record -> accumulated, then threshold reached (records >= 2) -> flush
         tx.send(SignalBatch::Logs(make_test_log_batch(1)))
             .await
             .unwrap();
@@ -1967,53 +1971,7 @@ mod tests {
 
         let res = sink.run(rx).await;
         assert!(res.is_ok());
-
-        let events = records.lock().unwrap();
-        // 1. Buffer accumulated batch
-        let acc_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.message == "Buffer accumulated batch")
-            .collect();
-        assert_eq!(acc_events.len(), 2, "Expected 2 accumulation events");
-        assert_eq!(acc_events[0].signal, "logs");
-        assert_eq!(acc_events[0].data_stream, "logs-otel-default");
-        assert_eq!(acc_events[0].records, 1);
-        assert!(acc_events[0].bytes > 0);
-
-        assert_eq!(acc_events[1].signal, "logs");
-        assert_eq!(acc_events[1].data_stream, "logs-otel-default");
-        assert_eq!(acc_events[1].records, 2);
-        assert!(acc_events[1].bytes > acc_events[0].bytes);
-
-        // 2. Buffer threshold reached, flushing
-        let thresh_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.message == "Buffer threshold reached, flushing")
-            .collect();
-        assert_eq!(thresh_events.len(), 1, "Expected 1 threshold event");
-        assert_eq!(thresh_events[0].signal, "logs");
-        assert_eq!(thresh_events[0].data_stream, "logs-otel-default");
-        assert_eq!(thresh_events[0].records, 2);
-        assert_eq!(thresh_events[0].reason, "threshold");
-
-        // 3. Flushing buffer
-        let flush_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.message == "Flushing buffer")
-            .collect();
-        assert_eq!(flush_events.len(), 1, "Expected 1 flush event");
-        assert_eq!(flush_events[0].signal, "logs");
-        assert_eq!(flush_events[0].data_stream, "logs-otel-default");
-        assert_eq!(flush_events[0].records, 2);
-
-        // 4. Buffer flushed and reset
-        let reset_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.message == "Buffer flushed and reset")
-            .collect();
-        assert_eq!(reset_events.len(), 1, "Expected 1 reset event");
-        assert_eq!(reset_events[0].signal, "logs");
-        assert_eq!(reset_events[0].data_stream, "logs-otel-default");
+        mock_server.verify().await;
     }
 
     #[tokio::test]
@@ -2119,14 +2077,14 @@ mod tests {
         let server = MockServer::start().await;
         setup_startup_validation_mocks(&server).await;
 
-        // First bulk request fails with 500 (exhausting retries if retried)
+        // First bulk request fails with 401 (fatal, no lease retry)
         Mock::given(method("POST"))
             .and(path("/logs-otel-default/_bulk"))
             .and(|req: &wiremock::Request| {
                 let body_str = String::from_utf8_lossy(&req.body);
                 body_str.contains("service_0")
             })
-            .respond_with(ResponseTemplate::new(500).set_body_string("internal server error"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
             .mount(&server)
             .await;
 
@@ -2149,9 +2107,12 @@ mod tests {
         config.max_retries = 0;
         config.max_payload_bytes = 200; // Force splitting into multiple chunks
 
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(2);
+        buf_cfg.max_attempts = 1;
         let mut sink = ElasticsearchSink::try_new(config).expect("sink creation failed");
 
-        let (tx, rx) = SinkBuffer::passthrough_pair();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
         let batch = make_multi_row_log_batch(2); // 2 rows, each serialized NDJSON is ~150 bytes
         tx.send(SignalBatch::Logs(batch))
             .await
@@ -2190,14 +2151,22 @@ mod tests {
         // Sleep briefly so the task completes panicked
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        let mut first_err = None;
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
         let res = ElasticsearchSink::dispatch(
             client,
             semaphore,
             &mut join_set,
             "logs-otel-default".to_string(),
-            bytes::Bytes::from_static(b"dummy payload"),
-            &mut first_err,
+            BulkChunk {
+                start_row: 0,
+                row_count: 1,
+                payload: bytes::Bytes::from_static(b"dummy payload"),
+            },
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         )
         .await;
 
@@ -2206,10 +2175,10 @@ mod tests {
             "dispatch should submit chunk even if earlier task panicked"
         );
         assert!(
-            first_err.is_some(),
-            "first_err must record task panic JoinError"
+            first_join_err.is_some(),
+            "first_join_err must record task panic JoinError"
         );
-        let err_msg = first_err.unwrap().to_string();
+        let err_msg = first_join_err.unwrap().to_string();
         assert!(
             err_msg.contains("Bulk dispatch task failed"),
             "error message must describe task join failure, got: {err_msg}"
@@ -2223,12 +2192,21 @@ mod tests {
             panic!("simulated worker panic for drain");
         });
 
-        let res = ElasticsearchSink::drain_join_set(&mut join_set).await;
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
+        ElasticsearchSink::drain_join_set(
+            &mut join_set,
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        )
+        .await;
         assert!(
-            res.is_err(),
+            first_join_err.is_some(),
             "drain_join_set must return error when task panicked"
         );
-        let err_msg = res.unwrap_err().to_string();
+        let err_msg = first_join_err.unwrap().to_string();
         assert!(
             err_msg.contains("Bulk dispatch task failed"),
             "error must describe join error, got: {err_msg}"
@@ -2237,48 +2215,442 @@ mod tests {
 
     #[test]
     fn test_record_task_result_unit() {
-        let mut first_err = None;
+        let mut outcomes = Vec::new();
+        let mut first_es_err = None;
+        let mut first_join_err = None;
 
         // Ok(Ok) does not record error
         ElasticsearchSink::record_task_result(
-            Ok(Ok(BulkResponse {
-                took: 1,
-                errors: false,
-                items: vec![],
-            })),
-            &mut first_err,
+            Ok((
+                0usize,
+                2usize,
+                Ok(BulkResponse {
+                    took: 1,
+                    errors: false,
+                    items: vec![],
+                }),
+            )),
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         );
-        assert!(first_err.is_none());
+        assert!(first_es_err.is_none());
+        assert!(first_join_err.is_none());
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, 0);
+        assert_eq!(outcomes[0].1, 2);
 
         // Ok(Err) records first error
         ElasticsearchSink::record_task_result(
-            Ok(Err(ElasticsearchError::StartupValidation(
-                "first error".to_string(),
-            ))),
-            &mut first_err,
+            Ok((
+                2usize,
+                1usize,
+                Err(ElasticsearchError::StartupValidation(
+                    "first error".to_string(),
+                )),
+            )),
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         );
-        assert!(first_err.is_some());
+        assert!(first_es_err.is_some());
         assert!(
-            first_err
+            first_es_err
                 .as_ref()
                 .unwrap()
                 .to_string()
                 .contains("first error")
         );
 
-        // Subsequent error does not overwrite first_err
+        // Subsequent error does not overwrite first_es_err
         ElasticsearchSink::record_task_result(
-            Ok(Err(ElasticsearchError::StartupValidation(
-                "second error".to_string(),
-            ))),
-            &mut first_err,
+            Ok((
+                3usize,
+                1usize,
+                Err(ElasticsearchError::StartupValidation(
+                    "second error".to_string(),
+                )),
+            )),
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
         );
         assert!(
-            first_err
+            first_es_err
                 .as_ref()
                 .unwrap()
                 .to_string()
                 .contains("first error")
         );
+    }
+
+    #[tokio::test]
+    async fn test_elasticsearch_retains_lease_when_any_bulk_chunk_returns_503() {
+        let server = MockServer::start().await;
+
+        // Chunk 0 (service_0) always succeeds with 200
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": false,
+                "items": [{"create": {"_index": "logs-otel-default", "_id": "1", "status": 201}}]
+            })))
+            .mount(&server)
+            .await;
+
+        // Chunk 1 (service_1) fails with 503 on first lease attempt, then succeeds with 200 on lease retry
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_1"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": false,
+                "items": [{"create": {"_index": "logs-otel-default", "_id": "2", "status": 201}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.max_retries = 0; // Let SinkBuffer lease retry handle the 503 nack
+        config.max_payload_bytes = 200; // Split 2 rows into 2 chunks
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(2);
+        buf_cfg.initial_backoff_ms = 10;
+        buf_cfg.max_backoff_sec = 1;
+        buf_cfg.max_attempts = 4;
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+
+        tx.send(SignalBatch::Logs(make_multi_row_log_batch(2)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let svc1_attempts = requests
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/logs-otel-default/_bulk"
+                    && String::from_utf8_lossy(&r.body).contains("service_1")
+            })
+            .count();
+        assert_eq!(
+            svc1_attempts, 2,
+            "Lease must be retained on 503 chunk failure and retried until all chunks succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_elasticsearch_sink_retains_lease_when_any_chunk_fails_503() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": false,
+                "items": [{"create": {"_index": "logs-otel-default", "_id": "1", "status": 201}}]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_1"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("service_1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": false,
+                "items": [{"create": {"_index": "logs-otel-default", "_id": "2", "status": 201}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.max_retries = 0;
+        config.max_payload_bytes = 200;
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(2);
+        buf_cfg.initial_backoff_ms = 10;
+        buf_cfg.max_backoff_sec = 1;
+        buf_cfg.max_attempts = 4;
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+
+        tx.send(SignalBatch::Logs(make_multi_row_log_batch(2)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_elasticsearch_bulk_item_400_quarantines_exact_sorted_row_across_chunks() {
+        let server = MockServer::start().await;
+        let dlq_dir = std::env::temp_dir().join(format!(
+            "otel-es-dlq-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        // Build an unsorted 4-row log batch:
+        // Unsorted rows: ts=30 (svc-ts30), ts=10 (svc-ts10), ts=40 (svc-ts40), ts=20 (svc-ts20)
+        // After sorting by `timestamp ASC`:
+        //   Sorted row 0: ts=10 (svc-ts10) -> Chunk 0, item 0
+        //   Sorted row 1: ts=20 (svc-ts20) -> Chunk 0, item 1
+        //   Sorted row 2: ts=30 (svc-ts30) -> Chunk 1, item 0
+        //   Sorted row 3: ts=40 (svc-ts40) -> Chunk 1, item 1 (returns 400 mapper_parsing_exception)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let unsorted_batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    1_700_000_000_000_000_030i64,
+                    1_700_000_000_000_000_010i64,
+                    1_700_000_000_000_000_040i64,
+                    1_700_000_000_000_000_020i64,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "svc-ts30", "svc-ts10", "svc-ts40", "svc-ts20",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "body-30", "body-10", "body-40", "body-20",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        // Measure 2-row serialized size so max_payload_bytes splits 4 sorted rows into 2 chunks of 2 rows
+        let two_row_chunks = crate::serializer::serialize_batch_chunks_with_ranges(
+            &unsorted_batch.slice(0, 2),
+            true,
+            10_485_760,
+        )
+        .unwrap();
+        let two_row_bytes = two_row_chunks[0].payload.len();
+
+        // Chunk 0 (contains svc-ts10 and svc-ts20): both items succeed with 201
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("svc-ts10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": false,
+                "items": [
+                    {"create": {"_index": "logs-otel-default", "_id": "1", "status": 201}},
+                    {"create": {"_index": "logs-otel-default", "_id": "2", "status": 201}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Chunk 1 (contains svc-ts30 and svc-ts40): item 0 succeeds (201), item 1 fails with 400
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .and(|req: &wiremock::Request| String::from_utf8_lossy(&req.body).contains("svc-ts30"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 3,
+                "errors": true,
+                "items": [
+                    {"create": {"_index": "logs-otel-default", "_id": "3", "status": 201}},
+                    {"create": {
+                        "_index": "logs-otel-default",
+                        "_id": "4",
+                        "status": 400,
+                        "error": {
+                            "type": "mapper_parsing_exception",
+                            "reason": "failed to parse field [body] of type [long]"
+                        }
+                    }}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.max_retries = 0;
+        config.max_payload_bytes = two_row_bytes;
+        config.order_by = Some(pipeline_core::sort::SortConfig {
+            on_missing_column: pipeline_core::sort::MissingColumnAction::Error,
+            logs: vec![pipeline_core::sort::SortColumnDef::Shorthand(
+                "timestamp ASC".to_string(),
+            )],
+            metrics: vec![],
+            traces: vec![],
+        });
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(4);
+        buf_cfg.dead_letter_path = Some(dlq_dir.clone());
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+
+        tx.send(SignalBatch::Logs(unsorted_batch)).await.unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let es_dlq = dlq_dir.join("elasticsearch");
+        assert!(
+            es_dlq.exists(),
+            "Expected elasticsearch DLQ directory to exist"
+        );
+        let mut json_files = Vec::new();
+        let mut arrow_files = Vec::new();
+        for entry in std::fs::read_dir(&es_dlq).unwrap() {
+            let p = entry.unwrap().path();
+            match p.extension().and_then(|e| e.to_str()) {
+                Some("json") => json_files.push(p),
+                Some("arrow") => arrow_files.push(p),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            json_files.len(),
+            1,
+            "Exactly 1 DLQ manifest must be written for the rejected row"
+        );
+        assert_eq!(
+            arrow_files.len(),
+            1,
+            "Exactly 1 DLQ Arrow IPC file must be written for the rejected row"
+        );
+
+        let manifest: DeadLetterManifest =
+            serde_json::from_slice(&std::fs::read(&json_files[0]).unwrap()).unwrap();
+        assert_eq!(manifest.sink, "elasticsearch");
+        assert_eq!(manifest.row_count, 1);
+        assert_eq!(manifest.signal, pipeline_core::buffer::SignalKind::Logs);
+        assert!(
+            manifest.reason.contains("mapper_parsing_exception"),
+            "DLQ reason must include item error details, got: {}",
+            manifest.reason
+        );
+
+        let file = std::fs::File::open(&arrow_files[0]).unwrap();
+        let mut reader = arrow::ipc::reader::FileReader::try_new(file, None).unwrap();
+        let dlq_batch = reader.next().unwrap().unwrap();
+        assert_eq!(dlq_batch.num_rows(), 1);
+        let svc_col = dlq_batch
+            .column_by_name("service_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            svc_col.value(0),
+            "svc-ts40",
+            "Quarantined row must be sorted_batch row (chunk.start_row + item_idx) = 2 + 1 = 3 (svc-ts40)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+    }
+
+    #[tokio::test]
+    async fn test_elasticsearch_sink_quarantines_item_400_to_dead_letter_and_acks_lease() {
+        let server = MockServer::start().await;
+        let dlq_dir = std::env::temp_dir().join(format!(
+            "otel-es-dlq-alias-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": true,
+                "items": [
+                    {"create": {"_index": "logs-otel-default", "_id": "1", "status": 201}},
+                    {"create": {
+                        "_index": "logs-otel-default",
+                        "_id": "2",
+                        "status": 400,
+                        "error": {
+                            "type": "mapper_parsing_exception",
+                            "reason": "failed to parse field"
+                        }
+                    }}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.max_retries = 0;
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(2);
+        buf_cfg.dead_letter_path = Some(dlq_dir.clone());
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+
+        tx.send(SignalBatch::Logs(make_multi_row_log_batch(2)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        let es_dlq = dlq_dir.join("elasticsearch");
+        assert!(es_dlq.exists());
+        let mut json_files = Vec::new();
+        for entry in std::fs::read_dir(&es_dlq).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                json_files.push(p);
+            }
+        }
+        assert_eq!(json_files.len(), 1);
+        let manifest: DeadLetterManifest =
+            serde_json::from_slice(&std::fs::read(&json_files[0]).unwrap()).unwrap();
+        assert_eq!(manifest.row_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
     }
 }

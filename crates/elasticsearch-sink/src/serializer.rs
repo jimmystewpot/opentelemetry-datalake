@@ -1,10 +1,16 @@
 //! Single-pass Arrow `RecordBatch` to NDJSON bulk serialization engine.
 
 use crate::error::ElasticsearchError;
-use arrow::array::{Array, AsArray};
+use arrow::array::{
+    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
+};
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use pipeline_core::error::PipelineError;
 
 /// Static bulk action header for data stream `create` operations.
 const BULK_ACTION: &[u8] = b"{\"create\":{}}\n";
@@ -12,17 +18,61 @@ const BULK_ACTION: &[u8] = b"{\"create\":{}}\n";
 /// Hexadecimal digit lookup table for escaping control characters.
 const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
 
+/// A bounded NDJSON bulk payload chunk along with the contiguous row range in the sorted
+/// `RecordBatch` that produced it (`batch.slice(start_row, row_count)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BulkChunk {
+    /// Starting row index in the input `RecordBatch` for this chunk.
+    pub start_row: usize,
+    /// Number of rows included in this chunk (`items.len()` in the Elasticsearch bulk response).
+    pub row_count: usize,
+    /// Uncompressed NDJSON bulk payload (`{"create":{}}\n{...}\n` per row).
+    pub payload: Bytes,
+}
+
+/// Serializes an Arrow `RecordBatch` into bounded [`BulkChunk`]s with exact row ranges.
+///
+/// Each chunk is kept strictly within `max_payload_bytes` and records its contiguous
+/// `(start_row, row_count)` slice in `batch` so per-item bulk errors (e.g. HTTP `400`) can
+/// slice the exact rejected row (`batch.slice(chunk.start_row + orig_idx, 1)`) for dead-letter
+/// quarantine.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] if Arrow column serialization fails.
+pub fn serialize_batch_chunks_with_ranges(
+    batch: &RecordBatch,
+    unpack_attributes: bool,
+    max_payload_bytes: usize,
+) -> Result<Vec<BulkChunk>, PipelineError> {
+    serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)
+        .map_err(PipelineError::from)
+}
+
 /// Serializes an Arrow `RecordBatch` into bounded NDJSON bulk payloads for the Elasticsearch Bulk API.
 ///
 /// Each chunk is kept strictly within `max_payload_bytes`. If adding the next row would exceed
 /// `max_payload_bytes`, the current buffer is sealed as a chunk and a new chunk begins.
 /// If an individual row exceeds `max_payload_bytes` on its own, it is logged with `tracing::error!`
 /// and skipped so it does not terminate the sink or discard adjacent rows.
+///
+/// # Errors
+///
+/// Returns [`ElasticsearchError`] if column serialization fails.
 pub fn serialize_batch_chunks(
     batch: &RecordBatch,
     unpack_attributes: bool,
     max_payload_bytes: usize,
 ) -> Result<Vec<Bytes>, ElasticsearchError> {
+    let chunks = serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)?;
+    Ok(chunks.into_iter().map(|c| c.payload).collect())
+}
+
+fn serialize_batch_chunks_internal(
+    batch: &RecordBatch,
+    unpack_attributes: bool,
+    max_payload_bytes: usize,
+) -> Result<Vec<BulkChunk>, ElasticsearchError> {
     if batch.num_rows() == 0 {
         return Ok(Vec::new());
     }
@@ -30,6 +80,8 @@ pub fn serialize_batch_chunks(
     let mem_size = batch.get_array_memory_size();
     let chunk_capacity = mem_size.min(max_payload_bytes);
     let mut current_chunk = Vec::with_capacity(chunk_capacity);
+    let mut chunk_start_row: usize = 0;
+    let mut chunk_row_count: usize = 0;
     let mut row_buf = Vec::with_capacity(1024);
     let mut chunks = Vec::new();
 
@@ -83,6 +135,15 @@ pub fn serialize_batch_chunks(
 
         // Check single record size limit
         if row_buf.len() > max_payload_bytes {
+            if !current_chunk.is_empty() {
+                chunks.push(BulkChunk {
+                    start_row: chunk_start_row,
+                    row_count: chunk_row_count,
+                    payload: Bytes::from(std::mem::take(&mut current_chunk)),
+                });
+                current_chunk = Vec::with_capacity(chunk_capacity);
+                chunk_row_count = 0;
+            }
             tracing::error!(
                 row,
                 record_bytes = row_buf.len(),
@@ -96,15 +157,28 @@ pub fn serialize_batch_chunks(
         if current_chunk.len().saturating_add(row_buf.len()) > max_payload_bytes
             && !current_chunk.is_empty()
         {
-            chunks.push(Bytes::from(std::mem::take(&mut current_chunk)));
+            chunks.push(BulkChunk {
+                start_row: chunk_start_row,
+                row_count: chunk_row_count,
+                payload: Bytes::from(std::mem::take(&mut current_chunk)),
+            });
             current_chunk = Vec::with_capacity(chunk_capacity);
+            chunk_row_count = 0;
         }
 
+        if chunk_row_count == 0 {
+            chunk_start_row = row;
+        }
         current_chunk.extend_from_slice(&row_buf);
+        chunk_row_count = chunk_row_count.saturating_add(1);
     }
 
     if !current_chunk.is_empty() {
-        chunks.push(Bytes::from(current_chunk));
+        chunks.push(BulkChunk {
+            start_row: chunk_start_row,
+            row_count: chunk_row_count,
+            payload: Bytes::from(current_chunk),
+        });
     }
 
     Ok(chunks)
@@ -114,6 +188,10 @@ pub fn serialize_batch_chunks(
 ///
 /// If the serialized batch exceeds `max_payload_bytes` across multiple chunks, returns
 /// `ElasticsearchError::PayloadTooLarge`.
+///
+/// # Errors
+///
+/// Returns [`ElasticsearchError`] if serialization fails or the batch exceeds `max_payload_bytes`.
 pub fn serialize_batch(
     batch: &RecordBatch,
     unpack_attributes: bool,
@@ -146,82 +224,147 @@ fn write_timestamp(buf: &mut Vec<u8>, secs: i64, subsec_nanos: u32) {
 }
 
 /// Writes a timestamp Arrow column value to the buffer formatted as ISO 8601 UTC.
-fn write_timestamp_col(buf: &mut Vec<u8>, col: &dyn Array, row: usize, unit: TimeUnit) {
+fn write_timestamp_col(
+    buf: &mut Vec<u8>,
+    col: &dyn Array,
+    row: usize,
+    unit: TimeUnit,
+) -> Result<(), ElasticsearchError> {
+    if col.is_null(row) {
+        buf.extend_from_slice(b"null");
+        return Ok(());
+    }
     match unit {
         TimeUnit::Nanosecond => {
-            let arr = col.as_primitive::<arrow::datatypes::TimestampNanosecondType>();
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .ok_or_else(|| {
+                    ElasticsearchError::Serialization(
+                        "expected TimestampNanosecondArray".to_string(),
+                    )
+                })?;
             let nanos = arr.value(row);
             let secs = nanos.div_euclid(1_000_000_000);
             let subsec_nanos = u32::try_from(nanos.rem_euclid(1_000_000_000)).unwrap_or(0);
             write_timestamp(buf, secs, subsec_nanos);
         }
         TimeUnit::Microsecond => {
-            let arr = col.as_primitive::<arrow::datatypes::TimestampMicrosecondType>();
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .ok_or_else(|| {
+                    ElasticsearchError::Serialization(
+                        "expected TimestampMicrosecondArray".to_string(),
+                    )
+                })?;
             let micros = arr.value(row);
             let secs = micros.div_euclid(1_000_000);
-            let subsec_nanos = u32::try_from(micros.rem_euclid(1_000_000) * 1_000).unwrap_or(0);
+            let subsec_nanos =
+                u32::try_from(micros.rem_euclid(1_000_000).saturating_mul(1_000)).unwrap_or(0);
             write_timestamp(buf, secs, subsec_nanos);
         }
         TimeUnit::Millisecond => {
-            let arr = col.as_primitive::<arrow::datatypes::TimestampMillisecondType>();
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| {
+                    ElasticsearchError::Serialization(
+                        "expected TimestampMillisecondArray".to_string(),
+                    )
+                })?;
             let millis = arr.value(row);
             let secs = millis.div_euclid(1_000);
-            let subsec_nanos = u32::try_from(millis.rem_euclid(1_000) * 1_000_000).unwrap_or(0);
+            let subsec_nanos =
+                u32::try_from(millis.rem_euclid(1_000).saturating_mul(1_000_000)).unwrap_or(0);
             write_timestamp(buf, secs, subsec_nanos);
         }
         TimeUnit::Second => {
-            let arr = col.as_primitive::<arrow::datatypes::TimestampSecondType>();
+            let arr = col
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| {
+                    ElasticsearchError::Serialization("expected TimestampSecondArray".to_string())
+                })?;
             let secs = arr.value(row);
             write_timestamp(buf, secs, 0);
         }
     }
+    Ok(())
 }
 
 /// Writes a numeric Arrow column value using fast `itoa` or `ryu` formatting.
-fn write_numeric_col(buf: &mut Vec<u8>, col: &dyn Array, row: usize, data_type: &DataType) {
+fn write_numeric_col(
+    buf: &mut Vec<u8>,
+    col: &dyn Array,
+    row: usize,
+    data_type: &DataType,
+) -> Result<(), ElasticsearchError> {
+    if col.is_null(row) {
+        buf.extend_from_slice(b"null");
+        return Ok(());
+    }
     match data_type {
         DataType::Int8 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int8Type>();
+            let arr = col.as_any().downcast_ref::<Int8Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Int8Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::Int16 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int16Type>();
+            let arr = col.as_any().downcast_ref::<Int16Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Int16Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::Int32 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int32Type>();
+            let arr = col.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Int32Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::Int64 => {
-            let arr = col.as_primitive::<arrow::datatypes::Int64Type>();
+            let arr = col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Int64Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::UInt8 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt8Type>();
+            let arr = col.as_any().downcast_ref::<UInt8Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected UInt8Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::UInt16 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt16Type>();
+            let arr = col.as_any().downcast_ref::<UInt16Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected UInt16Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::UInt32 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt32Type>();
+            let arr = col.as_any().downcast_ref::<UInt32Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected UInt32Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::UInt64 => {
-            let arr = col.as_primitive::<arrow::datatypes::UInt64Type>();
+            let arr = col.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected UInt64Array".to_string())
+            })?;
             let mut itoa_buf = itoa::Buffer::new();
             buf.extend_from_slice(itoa_buf.format(arr.value(row)).as_bytes());
         }
         DataType::Float32 => {
-            let arr = col.as_primitive::<arrow::datatypes::Float32Type>();
+            let arr = col.as_any().downcast_ref::<Float32Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Float32Array".to_string())
+            })?;
             let val = arr.value(row);
             if val.is_finite() {
                 let mut ryu_buf = ryu::Buffer::new();
@@ -231,7 +374,9 @@ fn write_numeric_col(buf: &mut Vec<u8>, col: &dyn Array, row: usize, data_type: 
             }
         }
         DataType::Float64 => {
-            let arr = col.as_primitive::<arrow::datatypes::Float64Type>();
+            let arr = col.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected Float64Array".to_string())
+            })?;
             let val = arr.value(row);
             if val.is_finite() {
                 let mut ryu_buf = ryu::Buffer::new();
@@ -242,6 +387,7 @@ fn write_numeric_col(buf: &mut Vec<u8>, col: &dyn Array, row: usize, data_type: 
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Writes a UTF-8 string Arrow column value, unpacking JSON objects when enabled.
@@ -251,11 +397,25 @@ fn write_string_col(
     row: usize,
     data_type: &DataType,
     unpack_json: bool,
-) {
+) -> Result<(), ElasticsearchError> {
+    if col.is_null(row) {
+        buf.extend_from_slice(b"null");
+        return Ok(());
+    }
     let val = match data_type {
-        DataType::Utf8 => col.as_string::<i32>().value(row),
-        DataType::LargeUtf8 => col.as_string::<i64>().value(row),
-        _ => return,
+        DataType::Utf8 => col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ElasticsearchError::Serialization("expected StringArray".to_string()))?
+            .value(row),
+        DataType::LargeUtf8 => col
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .ok_or_else(|| {
+                ElasticsearchError::Serialization("expected LargeStringArray".to_string())
+            })?
+            .value(row),
+        _ => return Ok(()),
     };
     if unpack_json && (val.starts_with('{') || val.starts_with('[')) {
         if val.contains('\n') || val.contains('\r') {
@@ -272,6 +432,7 @@ fn write_string_col(
     } else {
         write_escaped_string(buf, val);
     }
+    Ok(())
 }
 
 /// Writes a single Arrow value to the output buffer.
@@ -282,13 +443,19 @@ fn write_value(
     data_type: &DataType,
     unpack_json: bool,
 ) -> Result<(), ElasticsearchError> {
+    if col.is_null(row) {
+        buf.extend_from_slice(b"null");
+        return Ok(());
+    }
     match data_type {
-        DataType::Timestamp(unit, _) => write_timestamp_col(buf, col, row, *unit),
+        DataType::Timestamp(unit, _) => write_timestamp_col(buf, col, row, *unit)?,
         DataType::Utf8 | DataType::LargeUtf8 => {
-            write_string_col(buf, col, row, data_type, unpack_json);
+            write_string_col(buf, col, row, data_type, unpack_json)?;
         }
         DataType::Boolean => {
-            let arr = col.as_boolean();
+            let arr = col.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                ElasticsearchError::Serialization("expected BooleanArray".to_string())
+            })?;
             buf.extend_from_slice(if arr.value(row) { b"true" } else { b"false" });
         }
         DataType::Int8
@@ -301,7 +468,7 @@ fn write_value(
         | DataType::UInt64
         | DataType::Float32
         | DataType::Float64 => {
-            write_numeric_col(buf, col, row, data_type);
+            write_numeric_col(buf, col, row, data_type)?;
         }
         DataType::Null => {
             buf.extend_from_slice(b"null");
@@ -934,5 +1101,37 @@ mod tests {
         let total_ndjson = String::from_utf8(chunks[0].to_vec()).unwrap();
         assert!(total_ndjson.contains("short"));
         assert!(!total_ndjson.contains("extremely-long-string"));
+    }
+
+    #[test]
+    fn test_serialize_batch_chunks_with_ranges_tracks_exact_row_ranges() {
+        let timestamps = TimestampNanosecondArray::from(vec![1_700_000_000_000_000_000i64; 10]);
+        let values = StringArray::from(vec!["test-value-12345"; 10]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(timestamps), Arc::new(values)]).unwrap();
+
+        let single_row_batch = batch.slice(0, 1);
+        let single_chunk =
+            serialize_batch_chunks_with_ranges(&single_row_batch, true, 10_000_000).unwrap();
+        let row_len = single_chunk[0].payload.len();
+
+        // Fit 3 rows per chunk -> 4 chunks: (0, 3), (3, 3), (6, 3), (9, 1)
+        let max_payload_bytes = row_len * 3 + 5;
+        let chunks =
+            serialize_batch_chunks_with_ranges(&batch, true, max_payload_bytes).expect("chunks");
+
+        assert_eq!(chunks.len(), 4);
+        assert_eq!((chunks[0].start_row, chunks[0].row_count), (0, 3));
+        assert_eq!((chunks[1].start_row, chunks[1].row_count), (3, 3));
+        assert_eq!((chunks[2].start_row, chunks[2].row_count), (6, 3));
+        assert_eq!((chunks[3].start_row, chunks[3].row_count), (9, 1));
     }
 }

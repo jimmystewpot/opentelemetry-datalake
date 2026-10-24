@@ -167,7 +167,8 @@ Configures the Elasticsearch & OpenSearch data streams sink. See [`docs/elastics
 | `max_retries` | Integer | `3` | Maximum SDK-level retries for transient HTTP errors (429/503/network). |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds (overridden dynamically by `Retry-After`). |
 | `validate_on_startup` | Boolean | `true` | Validate cluster health and data stream index templates during startup. |
-| `batching` | Map | `null` | Optional micro-batch accumulation settings (see below). |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `max_inflight_leases`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy micro-batch alias for `[elasticsearch.buffer]`. Cannot be combined with `[elasticsearch.buffer]`. |
 | `order_by` | Map | `null` | Optional pre-sorting columns per signal (see below). |
 
 ### Elasticsearch Data Streams (`[elasticsearch.data_streams]`)
@@ -187,11 +188,13 @@ traces  = "traces-otel-default"
 * **Bearer Token**: `{ type = "bearer", token = "<jwt_or_oauth_token>" }`
 * **AWS SigV4**: `{ type = "aws_sigv4", region = "us-east-1", service = "es" }` (Requires `--features aws`).
 
-### Elasticsearch Batching (`[elasticsearch.batching]`)
+### Elasticsearch Buffering (`[elasticsearch.buffer]` and legacy `[elasticsearch.batching]`)
+
+Prefer `[elasticsearch.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). When `[elasticsearch.buffer]` is not explicitly set, `max_inflight_leases` defaults to `max_concurrent_requests` (`8`). Legacy `[elasticsearch.batching]` remains supported as a deprecated alias, but specifying both `[elasticsearch.buffer]` and `[elasticsearch.batching]` is rejected at startup:
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `10485760` | Max accumulated Arrow byte size before flushing (10 MiB). |
+| `max_batch_size_bytes` | Integer | `10485760` | Max accumulated Arrow byte size per lease before flushing (10 MiB in `[elasticsearch.batching]`; 64 MiB default in `[elasticsearch.buffer]`). |
 | `max_batch_records` | Integer | `50000` | Max accumulated records before flushing. |
 | `max_batch_interval_sec` | Integer | `10` | Max time in seconds between flushes. |
 
@@ -202,7 +205,7 @@ All sinks (Iceberg, Kafka, StarRocks, and Elasticsearch) support in-memory chron
 ```toml
 [elasticsearch.order_by]
 logs    = ["timestamp ASC", "service_name ASC NULLS LAST"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces  = ["timestamp ASC"]
 on_missing_column = "skip" # "skip" (default) or "error"
 ```
@@ -321,13 +324,13 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 ca_cert_path = "/etc/ssl/certs/es-ca.crt"
 verification = "full"
 
-[elasticsearch.batching]
+[elasticsearch.buffer]
 max_batch_size_bytes = 10485760 # 10 MiB
 max_batch_records = 50000
 max_batch_interval_sec = 5
 
 [elasticsearch.order_by]
 logs = ["timestamp ASC", "service_name ASC"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces = ["timestamp ASC"]
 ```

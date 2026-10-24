@@ -1,6 +1,8 @@
 //! Configuration structures and defaults for the Elasticsearch sink.
 
 use crate::tls::TlsConfig;
+use pipeline_core::buffer::{BufferConfig, LegacyBatchingConfig};
+use pipeline_core::error::PipelineError;
 use serde::{Deserialize, Serialize};
 
 const fn default_max_concurrent_requests() -> usize {
@@ -175,7 +177,14 @@ pub struct ElasticsearchSinkConfig {
     #[serde(default = "default_true")]
     pub validate_on_startup: bool,
 
-    /// Optional micro-batch accumulation thresholds.
+    /// Unified sink buffer configuration (`[elasticsearch.buffer]`).
+    #[serde(default)]
+    pub buffer: Option<BufferConfig>,
+
+    /// Deprecated micro-batch accumulation thresholds (`[elasticsearch.batching]`).
+    ///
+    /// Prefer `[elasticsearch.buffer]` instead. Setting both `buffer` and `batching`
+    /// is rejected at startup (validation rule V4).
     #[serde(default)]
     pub batching: Option<ElasticsearchBatchingConfig>,
 
@@ -185,6 +194,29 @@ pub struct ElasticsearchSinkConfig {
 }
 
 impl ElasticsearchSinkConfig {
+    /// Resolves the effective [`BufferConfig`] for this sink, mapping legacy
+    /// `[elasticsearch.batching]` onto [`BufferConfig`] triggers, defaulting
+    /// `max_inflight_leases` to `self.max_concurrent_requests` when `buffer` is not
+    /// explicitly set, and enforcing startup validation rules V1–V5.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::Configuration`] if both `buffer` and `batching` are set (V4)
+    /// or if any buffer invariant V1–V5 is violated.
+    pub fn resolved_buffer_config(&self) -> Result<BufferConfig, PipelineError> {
+        let legacy = self.batching.as_ref().map(|b| LegacyBatchingConfig {
+            max_batch_size_bytes: b.max_batch_size_bytes,
+            max_batch_records: Some(b.max_batch_records),
+            max_batch_interval_sec: b.max_batch_interval_sec,
+        });
+        let mut cfg = BufferConfig::resolve("elasticsearch", self.buffer.clone(), legacy, true)?;
+        if self.buffer.is_none() {
+            cfg.max_inflight_leases = self.max_concurrent_requests;
+            cfg.validate("elasticsearch")?;
+        }
+        Ok(cfg)
+    }
+
     /// Validates static configuration constraints without initiating network transport.
     ///
     /// # Errors
@@ -258,6 +290,9 @@ impl ElasticsearchSinkConfig {
 
         self.tls
             .validate()
+            .map_err(|e| crate::error::ElasticsearchError::StartupValidation(e.to_string()))?;
+
+        self.resolved_buffer_config()
             .map_err(|e| crate::error::ElasticsearchError::StartupValidation(e.to_string()))?;
 
         Ok(())
@@ -643,6 +678,36 @@ mod tests {
         assert!(
             result.is_err(),
             "ElasticsearchAuthConfig must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn test_resolved_buffer_config_defaults_max_inflight_leases_to_max_concurrent_requests() {
+        let mut cfg = make_minimal_config();
+        cfg.max_concurrent_requests = 6;
+        let resolved = cfg.resolved_buffer_config().unwrap();
+        assert_eq!(resolved.max_inflight_leases, 6);
+    }
+
+    #[test]
+    fn test_resolved_buffer_config_maps_legacy_batching_and_rejects_conflict() {
+        let mut cfg = make_minimal_config();
+        cfg.batching = Some(ElasticsearchBatchingConfig {
+            max_batch_size_bytes: 4_194_304,
+            max_batch_interval_sec: 7,
+            max_batch_records: 2_500,
+        });
+        let resolved = cfg.resolved_buffer_config().unwrap();
+        assert_eq!(resolved.max_batch_size_bytes, 4_194_304);
+        assert_eq!(resolved.max_batch_interval_sec, 7);
+        assert_eq!(resolved.max_batch_records, Some(2_500));
+
+        cfg.buffer = Some(BufferConfig::default());
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("[elasticsearch.buffer]")
+                && err.to_string().contains("[elasticsearch.batching]"),
+            "Expected V4 conflict error, got: {err}"
         );
     }
 }
