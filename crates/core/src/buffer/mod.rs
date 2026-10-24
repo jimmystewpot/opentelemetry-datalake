@@ -1,10 +1,14 @@
 pub mod config;
+pub mod dead_letter;
 pub mod disk;
 pub mod lease;
 pub mod memory;
 
 pub use crate::buffer::config::{
     BufferConfig, BufferMode, DrainTimeoutPolicy, LegacyBatchingConfig, OverflowPolicy, SignalKind,
+};
+pub use crate::buffer::dead_letter::{
+    DeadLetterManifest, DeadLetterMetadata, DeadLetterStore, is_safe_path_component,
 };
 pub use crate::buffer::disk::{
     DiskWatermark, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, FrameDecodeError, FrameHeader,
@@ -36,6 +40,7 @@ pub(crate) struct BufferInner {
     pub(crate) config: BufferConfig,
     pub(crate) rings: [SignalRingState; 3],
     pub(crate) disk: Option<DiskBackend>,
+    pub(crate) dead_letter: Option<Arc<DeadLetterStore>>,
     pub(crate) any_data_ready_notify: Notify,
     pub(crate) fatal_error: Mutex<Option<String>>,
 }
@@ -52,11 +57,20 @@ impl BufferInner {
         } else {
             None
         };
+        let dead_letter = if let Some(ref dl_path) = config.dead_letter_path {
+            Some(Arc::new(DeadLetterStore::new(
+                dl_path.clone(),
+                config.max_dead_letter_bytes,
+            )?))
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             sink_name: sink_name.to_string(),
             config,
             rings,
             disk,
+            dead_letter,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
         }))
@@ -72,6 +86,7 @@ impl BufferInner {
                 SignalRingState::new(),
             ],
             disk: None,
+            dead_letter: None,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
         })
@@ -180,6 +195,66 @@ impl BufferInner {
                 .notify_waiters();
         }
         self.any_data_ready_notify.notify_waiters();
+    }
+
+    pub(crate) async fn quarantine_batches(
+        &self,
+        signal: SignalKind,
+        first_seq: u64,
+        last_seq: u64,
+        attempts: u32,
+        reason: String,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<Option<std::path::PathBuf>, PipelineError> {
+        let row_count: usize = batches
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum();
+        if batches.is_empty() || row_count == 0 {
+            return Ok(None);
+        }
+
+        let written_path = if let Some(ref dlq) = self.dead_letter {
+            let dlq = Arc::clone(dlq);
+            let meta = DeadLetterMetadata {
+                sink: self.sink_name.clone(),
+                signal,
+                first_seq,
+                last_seq,
+                row_count,
+                attempts,
+                reason: reason.clone(),
+                timestamp_unix_ms: crate::buffer::dead_letter::current_unix_ms(),
+            };
+            let path = tokio::task::spawn_blocking(move || dlq.write_quarantine(&meta, &batches))
+                .await
+                .map_err(|e| {
+                    PipelineError::Internal(format!("dead-letter write join error: {e}"))
+                })??;
+            Some(path)
+        } else {
+            None
+        };
+
+        self.rings[signal.as_u8() as usize]
+            .dead_letter_drops
+            .fetch_add(
+                u64::try_from(row_count).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+
+        tracing::error!(
+            sink = %self.sink_name,
+            signal = signal.as_str(),
+            first_seq,
+            last_seq,
+            rows = row_count,
+            attempts,
+            reason = %reason,
+            "Quarantined rejected batch rows to dead-letter store"
+        );
+
+        Ok(written_path)
     }
 
     fn increment_senders(&self, scope: Option<SignalKind>) {
@@ -739,6 +814,45 @@ impl SinkBuffer {
             disk.flush_and_sync_watermark(wm)?;
         }
         Ok(())
+    }
+
+    /// Returns the cumulative number of records quarantined to the dead-letter store.
+    #[must_use]
+    pub fn dead_letter_drops(&self) -> u64 {
+        match self.signal_scope {
+            Some(sig) => self.inner.rings[sig.as_u8() as usize]
+                .dead_letter_drops
+                .load(Ordering::Acquire),
+            None => ALL_SIGNALS.iter().fold(0u64, |acc, &sig| {
+                acc.saturating_add(
+                    self.inner.rings[sig.as_u8() as usize]
+                        .dead_letter_drops
+                        .load(Ordering::Acquire),
+                )
+            }),
+        }
+    }
+
+    /// Returns a reference to the underlying [`DeadLetterStore`] if `dead_letter_path` is configured.
+    #[must_use]
+    pub fn dead_letter_store(&self) -> Option<&Arc<DeadLetterStore>> {
+        self.inner.dead_letter.as_ref()
+    }
+
+    /// Quarantines a rejected subset of batches (e.g. item-level HTTP 400 rows) to the
+    /// configured [`DeadLetterStore`] inside `tokio::task::spawn_blocking`.
+    pub async fn quarantine_batches(
+        &self,
+        signal: SignalKind,
+        first_seq: u64,
+        last_seq: u64,
+        attempts: u32,
+        reason: String,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<Option<std::path::PathBuf>, PipelineError> {
+        self.inner
+            .quarantine_batches(signal, first_seq, last_seq, attempts, reason, batches)
+            .await
     }
 }
 

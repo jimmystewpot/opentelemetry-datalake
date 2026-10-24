@@ -1,9 +1,12 @@
 use crate::buffer::BufferInner;
 use crate::buffer::config::SignalKind;
+use crate::buffer::dead_letter::{DeadLetterMetadata, current_unix_ms};
 use crate::buffer::memory::{BatchPayload, LeasedBatchMeta};
 use crate::error::PipelineError;
 use arrow::record_batch::RecordBatch;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Unique identifier for a leased range of batches within a signal ring.
@@ -147,6 +150,25 @@ impl Lease {
         .map_err(|e| PipelineError::Internal(format!("Lease::prepare join error: {e}")))?
     }
 
+    /// Quarantines a rejected subset of batches belonging to this lease (e.g. item-level HTTP 400
+    /// rows) to the configured [`crate::buffer::DeadLetterStore`] inside `tokio::task::spawn_blocking`.
+    pub async fn quarantine_batches(
+        &self,
+        reason: String,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Option<PathBuf>, PipelineError> {
+        self.inner
+            .quarantine_batches(
+                self.id.signal,
+                self.id.first_seq,
+                self.id.last_seq,
+                self.attempt.saturating_add(1),
+                reason,
+                batches,
+            )
+            .await
+    }
+
     /// Commits the lease, freeing its byte budget and advancing the contiguous watermark.
     pub async fn ack(mut self) -> Result<(), PipelineError> {
         self.completed = true;
@@ -202,17 +224,7 @@ impl Lease {
                     self.inner
                         .requeue_lease(signal, payloads, meta, next_attempt, None);
                 } else {
-                    tracing::error!(
-                        sink = %self.inner.sink_name,
-                        signal = signal.as_str(),
-                        first_seq = self.id.first_seq,
-                        last_seq = self.id.last_seq,
-                        attempts = next_attempt,
-                        reason = %reason,
-                        "Rejected lease exhausted max_attempts; dropping and advancing watermark"
-                    );
-                    self.inner
-                        .ack_lease(signal, &meta, self.byte_size, self.num_rows)
+                    self.nack_rejected_exhausted(signal, payloads, meta, next_attempt, reason)
                         .await?;
                 }
             }
@@ -221,6 +233,99 @@ impl Lease {
             }
         }
         Ok(())
+    }
+
+    async fn nack_rejected_exhausted(
+        &self,
+        signal: SignalKind,
+        payloads: Vec<BatchPayload>,
+        meta: Vec<LeasedBatchMeta>,
+        next_attempt: u32,
+        reason: String,
+    ) -> Result<(), PipelineError> {
+        if let Some(ref dlq) = self.inner.dead_letter {
+            let dlq = Arc::clone(dlq);
+            let disk_path = self.inner.config.disk_path.clone();
+            let max_payload_len =
+                u32::try_from(self.inner.config.segment_size_bytes.saturating_mul(2))
+                    .unwrap_or(u32::MAX);
+            let dlq_meta = DeadLetterMetadata {
+                sink: self.inner.sink_name.clone(),
+                signal,
+                first_seq: self.id.first_seq,
+                last_seq: self.id.last_seq,
+                row_count: self.num_rows,
+                attempts: next_attempt,
+                reason: reason.clone(),
+                timestamp_unix_ms: current_unix_ms(),
+            };
+
+            let (returned_payloads, write_res) = tokio::task::spawn_blocking(move || {
+                let res = (|| -> Result<PathBuf, PipelineError> {
+                    let mut decoded = Vec::with_capacity(payloads.len());
+                    for payload in &payloads {
+                        match payload {
+                            BatchPayload::InMemory(batch) => {
+                                decoded.push(batch.clone());
+                            }
+                            BatchPayload::OnDisk {
+                                segment_id,
+                                offset,
+                                len,
+                                ..
+                            } => {
+                                let base_dir = disk_path.as_ref().ok_or_else(|| {
+                                    PipelineError::Storage(
+                                        "OnDisk payload encountered without configured disk_path"
+                                            .into(),
+                                    )
+                                })?;
+                                let batch = crate::buffer::disk::read_frame_at(
+                                    base_dir,
+                                    *segment_id,
+                                    *offset,
+                                    *len,
+                                    max_payload_len,
+                                )?;
+                                decoded.push(batch);
+                            }
+                        }
+                    }
+                    dlq.write_quarantine(&dlq_meta, &decoded)
+                })();
+                (payloads, res)
+            })
+            .await
+            .map_err(|e| {
+                PipelineError::Internal(format!("Lease::nack dead-letter join error: {e}"))
+            })?;
+
+            if let Err(err) = write_res {
+                self.inner
+                    .fail_lease(signal, returned_payloads, meta, err.to_string());
+                return Err(err);
+            }
+        }
+
+        self.inner.rings[signal.as_u8() as usize]
+            .dead_letter_drops
+            .fetch_add(
+                u64::try_from(self.num_rows).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+
+        tracing::error!(
+            sink = %self.inner.sink_name,
+            signal = signal.as_str(),
+            first_seq = self.id.first_seq,
+            last_seq = self.id.last_seq,
+            attempts = next_attempt,
+            reason = %reason,
+            "Rejected lease exhausted max_attempts; quarantined and advancing watermark"
+        );
+        self.inner
+            .ack_lease(signal, &meta, self.byte_size, self.num_rows)
+            .await
     }
 }
 

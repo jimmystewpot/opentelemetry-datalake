@@ -218,6 +218,8 @@ pub struct SignalRingState {
     pub corruption_drops: AtomicU64,
     /// Cumulative number of records replayed from disk during startup recovery.
     pub replayed_records: AtomicU64,
+    /// Cumulative number of records quarantined or dropped after exhausting rejected retries.
+    pub dead_letter_drops: AtomicU64,
 }
 
 impl Default for SignalRingState {
@@ -238,6 +240,7 @@ impl SignalRingState {
             active_senders: AtomicU64::new(0),
             corruption_drops: AtomicU64::new(0),
             replayed_records: AtomicU64::new(0),
+            dead_letter_drops: AtomicU64::new(0),
         }
     }
 }
