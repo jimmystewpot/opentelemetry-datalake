@@ -79,6 +79,7 @@ Configures the Kafka sink.
 | `logs_format` | String | `"json"` | Serialization format for logs (`json` or `protobuf`). |
 | `traces_format` | String | `"json"` | Serialization format for traces (`json` or `protobuf`). |
 | `metrics_format` | String | `"json"` | Serialization format for metrics (`json` or `protobuf`). |
+| `flush_timeout_ms` | Integer | `10000` | Maximum time in milliseconds to wait for in-flight messages in `librdkafka` to flush during graceful shutdown (must be > 0). |
 | `options` | Map | `{}` | Additional `librdkafka` configuration options. |
 
 ---

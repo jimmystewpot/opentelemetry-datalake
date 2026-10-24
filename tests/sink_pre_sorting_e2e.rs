@@ -97,9 +97,9 @@ fn test_e2e_kafka_partition_key_slicing_flow() {
 
     let slices = kafka_sink::extract_partition_slices(&output_batch, "service_name").unwrap();
     assert_eq!(slices.len(), 2);
-    assert_eq!(slices[0].0, "checkout");
+    assert_eq!(slices[0].0.as_deref(), Some("checkout"));
     assert_eq!(slices[0].1.num_rows(), 1);
-    assert_eq!(slices[1].0, "payment");
+    assert_eq!(slices[1].0.as_deref(), Some("payment"));
     assert_eq!(slices[1].1.num_rows(), 2);
 
     let payment_ts = slices[1]
@@ -420,7 +420,10 @@ fn test_e2e_kafka_partition_key_slicing_edge_cases() {
     // 1. Empty batch
     let empty_batch = RecordBatch::new_empty(schema.clone());
     let empty_slices = kafka_sink::extract_partition_slices(&empty_batch, "service_name").unwrap();
-    assert!(empty_slices.is_empty());
+    #[allow(clippy::assert_is_empty)]
+    {
+        assert!(empty_slices.is_empty());
+    }
 
     // 2. Single row batch
     let single_batch = RecordBatch::try_new(
@@ -434,7 +437,7 @@ fn test_e2e_kafka_partition_key_slicing_edge_cases() {
     let single_slices =
         kafka_sink::extract_partition_slices(&single_batch, "service_name").unwrap();
     assert_eq!(single_slices.len(), 1);
-    assert_eq!(single_slices[0].0, "solo_service");
+    assert_eq!(single_slices[0].0.as_deref(), Some("solo_service"));
     assert_eq!(single_slices[0].1.num_rows(), 1);
 
     // 3. Uniform partition batch (all rows have identical partition key)
@@ -449,7 +452,7 @@ fn test_e2e_kafka_partition_key_slicing_edge_cases() {
     let uniform_slices =
         kafka_sink::extract_partition_slices(&uniform_batch, "service_name").unwrap();
     assert_eq!(uniform_slices.len(), 1);
-    assert_eq!(uniform_slices[0].0, "auth");
+    assert_eq!(uniform_slices[0].0.as_deref(), Some("auth"));
     assert_eq!(uniform_slices[0].1.num_rows(), 3);
 
     // 4. Missing partition key column error
@@ -473,4 +476,59 @@ fn test_e2e_kafka_partition_key_slicing_edge_cases() {
         ),
         "Expected non-Utf8 partition key column error, got: {non_utf8_err}"
     );
+}
+
+#[test]
+fn test_e2e_kafka_sink_presorting_with_null_partition_keys() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("service_name", DataType::Utf8, true),
+        Field::new("timestamp", DataType::Int64, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("payment"),
+                Some(""),
+                None,
+                Some("payment"),
+            ])),
+            Arc::new(Int64Array::from(vec![300, 200, 100, 150, 50])),
+        ],
+    )
+    .unwrap();
+
+    let sort_config = SortConfig {
+        on_missing_column: MissingColumnAction::Error,
+        logs: vec![SortColumnDef::Shorthand("timestamp ASC".to_string())],
+        metrics: vec![],
+        traces: vec![],
+    };
+
+    let sorter = BatchSorter::from_config(&sort_config).unwrap();
+    let output_batch = sorter
+        .sort_with_extra_lead_column(&batch, SignalType::Logs, Some("service_name"))
+        .unwrap();
+
+    let slices = kafka_sink::extract_partition_slices(&output_batch, "service_name").unwrap();
+    // Lead column sorts ASC with nulls_last = true: Some(""), Some("payment") (2 rows), None (2 rows)
+    assert_eq!(slices.len(), 3);
+    assert_eq!(slices[0].0.as_deref(), Some(""));
+    assert_eq!(slices[0].1.num_rows(), 1);
+    assert_eq!(slices[1].0.as_deref(), Some("payment"));
+    assert_eq!(slices[1].1.num_rows(), 2);
+    assert_eq!(slices[2].0, None);
+    assert_eq!(slices[2].1.num_rows(), 2);
+
+    let null_ts = slices[2]
+        .1
+        .column_by_name("timestamp")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(null_ts.value(0), 150);
+    assert_eq!(null_ts.value(1), 300);
 }

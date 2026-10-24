@@ -48,6 +48,8 @@ struct KafkaConfig {
     #[serde(default)]
     order_by: Option<pipeline_core::sort::SortConfig>,
     #[serde(default)]
+    flush_timeout_ms: Option<u64>,
+    #[serde(default)]
     options: HashMap<String, String>,
 }
 
@@ -133,6 +135,11 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref kafka_cfg) = config.kafka {
+        if kafka_cfg.flush_timeout_ms == Some(0) {
+            anyhow::bail!(
+                "Configuration validation failed: kafka.flush_timeout_ms must be greater than 0"
+            );
+        }
         if let Some(sort_cfg) = kafka_cfg.order_by.as_ref() {
             pipeline_core::sort::BatchSorter::from_config(sort_cfg)
                 .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
@@ -938,6 +945,13 @@ async fn main() -> anyhow::Result<()> {
             &kafka_cfg.options,
         )?
         .with_sorting(sorter, kafka_cfg.metrics_partition_key.clone());
+
+        if let Some(ms) = kafka_cfg.flush_timeout_ms {
+            let timeout = std::time::Duration::from_millis(ms);
+            logs_sink = logs_sink.with_flush_timeout(timeout);
+            traces_sink = traces_sink.with_flush_timeout(timeout);
+            metrics_sink = metrics_sink.with_flush_timeout(timeout);
+        }
 
         logs_sink_handle = tokio::spawn(async move {
             let res = logs_sink.run(logs_sink_rx).await;
@@ -2631,6 +2645,57 @@ mod tests {
             panic_err
                 .to_string()
                 .contains("Metrics sink task panicked:")
+        );
+    }
+
+    #[test]
+    fn test_validate_config_kafka_flush_timeout() {
+        let valid_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        flush_timeout_ms = 5000
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(valid_toml))
+            .extract()
+            .unwrap();
+        assert_eq!(cfg.kafka.as_ref().unwrap().flush_timeout_ms, Some(5000));
+        assert!(validate_config(&cfg).is_ok());
+
+        let zero_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        flush_timeout_ms = 0
+        "#;
+        let zero_cfg: AppConfig = Figment::new()
+            .merge(Toml::string(zero_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&zero_cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("flush_timeout_ms must be greater than 0"),
+            "Unexpected error message: {err}"
         );
     }
 }
