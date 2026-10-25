@@ -66,7 +66,7 @@ impl KafkaSinkConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Config`] if buffer validation fails (rules V1–V5).
+    /// Returns [`PipelineError::Configuration`] if buffer validation fails (rules V1–V5).
     pub fn resolved_buffer_config(&self) -> Result<BufferConfig, PipelineError> {
         BufferConfig::resolve("kafka", self.buffer.clone(), self.batching.clone(), true)
     }
