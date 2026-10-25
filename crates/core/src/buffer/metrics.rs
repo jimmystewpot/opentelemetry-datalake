@@ -584,3 +584,165 @@ impl BufferMetrics {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::data::ResourceMetrics;
+    use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+    use opentelemetry_sdk::metrics::{SdkMeterProvider, Temporality};
+
+    #[derive(Debug, Clone, Default)]
+    struct TestPushExporter {
+        exports: Arc<AtomicU64>,
+    }
+
+    impl PushMetricExporter for TestPushExporter {
+        async fn export(&self, _metrics: &ResourceMetrics) -> OTelSdkResult {
+            self.exports.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+            Ok(())
+        }
+
+        fn temporality(&self) -> Temporality {
+            Temporality::Cumulative
+        }
+    }
+
+    #[test]
+    fn test_buffer_metrics_observable_gauges_and_counters_in_memory_and_disk_modes() {
+        let exporter = TestPushExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_meter_provider(provider.clone());
+
+        let mem_cfg = BufferConfig {
+            mode: BufferMode::Memory,
+            max_batch_records: Some(250),
+            ..BufferConfig::default()
+        };
+        let disk_cfg = BufferConfig {
+            mode: BufferMode::Disk,
+            max_batch_records: None,
+            ..BufferConfig::default()
+        };
+
+        let mem_metrics = BufferMetrics::new("test_mem_sink", &mem_cfg);
+        let disk_metrics = BufferMetrics::new("test_disk_sink", &disk_cfg);
+
+        // Exercise update_gauges with oldest_ms == 0 and oldest_ms > 0
+        mem_metrics.update_gauges(SignalKind::Logs, 12, 4_096, 1, 0);
+        let two_secs_ago = current_unix_ms().saturating_sub(2_000);
+        mem_metrics.update_gauges(SignalKind::Metrics, 34, 8_192, 2, two_secs_ago);
+        disk_metrics.update_gauges(SignalKind::Traces, 56, 16_384, 3, two_secs_ago);
+
+        let logs_state = mem_metrics.gauges.signal_state(SignalKind::Logs);
+        assert_eq!(logs_state.buffered_records.load(Ordering::Relaxed), 12);
+        assert_eq!(logs_state.buffered_bytes.load(Ordering::Relaxed), 4_096);
+        assert_eq!(logs_state.inflight_leases.load(Ordering::Relaxed), 1);
+        assert_eq!(logs_state.max_events.load(Ordering::Relaxed), 250);
+        assert_eq!(
+            disk_metrics
+                .gauges
+                .signal_state(SignalKind::Traces)
+                .max_events
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Record committed, dropped (all reasons + 0 no-op), nacks (all classes), and replayed
+        mem_metrics.record_committed(SignalKind::Logs, 10, Duration::from_millis(25));
+        mem_metrics.record_committed(SignalKind::Metrics, 5, Duration::from_millis(50));
+        assert_eq!(mem_metrics.committed_records(Some(SignalKind::Logs)), 10);
+        assert_eq!(mem_metrics.committed_records(Some(SignalKind::Metrics)), 5);
+        assert_eq!(mem_metrics.committed_records(None), 15);
+
+        mem_metrics.record_dropped(SignalKind::Logs, 0, "overflow");
+        mem_metrics.record_dropped(SignalKind::Logs, 3, "overflow");
+        mem_metrics.record_dropped(SignalKind::Metrics, 4, "dead_letter");
+        mem_metrics.record_dropped(SignalKind::Traces, 5, "corruption");
+        mem_metrics.record_dropped(SignalKind::Logs, 6, "shutdown_timeout");
+        mem_metrics.record_dropped(SignalKind::Logs, 7, "unknown");
+
+        assert_eq!(
+            mem_metrics.dropped_records(Some(SignalKind::Logs), "overflow"),
+            3
+        );
+        assert_eq!(mem_metrics.dropped_records(None, "overflow"), 3);
+        assert_eq!(
+            mem_metrics.dropped_records(Some(SignalKind::Metrics), "dead_letter"),
+            4
+        );
+        assert_eq!(mem_metrics.dropped_records(None, "dead_letter"), 4);
+        assert_eq!(
+            mem_metrics.dropped_records(Some(SignalKind::Traces), "corruption"),
+            5
+        );
+        assert_eq!(mem_metrics.dropped_records(None, "corruption"), 5);
+        assert_eq!(
+            mem_metrics.dropped_records(Some(SignalKind::Logs), "shutdown_timeout"),
+            6
+        );
+        assert_eq!(mem_metrics.dropped_records(None, "shutdown_timeout"), 6);
+        assert_eq!(
+            mem_metrics.dropped_records(Some(SignalKind::Logs), "unknown"),
+            0
+        );
+        assert_eq!(mem_metrics.dropped_records(None, "unknown"), 0);
+
+        mem_metrics.record_nack(SignalKind::Logs, "transient");
+        mem_metrics.record_nack(SignalKind::Metrics, "transient");
+        mem_metrics.record_nack(SignalKind::Logs, "rejected");
+        mem_metrics.record_nack(SignalKind::Traces, "fatal");
+        mem_metrics.record_nack(SignalKind::Logs, "unknown");
+
+        assert_eq!(
+            mem_metrics.lease_nacks(Some(SignalKind::Logs), "transient"),
+            1
+        );
+        assert_eq!(mem_metrics.lease_nacks(None, "transient"), 2);
+        assert_eq!(
+            mem_metrics.lease_nacks(Some(SignalKind::Logs), "rejected"),
+            1
+        );
+        assert_eq!(mem_metrics.lease_nacks(None, "rejected"), 1);
+        assert_eq!(
+            mem_metrics.lease_nacks(Some(SignalKind::Traces), "fatal"),
+            1
+        );
+        assert_eq!(mem_metrics.lease_nacks(None, "fatal"), 1);
+        assert_eq!(
+            mem_metrics.lease_nacks(Some(SignalKind::Logs), "unknown"),
+            0
+        );
+        assert_eq!(mem_metrics.lease_nacks(None, "unknown"), 0);
+
+        disk_metrics.record_replayed(SignalKind::Logs, 0);
+        disk_metrics.record_replayed(SignalKind::Logs, 5);
+        assert_eq!(
+            disk_metrics
+                .gauges
+                .signal_state(SignalKind::Logs)
+                .replayed_records
+                .load(Ordering::Relaxed),
+            5
+        );
+
+        // Flush the meter provider so all 9 observable gauge callbacks execute for both
+        // Memory and Disk modes and both oldest_ms == 0 and oldest_ms > 0.
+        provider.force_flush().unwrap();
+        assert!(exporter.exports.load(Ordering::Relaxed) >= 1);
+
+        opentelemetry::global::set_meter_provider(SdkMeterProvider::default());
+        let _ = provider.shutdown();
+    }
+}

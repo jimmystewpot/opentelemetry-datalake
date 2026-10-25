@@ -2045,4 +2045,65 @@ mod tests {
         closed_lease.ack().await.unwrap();
         assert!(buf.next_lease().await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn test_buffer_controller_and_recv_passthrough_coalescing_and_quarantine_helpers() {
+        let sample = make_batch(&[1, 2]);
+        let batch_bytes = sample.get_array_memory_size();
+        let config = BufferConfig {
+            max_batch_size_bytes: batch_bytes * 4,
+            max_batch_records: Some(4),
+            max_batch_interval_sec: 0,
+            drain_timeout_sec: 15,
+            on_drain_timeout: Some(DrainTimeoutPolicy::Discard),
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_ctrl_helper", config).unwrap();
+        let ctrl = buf.controller();
+        assert_eq!(ctrl.instance_id(), buf.instance_id());
+        assert!(ctrl.is_ready());
+        assert_eq!(ctrl.drain_timeout_sec(), 15);
+        assert_eq!(buf.drain_timeout_sec(), 15);
+        assert!(buf.dead_letter_store().is_none());
+
+        // quarantine_batches with empty slice returns Ok(None)
+        assert!(
+            buf.quarantine_batches(SignalKind::Logs, 1, 1, 1, "none".into(), Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        // quarantine_batches without dead_letter_path increments dead_letter_drops and returns Ok(None)
+        assert!(
+            buf.quarantine_batches(
+                SignalKind::Logs,
+                1,
+                1,
+                1,
+                "rejected_no_dlq".into(),
+                vec![sample.clone()],
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(buf.dead_letter_drops(), 2);
+
+        // Coalesce 2 batches into 1 lease and consume via recv_passthrough()
+        tx.send(SignalBatch::Logs(make_batch(&[10, 20])))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[30, 40])))
+            .await
+            .unwrap();
+        let coalesced = buf.recv_passthrough().await.unwrap().unwrap();
+        assert!(matches!(coalesced, SignalBatch::Logs(ref b) if b.num_rows() == 4));
+        assert_eq!(buf.committed_records(), 4);
+
+        // Enqueue 1 more batch and exercise ctrl.finalize_shutdown_timeout()
+        tx.send(SignalBatch::Logs(make_batch(&[50]))).await.unwrap();
+        drop(tx);
+        assert!(ctrl.finalize_shutdown_timeout().is_err());
+        assert_eq!(buf.shutdown_timeout_drops(), 1);
+    }
 }

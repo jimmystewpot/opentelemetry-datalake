@@ -2443,4 +2443,195 @@ mod tests {
             Some(expected_token.as_str())
         );
     }
+
+    #[test]
+    fn test_iceberg_lease_tokens_and_error_classification_variants() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        assert_eq!(
+            lease_snapshot_property_key(SignalKind::Logs),
+            "datalake.lease.logs"
+        );
+        assert_eq!(
+            lease_snapshot_property_key(SignalKind::Metrics),
+            "datalake.lease.metrics"
+        );
+        assert_eq!(
+            lease_snapshot_property_key(SignalKind::Traces),
+            "datalake.lease.traces"
+        );
+        assert_eq!(
+            instance_snapshot_property_key(SignalKind::Logs, 1),
+            "datalake.lease.logs.0000000000000001"
+        );
+
+        let lease_id = LeaseId {
+            instance_id: 1,
+            signal: SignalKind::Logs,
+            first_seq: 2,
+            last_seq: 5,
+        };
+        assert_eq!(format_lease_range(lease_id), "0000000000000001:2-5");
+        assert_eq!(parse_lease_token("0000000000000000:1:2"), None);
+        assert_eq!(parse_lease_token("0000000000000001:5:2"), None);
+        assert_eq!(parse_lease_token("0000000000000001:2-5"), Some((1, 2, 5)));
+
+        let mut props = HashMap::new();
+        props.insert(
+            "datalake.lease.logs.0000000000000001".to_string(),
+            "0000000000000001:1-10".to_string(),
+        );
+        assert!(!props.has_committed_lease(LeaseId {
+            instance_id: 0,
+            signal: SignalKind::Logs,
+            first_seq: 1,
+            last_seq: 1,
+        }));
+        let props_ref = &props;
+        assert!(!(&props_ref).has_committed_lease(LeaseId {
+            instance_id: 0,
+            signal: SignalKind::Logs,
+            first_seq: 1,
+            last_seq: 1,
+        }));
+        assert!((&props_ref).has_committed_lease(lease_id));
+        assert_eq!(
+            (&props_ref).lease_property("datalake.lease.logs.0000000000000001"),
+            Some("0000000000000001:1-10")
+        );
+
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Internal("bad row".into())),
+            FailureClass::Rejected { .. }
+        ));
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Arrow(
+                arrow::error::ArrowError::InvalidArgumentError("bad col".into())
+            )),
+            FailureClass::Rejected { .. }
+        ));
+        let cfg_err = BufferConfig {
+            max_attempts: 0,
+            ..BufferConfig::default()
+        }
+        .validate("iceberg")
+        .unwrap_err();
+        assert!(matches!(
+            classify_iceberg_error(&cfg_err),
+            FailureClass::Fatal { .. }
+        ));
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Storage("401 Unauthorized".into())),
+            FailureClass::Fatal { .. }
+        ));
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Storage("TableNotFound".into())),
+            FailureClass::Fatal { .. }
+        ));
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Storage("DataInvalid: bad field".into())),
+            FailureClass::Rejected { .. }
+        ));
+        assert!(matches!(
+            classify_iceberg_error(&PipelineError::Storage("503 Service Unavailable".into())),
+            FailureClass::Transient
+        ));
+
+        let default_buf = IcebergSink::default_buffer_config();
+        assert_eq!(default_buf.max_batch_size_bytes, 134_217_728);
+        assert_eq!(default_buf.max_batch_interval_sec, 60);
+
+        let sink = IcebergSink::new(make_dry_run_config(SchemaMode::Fixed));
+        let empty_batch = make_test_logs_batch().slice(0, 0);
+        let empty_res = prepare_iceberg_batches(
+            empty_batch,
+            SignalKind::Logs,
+            SchemaMode::Fixed,
+            true,
+            None,
+            &sink.sorter,
+            PartitionGranularity::Daily,
+        )
+        .unwrap();
+        assert!(empty_res.is_empty());
+    }
+
+    #[test]
+    fn test_partition_batch_microsecond_and_error_branches() {
+        use arrow::array::{Int64Array, TimestampMicrosecondArray, TimestampNanosecondArray};
+        use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+
+        // 1. Valid TimestampMicrosecondArray with PartitionGranularity::Daily
+        let micro_schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+        let micro_batch = RecordBatch::try_new(
+            Arc::clone(&micro_schema),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_700_000_000_000_000i64),
+                Some(1_700_000_001_000_000i64),
+            ]))],
+        )
+        .unwrap();
+        let parts =
+            partition_batch(&micro_batch, "timestamp", PartitionGranularity::Daily).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, "year=2023/month=11/day=14/");
+        assert_eq!(parts[0].1.num_rows(), 2);
+
+        // 2. Null timestamp in TimestampMicrosecondArray -> Err
+        let null_micro_batch = RecordBatch::try_new(
+            micro_schema,
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(1_700_000_000_000_000i64),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let null_err = partition_batch(&null_micro_batch, "timestamp", PartitionGranularity::Daily)
+            .unwrap_err();
+        assert!(null_err.to_string().contains("Null timestamp"));
+
+        // 3. Null timestamp in TimestampNanosecondArray -> Err
+        let nano_schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            true,
+        )]));
+        let null_nano_batch = RecordBatch::try_new(
+            nano_schema,
+            vec![Arc::new(TimestampNanosecondArray::from(vec![None]))],
+        )
+        .unwrap();
+        let null_nano_err =
+            partition_batch(&null_nano_batch, "timestamp", PartitionGranularity::Hourly)
+                .unwrap_err();
+        assert!(null_nano_err.to_string().contains("Null timestamp"));
+
+        // 4. Missing timestamp column -> Err
+        let missing_err =
+            partition_batch(&micro_batch, "missing_ts", PartitionGranularity::Daily).unwrap_err();
+        assert!(missing_err.to_string().contains("Missing missing_ts"));
+
+        // 5. Unsupported timestamp datatype -> Err
+        let bad_type_schema = Arc::new(Schema::new(vec![Field::new(
+            "timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        let bad_type_batch = RecordBatch::try_new(
+            bad_type_schema,
+            vec![Arc::new(Int64Array::from(vec![1_700_000_000i64]))],
+        )
+        .unwrap();
+        let bad_type_err =
+            partition_batch(&bad_type_batch, "timestamp", PartitionGranularity::Daily).unwrap_err();
+        assert!(
+            bad_type_err
+                .to_string()
+                .contains("Unexpected timestamp column datatype")
+        );
+    }
 }

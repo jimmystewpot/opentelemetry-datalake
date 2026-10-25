@@ -2081,4 +2081,84 @@ mod tests {
         .unwrap();
         drop(tx);
     }
+
+    #[test]
+    fn test_decode_frame_rejects_invalid_magic_version_signal_and_oversized_header() {
+        let batch = make_batch(&[1, 2, 3]);
+        let mut valid_buf = Vec::new();
+        let hdr = encode_frame(SignalKind::Logs, 1, &batch, &mut valid_buf).unwrap();
+
+        // 1. Partial 10-byte header EOF -> TornFrame
+        let mut torn_hdr_cursor = Cursor::new(&valid_buf[..10]);
+        assert!(matches!(
+            decode_frame(&mut torn_hdr_cursor, u32::MAX),
+            Err(FrameDecodeError::TornFrame)
+        ));
+
+        // 2. Bad magic -> InvalidHeader
+        let mut bad_magic = valid_buf.clone();
+        bad_magic[0..4].copy_from_slice(b"XXXX");
+        let mut cursor = Cursor::new(&bad_magic);
+        assert!(matches!(
+            decode_frame(&mut cursor, u32::MAX),
+            Err(FrameDecodeError::InvalidHeader { ref reason }) if reason.contains("magic")
+        ));
+
+        // 3. Bad version -> InvalidHeader
+        let mut bad_ver = valid_buf.clone();
+        bad_ver[4] = 99;
+        let mut cursor = Cursor::new(&bad_ver);
+        assert!(matches!(
+            decode_frame(&mut cursor, u32::MAX),
+            Err(FrameDecodeError::InvalidHeader { ref reason }) if reason.contains("version")
+        ));
+
+        // 4. Invalid signal byte -> InvalidHeader
+        let mut bad_sig = valid_buf.clone();
+        bad_sig[5] = 99;
+        let mut cursor = Cursor::new(&bad_sig);
+        assert!(matches!(
+            decode_frame(&mut cursor, u32::MAX),
+            Err(FrameDecodeError::InvalidHeader { ref reason }) if reason.contains("signal")
+        ));
+
+        // 5. payload_len > max_payload_len -> InvalidHeader
+        let mut cursor = Cursor::new(&valid_buf);
+        assert!(matches!(
+            decode_frame(&mut cursor, hdr.payload_len.saturating_sub(1)),
+            Err(FrameDecodeError::InvalidHeader { ref reason }) if reason.contains("payload_len")
+        ));
+
+        // 6. Valid CRC but invalid IPC payload -> IpcDecode
+        let mut bad_ipc = valid_buf.clone();
+        for b in &mut bad_ipc[FRAME_HEADER_LEN..] {
+            *b = 0xFF;
+        }
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&bad_ipc[4..24]);
+        hasher.update(&bad_ipc[FRAME_HEADER_LEN..]);
+        let crc = hasher.finalize();
+        bad_ipc[24..28].copy_from_slice(&crc.to_le_bytes());
+        let mut cursor = Cursor::new(&bad_ipc);
+        assert!(matches!(
+            decode_frame(&mut cursor, u32::MAX),
+            Err(FrameDecodeError::IpcDecode { .. })
+        ));
+
+        // 7. Segment recovery encountering InvalidHeader stops segment scan and increments corruption_drops
+        let tmp = TempDiskDir::new("invalid_hdr_recovery");
+        let seg_path = tmp.path.join("segment-00000000000000000001.bin");
+        std::fs::write(&seg_path, &bad_magic).unwrap();
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, buf) = SinkBuffer::new("test_inv_hdr", config).unwrap();
+        assert_eq!(buf.corruption_drops(), 1);
+        drop(tx);
+    }
 }

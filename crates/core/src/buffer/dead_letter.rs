@@ -669,4 +669,92 @@ mod tests {
         );
         assert_eq!(buf.dead_letter_drops(), 0);
     }
+
+    #[test]
+    fn test_dead_letter_store_path_validation_stale_tmp_cleanup_and_duplicate_stem() {
+        assert!(!is_safe_path_component(""));
+        assert!(!is_safe_path_component("../escape"));
+        assert!(!is_safe_path_component("a/b"));
+        assert!(!is_safe_path_component("a\\b"));
+        assert!(!is_safe_path_component("a\0b"));
+        assert!(!is_safe_path_component("."));
+        assert!(!is_safe_path_component(".."));
+        assert!(is_safe_path_component("valid_sink"));
+
+        let tmp_dir = TempDlqDir::new("path_tmp_dup");
+        let dlq_dir = tmp_dir.path.join("dlq_store");
+        let sink_subdir = dlq_dir.join("elasticsearch");
+        std::fs::create_dir_all(&sink_subdir).unwrap();
+
+        let root_tmp = dlq_dir.join(".tmp_stale_root");
+        let sub_tmp = sink_subdir.join(".tmp_stale_sub");
+        let root_existing = dlq_dir.join("root_existing.bin");
+        let sub_existing = sink_subdir.join("sub_existing.bin");
+        std::fs::write(&root_tmp, b"stale-root").unwrap();
+        std::fs::write(&sub_tmp, b"stale-sub").unwrap();
+        std::fs::write(&root_existing, b"12345").unwrap();
+        std::fs::write(&sub_existing, b"1234567").unwrap();
+
+        let store = DeadLetterStore::new(dlq_dir.clone(), 10 * 1024 * 1024).unwrap();
+        assert!(!root_tmp.exists(), "Root .tmp_ file must be cleaned up");
+        assert!(
+            !sub_tmp.exists(),
+            "Subdirectory .tmp_ file must be cleaned up"
+        );
+        assert_eq!(store.dir(), dlq_dir.as_path());
+        assert_eq!(store.max_bytes(), 10 * 1024 * 1024);
+        assert_eq!(store.current_bytes(), 12);
+
+        let batch = make_batch(&[1, 2, 3]);
+
+        // Reject unsafe meta.sink
+        let unsafe_meta = DeadLetterMetadata {
+            sink: "../escape".into(),
+            signal: SignalKind::Logs,
+            first_seq: 1,
+            last_seq: 2,
+            row_count: 3,
+            attempts: 1,
+            reason: "bad sink".into(),
+            timestamp_unix_ms: 1_700_000_000_000,
+        };
+        let err = store
+            .write_quarantine(&unsafe_meta, std::slice::from_ref(&batch))
+            .unwrap_err();
+        assert!(matches!(err, PipelineError::Storage(_)));
+
+        // Reject empty batches slice
+        let valid_meta = DeadLetterMetadata {
+            sink: "elasticsearch".into(),
+            signal: SignalKind::Logs,
+            first_seq: 10,
+            last_seq: 20,
+            row_count: 3,
+            attempts: 3,
+            reason: "mapper_parsing_exception".into(),
+            timestamp_unix_ms: 1_700_000_000_123,
+        };
+        let empty_err = store.write_quarantine(&valid_meta, &[]).unwrap_err();
+        assert!(matches!(empty_err, PipelineError::Storage(_)));
+
+        // Write twice with identical (signal, first_seq, last_seq, timestamp_unix_ms)
+        let first_path = store
+            .write_quarantine(&valid_meta, std::slice::from_ref(&batch))
+            .unwrap();
+        let second_path = store
+            .write_quarantine(&valid_meta, std::slice::from_ref(&batch))
+            .unwrap();
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        assert_ne!(first_path, second_path);
+        assert_eq!(
+            first_path.file_name().and_then(|n| n.to_str()),
+            Some("logs_10_20_1700000000123.arrow")
+        );
+        assert_eq!(
+            second_path.file_name().and_then(|n| n.to_str()),
+            Some("logs_10_20_1700000000123_2.arrow")
+        );
+        assert!(store.current_bytes() > 12);
+    }
 }

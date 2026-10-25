@@ -1134,4 +1134,94 @@ mod tests {
         assert_eq!((chunks[2].start_row, chunks[2].row_count), (6, 3));
         assert_eq!((chunks[3].start_row, chunks[3].row_count), (9, 1));
     }
+
+    #[test]
+    fn test_serialize_all_numeric_timestamp_and_multiline_json_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            Field::new(
+                "ts_milli",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_micro",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("i8_col", DataType::Int8, false),
+            Field::new("i16_col", DataType::Int16, false),
+            Field::new("u8_col", DataType::UInt8, false),
+            Field::new("u16_col", DataType::UInt16, false),
+            Field::new("u32_col", DataType::UInt32, false),
+            Field::new("u64_col", DataType::UInt64, false),
+            Field::new("f32_col", DataType::Float32, false),
+            Field::new("f64_col", DataType::Float64, false),
+            Field::new("large_str", DataType::LargeUtf8, false),
+            Field::new("attributes", DataType::Utf8, false),
+            Field::new("resource_attributes", DataType::LargeUtf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![
+                    1_726_500_000i64,
+                    1_726_500_001i64,
+                ])),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    1_726_500_000_000i64,
+                    1_726_500_001_000i64,
+                ])),
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_726_500_000_000_000i64,
+                    1_726_500_001_000_000i64,
+                ])),
+                Arc::new(Int8Array::from(vec![-7, 7])),
+                Arc::new(Int16Array::from(vec![-17, 17])),
+                Arc::new(UInt8Array::from(vec![9, 10])),
+                Arc::new(UInt16Array::from(vec![19, 20])),
+                Arc::new(UInt32Array::from(vec![29, 30])),
+                Arc::new(UInt64Array::from(vec![39, 40])),
+                Arc::new(Float32Array::from(vec![3.25, f32::NAN])),
+                Arc::new(Float64Array::from(vec![6.5, f64::INFINITY])),
+                Arc::new(LargeStringArray::from(vec!["large-0", "large-1"])),
+                Arc::new(StringArray::from(vec!["{\n  \"k\": 1\n}", "{\nnot_json"])),
+                Arc::new(LargeStringArray::from(vec![
+                    "[\n  1,\n  2\n]",
+                    "[\nnot_json_array",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let chunks = serialize_batch_chunks_with_ranges(&batch, true, 10_485_760).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_row, 0);
+        assert_eq!(chunks[0].row_count, 2);
+
+        let text = std::str::from_utf8(&chunks[0].payload).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].contains(r#""i8_col":-7"#));
+        assert!(lines[1].contains(r#""i16_col":-17"#));
+        assert!(lines[1].contains(r#""u8_col":9"#));
+        assert!(lines[1].contains(r#""u16_col":19"#));
+        assert!(lines[1].contains(r#""u32_col":29"#));
+        assert!(lines[1].contains(r#""u64_col":39"#));
+        assert!(lines[1].contains(r#""f32_col":3.25"#));
+        assert!(lines[1].contains(r#""f64_col":6.5"#));
+        assert!(lines[1].contains(r#""large_str":"large-0""#));
+        assert!(lines[1].contains(r#""attributes":{"k":1}"#));
+        assert!(lines[1].contains(r#""resource_attributes":[1,2]"#));
+
+        assert!(lines[3].contains(r#""f32_col":null"#));
+        assert!(lines[3].contains(r#""f64_col":null"#));
+        assert!(lines[3].contains(r#""attributes":"{\nnot_json""#));
+        assert!(lines[3].contains(r#""resource_attributes":"[\nnot_json_array""#));
+    }
 }
