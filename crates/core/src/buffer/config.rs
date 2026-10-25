@@ -311,6 +311,18 @@ impl BufferConfig {
         self.max_buffer_bytes / 3
     }
 
+    /// Returns the maximum allowed on-disk `OTLB` frame IPC payload size in bytes (`2 * segment_size_bytes`,
+    /// capped at `u32::MAX`).
+    #[must_use]
+    pub const fn max_disk_frame_payload_bytes(&self) -> u32 {
+        let doubled = self.segment_size_bytes.saturating_mul(2);
+        if doubled > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            doubled as u32
+        }
+    }
+
     /// Returns the effective drain timeout policy, defaulting to `Discard` for memory mode
     /// and `Persist` for disk mode.
     #[must_use]

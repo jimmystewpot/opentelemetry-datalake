@@ -839,6 +839,73 @@ impl StarRocksSink {
         }
     }
 
+    fn is_load_state_committed(state: Option<&str>, existing_job_status: Option<&str>) -> bool {
+        let matches_committed = |val: &str| {
+            let trimmed = val.trim();
+            trimmed.eq_ignore_ascii_case("VISIBLE")
+                || trimmed.eq_ignore_ascii_case("COMMITTED")
+                || trimmed.eq_ignore_ascii_case("FINISHED")
+        };
+        state.is_some_and(matches_committed) || existing_job_status.is_some_and(matches_committed)
+    }
+
+    async fn confirm_v2_label_committed(
+        manager: &StreamLoadManager,
+        table: &str,
+        label: &str,
+    ) -> Result<(), StreamLoadError> {
+        match manager.get_load_status(label).await {
+            Ok(status_resp)
+                if (status_resp.status.trim().eq_ignore_ascii_case("Success")
+                    || status_resp.status.trim().eq_ignore_ascii_case("OK"))
+                    && Self::is_load_state_committed(
+                        status_resp.state.as_deref(),
+                        status_resp.existing_job_status.as_deref(),
+                    ) =>
+            {
+                info!(
+                    label = label,
+                    table = table,
+                    state = ?status_resp.state,
+                    existing_job_status = ?status_resp.existing_job_status,
+                    "StarRocks V2 confirmed existing label is committed; treating as idempotent success"
+                );
+                Ok(())
+            }
+            Ok(status_resp) => {
+                warn!(
+                    label = label,
+                    table = table,
+                    status = %status_resp.status,
+                    state = ?status_resp.state,
+                    existing_job_status = ?status_resp.existing_job_status,
+                    "StarRocks V2 existing label is not committed; attempting rollback before retry"
+                );
+                if let Err(rb_err) = manager.rollback_transaction(label).await {
+                    warn!(
+                        label = label,
+                        table = table,
+                        error = %rb_err,
+                        "StarRocks V2 rollback of uncommitted existing label failed"
+                    );
+                }
+                Err(StreamLoadError::Transaction(format!(
+                    "StarRocks V2 label '{label}' already exists in uncommitted state (status='{}', state={:?}, existing_job_status={:?})",
+                    status_resp.status, status_resp.state, status_resp.existing_job_status
+                )))
+            }
+            Err(status_err) => {
+                warn!(
+                    label = label,
+                    table = table,
+                    error = %status_err,
+                    "StarRocks V2 failed to query load status for existing label; retaining lease for retry"
+                );
+                Err(status_err)
+            }
+        }
+    }
+
     /// Processes one batch via the V2 (exactly-once, 2PC) path.
     ///
     /// Steps: `begin` → `load` → `prepare` → `commit`.
@@ -854,12 +921,7 @@ impl StarRocksSink {
         let txn_id = match manager.begin_transaction(label).await {
             Ok(id) => id,
             Err(e) if is_label_already_exists(&e) => {
-                info!(
-                    label = label,
-                    table = table,
-                    "StarRocks V2 begin_transaction returned Label Already Exists; treating as idempotent success"
-                );
-                return Ok(());
+                return Self::confirm_v2_label_committed(manager, table, label).await;
             }
             Err(e) => {
                 error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
@@ -895,13 +957,7 @@ impl StarRocksSink {
         let commit_response = match manager.commit_transaction(label).await {
             Ok(resp) => resp,
             Err(e) if is_label_already_exists(&e) => {
-                info!(
-                    label = label,
-                    txn_id = txn_id,
-                    table = table,
-                    "StarRocks V2 commit_transaction returned Label Already Exists; treating as idempotent success"
-                );
-                return Ok(());
+                return Self::confirm_v2_label_committed(manager, table, label).await;
             }
             Err(e) => {
                 error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
@@ -2514,5 +2570,87 @@ mod tests {
         assert!(manifest.reason.contains("max_payload_bytes"));
 
         let _ = std::fs::remove_dir_all(&dlq_dir);
+    }
+
+    #[tokio::test]
+    async fn test_starrocks_v2_label_already_exists_confirms_load_status_before_acking() {
+        use pipeline_core::buffer::BufferConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+        let status_queries = std::sync::Arc::new(AtomicUsize::new(0));
+        let status_queries_clone = std::sync::Arc::clone(&status_queries);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = move |_method: &str, path: &str| {
+                if path == "/api/transaction/begin" {
+                    (
+                        200,
+                        r#"{"Status":"Label Already Exists","Message":"Label already exists, state: PREPARE"}"#,
+                    )
+                } else if path.starts_with("/api/otel/get_load_state?label=") {
+                    let q = status_queries_clone.fetch_add(1, Ordering::SeqCst);
+                    if q == 0 {
+                        // First status check: transaction is still uncommitted (PREPARE)
+                        (200, r#"{"Status":"Success","State":"PREPARE"}"#)
+                    } else {
+                        // Second status check: transaction is confirmed committed (VISIBLE)
+                        (200, r#"{"Status":"Success","State":"VISIBLE"}"#)
+                    }
+                } else if path == "/api/transaction/rollback" {
+                    (200, r#"{"Status":"OK"}"#)
+                } else {
+                    (500, r#"{"Status":"Fail","Message":"Unexpected endpoint"}"#)
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V2;
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            initial_backoff_ms: 10,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let expected_label = format!("dl_otel_logs_{:016x}_logs_1_1", rx.instance_id());
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        sink_handle.await.unwrap().unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert_eq!(
+            reqs.len(),
+            5,
+            "Expected begin -> get_load_state(PREPARE) -> rollback -> begin -> get_load_state(VISIBLE), got: {:?}",
+            reqs.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert_eq!(reqs[0].path, "/api/transaction/begin");
+        assert_eq!(
+            reqs[1].path,
+            format!("/api/otel/get_load_state?label={expected_label}")
+        );
+        assert_eq!(reqs[2].path, "/api/transaction/rollback");
+        assert_eq!(reqs[3].path, "/api/transaction/begin");
+        assert_eq!(
+            reqs[4].path,
+            format!("/api/otel/get_load_state?label={expected_label}")
+        );
     }
 }

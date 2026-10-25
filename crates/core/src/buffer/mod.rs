@@ -689,6 +689,47 @@ impl BufferSender {
         };
 
         let batch_bytes = record_batch.get_array_memory_size();
+        if self.inner.disk.is_some() {
+            let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
+            if batch_bytes.saturating_add(65_536) >= max_payload_len as usize {
+                let chunks = if batch_bytes >= 65_536 {
+                    tokio::task::spawn_blocking(move || {
+                        crate::buffer::disk::split_batch_for_disk_limit(
+                            signal,
+                            record_batch,
+                            max_payload_len,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        PipelineError::Internal(format!("disk frame split join error: {e}"))
+                    })??
+                } else {
+                    crate::buffer::disk::split_batch_for_disk_limit(
+                        signal,
+                        record_batch,
+                        max_payload_len,
+                    )?
+                };
+
+                for (sub_batch, encoded_bytes) in chunks {
+                    self.send_single_batch(signal, sub_batch, encoded_bytes)
+                        .await?;
+                }
+                return Ok(());
+            }
+        }
+
+        self.send_single_batch(signal, record_batch, batch_bytes)
+            .await
+    }
+
+    async fn send_single_batch(
+        &self,
+        signal: SignalKind,
+        record_batch: arrow::record_batch::RecordBatch,
+        batch_bytes: usize,
+    ) -> Result<(), PipelineError> {
         let batch_rows = record_batch.num_rows();
         let budget = self.inner.config.per_signal_budget();
         let ring_state = &self.inner.rings[signal.as_u8() as usize];

@@ -141,6 +141,51 @@ pub fn encode_frame(
     })
 }
 
+/// Splits `batch` by row bisection so every resulting sub-batch encodes to an `OTLB` frame
+/// whose `payload_len <= max_payload_len`. Returns `(sub_batch, encoded_frame_bytes)` pairs,
+/// or `Err(PipelineError::Storage)` if an unsplittable (`<= 1` row) batch exceeds `max_payload_len`.
+pub(crate) fn split_batch_for_disk_limit(
+    signal: SignalKind,
+    batch: RecordBatch,
+    max_payload_len: u32,
+) -> Result<Vec<(RecordBatch, usize)>, PipelineError> {
+    let mut scratch = Vec::with_capacity(batch.get_array_memory_size().min(64 * 1024));
+    let mut out = Vec::with_capacity(1);
+    split_batch_recursive(signal, batch, max_payload_len, &mut scratch, &mut out)?;
+    Ok(out)
+}
+
+fn split_batch_recursive(
+    signal: SignalKind,
+    batch: RecordBatch,
+    max_payload_len: u32,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<(RecordBatch, usize)>,
+) -> Result<(), PipelineError> {
+    scratch.clear();
+    let header = encode_frame(signal, 1, &batch, scratch)?;
+    if header.payload_len <= max_payload_len {
+        let frame_bytes = FRAME_HEADER_LEN.saturating_add(header.payload_len as usize);
+        out.push((batch, frame_bytes));
+        return Ok(());
+    }
+
+    let rows = batch.num_rows();
+    if rows <= 1 {
+        return Err(storage_err(format!(
+            "single-row RecordBatch encoded OTLB payload ({} bytes) exceeds max_payload_len ({max_payload_len} bytes)",
+            header.payload_len
+        )));
+    }
+
+    let mid = rows / 2;
+    let left = batch.slice(0, mid);
+    let right = batch.slice(mid, rows - mid);
+    split_batch_recursive(signal, left, max_payload_len, scratch, out)?;
+    split_batch_recursive(signal, right, max_payload_len, scratch, out)?;
+    Ok(())
+}
+
 /// Decodes the next 28-byte `OTLB` frame and Arrow IPC `RecordBatch` from `reader`,
 /// returning `Ok(None)` on clean EOF at a frame boundary.
 pub fn decode_frame<R: Read>(
@@ -300,6 +345,17 @@ impl DiskWatermark {
                 .committed_seq
                 .load(Ordering::Acquire),
         }
+    }
+
+    /// Monotonically merges `incoming` into `self` so out-of-order concurrent snapshots
+    /// never regress any signal's committed watermark.
+    pub(crate) fn merge_monotonic(&mut self, incoming: Self) {
+        if self.instance_id == 0 && incoming.instance_id != 0 {
+            self.instance_id = incoming.instance_id;
+        }
+        self.logs = self.logs.max(incoming.logs);
+        self.metrics = self.metrics.max(incoming.metrics);
+        self.traces = self.traces.max(incoming.traces);
     }
 }
 
@@ -520,6 +576,7 @@ impl DiskBackend {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WriterCommand>();
         let writer_dir = dir.clone();
         let segment_size_bytes = config.segment_size_bytes;
+        let max_payload_len = config.max_disk_frame_payload_bytes();
         let sync_on_write = config.sync_on_write;
         let next_segment_id = max_segment_id.saturating_add(1);
 
@@ -530,6 +587,7 @@ impl DiskBackend {
                     &writer_dir,
                     &cmd_rx,
                     segment_size_bytes,
+                    max_payload_len,
                     sync_on_write,
                     next_segment_id,
                     sealed_segments,
@@ -643,8 +701,7 @@ impl DiskBackend {
         }
         segments.sort_by_key(|(segment_num, _)| *segment_num);
 
-        let max_payload_len =
-            u32::try_from(config.segment_size_bytes.saturating_mul(2)).unwrap_or(u32::MAX);
+        let max_payload_len = config.max_disk_frame_payload_bytes();
         let mut max_segment_id = 0u64;
         let mut sealed_segments = Vec::new();
 
@@ -954,10 +1011,12 @@ impl DiskBackend {
         res.map_err(storage_err)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn writer_loop(
         dir: &Path,
         cmd_rx: &std::sync::mpsc::Receiver<WriterCommand>,
         segment_size_bytes: u64,
+        max_payload_len: u32,
         sync_on_write: bool,
         mut next_segment_id: u64,
         mut sealed_segments: Vec<SealedSegmentMeta>,
@@ -996,6 +1055,7 @@ impl DiskBackend {
                             &mut sealed_segments,
                             &mut next_segment_id,
                             segment_size_bytes,
+                            max_payload_len,
                             current_watermark,
                             signal,
                             seq_id,
@@ -1005,14 +1065,14 @@ impl DiskBackend {
                         append_replies.push((reply, res));
                     }
                     WriterCommand::UpdateWatermark { watermark, reply } => {
-                        current_watermark = watermark;
+                        current_watermark.merge_monotonic(watermark);
                         watermark_dirty = true;
                         if let Some(r) = reply {
                             wm_oneshot_replies.push(r);
                         }
                     }
                     WriterCommand::FlushWatermarkSync { watermark, reply } => {
-                        current_watermark = watermark;
+                        current_watermark.merge_monotonic(watermark);
                         watermark_dirty = true;
                         force_sync_segment = true;
                         wm_blocking_replies.push(reply);
@@ -1075,13 +1135,20 @@ impl DiskBackend {
         sealed_segments: &mut Vec<SealedSegmentMeta>,
         next_segment_id: &mut u64,
         segment_size_bytes: u64,
+        max_payload_len: u32,
         current_watermark: DiskWatermark,
         signal: SignalKind,
         seq_id: u64,
         batch: &RecordBatch,
         encode_buf: &mut Vec<u8>,
     ) -> Result<WrittenFrame, String> {
-        encode_frame(signal, seq_id, batch, encode_buf).map_err(|e| e.to_string())?;
+        let header = encode_frame(signal, seq_id, batch, encode_buf).map_err(|e| e.to_string())?;
+        if header.payload_len > max_payload_len {
+            return Err(format!(
+                "OTLB frame payload_len ({}) exceeds max_payload_len ({max_payload_len})",
+                header.payload_len
+            ));
+        }
         let frame_len_u64 = encode_buf.len() as u64;
         let frame_len_u32 =
             u32::try_from(encode_buf.len()).map_err(|_| "frame length overflow".to_string())?;
@@ -1668,5 +1735,156 @@ mod tests {
             assert_eq!(replayed_lease.id().last_seq, 1);
             replayed_lease.ack().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_disk_watermark_merges_out_of_order_signal_snapshots_monotonically() {
+        let tmp = TempDiskDir::new("monotonic_watermark_merge");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        let (tx, buf) = SinkBuffer::new("test_mono_wm", config).unwrap();
+        let inst_id = buf.instance_id();
+        let disk = buf.inner.disk.as_ref().unwrap();
+
+        // Snapshot 1 arrives first with metrics=10, traces=3, logs=5
+        disk.update_watermark(DiskWatermark {
+            instance_id: inst_id,
+            logs: 5,
+            metrics: 10,
+            traces: 3,
+        })
+        .await
+        .unwrap();
+
+        // Snapshot 2 was captured earlier for metrics/traces (metrics=8, traces=2) while logs advanced to 6,
+        // and arrives at the writer thread after Snapshot 1.
+        disk.update_watermark(DiskWatermark {
+            instance_id: inst_id,
+            logs: 6,
+            metrics: 8,
+            traces: 2,
+        })
+        .await
+        .unwrap();
+
+        let persisted_bytes = std::fs::read(tmp.path.join("watermark.json")).unwrap();
+        let persisted: DiskWatermark = serde_json::from_slice(&persisted_bytes).unwrap();
+        assert_eq!(persisted.instance_id, inst_id);
+        assert_eq!(persisted.logs, 6);
+        assert_eq!(
+            persisted.metrics, 10,
+            "Out-of-order watermark snapshot must not regress metrics watermark from 10 to 8"
+        );
+        assert_eq!(
+            persisted.traces, 3,
+            "Out-of-order watermark snapshot must not regress traces watermark from 3 to 2"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn test_disk_buffer_splits_oversized_multirow_batch_and_recovers_cleanly() {
+        let tmp = TempDiskDir::new("oversized_multirow_split");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            segment_size_bytes: 4_096,
+            max_batch_size_bytes: 2_048,
+            max_buffer_bytes: 65_536,
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        // 2,048 i64 values = 16,384 bytes (> 2 * segment_size_bytes = 8,192 bytes)
+        let values: Vec<i64> = (0..2_048).collect();
+        let oversized_batch = make_batch(&values);
+        assert!(oversized_batch.get_array_memory_size() > (config.segment_size_bytes as usize) * 2);
+
+        {
+            let (tx, _buf) = SinkBuffer::new("test_oversized_split", config.clone()).unwrap();
+            tx.send(SignalBatch::Logs(oversized_batch)).await.unwrap();
+        }
+
+        // Reopen from disk to verify startup recovery AND Lease::prepare both succeed on all split frames
+        {
+            let (tx, mut reopened) = SinkBuffer::new("test_oversized_split", config).unwrap();
+            drop(tx);
+            assert_eq!(
+                reopened.corruption_drops(),
+                0,
+                "Recovery must not drop any frame from a split oversized batch"
+            );
+
+            let mut recovered_values = Vec::new();
+            while let Some(lease) = reopened.next_lease().await.unwrap() {
+                let batch = lease.prepare(Ok).await.unwrap();
+                let col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                for i in 0..col.len() {
+                    recovered_values.push(col.value(i));
+                }
+                lease.ack().await.unwrap();
+            }
+            assert_eq!(recovered_values, values);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_disk_buffer_rejects_unsplittable_single_row_batch_exceeding_max_payload() {
+        use arrow::array::StringArray;
+
+        let tmp = TempDiskDir::new("oversized_single_row_reject");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            segment_size_bytes: 1_024,
+            max_batch_size_bytes: 512,
+            max_buffer_bytes: 16_384,
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        let (tx, mut buf) = SinkBuffer::new("test_single_row_reject", config).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("msg", DataType::Utf8, false)]));
+        let huge_str = "x".repeat(4_096);
+        let single_row_oversized = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![huge_str.as_str()]))],
+        )
+        .unwrap();
+
+        let err = tx
+            .send(SignalBatch::Logs(single_row_oversized))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Storage(_)),
+            "Expected Storage error for unsplittable single-row batch > 2 * segment_size_bytes, got: {err:?}"
+        );
+
+        // Buffer must remain usable for subsequent valid batches
+        tx.send(SignalBatch::Logs(make_batch(&[7, 8, 9])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        let batch = lease.prepare(Ok).await.unwrap();
+        assert_eq!(batch, make_batch(&[7, 8, 9]));
+        lease.ack().await.unwrap();
     }
 }

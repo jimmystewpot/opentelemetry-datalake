@@ -109,8 +109,7 @@ impl Lease {
         }
         let payloads = self.payloads.clone();
         let disk_path = self.inner.config.disk_path.clone();
-        let max_payload_len = u32::try_from(self.inner.config.segment_size_bytes.saturating_mul(2))
-            .unwrap_or(u32::MAX);
+        let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
         tokio::task::spawn_blocking(move || {
             let mut decoded = Vec::with_capacity(payloads.len());
             for payload in payloads {
@@ -279,9 +278,7 @@ impl Lease {
         if let Some(ref dlq) = self.inner.dead_letter {
             let dlq = Arc::clone(dlq);
             let disk_path = self.inner.config.disk_path.clone();
-            let max_payload_len =
-                u32::try_from(self.inner.config.segment_size_bytes.saturating_mul(2))
-                    .unwrap_or(u32::MAX);
+            let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
             let dlq_meta = DeadLetterMetadata {
                 sink: self.inner.sink_name.clone(),
                 signal,
