@@ -50,7 +50,7 @@ pub type StreamLoadError = starrocks_stream_load::Error;
 const MAX_STREAM_LOAD_LABEL_LEN: usize = 128;
 
 /// Formats a deterministic `StarRocks` Stream Load transaction label from a table name
-/// and [`LeaseId`] (`dl_{table}_{signal}_{first_seq}_{last_seq}`).
+/// and [`LeaseId`] (`dl_{table}_{instance_id:016x}_{signal}_{first_seq}_{last_seq}`).
 ///
 /// If the formatted label exceeds `StarRocks`'s 128-character limit or `table` contains
 /// characters outside `[A-Za-z0-9_-]`, the table segment is sanitized and truncated with
@@ -58,7 +58,13 @@ const MAX_STREAM_LOAD_LABEL_LEN: usize = 128;
 /// and collision-resistant within `<= 128` ASCII characters.
 #[must_use]
 pub fn format_lease_label(table: &str, id: LeaseId) -> String {
-    let suffix = format!("_{}_{}_{}", id.signal.as_str(), id.first_seq, id.last_seq);
+    let suffix = format!(
+        "_{:016x}_{}_{}_{}",
+        id.instance_id,
+        id.signal.as_str(),
+        id.first_seq,
+        id.last_seq
+    );
     let sanitized_table: String = table
         .chars()
         .map(|c| {
@@ -1268,6 +1274,7 @@ mod tests {
         let a = format_lease_label(
             "otel_traces",
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Traces,
                 first_seq: 1,
                 last_seq: 1,
@@ -1276,6 +1283,7 @@ mod tests {
         let b = format_lease_label(
             "otel_traces",
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Traces,
                 first_seq: 2,
                 last_seq: 2,
@@ -1283,8 +1291,8 @@ mod tests {
         );
         assert_ne!(a, b, "Labels must be distinct across lease sequence ranges");
         assert!(
-            a.starts_with("dl_otel_traces_traces_"),
-            "Label must include table and signal type prefix"
+            a.starts_with("dl_otel_traces_0123456789abcdef_traces_"),
+            "Label must include table, instance_id, and signal type prefix"
         );
     }
 
@@ -1430,6 +1438,7 @@ mod tests {
         let logs_label = format_lease_label(
             "otel_logs",
             LeaseId {
+                instance_id: 0x0000_0000_0000_0001,
                 signal: SignalKind::Logs,
                 first_seq: 1,
                 last_seq: 1,
@@ -1438,6 +1447,7 @@ mod tests {
         let metrics_label = format_lease_label(
             "otel_metrics",
             LeaseId {
+                instance_id: 0x0000_0000_0000_0001,
                 signal: SignalKind::Metrics,
                 first_seq: 1,
                 last_seq: 1,
@@ -1446,15 +1456,16 @@ mod tests {
         let traces_label = format_lease_label(
             "otel_traces",
             LeaseId {
+                instance_id: 0x0000_0000_0000_0001,
                 signal: SignalKind::Traces,
                 first_seq: 1,
                 last_seq: 1,
             },
         );
 
-        assert!(logs_label.starts_with("dl_otel_logs_logs_"));
-        assert!(metrics_label.starts_with("dl_otel_metrics_metrics_"));
-        assert!(traces_label.starts_with("dl_otel_traces_traces_"));
+        assert!(logs_label.starts_with("dl_otel_logs_0000000000000001_logs_"));
+        assert!(metrics_label.starts_with("dl_otel_metrics_0000000000000001_metrics_"));
+        assert!(traces_label.starts_with("dl_otel_traces_0000000000000001_traces_"));
 
         // All labels must be unique
         assert_ne!(logs_label, metrics_label);
@@ -1779,6 +1790,7 @@ mod tests {
         let buf_cfg = config.resolved_buffer_config().unwrap();
         let mut sink = StarRocksSink::try_new(config).unwrap();
         let (sender, receiver) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let expected_label = format!("dl_otel_logs_{:016x}_logs_1_2", receiver.instance_id());
 
         // Enqueue two 3-row batches (total 6 rows <= max_batch_records = 6) before the sink drains
         sender.send(SignalBatch::Logs(make_batch())).await.unwrap();
@@ -1793,8 +1805,8 @@ mod tests {
         assert_eq!(reqs.len(), 1, "Expected a single coalesced flush");
         assert_eq!(
             reqs[0].headers.get("label").map(String::as_str),
-            Some("dl_otel_logs_logs_1_2"),
-            "Coalesced lease must carry sequence range 1..=2"
+            Some(expected_label.as_str()),
+            "Coalesced lease must carry sequence range 1..=2 and instance_id"
         );
     }
 
@@ -2186,16 +2198,28 @@ mod tests {
         use pipeline_core::buffer::{LeaseId, SignalKind};
 
         let id = LeaseId {
+            instance_id: 0xfeed_face_cafe_beef,
             signal: SignalKind::Logs,
             first_seq: 10,
             last_seq: 25,
         };
         let label1 = format_lease_label("otel_logs", id);
         let label2 = format_lease_label("otel_logs", id);
-        assert_eq!(label1, "dl_otel_logs_logs_10_25");
+        assert_eq!(label1, "dl_otel_logs_feedfacecafebeef_logs_10_25");
         assert_eq!(label1, label2);
         assert!(label1.len() <= 128);
         assert!(label1.is_ascii());
+
+        // Distinct buffer instance_ids with identical sequence range must produce distinct labels
+        let other_instance_id = LeaseId {
+            instance_id: 0x1111_2222_3333_4444,
+            ..id
+        };
+        let other_label = format_lease_label("otel_logs", other_instance_id);
+        assert_ne!(
+            label1, other_label,
+            "Restarted memory buffers or distinct replicas must not collide on StarRocks labels"
+        );
     }
 
     #[test]
@@ -2203,6 +2227,7 @@ mod tests {
         use pipeline_core::buffer::{LeaseId, SignalKind};
 
         let id = LeaseId {
+            instance_id: 0x0102_0304_0506_0708,
             signal: SignalKind::Traces,
             first_seq: 100,
             last_seq: 200,
@@ -2225,7 +2250,7 @@ mod tests {
             label_a1.len()
         );
         assert!(label_a1.starts_with("dl_"));
-        assert!(label_a1.ends_with("_traces_100_200"));
+        assert!(label_a1.ends_with("_0102030405060708_traces_100_200"));
         assert!(
             label_a1
                 .chars()
@@ -2273,6 +2298,7 @@ mod tests {
 
         let buf_cfg = config.resolved_buffer_config().unwrap();
         let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let expected_label = format!("dl_otel_logs_{:016x}_logs_1_1", rx.instance_id());
         let ctrl = rx.controller();
         let mut sink = StarRocksSink::try_new(config).unwrap();
 
@@ -2288,11 +2314,11 @@ mod tests {
         assert_eq!(reqs.len(), 2, "Expected 2 attempts (503 then 200)");
         assert_eq!(
             reqs[0].headers.get("label").map(String::as_str),
-            Some("dl_otel_logs_logs_1_1")
+            Some(expected_label.as_str())
         );
         assert_eq!(
             reqs[1].headers.get("label").map(String::as_str),
-            Some("dl_otel_logs_logs_1_1"),
+            Some(expected_label.as_str()),
             "Retry must reuse the exact deterministic lease label"
         );
         assert!(ctrl.is_ready());
@@ -2343,6 +2369,7 @@ mod tests {
 
         let buf_cfg = config.resolved_buffer_config().unwrap();
         let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let expected_label = format!("dl_otel_logs_{:016x}_logs_1_1", rx.instance_id());
         let mut sink = StarRocksSink::try_new(config).unwrap();
 
         let sink_handle = tokio::spawn(async move { sink.run(rx).await });
@@ -2357,11 +2384,11 @@ mod tests {
         assert_eq!(reqs.len(), 2);
         assert_eq!(
             reqs[0].headers.get("label").map(String::as_str),
-            Some("dl_otel_logs_logs_1_1")
+            Some(expected_label.as_str())
         );
         assert_eq!(
             reqs[1].headers.get("label").map(String::as_str),
-            Some("dl_otel_logs_logs_1_1")
+            Some(expected_label.as_str())
         );
     }
 

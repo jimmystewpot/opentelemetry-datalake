@@ -262,6 +262,9 @@ pub fn decode_frame<R: Read>(
 /// Persisted contiguous low-watermark sequence numbers across all three signals.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskWatermark {
+    /// Durable 64-bit buffer instance identifier persisted across crash recovery.
+    #[serde(default)]
+    pub instance_id: u64,
     /// Highest contiguous acknowledged sequence number for `Logs`.
     #[serde(default)]
     pub logs: u64,
@@ -284,8 +287,9 @@ impl DiskWatermark {
     }
 
     #[must_use]
-    pub(crate) fn from_rings(rings: &[SignalRingState; 3]) -> Self {
+    pub(crate) fn from_rings(instance_id: u64, rings: &[SignalRingState; 3]) -> Self {
         Self {
+            instance_id,
             logs: rings[SignalKind::Logs.as_u8() as usize]
                 .committed_seq
                 .load(Ordering::Acquire),
@@ -468,6 +472,7 @@ pub(crate) fn read_frame_at(
 /// `NVMe` segmented disk backend managing the advisory lock, startup recovery, and group-commit writer thread.
 pub(crate) struct DiskBackend {
     dir: PathBuf,
+    instance_id: u64,
     cmd_tx: Mutex<Option<std::sync::mpsc::Sender<WriterCommand>>>,
     writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     _lock_file: File,
@@ -477,11 +482,17 @@ impl std::fmt::Debug for DiskBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiskBackend")
             .field("dir", &self.dir)
+            .field("instance_id", &self.instance_id)
             .finish_non_exhaustive()
     }
 }
 
 impl DiskBackend {
+    #[must_use]
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     pub(crate) fn open_and_recover(
         sink_name: &str,
         config: &BufferConfig,
@@ -502,6 +513,7 @@ impl DiskBackend {
 
         let lock_file = Self::acquire_advisory_lock(&dir)?;
         let watermark = Self::load_initial_watermark(&dir, rings)?;
+        let instance_id = watermark.instance_id;
         let (max_segment_id, sealed_segments) =
             Self::recover_segments(sink_name, &dir, config, watermark, rings)?;
 
@@ -532,6 +544,7 @@ impl DiskBackend {
 
         Ok(Self {
             dir,
+            instance_id,
             cmd_tx: Mutex::new(Some(cmd_tx)),
             writer_handle: Mutex::new(Some(writer_handle)),
             _lock_file: lock_file,
@@ -572,7 +585,7 @@ impl DiskBackend {
         }
 
         let watermark_path = dir.join("watermark.json");
-        let watermark = if watermark_path.exists() {
+        let mut watermark = if watermark_path.exists() {
             let bytes = std::fs::read(&watermark_path).map_err(|e| {
                 storage_err(format!(
                     "failed to read '{}': {e}",
@@ -588,6 +601,11 @@ impl DiskBackend {
         } else {
             DiskWatermark::default()
         };
+
+        if watermark.instance_id == 0 {
+            watermark.instance_id = crate::buffer::generate_instance_id();
+            write_watermark_atomic(dir, watermark).map_err(storage_err)?;
+        }
 
         for sig in [SignalKind::Logs, SignalKind::Metrics, SignalKind::Traces] {
             let wm_val = watermark.for_signal(sig);
@@ -1609,5 +1627,46 @@ mod tests {
 
         assert!(!seg1.exists());
         assert!(seg2.exists());
+    }
+
+    #[tokio::test]
+    async fn test_disk_buffer_persists_instance_id_across_crash_recovery_even_before_first_ack() {
+        let tmp = TempDiskDir::new("instance_id_recovery");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        let first_instance_id = {
+            let (tx, mut buf) = SinkBuffer::new("test_inst_id", config.clone()).unwrap();
+            let inst_id = buf.instance_id();
+            assert_ne!(inst_id, 0);
+            tx.send(SignalBatch::Logs(make_batch(&[42, 43])))
+                .await
+                .unwrap();
+
+            let lease = buf.next_lease().await.unwrap().unwrap();
+            assert_eq!(lease.id().instance_id, inst_id);
+            assert_eq!(lease.id().first_seq, 1);
+            // Drop lease and buffer without calling ack() -> simulates process crash during in-flight commit
+            inst_id
+        };
+
+        // Reopen on the same disk_path: must recover the exact same instance_id and sequence number
+        {
+            let (tx, mut reopened) = SinkBuffer::new("test_inst_id", config).unwrap();
+            drop(tx);
+            assert_eq!(reopened.instance_id(), first_instance_id);
+
+            let replayed_lease = reopened.next_lease().await.unwrap().unwrap();
+            assert_eq!(replayed_lease.id().instance_id, first_instance_id);
+            assert_eq!(replayed_lease.id().first_seq, 1);
+            assert_eq!(replayed_lease.id().last_seq, 1);
+            replayed_lease.ack().await.unwrap();
+        }
     }
 }

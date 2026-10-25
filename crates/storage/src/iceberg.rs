@@ -48,30 +48,54 @@ pub const fn lease_snapshot_property_key(signal: SignalKind) -> &'static str {
     snapshot_property_key(signal)
 }
 
-/// Formats a [`LeaseId`] sequence range into a snapshot delivery token (`"{first_seq}:{last_seq}"`).
+/// Returns the instance-scoped Iceberg snapshot summary property key
+/// (`"datalake.lease.<signal>.<instance_id:016x>"`).
+#[must_use]
+pub fn instance_snapshot_property_key(signal: SignalKind, instance_id: u64) -> String {
+    format!("{}.{:016x}", snapshot_property_key(signal), instance_id)
+}
+
+/// Formats a [`LeaseId`] into a snapshot delivery token (`"{instance_id:016x}:{first_seq}:{last_seq}"`).
 #[must_use]
 pub fn format_lease_token(id: LeaseId) -> String {
-    format!("{}:{}", id.first_seq, id.last_seq)
+    format!("{:016x}:{}:{}", id.instance_id, id.first_seq, id.last_seq)
 }
 
-/// Formats a [`LeaseId`] sequence range (`"{first_seq}-{last_seq}"`).
+/// Formats a [`LeaseId`] sequence range (`"{instance_id:016x}:{first_seq}-{last_seq}"`).
 #[must_use]
 pub fn format_lease_range(id: LeaseId) -> String {
-    format!("{}-{}", id.first_seq, id.last_seq)
+    format!("{:016x}:{}-{}", id.instance_id, id.first_seq, id.last_seq)
 }
 
-/// Parses a snapshot delivery token (`"{first_seq}:{last_seq}"` or `"{first_seq}-{last_seq}"`)
-/// into `(first_seq, last_seq)` when `first_seq <= last_seq`.
+/// Parses a snapshot delivery token (`"{instance_id:016x}:{first_seq}:{last_seq}"` or
+/// `"{instance_id:016x}:{first_seq}-{last_seq}"`) into `(instance_id, first_seq, last_seq)`
+/// when `instance_id != 0` and `first_seq <= last_seq`.
 #[must_use]
-pub fn parse_lease_token(token: &str) -> Option<(u64, u64)> {
-    let (first_str, last_str) = token.split_once(':').or_else(|| token.split_once('-'))?;
+pub fn parse_lease_token(token: &str) -> Option<(u64, u64, u64)> {
+    let (inst_str, seq_part) = token.split_once(':')?;
+    let instance_id = u64::from_str_radix(inst_str, 16).ok()?;
+    if instance_id == 0 {
+        return None;
+    }
+    let (first_str, last_str) = seq_part
+        .split_once(':')
+        .or_else(|| seq_part.split_once('-'))?;
     let first_seq = first_str.parse::<u64>().ok()?;
     let last_seq = last_str.parse::<u64>().ok()?;
     if first_seq <= last_seq {
-        Some((first_seq, last_seq))
+        Some((instance_id, first_seq, last_seq))
     } else {
         None
     }
+}
+
+fn token_matches_lease(raw: &str, id: LeaseId) -> bool {
+    let Some((committed_instance_id, _committed_first_seq, committed_last_seq)) =
+        parse_lease_token(raw)
+    else {
+        return false;
+    };
+    committed_instance_id == id.instance_id && committed_last_seq >= id.last_seq
 }
 
 /// Abstraction over an Iceberg [`iceberg::table::Table`], [`iceberg::spec::TableMetadata`],
@@ -79,6 +103,26 @@ pub fn parse_lease_token(token: &str) -> Option<(u64, u64)> {
 pub trait SnapshotPropertiesSource {
     /// Looks up a snapshot summary property by key.
     fn lease_property(&self, key: &str) -> Option<&str>;
+
+    /// Returns `true` if `self` records a committed lease matching `id.instance_id` with
+    /// `committed_last_seq >= id.last_seq`.
+    fn has_committed_lease(&self, id: LeaseId) -> bool {
+        if id.instance_id == 0 {
+            return false;
+        }
+        let inst_key = instance_snapshot_property_key(id.signal, id.instance_id);
+        if let Some(raw) = self.lease_property(&inst_key)
+            && token_matches_lease(raw, id)
+        {
+            return true;
+        }
+        if let Some(raw) = self.lease_property(snapshot_property_key(id.signal))
+            && token_matches_lease(raw, id)
+        {
+            return true;
+        }
+        false
+    }
 }
 
 impl SnapshotPropertiesSource for iceberg::table::Table {
@@ -90,6 +134,10 @@ impl SnapshotPropertiesSource for iceberg::table::Table {
             .get(key)
             .map(String::as_str)
     }
+
+    fn has_committed_lease(&self, id: LeaseId) -> bool {
+        self.metadata().has_committed_lease(id)
+    }
 }
 
 impl SnapshotPropertiesSource for iceberg::spec::TableMetadata {
@@ -99,6 +147,19 @@ impl SnapshotPropertiesSource for iceberg::spec::TableMetadata {
             .additional_properties
             .get(key)
             .map(String::as_str)
+    }
+
+    fn has_committed_lease(&self, id: LeaseId) -> bool {
+        if id.instance_id == 0 {
+            return false;
+        }
+        if let Some(curr) = self.current_snapshot()
+            && curr.has_committed_lease(id)
+        {
+            return true;
+        }
+        self.snapshots()
+            .any(|snap| snap.as_ref().has_committed_lease(id))
     }
 }
 
@@ -121,22 +182,21 @@ impl<T: SnapshotPropertiesSource + ?Sized> SnapshotPropertiesSource for &T {
     fn lease_property(&self, key: &str) -> Option<&str> {
         (*self).lease_property(key)
     }
+
+    fn has_committed_lease(&self, id: LeaseId) -> bool {
+        (*self).has_committed_lease(id)
+    }
 }
 
-/// Returns `true` if the target table's current snapshot summary properties already record
-/// a committed sequence range for `id.signal` with `committed_last_seq >= id.last_seq`.
+/// Returns `true` if the target table's snapshot summary properties already record
+/// a committed sequence range for `id.instance_id` and `id.signal` with
+/// `committed_last_seq >= id.last_seq`.
 #[must_use]
 pub fn is_lease_already_committed<S: SnapshotPropertiesSource + ?Sized>(
     source: &S,
     id: LeaseId,
 ) -> bool {
-    let Some(raw) = source.lease_property(snapshot_property_key(id.signal)) else {
-        return false;
-    };
-    let Some((_committed_first_seq, committed_last_seq)) = parse_lease_token(raw) else {
-        return false;
-    };
-    committed_last_seq >= id.last_seq
+    source.has_committed_lease(id)
 }
 
 /// Classifies an Iceberg [`PipelineError`] into a [`FailureClass`] for [`SinkBuffer`] lease handling.
@@ -779,10 +839,14 @@ impl IcebergSink {
 
             if let (Some(cat), false) = (catalog, all_data_files.is_empty()) {
                 let tx = Transaction::new(table);
-                let snapshot_props = HashMap::from([(
-                    snapshot_property_key(signal).to_string(),
-                    format_lease_token(lease.id()),
-                )]);
+                let token = format_lease_token(lease.id());
+                let snapshot_props = HashMap::from([
+                    (snapshot_property_key(signal).to_string(), token.clone()),
+                    (
+                        instance_snapshot_property_key(signal, lease.id().instance_id),
+                        token,
+                    ),
+                ]);
                 let action = tx
                     .fast_append()
                     .set_snapshot_properties(snapshot_props)
@@ -1813,21 +1877,29 @@ mod tests {
         );
 
         let id = LeaseId {
+            instance_id: 0x0123_4567_89ab_cdef,
             signal: SignalKind::Logs,
             first_seq: 12,
             last_seq: 34,
         };
         let token = format_lease_token(id);
-        assert_eq!(token, "12:34");
-        assert_eq!(parse_lease_token(&token), Some((12, 34)));
+        assert_eq!(token, "0123456789abcdef:12:34");
+        assert_eq!(
+            parse_lease_token(&token),
+            Some((0x0123_4567_89ab_cdef, 12, 34))
+        );
 
         let range = format_lease_range(id);
-        assert_eq!(range, "12-34");
-        assert_eq!(parse_lease_token(&range), Some((12, 34)));
+        assert_eq!(range, "0123456789abcdef:12-34");
+        assert_eq!(
+            parse_lease_token(&range),
+            Some((0x0123_4567_89ab_cdef, 12, 34))
+        );
 
         assert_eq!(parse_lease_token(""), None);
         assert_eq!(parse_lease_token("abc"), None);
-        assert_eq!(parse_lease_token("20:10"), None);
+        assert_eq!(parse_lease_token("0000000000000000:1:2"), None);
+        assert_eq!(parse_lease_token("0123456789abcdef:20:10"), None);
     }
 
     #[test]
@@ -1870,7 +1942,7 @@ mod tests {
               "manifest-list": "memory:///bucket/test/location/metadata/snap-101.avro",
               "summary": {
                 "operation": "append",
-                "datalake.lease.logs": "1:5"
+                "datalake.lease.logs": "0123456789abcdef:1:5"
               },
               "schema-id": 0,
               "first-row-id": 0,
@@ -1896,6 +1968,7 @@ mod tests {
         assert!(is_lease_already_committed(
             &table,
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Logs,
                 first_seq: 1,
                 last_seq: 5,
@@ -1904,14 +1977,26 @@ mod tests {
         assert!(is_lease_already_committed(
             &table,
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Logs,
                 first_seq: 1,
                 last_seq: 3,
             }
         ));
+        // A different buffer instance (e.g. restarted memory buffer or second replica) with seq 1..5 must NOT be treated as committed
         assert!(!is_lease_already_committed(
             &table,
             LeaseId {
+                instance_id: 0xfedc_ba98_7654_3210,
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 5,
+            }
+        ));
+        assert!(!is_lease_already_committed(
+            &table,
+            LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Logs,
                 first_seq: 6,
                 last_seq: 6,
@@ -1920,6 +2005,7 @@ mod tests {
         assert!(!is_lease_already_committed(
             &table,
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
                 signal: SignalKind::Metrics,
                 first_seq: 1,
                 last_seq: 5,
@@ -2167,39 +2253,64 @@ mod tests {
 
     #[tokio::test]
     async fn test_iceberg_snapshot_token_skips_already_committed_lease_on_retry() {
-        use pipeline_core::buffer::{BufferConfig, LeaseId, SignalKind};
+        use pipeline_core::buffer::{BufferConfig, BufferMode, LeaseId, SignalKind};
 
-        let snapshot_summary_props =
-            HashMap::from([("datalake.lease.logs".to_string(), "1-5".to_string())]);
+        let snapshot_summary_props = HashMap::from([(
+            "datalake.lease.logs".to_string(),
+            "0123456789abcdef:1-5".to_string(),
+        )]);
         assert!(is_lease_already_committed(
             &snapshot_summary_props,
             LeaseId {
+                instance_id: 0x0123_4567_89ab_cdef,
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 5,
+            }
+        ));
+        assert!(!is_lease_already_committed(
+            &snapshot_summary_props,
+            LeaseId {
+                instance_id: 0x9999_8888_7777_6666,
                 signal: SignalKind::Logs,
                 first_seq: 1,
                 last_seq: 5,
             }
         ));
 
-        // Also verify against a live catalog where the first commit persists the
-        // snapshot token in the catalog before the client receives a disconnect error,
-        // and where a subsequent retry lease with the same sequence range is skipped
-        // without a duplicate `update_table` call.
+        // Verify against a live catalog:
+        // 1. A disk-backed buffer commits lease 1:1 where the first commit persists the
+        //    snapshot token before returning a disconnect error; post-error reload detects
+        //    the token and acks without a second `update_table`.
+        // 2. If the disk buffer crashed before persisting its watermark and is reopened on
+        //    the same `disk_path`, it recovers the same `instance_id` and skips duplicate
+        //    commit (`update_calls == 1`).
+        // 3. A fresh memory-mode buffer (process restart in memory mode or second replica)
+        //    gets a distinct `instance_id` and commits its own `1:1` lease (`update_calls == 2`).
+        let disk_dir =
+            std::env::temp_dir().join(format!("otel-iceberg-inst-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&disk_dir);
+
         let catalog = make_mock_logs_catalog(false, true).await;
         let mut config = make_dry_run_config(SchemaMode::Catalog);
         config.dry_run = false;
         config.table_identifier = "otel.logs".to_string();
 
         let mut sink = IcebergSink::with_catalog(config, catalog.clone());
-        let buf_cfg = BufferConfig {
+        let disk_buf_cfg = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(disk_dir.clone()),
+            sync_on_write: true,
             max_batch_size_bytes: 1_048_576,
             max_batch_records: Some(1),
-            max_batch_interval_sec: 60,
+            max_batch_interval_sec: 0,
             initial_backoff_ms: 5,
             max_backoff_sec: 1,
             ..BufferConfig::default()
         };
         let [(logs_tx, logs_rx), _, _] =
-            SinkBuffer::new_signal_triad("iceberg", buf_cfg.clone()).unwrap();
+            SinkBuffer::new_signal_triad("iceberg", disk_buf_cfg.clone()).unwrap();
+        let disk_inst_id = logs_rx.instance_id();
         logs_tx
             .send(SignalBatch::Logs(make_test_logs_batch()))
             .await
@@ -2208,8 +2319,6 @@ mod tests {
 
         sink.run(logs_rx).await.unwrap();
 
-        // Only 1 update_table call was needed because the post-error table reload
-        // detected `"datalake.lease.logs" = "1:1"` in the current snapshot summary.
         assert_eq!(
             catalog
                 .update_calls
@@ -2217,6 +2326,7 @@ mod tests {
             1
         );
 
+        let expected_token = format!("{disk_inst_id:016x}:1:1");
         let table = catalog
             .load_table(&iceberg::TableIdent::from_strs(["otel", "logs"]).unwrap())
             .await
@@ -2227,28 +2337,59 @@ mod tests {
                 .additional_properties
                 .get("datalake.lease.logs")
                 .map(String::as_str),
-            Some("1:1")
+            Some(expected_token.as_str())
         );
 
-        // Now send a fresh buffer whose first lease ALSO has seq 1:1 against the same
-        // catalog; `commit_lease` must detect `is_lease_already_committed` upfront and
-        // ack without calling `update_table` a second time.
-        let [(retry_tx, retry_rx), _, _] =
-            SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
-        retry_tx
-            .send(SignalBatch::Logs(make_test_logs_batch()))
-            .await
-            .unwrap();
-        drop(retry_tx);
+        // Simulate crash before watermark update by resetting watermark counts to 0 while keeping instance_id
+        let wm_path = disk_dir.join("watermark.json");
+        let mut wm: pipeline_core::buffer::DiskWatermark =
+            serde_json::from_slice(&std::fs::read(&wm_path).unwrap()).unwrap();
+        assert_eq!(wm.instance_id, disk_inst_id);
+        wm.logs = 0;
+        std::fs::write(&wm_path, serde_json::to_vec(&wm).unwrap()).unwrap();
 
-        sink.run(retry_rx).await.unwrap();
+        // Reopen disk buffer on same disk_path -> replays seq 1:1 with same instance_id -> skipped!
+        let [(reopen_tx, reopen_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", disk_buf_cfg).unwrap();
+        assert_eq!(reopen_rx.instance_id(), disk_inst_id);
+        drop(reopen_tx);
+        sink.run(reopen_rx).await.unwrap();
         assert_eq!(
             catalog
                 .update_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "Duplicate lease 1:1 must be skipped without calling update_table again"
+            "Recovered disk lease with matching instance_id must be skipped without calling update_table again"
         );
+
+        // Now start a fresh memory-mode buffer whose first lease ALSO has seq 1:1 -> distinct instance_id -> MUST commit!
+        let mem_buf_cfg = BufferConfig {
+            max_batch_size_bytes: 1_048_576,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            initial_backoff_ms: 5,
+            max_backoff_sec: 1,
+            ..BufferConfig::default()
+        };
+        let [(mem_tx, mem_rx), _, _] =
+            SinkBuffer::new_signal_triad("iceberg", mem_buf_cfg).unwrap();
+        assert_ne!(mem_rx.instance_id(), disk_inst_id);
+        mem_tx
+            .send(SignalBatch::Logs(make_test_logs_batch()))
+            .await
+            .unwrap();
+        drop(mem_tx);
+
+        sink.run(mem_rx).await.unwrap();
+        assert_eq!(
+            catalog
+                .update_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "Fresh memory buffer with distinct instance_id must commit its own seq 1:1 lease instead of dropping it"
+        );
+
+        let _ = std::fs::remove_dir_all(&disk_dir);
     }
 
     #[tokio::test]
@@ -2270,6 +2411,7 @@ mod tests {
             ..BufferConfig::default()
         };
         let [(logs_tx, logs_rx), _, _] = SinkBuffer::new_signal_triad("iceberg", buf_cfg).unwrap();
+        let expected_token = format!("{:016x}:1:1", logs_rx.instance_id());
         logs_tx
             .send(SignalBatch::Logs(make_test_logs_batch()))
             .await
@@ -2298,7 +2440,7 @@ mod tests {
                 .additional_properties
                 .get("datalake.lease.logs")
                 .map(String::as_str),
-            Some("1:1")
+            Some(expected_token.as_str())
         );
     }
 }

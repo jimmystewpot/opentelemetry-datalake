@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 /// Unique identifier for a leased range of batches within a signal ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseId {
+    /// Durable or per-process buffer instance identifier scoping sequence numbers.
+    pub instance_id: u64,
     /// Telemetry signal type of the leased batches.
     pub signal: SignalKind,
     /// Inclusive first sequence number in the lease.

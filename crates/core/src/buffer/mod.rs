@@ -35,10 +35,40 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Generates a non-zero 64-bit buffer instance identifier combining OS CSPRNG state,
+/// wall-clock nanoseconds, process ID, and a monotonic counter mixed via SplitMix64.
+#[must_use]
+pub(crate) fn generate_instance_id() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    let pid = u64::from(std::process::id());
+
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(nanos);
+    hasher.write_u64(pid);
+    hasher.write_u64(seq);
+    let mut z = hasher
+        .finish()
+        .wrapping_add(seq.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    let out = z ^ (z >> 31);
+    if out == 0 { 1 } else { out }
+}
+
 /// Shared state backing a [`SinkBuffer`] and its [`BufferSender`] handles.
 #[derive(Debug)]
 pub(crate) struct BufferInner {
     pub(crate) sink_name: String,
+    pub(crate) instance_id: u64,
     pub(crate) config: BufferConfig,
     pub(crate) rings: [SignalRingState; 3],
     pub(crate) disk: Option<DiskBackend>,
@@ -55,10 +85,12 @@ impl BufferInner {
             SignalRingState::new(),
             SignalRingState::new(),
         ];
-        let disk = if config.mode == BufferMode::Disk {
-            Some(DiskBackend::open_and_recover(sink_name, &config, &rings)?)
+        let (disk, instance_id) = if config.mode == BufferMode::Disk {
+            let disk = DiskBackend::open_and_recover(sink_name, &config, &rings)?;
+            let id = disk.instance_id();
+            (Some(disk), id)
         } else {
-            None
+            (None, generate_instance_id())
         };
         let dead_letter = if let Some(ref dl_path) = config.dead_letter_path {
             Some(Arc::new(DeadLetterStore::new(
@@ -90,6 +122,7 @@ impl BufferInner {
         }
         Ok(Arc::new(Self {
             sink_name: sink_name.to_string(),
+            instance_id,
             config,
             rings,
             disk,
@@ -105,6 +138,7 @@ impl BufferInner {
         let metrics = BufferMetrics::new("passthrough", &config);
         Arc::new(Self {
             sink_name: "passthrough".to_string(),
+            instance_id: generate_instance_id(),
             config,
             rings: [
                 SignalRingState::new(),
@@ -167,7 +201,7 @@ impl BufferInner {
         match self.config.effective_drain_policy() {
             DrainTimeoutPolicy::Persist => {
                 if let Some(disk) = &self.disk {
-                    let wm = DiskWatermark::from_rings(&self.rings);
+                    let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
                     disk.flush_and_sync_watermark(wm)?;
                 }
                 Ok(())
@@ -244,7 +278,7 @@ impl BufferInner {
         self.notify_data_ready(signal);
 
         if let Some(disk) = &self.disk {
-            let wm = DiskWatermark::from_rings(&self.rings);
+            let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
             disk.update_watermark(wm).await?;
         }
         Ok(())
@@ -443,6 +477,57 @@ impl BufferInner {
             return (None, Some(ready_at), false);
         }
 
+        let first_attempt = front.attempt;
+        let first_schema = front.payload.schema();
+        let first_enqueued_at = front.enqueued_at;
+        let mut check_last_seq = front.seq_id;
+        let mut check_bytes = front.byte_size;
+        let mut check_rows = front.row_count;
+        let mut coalesce_count = 1usize;
+        let mut hit_coalesce_boundary = false;
+
+        for next in ring.queue.iter().skip(1) {
+            if next.ready_at.is_some_and(|t| t > now)
+                || next.attempt != first_attempt
+                || next.seq_id != check_last_seq.saturating_add(1)
+                || next.payload.schema() != first_schema
+                || check_bytes.saturating_add(next.byte_size) > self.config.max_batch_size_bytes
+                || self.config.max_batch_records.is_some_and(|max_rec| {
+                    max_rec <= 1 || check_rows.saturating_add(next.row_count) > max_rec
+                })
+            {
+                hit_coalesce_boundary = true;
+                break;
+            }
+            check_last_seq = next.seq_id;
+            check_bytes = check_bytes.saturating_add(next.byte_size);
+            check_rows = check_rows.saturating_add(next.row_count);
+            coalesce_count = coalesce_count.saturating_add(1);
+        }
+
+        let interval_zero = self.config.max_batch_interval_sec == 0;
+        let bytes_reached = check_bytes >= self.config.max_batch_size_bytes;
+        let records_reached = self
+            .config
+            .max_batch_records
+            .is_some_and(|max_rec| check_rows >= max_rec);
+        let sender_blocked = ring_state.blocked_senders.load(Ordering::Acquire) > 0;
+
+        if !interval_zero
+            && !ring.closed
+            && first_attempt == 0
+            && !bytes_reached
+            && !records_reached
+            && !hit_coalesce_boundary
+            && !sender_blocked
+        {
+            let flush_deadline = first_enqueued_at
+                + std::time::Duration::from_secs(self.config.max_batch_interval_sec);
+            if flush_deadline > now {
+                return (None, Some(flush_deadline), false);
+            }
+        }
+
         let Some(first) = ring.queue.pop_front() else {
             let is_drained = ring.closed && ring.inflight_leases == 0;
             return (None, None, is_drained);
@@ -452,43 +537,23 @@ impl BufferInner {
         let first_seq = first.seq_id;
         let mut last_seq = first.seq_id;
         let attempt = first.attempt;
-        let first_schema = first.payload.schema();
         let mut total_bytes = first.byte_size;
         let mut total_rows = first.row_count;
         let mut batches = Vec::new();
         if let BatchPayload::InMemory(ref b) = first.payload {
             batches.push(b.clone());
         }
-        let mut payloads = vec![first.payload];
-        let mut meta = vec![LeasedBatchMeta {
+        let mut payloads = Vec::with_capacity(coalesce_count);
+        payloads.push(first.payload);
+        let mut meta = Vec::with_capacity(coalesce_count);
+        meta.push(LeasedBatchMeta {
             seq_id: first.seq_id,
             byte_size: first.byte_size,
             row_count: first.row_count,
             enqueued_at: first.enqueued_at,
-        }];
+        });
 
-        while let Some(next) = ring.queue.front() {
-            if next.ready_at.is_some_and(|t| t > now) {
-                break;
-            }
-            if next.attempt != attempt {
-                break;
-            }
-            if next.seq_id != last_seq.saturating_add(1) {
-                break;
-            }
-            if next.payload.schema() != first_schema {
-                break;
-            }
-            if total_bytes.saturating_add(next.byte_size) > self.config.max_batch_size_bytes {
-                break;
-            }
-            if let Some(max_rec) = self.config.max_batch_records
-                && (max_rec <= 1 || total_rows.saturating_add(next.row_count) > max_rec)
-            {
-                break;
-            }
-
+        for _ in 1..coalesce_count {
             let Some(popped) = ring.queue.pop_front() else {
                 break;
             };
@@ -513,6 +578,7 @@ impl BufferInner {
         let lease = Lease {
             inner: Arc::clone(self),
             id: LeaseId {
+                instance_id: self.instance_id,
                 signal,
                 first_seq,
                 last_seq,
@@ -669,6 +735,7 @@ impl BufferSender {
                         .record_dropped(signal, evicted_rows, "overflow");
                     if let Some(disk) = &self.inner.disk {
                         disk.update_watermark_nonblocking(DiskWatermark::from_rings(
+                            self.inner.instance_id,
                             &self.inner.rings,
                         ));
                     }
@@ -705,6 +772,7 @@ impl BufferSender {
             }
 
             blocked_guard.mark_blocked();
+            self.inner.notify_data_ready(signal);
             notified.await;
         };
 
@@ -812,6 +880,12 @@ pub struct BufferController {
 }
 
 impl BufferController {
+    /// Returns the buffer's 64-bit instance identifier.
+    #[must_use]
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id
+    }
+
     /// Returns `true` if the buffer is healthy and not stalled beyond `readiness_stall_sec`
     /// or `max_transient_duration_sec`.
     #[must_use]
@@ -901,6 +975,12 @@ impl SinkBuffer {
         BufferController {
             inner: Arc::clone(&self.inner),
         }
+    }
+
+    /// Returns the buffer's 64-bit instance identifier.
+    #[must_use]
+    pub fn instance_id(&self) -> u64 {
+        self.inner.instance_id
     }
 
     /// Returns `true` if the buffer is healthy and not stalled beyond `readiness_stall_sec`
@@ -1127,7 +1207,7 @@ impl SinkBuffer {
     /// Flushes pending disk writes and durably syncs `watermark.json` (`BufferMode::Disk`).
     pub fn flush_and_sync_watermark(&self) -> Result<(), PipelineError> {
         if let Some(disk) = &self.inner.disk {
-            let wm = DiskWatermark::from_rings(&self.inner.rings);
+            let wm = DiskWatermark::from_rings(self.inner.instance_id, &self.inner.rings);
             disk.flush_and_sync_watermark(wm)?;
         }
         Ok(())
@@ -1786,5 +1866,130 @@ mod tests {
         let lease2 = buf.next_lease().await.unwrap().unwrap();
         lease2.ack().await.unwrap();
         assert_eq!(buf.committed_records(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_memory_buffers_assign_distinct_instance_ids_and_preserve_across_retries() {
+        let config = BufferConfig {
+            initial_backoff_ms: 1,
+            max_backoff_sec: 1,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx1, mut buf1) = SinkBuffer::new("inst_test_1", config.clone()).unwrap();
+        let (tx2, mut buf2) = SinkBuffer::new("inst_test_2", config).unwrap();
+
+        let id1 = buf1.instance_id();
+        let id2 = buf2.instance_id();
+        assert_ne!(id1, 0);
+        assert_ne!(id2, 0);
+        assert_ne!(
+            id1, id2,
+            "Distinct memory buffer instances must receive distinct instance_ids"
+        );
+        assert_eq!(buf1.controller().instance_id(), id1);
+
+        tx1.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+        tx2.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+
+        let lease1_first = buf1.next_lease().await.unwrap().unwrap();
+        let lease2_first = buf2.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1_first.id().instance_id, id1);
+        assert_eq!(lease2_first.id().instance_id, id2);
+        assert_ne!(lease1_first.id(), lease2_first.id());
+
+        // Nack lease1 and verify retry preserves the exact same LeaseId (including instance_id)
+        let original_lease1_id = lease1_first.id();
+        lease1_first.nack(FailureClass::Transient).await.unwrap();
+        let lease1_retry = buf1.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1_retry.id(), original_lease1_id);
+        lease1_retry.ack().await.unwrap();
+        lease2_first.ack().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_next_lease_waits_for_batch_interval_or_threshold_and_flushes_early_on_boundary_or_close()
+     {
+        let sample = make_batch(&[1, 2]);
+        let batch_bytes = sample.get_array_memory_size();
+
+        // 1. Partial batch below max_batch_size_bytes and max_batch_records must wait for max_batch_interval_sec
+        let config_interval = BufferConfig {
+            max_batch_size_bytes: batch_bytes * 10,
+            max_batch_records: Some(20),
+            max_batch_interval_sec: 1,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_interval_wait", config_interval).unwrap();
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+
+        // Must NOT pop within 80ms while sender is open and thresholds are not met
+        let early = tokio::time::timeout(Duration::from_millis(80), buf.next_lease()).await;
+        assert!(
+            early.is_err(),
+            "Partial batch must wait for batching trigger while sender is open"
+        );
+
+        // Sending 9 more batches reaches max_batch_records (10 * 2 = 20 rows) -> pops immediately without waiting full 1s!
+        for _ in 0..9 {
+            tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        }
+        let threshold_lease = tokio::time::timeout(Duration::from_millis(100), buf.next_lease())
+            .await
+            .expect("Reaching max_batch_records must trigger immediate lease")
+            .unwrap()
+            .unwrap();
+        assert_eq!(threshold_lease.num_rows(), 20);
+        assert_eq!(threshold_lease.id().first_seq, 1);
+        assert_eq!(threshold_lease.id().last_seq, 10);
+        threshold_lease.ack().await.unwrap();
+
+        // 2. Partial batch pops once max_batch_interval_sec (1s) elapses
+        let start = Instant::now();
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        let timer_lease = tokio::time::timeout(Duration::from_millis(1_500), buf.next_lease())
+            .await
+            .expect("Interval timer must flush partial batch")
+            .unwrap()
+            .unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(850),
+            "Partial batch must wait for max_batch_interval_sec before flushing"
+        );
+        assert_eq!(timer_lease.num_rows(), 2);
+        timer_lease.ack().await.unwrap();
+
+        // 3. Schema boundary queued behind front batch flushes front batch immediately
+        let alt_schema = Arc::new(Schema::new(vec![Field::new(
+            "other_col",
+            DataType::Int64,
+            false,
+        )]));
+        let alt_batch =
+            RecordBatch::try_new(alt_schema, vec![Arc::new(Int64Array::from(vec![99]))]).unwrap();
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        tx.send(SignalBatch::Logs(alt_batch)).await.unwrap();
+        let boundary_lease = tokio::time::timeout(Duration::from_millis(100), buf.next_lease())
+            .await
+            .expect("Coalescing boundary must flush front batch immediately")
+            .unwrap()
+            .unwrap();
+        assert_eq!(boundary_lease.num_rows(), 2);
+        boundary_lease.ack().await.unwrap();
+
+        // 4. Dropping sender (ring.closed) flushes remaining partial batch immediately
+        drop(tx);
+        let closed_lease = tokio::time::timeout(Duration::from_millis(100), buf.next_lease())
+            .await
+            .expect("Closing sender must flush remaining batch immediately")
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed_lease.num_rows(), 1);
+        closed_lease.ack().await.unwrap();
+        assert!(buf.next_lease().await.unwrap().is_none());
     }
 }
