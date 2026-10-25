@@ -13,7 +13,7 @@ pub use crate::buffer::dead_letter::{
 };
 pub use crate::buffer::disk::{
     DiskWatermark, FRAME_HEADER_LEN, FRAME_MAGIC, FRAME_VERSION, FrameDecodeError, FrameHeader,
-    decode_frame, encode_frame,
+    decode_frame, encode_frame, patch_frame_seq_id,
 };
 pub use crate::buffer::lease::{FailureClass, Lease, LeaseId};
 pub use crate::buffer::metrics::{BufferGaugeState, BufferMetrics, SignalMetricsState};
@@ -691,51 +691,50 @@ impl BufferSender {
         let batch_bytes = record_batch.get_array_memory_size();
         if self.inner.disk.is_some() {
             let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
-            if batch_bytes.saturating_add(65_536) >= max_payload_len as usize {
-                let chunks = if batch_bytes >= 65_536 {
-                    tokio::task::spawn_blocking(move || {
-                        crate::buffer::disk::split_batch_for_disk_limit(
-                            signal,
-                            record_batch,
-                            max_payload_len,
-                        )
-                    })
-                    .await
-                    .map_err(|e| {
-                        PipelineError::Internal(format!("disk frame split join error: {e}"))
-                    })??
-                } else {
-                    crate::buffer::disk::split_batch_for_disk_limit(
+            let frames = if batch_bytes >= 65_536 {
+                tokio::task::spawn_blocking(move || {
+                    crate::buffer::disk::split_and_encode_frames_for_disk(
                         signal,
                         record_batch,
                         max_payload_len,
-                    )?
-                };
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    PipelineError::Internal(format!("disk frame encode join error: {e}"))
+                })??
+            } else {
+                crate::buffer::disk::split_and_encode_frames_for_disk(
+                    signal,
+                    record_batch,
+                    max_payload_len,
+                )?
+            };
 
-                for (sub_batch, encoded_bytes) in chunks {
-                    self.send_single_batch(signal, sub_batch, encoded_bytes)
-                        .await?;
-                }
-                return Ok(());
+            for frame in frames {
+                self.send_pre_encoded_disk_frame(signal, frame).await?;
             }
+            return Ok(());
         }
 
-        self.send_single_batch(signal, record_batch, batch_bytes)
-            .await
+        let batch_rows = record_batch.num_rows();
+        self.reserve_or_enqueue_slot(signal, batch_bytes, batch_rows, Some(record_batch))
+            .await?;
+        Ok(())
     }
 
-    async fn send_single_batch(
+    async fn reserve_or_enqueue_slot(
         &self,
         signal: SignalKind,
-        record_batch: arrow::record_batch::RecordBatch,
         batch_bytes: usize,
-    ) -> Result<(), PipelineError> {
-        let batch_rows = record_batch.num_rows();
+        batch_rows: usize,
+        mut in_memory_batch: Option<arrow::record_batch::RecordBatch>,
+    ) -> Result<Option<u64>, PipelineError> {
         let budget = self.inner.config.per_signal_budget();
         let ring_state = &self.inner.rings[signal.as_u8() as usize];
         let mut blocked_guard = BlockedSendGuard::new(ring_state);
 
-        let reserved_seq_id = loop {
+        loop {
             if let Some(reason) = self.inner.fatal_reason() {
                 return Err(PipelineError::Storage(reason.into()));
             }
@@ -789,7 +788,7 @@ impl BufferSender {
                     ring.rows_in_flight = ring.rows_in_flight.saturating_add(batch_rows);
                     ring.slots.insert(seq_id, LeaseSlotState::Queued);
 
-                    if self.inner.disk.is_none() {
+                    if let Some(record_batch) = in_memory_batch.take() {
                         ring.queue.push_back(QueuedBatch {
                             seq_id,
                             payload: BatchPayload::InMemory(record_batch),
@@ -803,47 +802,60 @@ impl BufferSender {
                         drop(ring);
                         blocked_guard.mark_admitted();
                         self.inner.notify_data_ready(signal);
-                        return Ok(());
+                        return Ok(None);
                     }
 
                     self.inner.sync_ring_metrics(signal, &ring);
                     blocked_guard.mark_admitted();
-                    break seq_id;
+                    return Ok(Some(seq_id));
                 }
             }
 
             blocked_guard.mark_blocked();
             self.inner.notify_data_ready(signal);
             notified.await;
-        };
-
-        self.finish_disk_send(
-            signal,
-            reserved_seq_id,
-            record_batch,
-            batch_bytes,
-            batch_rows,
-        )
-        .await
+        }
     }
 
-    async fn finish_disk_send(
+    async fn send_pre_encoded_disk_frame(
         &self,
         signal: SignalKind,
-        reserved_seq_id: u64,
-        record_batch: arrow::record_batch::RecordBatch,
-        batch_bytes: usize,
-        batch_rows: usize,
+        mut frame: crate::buffer::disk::PreEncodedFrame,
     ) -> Result<(), PipelineError> {
+        let frame_bytes_len = frame.bytes.len();
+        let batch_rows = frame.batch.num_rows();
+        let schema = frame.batch.schema();
+        drop(frame.batch);
+
+        let Some(reserved_seq_id) = self
+            .reserve_or_enqueue_slot(signal, frame_bytes_len, batch_rows, None)
+            .await?
+        else {
+            return Ok(());
+        };
+
         let ring_state = &self.inner.rings[signal.as_u8() as usize];
+        if let Err(err) = crate::buffer::disk::patch_frame_seq_id(
+            &mut frame.bytes,
+            &mut frame.header,
+            reserved_seq_id,
+        ) {
+            let mut ring = lock_unpoisoned(&ring_state.ring);
+            ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(frame_bytes_len);
+            ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
+            ring.slots.remove(&reserved_seq_id);
+            self.inner.sync_ring_metrics(signal, &ring);
+            return Err(err);
+        }
+
         let Some(disk) = &self.inner.disk else {
             return Err(PipelineError::Internal(
                 "disk backend missing on disk send path".into(),
             ));
         };
-        let schema = record_batch.schema();
+
         match disk
-            .append_frame(signal, reserved_seq_id, record_batch)
+            .append_encoded_frame(signal, reserved_seq_id, frame.header.row_count, frame.bytes)
             .await
         {
             Ok(written) => {
@@ -852,7 +864,7 @@ impl BufferSender {
                     let mut ring = lock_unpoisoned(&ring_state.ring);
                     ring.bytes_in_flight = ring
                         .bytes_in_flight
-                        .saturating_sub(batch_bytes)
+                        .saturating_sub(frame_bytes_len)
                         .saturating_add(actual_bytes);
                     ring.enqueue_ordered(QueuedBatch {
                         seq_id: reserved_seq_id,
@@ -860,7 +872,7 @@ impl BufferSender {
                             segment_id: written.segment_id,
                             offset: written.offset,
                             len: written.len,
-                            rows: u32::try_from(batch_rows).unwrap_or(u32::MAX),
+                            rows: frame.header.row_count,
                             schema,
                         },
                         byte_size: actual_bytes,
@@ -871,7 +883,7 @@ impl BufferSender {
                     });
                     self.inner.sync_ring_metrics(signal, &ring);
                 }
-                if actual_bytes < batch_bytes {
+                if actual_bytes < frame_bytes_len {
                     ring_state.space_available_notify.notify_waiters();
                 }
                 self.inner.notify_data_ready(signal);
@@ -880,7 +892,7 @@ impl BufferSender {
             Err(err) => {
                 {
                     let mut ring = lock_unpoisoned(&ring_state.ring);
-                    ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(batch_bytes);
+                    ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(frame_bytes_len);
                     ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
                     ring.slots.remove(&reserved_seq_id);
                     self.inner.sync_ring_metrics(signal, &ring);

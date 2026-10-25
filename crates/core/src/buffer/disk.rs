@@ -141,32 +141,71 @@ pub fn encode_frame(
     })
 }
 
-/// Splits `batch` by row bisection so every resulting sub-batch encodes to an `OTLB` frame
-/// whose `payload_len <= max_payload_len`. Returns `(sub_batch, encoded_frame_bytes)` pairs,
-/// or `Err(PipelineError::Storage)` if an unsplittable (`<= 1` row) batch exceeds `max_payload_len`.
-pub(crate) fn split_batch_for_disk_limit(
+/// Pre-encoded `OTLB` frame produced prior to reserving a sequence number in the signal ring.
+#[derive(Debug, Clone)]
+pub(crate) struct PreEncodedFrame {
+    pub header: FrameHeader,
+    pub bytes: Vec<u8>,
+    pub batch: RecordBatch,
+}
+
+/// Patches `seq_id` into `frame_bytes[8..16]` and recomputes `crc32c` (`frame_bytes[24..28]`)
+/// in place without re-encoding the Arrow IPC payload.
+pub fn patch_frame_seq_id(
+    frame_bytes: &mut [u8],
+    header: &mut FrameHeader,
+    seq_id: u64,
+) -> Result<(), PipelineError> {
+    let expected_len = FRAME_HEADER_LEN.saturating_add(header.payload_len as usize);
+    if frame_bytes.len() < FRAME_HEADER_LEN || frame_bytes.len() != expected_len {
+        return Err(storage_err(format!(
+            "cannot patch OTLB frame seq_id: buffer length ({}) does not match expected frame length ({expected_len})",
+            frame_bytes.len()
+        )));
+    }
+
+    frame_bytes[8..16].copy_from_slice(&seq_id.to_le_bytes());
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&frame_bytes[4..24]);
+    hasher.update(&frame_bytes[FRAME_HEADER_LEN..]);
+    let crc32c = hasher.finalize();
+
+    frame_bytes[24..28].copy_from_slice(&crc32c.to_le_bytes());
+    header.seq_id = seq_id;
+    header.crc32c = crc32c;
+    Ok(())
+}
+
+/// Encodes `batch` into one or more [`PreEncodedFrame`]s (with placeholder `seq_id = 0`),
+/// splitting by row bisection whenever a frame's `payload_len > max_payload_len`.
+/// Returns `Err(PipelineError::Storage)` if an unsplittable (`<= 1` row) batch exceeds `max_payload_len`.
+pub(crate) fn split_and_encode_frames_for_disk(
     signal: SignalKind,
     batch: RecordBatch,
     max_payload_len: u32,
-) -> Result<Vec<(RecordBatch, usize)>, PipelineError> {
-    let mut scratch = Vec::with_capacity(batch.get_array_memory_size().min(64 * 1024));
+) -> Result<Vec<PreEncodedFrame>, PipelineError> {
     let mut out = Vec::with_capacity(1);
-    split_batch_recursive(signal, batch, max_payload_len, &mut scratch, &mut out)?;
+    split_and_encode_recursive(signal, batch, max_payload_len, &mut out)?;
     Ok(out)
 }
 
-fn split_batch_recursive(
+fn split_and_encode_recursive(
     signal: SignalKind,
     batch: RecordBatch,
     max_payload_len: u32,
-    scratch: &mut Vec<u8>,
-    out: &mut Vec<(RecordBatch, usize)>,
+    out: &mut Vec<PreEncodedFrame>,
 ) -> Result<(), PipelineError> {
-    scratch.clear();
-    let header = encode_frame(signal, 1, &batch, scratch)?;
+    let mut bytes = Vec::with_capacity(
+        FRAME_HEADER_LEN.saturating_add(batch.get_array_memory_size().min(64 * 1024)),
+    );
+    let header = encode_frame(signal, 0, &batch, &mut bytes)?;
     if header.payload_len <= max_payload_len {
-        let frame_bytes = FRAME_HEADER_LEN.saturating_add(header.payload_len as usize);
-        out.push((batch, frame_bytes));
+        out.push(PreEncodedFrame {
+            header,
+            bytes,
+            batch,
+        });
         return Ok(());
     }
 
@@ -181,8 +220,8 @@ fn split_batch_recursive(
     let mid = rows / 2;
     let left = batch.slice(0, mid);
     let right = batch.slice(mid, rows - mid);
-    split_batch_recursive(signal, left, max_payload_len, scratch, out)?;
-    split_batch_recursive(signal, right, max_payload_len, scratch, out)?;
+    split_and_encode_recursive(signal, left, max_payload_len, out)?;
+    split_and_encode_recursive(signal, right, max_payload_len, out)?;
     Ok(())
 }
 
@@ -348,14 +387,30 @@ impl DiskWatermark {
     }
 
     /// Monotonically merges `incoming` into `self` so out-of-order concurrent snapshots
-    /// never regress any signal's committed watermark.
-    pub(crate) fn merge_monotonic(&mut self, incoming: Self) {
+    /// never regress any signal's committed watermark. Returns `true` iff any field changed.
+    pub const fn merge_monotonic(&mut self, incoming: Self) -> bool {
+        let prev_instance = self.instance_id;
+        let prev_logs = self.logs;
+        let prev_metrics = self.metrics;
+        let prev_traces = self.traces;
+
         if self.instance_id == 0 && incoming.instance_id != 0 {
             self.instance_id = incoming.instance_id;
         }
-        self.logs = self.logs.max(incoming.logs);
-        self.metrics = self.metrics.max(incoming.metrics);
-        self.traces = self.traces.max(incoming.traces);
+        if incoming.logs > self.logs {
+            self.logs = incoming.logs;
+        }
+        if incoming.metrics > self.metrics {
+            self.metrics = incoming.metrics;
+        }
+        if incoming.traces > self.traces {
+            self.traces = incoming.traces;
+        }
+
+        self.instance_id != prev_instance
+            || self.logs != prev_logs
+            || self.metrics != prev_metrics
+            || self.traces != prev_traces
     }
 }
 
@@ -372,10 +427,11 @@ type WatermarkOneshotReply = tokio::sync::oneshot::Sender<Result<(), String>>;
 type WatermarkSyncReply = std::sync::mpsc::SyncSender<Result<(), String>>;
 
 enum WriterCommand {
-    Append {
+    AppendEncoded {
         signal: SignalKind,
         seq_id: u64,
-        batch: RecordBatch,
+        rows: u32,
+        frame_bytes: Vec<u8>,
         reply: AppendReply,
     },
     UpdateWatermark {
@@ -922,11 +978,12 @@ impl DiskBackend {
         })
     }
 
-    pub(crate) async fn append_frame(
+    pub(crate) async fn append_encoded_frame(
         &self,
         signal: SignalKind,
         seq_id: u64,
-        batch: RecordBatch,
+        rows: u32,
+        frame_bytes: Vec<u8>,
     ) -> Result<WrittenFrame, PipelineError> {
         let sender = {
             let guard = lock_unpoisoned(&self.cmd_tx);
@@ -936,10 +993,11 @@ impl DiskBackend {
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         sender
-            .send(WriterCommand::Append {
+            .send(WriterCommand::AppendEncoded {
                 signal,
                 seq_id,
-                batch,
+                rows,
+                frame_bytes,
                 reply: tx,
             })
             .map_err(|_| storage_err("disk buffer writer thread exited"))?;
@@ -1023,7 +1081,6 @@ impl DiskBackend {
         mut current_watermark: DiskWatermark,
     ) {
         let mut active_segment: Option<ActiveSegment> = None;
-        let mut encode_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
         while let Ok(first_cmd) = cmd_rx.recv() {
             let mut batch_cmds = Vec::with_capacity(16);
@@ -1042,14 +1099,14 @@ impl DiskBackend {
 
             for cmd in batch_cmds {
                 match cmd {
-                    WriterCommand::Append {
+                    WriterCommand::AppendEncoded {
                         signal,
                         seq_id,
-                        batch,
+                        rows,
+                        frame_bytes,
                         reply,
                     } => {
-                        encode_buf.clear();
-                        let res = Self::write_single_frame(
+                        let res = Self::write_encoded_frame(
                             dir,
                             &mut active_segment,
                             &mut sealed_segments,
@@ -1059,20 +1116,21 @@ impl DiskBackend {
                             current_watermark,
                             signal,
                             seq_id,
-                            &batch,
-                            &mut encode_buf,
+                            rows,
+                            &frame_bytes,
                         );
                         append_replies.push((reply, res));
                     }
                     WriterCommand::UpdateWatermark { watermark, reply } => {
-                        current_watermark.merge_monotonic(watermark);
-                        watermark_dirty = true;
+                        if current_watermark.merge_monotonic(watermark) {
+                            watermark_dirty = true;
+                        }
                         if let Some(r) = reply {
                             wm_oneshot_replies.push(r);
                         }
                     }
                     WriterCommand::FlushWatermarkSync { watermark, reply } => {
-                        current_watermark.merge_monotonic(watermark);
+                        let _ = current_watermark.merge_monotonic(watermark);
                         watermark_dirty = true;
                         force_sync_segment = true;
                         wm_blocking_replies.push(reply);
@@ -1116,6 +1174,10 @@ impl DiskBackend {
                 for reply in wm_blocking_replies {
                     let _ = reply.send(wm_res.clone());
                 }
+            } else {
+                for reply in wm_oneshot_replies {
+                    let _ = reply.send(Ok(()));
+                }
             }
 
             if should_shutdown {
@@ -1129,7 +1191,7 @@ impl DiskBackend {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn write_single_frame(
+    fn write_encoded_frame(
         dir: &Path,
         active_segment: &mut Option<ActiveSegment>,
         sealed_segments: &mut Vec<SealedSegmentMeta>,
@@ -1139,19 +1201,33 @@ impl DiskBackend {
         current_watermark: DiskWatermark,
         signal: SignalKind,
         seq_id: u64,
-        batch: &RecordBatch,
-        encode_buf: &mut Vec<u8>,
+        rows: u32,
+        frame_bytes: &[u8],
     ) -> Result<WrittenFrame, String> {
-        let header = encode_frame(signal, seq_id, batch, encode_buf).map_err(|e| e.to_string())?;
-        if header.payload_len > max_payload_len {
+        if frame_bytes.len() < FRAME_HEADER_LEN {
             return Err(format!(
-                "OTLB frame payload_len ({}) exceeds max_payload_len ({max_payload_len})",
-                header.payload_len
+                "encoded OTLB frame shorter than {FRAME_HEADER_LEN}-byte header ({} bytes)",
+                frame_bytes.len()
             ));
         }
-        let frame_len_u64 = encode_buf.len() as u64;
+        let payload_len = u32::try_from(frame_bytes.len() - FRAME_HEADER_LEN)
+            .map_err(|_| "frame payload length overflow".to_string())?;
+        if payload_len > max_payload_len {
+            return Err(format!(
+                "OTLB frame payload_len ({payload_len}) exceeds max_payload_len ({max_payload_len})"
+            ));
+        }
+        let mut hdr_row_bytes = [0u8; 4];
+        hdr_row_bytes.copy_from_slice(&frame_bytes[16..20]);
+        let hdr_rows = u32::from_le_bytes(hdr_row_bytes);
+        if hdr_rows != rows {
+            return Err(format!(
+                "OTLB frame header row_count ({hdr_rows}) does not match expected rows ({rows})"
+            ));
+        }
+        let frame_len_u64 = frame_bytes.len() as u64;
         let frame_len_u32 =
-            u32::try_from(encode_buf.len()).map_err(|_| "frame length overflow".to_string())?;
+            u32::try_from(frame_bytes.len()).map_err(|_| "frame length overflow".to_string())?;
 
         // Roll active segment before writing if adding this frame would exceed segment_size_bytes
         if let Some(seg) = active_segment.as_ref()
@@ -1200,7 +1276,7 @@ impl DiskBackend {
         let offset = seg.bytes_written;
         let segment_id = seg.segment_id;
         seg.file
-            .write_all(encode_buf)
+            .write_all(frame_bytes)
             .map_err(|e| format!("failed to write to segment '{}': {e}", seg.path.display()))?;
         seg.bytes_written = seg.bytes_written.saturating_add(frame_len_u64);
         let sig_idx = signal.as_u8() as usize;
@@ -1886,5 +1962,123 @@ mod tests {
         let batch = lease.prepare(Ok).await.unwrap();
         assert_eq!(batch, make_batch(&[7, 8, 9]));
         lease.ack().await.unwrap();
+    }
+
+    #[test]
+    fn test_patch_frame_seq_id_updates_header_and_crc_cleanly() {
+        let batch = make_batch(&[10, 20, 30]);
+        let mut buf = Vec::new();
+        let mut hdr = encode_frame(SignalKind::Logs, 0, &batch, &mut buf).unwrap();
+        assert_eq!(hdr.seq_id, 0);
+
+        patch_frame_seq_id(&mut buf, &mut hdr, 42).unwrap();
+        assert_eq!(hdr.seq_id, 42);
+
+        let mut cursor = Cursor::new(&buf);
+        let (decoded_hdr, decoded_batch) = decode_frame(&mut cursor, u32::MAX).unwrap().unwrap();
+        assert_eq!(decoded_hdr.seq_id, 42);
+        assert_eq!(decoded_hdr, hdr);
+        assert_eq!(decoded_batch, batch);
+
+        let mut short_buf = [0u8; 10];
+        assert!(patch_frame_seq_id(&mut short_buf, &mut hdr, 99).is_err());
+    }
+
+    #[test]
+    fn test_split_and_encode_frames_for_disk_produces_valid_pre_encoded_frames() {
+        let values: Vec<i64> = (0..256).collect();
+        let batch = make_batch(&values);
+        let mut full_buf = Vec::new();
+        let full_hdr = encode_frame(SignalKind::Metrics, 0, &batch, &mut full_buf).unwrap();
+        let max_payload_len = full_hdr.payload_len / 2;
+
+        let frames =
+            split_and_encode_frames_for_disk(SignalKind::Metrics, batch, max_payload_len).unwrap();
+        assert!(frames.len() >= 2);
+
+        let mut recovered = Vec::new();
+        for (idx, mut frame) in frames.into_iter().enumerate() {
+            assert!(frame.header.payload_len <= max_payload_len);
+            assert_eq!(
+                frame.bytes.len(),
+                FRAME_HEADER_LEN + frame.header.payload_len as usize
+            );
+            let seq_id = (idx as u64) + 100;
+            patch_frame_seq_id(&mut frame.bytes, &mut frame.header, seq_id).unwrap();
+
+            let mut cursor = Cursor::new(&frame.bytes);
+            let (decoded_hdr, decoded_batch) =
+                decode_frame(&mut cursor, max_payload_len).unwrap().unwrap();
+            assert_eq!(decoded_hdr.seq_id, seq_id);
+            assert_eq!(decoded_hdr, frame.header);
+            assert_eq!(decoded_batch, frame.batch);
+
+            let col = decoded_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..col.len() {
+                recovered.push(col.value(i));
+            }
+        }
+        assert_eq!(recovered, values);
+    }
+
+    #[tokio::test]
+    async fn test_disk_watermark_merge_monotonic_returns_false_when_unchanged() {
+        let mut wm = DiskWatermark {
+            instance_id: 77,
+            logs: 10,
+            metrics: 20,
+            traces: 30,
+        };
+        assert!(!wm.merge_monotonic(DiskWatermark {
+            instance_id: 77,
+            logs: 10,
+            metrics: 15,
+            traces: 25,
+        }));
+        assert!(!wm.merge_monotonic(wm));
+        assert!(wm.merge_monotonic(DiskWatermark {
+            instance_id: 77,
+            logs: 11,
+            metrics: 20,
+            traces: 30,
+        }));
+        assert_eq!(wm.logs, 11);
+
+        let tmp = TempDiskDir::new("wm_merge_unchanged");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, buf) = SinkBuffer::new("test_wm_unchanged", config).unwrap();
+        let inst_id = buf.instance_id();
+        let disk = buf.inner.disk.as_ref().unwrap();
+
+        let wm1 = DiskWatermark {
+            instance_id: inst_id,
+            logs: 5,
+            metrics: 4,
+            traces: 3,
+        };
+        disk.update_watermark(wm1).await.unwrap();
+
+        // Second update with identical or older values must still resolve Ok(()) promptly
+        disk.update_watermark(wm1).await.unwrap();
+        disk.update_watermark(DiskWatermark {
+            instance_id: inst_id,
+            logs: 2,
+            metrics: 4,
+            traces: 1,
+        })
+        .await
+        .unwrap();
+        drop(tx);
     }
 }
