@@ -432,6 +432,7 @@ enum WriterCommand {
         seq_id: u64,
         rows: u32,
         frame_bytes: Vec<u8>,
+        reservation: Option<crate::buffer::AppendReservation>,
         reply: AppendReply,
     },
     UpdateWatermark {
@@ -978,6 +979,7 @@ impl DiskBackend {
         seq_id: u64,
         rows: u32,
         frame_bytes: Vec<u8>,
+        reservation: Option<crate::buffer::AppendReservation>,
     ) -> Result<WrittenFrame, PipelineError> {
         let sender = {
             let guard = lock_unpoisoned(&self.cmd_tx);
@@ -992,6 +994,7 @@ impl DiskBackend {
                 seq_id,
                 rows,
                 frame_bytes,
+                reservation,
                 reply: tx,
             })
             .map_err(|_| storage_err("disk buffer writer thread exited"))?;
@@ -1084,7 +1087,11 @@ impl DiskBackend {
                 batch_cmds.push(cmd);
             }
 
-            let mut append_replies: Vec<(AppendReply, Result<WrittenFrame, String>)> = Vec::new();
+            let mut append_replies: Vec<(
+                AppendReply,
+                Option<crate::buffer::AppendReservation>,
+                Result<WrittenFrame, String>,
+            )> = Vec::new();
             let mut wm_oneshot_replies: Vec<WatermarkOneshotReply> = Vec::new();
             let mut wm_blocking_replies: Vec<WatermarkSyncReply> = Vec::new();
             let mut watermark_dirty = false;
@@ -1098,6 +1105,7 @@ impl DiskBackend {
                         seq_id,
                         rows,
                         frame_bytes,
+                        reservation,
                         reply,
                     } => {
                         let res = Self::write_encoded_frame(
@@ -1113,7 +1121,7 @@ impl DiskBackend {
                             rows,
                             &frame_bytes,
                         );
-                        append_replies.push((reply, res));
+                        append_replies.push((reply, reservation, res));
                     }
                     WriterCommand::UpdateWatermark { watermark, reply } => {
                         if current_watermark.merge_monotonic(watermark) {
@@ -1146,11 +1154,14 @@ impl DiskBackend {
                 ));
             }
 
-            for (reply, write_res) in append_replies {
+            for (reply, reservation, write_res) in append_replies {
                 let final_res = match (&sync_err, write_res) {
                     (Some(err), _) => Err(err.clone()),
                     (None, r) => r,
                 };
+                if let Some(res_guard) = reservation {
+                    res_guard.finish(&final_res);
+                }
                 let _ = reply.send(final_res);
             }
 
