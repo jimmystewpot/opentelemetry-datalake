@@ -775,6 +775,10 @@ impl DiskBackend {
                 sealed_segments.push(sealed);
             }
         }
+        for ring_state in rings {
+            let mut ring = lock_unpoisoned(&ring_state.ring);
+            ring.advance_watermark(&ring_state.committed_seq);
+        }
         Ok((max_segment_id, sealed_segments))
     }
 
@@ -843,13 +847,7 @@ impl DiskBackend {
                     let frame_len = FRAME_HEADER_LEN_U32.saturating_add(header.payload_len);
                     let sig_idx = header.signal.as_u8() as usize;
                     max_seq[sig_idx] = max_seq[sig_idx].max(header.seq_id);
-                    Self::record_corrupted_frame(
-                        sink_name,
-                        &seg_path,
-                        &header,
-                        watermark,
-                        &rings[sig_idx],
-                    );
+                    Self::record_corrupted_frame(sink_name, &seg_path, &header, &rings[sig_idx]);
                     offset = offset.saturating_add(u64::from(frame_len));
                 }
                 Err(FrameDecodeError::InvalidHeader { reason }) => {
@@ -931,7 +929,6 @@ impl DiskBackend {
         sink_name: &str,
         seg_path: &Path,
         header: &FrameHeader,
-        watermark: DiskWatermark,
         ring_state: &SignalRingState,
     ) {
         tracing::error!(
@@ -947,9 +944,6 @@ impl DiskBackend {
             .fetch_add(u64::from(header.row_count), Ordering::Relaxed);
         let mut ring = lock_unpoisoned(&ring_state.ring);
         ring.next_seq = ring.next_seq.max(header.seq_id.saturating_add(1));
-        if header.seq_id > watermark.for_signal(header.signal) {
-            ring.slots.insert(header.seq_id, LeaseSlotState::Acked);
-        }
     }
 
     fn truncate_torn_segment(

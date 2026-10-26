@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::Notify;
 
-/// State of a sequence number slot in a signal ring.
+/// State of an active (unacknowledged) sequence number slot in a signal ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseSlotState {
+    /// Sequence number is reserved for an in-flight disk append and not yet in `queue`.
+    Reserved,
     /// Batch is waiting in the ring queue to be leased.
     Queued,
     /// Batch is currently leased to a sink task.
     InFlight,
-    /// Batch has been acknowledged (or evicted) and is eligible to advance the watermark.
-    Acked,
 }
 
 /// Storage payload for a queued or leased batch inside a [`SignalRing`].
@@ -147,16 +147,14 @@ impl SignalRing {
         }
     }
 
-    /// Pops all leading [`LeaseSlotState::Acked`] entries from `slots` and advances `committed_seq`.
+    /// Advances `committed_seq` to the highest contiguous sequence number below the
+    /// earliest active slot in `slots` (or `next_seq - 1` when no active slots remain).
     pub fn advance_watermark(&mut self, committed_seq: &AtomicU64) {
-        while let Some((&seq, &state)) = self.slots.first_key_value() {
-            if state == LeaseSlotState::Acked {
-                self.slots.pop_first();
-                committed_seq.store(seq, Ordering::Release);
-            } else {
-                break;
-            }
-        }
+        let candidate = self.slots.first_key_value().map_or_else(
+            || self.next_seq.saturating_sub(1),
+            |(&first_unacked, _)| first_unacked.saturating_sub(1),
+        );
+        committed_seq.fetch_max(candidate, Ordering::AcqRel);
     }
 
     /// Requeues leased batch payloads at the front of `queue` in their original sequence order.
@@ -182,7 +180,7 @@ impl SignalRing {
         self.inflight_leases = self.inflight_leases.saturating_sub(1);
     }
 
-    /// Marks all batch sequence numbers in `meta` as [`LeaseSlotState::Acked`], releases
+    /// Removes all acknowledged batch sequence numbers in `meta` from `slots`, releases
     /// their byte/row budget, and advances the contiguous watermark.
     pub fn ack_entries(
         &mut self,
@@ -192,7 +190,7 @@ impl SignalRing {
         committed_seq: &AtomicU64,
     ) {
         for item in meta {
-            self.slots.insert(item.seq_id, LeaseSlotState::Acked);
+            self.slots.remove(&item.seq_id);
         }
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(byte_size);
         self.rows_in_flight = self.rows_in_flight.saturating_sub(num_rows);

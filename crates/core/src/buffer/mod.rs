@@ -462,14 +462,25 @@ impl BufferInner {
         let mut ring = lock_unpoisoned(&ring_state.ring);
 
         if ring.inflight_leases >= self.config.max_inflight_leases {
-            let is_drained = ring.closed && ring.queue.is_empty() && ring.inflight_leases == 0;
+            let is_drained = ring.closed
+                && ring.queue.is_empty()
+                && ring.inflight_leases == 0
+                && ring.slots.is_empty();
             return (None, None, is_drained);
         }
 
         let Some(front) = ring.queue.front() else {
-            let is_drained = ring.closed && ring.inflight_leases == 0;
+            let is_drained = ring.closed && ring.inflight_leases == 0 && ring.slots.is_empty();
             return (None, None, is_drained);
         };
+
+        let has_earlier_reserved = ring
+            .slots
+            .range(..front.seq_id)
+            .any(|(_, &state)| state == LeaseSlotState::Reserved);
+        if has_earlier_reserved {
+            return (None, None, false);
+        }
 
         if let Some(ready_at) = front.ready_at
             && ready_at > now
@@ -487,9 +498,15 @@ impl BufferInner {
         let mut hit_coalesce_boundary = false;
 
         for next in ring.queue.iter().skip(1) {
+            let expected_next_seq = check_last_seq.saturating_add(1);
+            if next.seq_id != expected_next_seq {
+                if ring.slots.get(&expected_next_seq) != Some(&LeaseSlotState::Reserved) {
+                    hit_coalesce_boundary = true;
+                }
+                break;
+            }
             if next.ready_at.is_some_and(|t| t > now)
                 || next.attempt != first_attempt
-                || next.seq_id != check_last_seq.saturating_add(1)
                 || next.payload.schema() != first_schema
                 || check_bytes.saturating_add(next.byte_size) > self.config.max_batch_size_bytes
                 || self.config.max_batch_records.is_some_and(|max_rec| {
@@ -529,7 +546,7 @@ impl BufferInner {
         }
 
         let Some(first) = ring.queue.pop_front() else {
-            let is_drained = ring.closed && ring.inflight_leases == 0;
+            let is_drained = ring.closed && ring.inflight_leases == 0 && ring.slots.is_empty();
             return (None, None, is_drained);
         };
 
@@ -663,6 +680,62 @@ impl Drop for BlockedSendGuard<'_> {
     }
 }
 
+struct DiskReservationGuard<'a> {
+    inner: &'a BufferInner,
+    signal: SignalKind,
+    seq_id: u64,
+    frame_bytes_len: usize,
+    batch_rows: usize,
+    active: bool,
+}
+
+impl<'a> DiskReservationGuard<'a> {
+    const fn new(
+        inner: &'a BufferInner,
+        signal: SignalKind,
+        seq_id: u64,
+        frame_bytes_len: usize,
+        batch_rows: usize,
+    ) -> Self {
+        Self {
+            inner,
+            signal,
+            seq_id,
+            frame_bytes_len,
+            batch_rows,
+            active: true,
+        }
+    }
+
+    const fn complete(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for DiskReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let ring_state = &self.inner.rings[self.signal.as_u8() as usize];
+            {
+                let mut ring = lock_unpoisoned(&ring_state.ring);
+                ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(self.frame_bytes_len);
+                ring.rows_in_flight = ring.rows_in_flight.saturating_sub(self.batch_rows);
+                ring.slots.remove(&self.seq_id);
+                ring.advance_watermark(&ring_state.committed_seq);
+                self.inner.sync_ring_metrics(self.signal, &ring);
+            }
+            if let Some(disk) = &self.inner.disk {
+                disk.update_watermark_nonblocking(DiskWatermark::from_rings(
+                    self.inner.instance_id,
+                    &self.inner.rings,
+                ));
+            }
+            ring_state.space_available_notify.notify_waiters();
+            self.inner.notify_data_ready(self.signal);
+        }
+    }
+}
+
 /// Cloneable producer handle used by transformers to enqueue [`SignalBatch`]es into a [`SinkBuffer`].
 #[derive(Debug)]
 pub struct BufferSender {
@@ -764,7 +837,7 @@ impl BufferSender {
                         let rows = u64::try_from(evicted.row_count).unwrap_or(u64::MAX);
                         ring.evicted_records = ring.evicted_records.saturating_add(rows);
                         evicted_rows = evicted_rows.saturating_add(rows);
-                        ring.slots.insert(evicted.seq_id, LeaseSlotState::Acked);
+                        ring.slots.remove(&evicted.seq_id);
                         ring.advance_watermark(&ring_state.committed_seq);
                     }
                 }
@@ -786,9 +859,9 @@ impl BufferSender {
                     ring.next_seq = ring.next_seq.saturating_add(1);
                     ring.bytes_in_flight = ring.bytes_in_flight.saturating_add(batch_bytes);
                     ring.rows_in_flight = ring.rows_in_flight.saturating_add(batch_rows);
-                    ring.slots.insert(seq_id, LeaseSlotState::Queued);
 
                     if let Some(record_batch) = in_memory_batch.take() {
+                        ring.slots.insert(seq_id, LeaseSlotState::Queued);
                         ring.queue.push_back(QueuedBatch {
                             seq_id,
                             payload: BatchPayload::InMemory(record_batch),
@@ -805,6 +878,7 @@ impl BufferSender {
                         return Ok(None);
                     }
 
+                    ring.slots.insert(seq_id, LeaseSlotState::Reserved);
                     self.inner.sync_ring_metrics(signal, &ring);
                     blocked_guard.mark_admitted();
                     return Ok(Some(seq_id));
@@ -834,19 +908,20 @@ impl BufferSender {
             return Ok(());
         };
 
+        let mut reservation_guard = DiskReservationGuard::new(
+            &self.inner,
+            signal,
+            reserved_seq_id,
+            frame_bytes_len,
+            batch_rows,
+        );
+
         let ring_state = &self.inner.rings[signal.as_u8() as usize];
-        if let Err(err) = crate::buffer::disk::patch_frame_seq_id(
+        crate::buffer::disk::patch_frame_seq_id(
             &mut frame.bytes,
             &mut frame.header,
             reserved_seq_id,
-        ) {
-            let mut ring = lock_unpoisoned(&ring_state.ring);
-            ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(frame_bytes_len);
-            ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
-            ring.slots.remove(&reserved_seq_id);
-            self.inner.sync_ring_metrics(signal, &ring);
-            return Err(err);
-        }
+        )?;
 
         let Some(disk) = &self.inner.disk else {
             return Err(PipelineError::Internal(
@@ -866,6 +941,7 @@ impl BufferSender {
                         .bytes_in_flight
                         .saturating_sub(frame_bytes_len)
                         .saturating_add(actual_bytes);
+                    ring.slots.insert(reserved_seq_id, LeaseSlotState::Queued);
                     ring.enqueue_ordered(QueuedBatch {
                         seq_id: reserved_seq_id,
                         payload: BatchPayload::OnDisk {
@@ -881,6 +957,7 @@ impl BufferSender {
                         attempt: 0,
                         ready_at: None,
                     });
+                    reservation_guard.complete();
                     self.inner.sync_ring_metrics(signal, &ring);
                 }
                 if actual_bytes < frame_bytes_len {
@@ -890,13 +967,7 @@ impl BufferSender {
                 Ok(())
             }
             Err(err) => {
-                {
-                    let mut ring = lock_unpoisoned(&ring_state.ring);
-                    ring.bytes_in_flight = ring.bytes_in_flight.saturating_sub(frame_bytes_len);
-                    ring.rows_in_flight = ring.rows_in_flight.saturating_sub(batch_rows);
-                    ring.slots.remove(&reserved_seq_id);
-                    self.inner.sync_ring_metrics(signal, &ring);
-                }
+                drop(reservation_guard);
                 self.inner.record_storage_failure(signal, err.to_string());
                 Err(err)
             }
@@ -2105,5 +2176,240 @@ mod tests {
         drop(tx);
         assert!(ctrl.finalize_shutdown_timeout().is_err());
         assert_eq!(buf.shutdown_timeout_drops(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_disk_buffer_waits_for_earlier_reserved_slot_before_leasing_later_batch() {
+        let dir = std::env::temp_dir().join(format!(
+            "dl_test_reserved_order_{}_{}",
+            std::process::id(),
+            generate_instance_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sample = make_batch(&[10, 20]);
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(dir.clone()),
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(4),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_reserved_order", config).unwrap();
+
+        // Reserve seq_id = 1 as an in-flight disk reservation (not yet enqueued),
+        // then send seq_id = 2 all the way through to ring.queue.
+        let max_payload_len = buf.inner.config.max_disk_frame_payload_bytes();
+        let mut frame1 = crate::buffer::disk::split_and_encode_frames_for_disk(
+            SignalKind::Logs,
+            make_batch(&[1, 2]),
+            max_payload_len,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let frame1_len = frame1.bytes.len();
+        let frame1_rows = frame1.batch.num_rows();
+        let frame1_schema = frame1.batch.schema();
+        drop(frame1.batch);
+
+        let reserved_seq_1 = tx
+            .reserve_or_enqueue_slot(SignalKind::Logs, frame1_len, frame1_rows, None)
+            .await
+            .unwrap()
+            .expect("disk reservation must return Some(seq_id)");
+        assert_eq!(reserved_seq_1, 1);
+
+        // Now send batch 2 (which reserves seq_id = 2, appends to disk, and enqueues into ring.queue).
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+
+        // Because seq_id = 1 is still LeaseSlotState::Reserved (< front.seq_id = 2),
+        // next_lease() must NOT lease seq_id = 2 ahead of seq_id = 1.
+        let premature = tokio::time::timeout(Duration::from_millis(40), buf.next_lease()).await;
+        assert!(
+            premature.is_err(),
+            "next_lease must wait while an earlier sequence slot is still Reserved"
+        );
+
+        // Complete the disk append for seq_id = 1 and enqueue it.
+        crate::buffer::disk::patch_frame_seq_id(
+            &mut frame1.bytes,
+            &mut frame1.header,
+            reserved_seq_1,
+        )
+        .unwrap();
+        let written1 = buf
+            .inner
+            .disk
+            .as_ref()
+            .unwrap()
+            .append_encoded_frame(
+                SignalKind::Logs,
+                reserved_seq_1,
+                frame1.header.row_count,
+                frame1.bytes,
+            )
+            .await
+            .unwrap();
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let mut ring = lock_unpoisoned(&ring_state.ring);
+            ring.slots.insert(reserved_seq_1, LeaseSlotState::Queued);
+            ring.enqueue_ordered(QueuedBatch {
+                seq_id: reserved_seq_1,
+                payload: BatchPayload::OnDisk {
+                    segment_id: written1.segment_id,
+                    offset: written1.offset,
+                    len: written1.len,
+                    rows: frame1.header.row_count,
+                    schema: frame1_schema,
+                },
+                byte_size: written1.len as usize,
+                row_count: frame1_rows,
+                enqueued_at: Instant::now(),
+                attempt: 0,
+                ready_at: None,
+            });
+        }
+        buf.inner.notify_data_ready(SignalKind::Logs);
+
+        // Now next_lease() must coalesce [1, 2] in order!
+        let lease = tokio::time::timeout(Duration::from_millis(200), buf.next_lease())
+            .await
+            .expect("next_lease must succeed once earlier reservation completes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.id().first_seq, 1);
+        assert_eq!(lease.id().last_seq, 2);
+        assert_eq!(lease.num_rows(), 4);
+        let prepared_rows = lease.prepare(|b| Ok(b.num_rows())).await.unwrap();
+        assert_eq!(prepared_rows, 4);
+        lease.ack().await.unwrap();
+        assert_eq!(
+            buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+                .committed_seq
+                .load(Ordering::Acquire),
+            2
+        );
+
+        // Verify DiskReservationGuard rollback on cancellation wakes waiters and cleans up slot 3
+        let reserved_seq_3 = tx
+            .reserve_or_enqueue_slot(SignalKind::Logs, frame1_len, frame1_rows, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reserved_seq_3, 3);
+        let guard = DiskReservationGuard::new(
+            &tx.inner,
+            SignalKind::Logs,
+            reserved_seq_3,
+            frame1_len,
+            frame1_rows,
+        );
+        tx.send(SignalBatch::Logs(make_batch(&[30, 40])))
+            .await
+            .unwrap();
+        // While guard for seq 3 is active, seq 4 cannot be leased.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), buf.next_lease())
+                .await
+                .is_err()
+        );
+        // Dropping guard rolls back seq 3 and allows seq 4 to be leased and advance watermark to 4.
+        drop(guard);
+        let lease4 = tokio::time::timeout(Duration::from_millis(200), buf.next_lease())
+            .await
+            .expect("dropping DiskReservationGuard must unblock waiting lease")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease4.id().first_seq, 4);
+        assert_eq!(lease4.id().last_seq, 4);
+        let rows4 = lease4.prepare(|b| Ok(b.num_rows())).await.unwrap();
+        assert_eq!(rows4, 2);
+        lease4.ack().await.unwrap();
+        assert_eq!(
+            buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+                .committed_seq
+                .load(Ordering::Acquire),
+            4
+        );
+        drop(tx);
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_drop_oldest_with_inflight_lease_keeps_slots_bounded() {
+        let sample = make_batch(&[1, 2]);
+        let batch_bytes = sample.get_array_memory_size();
+        // Per-signal budget is max_buffer_bytes / 3. Allow ~2 batches in flight per signal.
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_buffer_bytes: (batch_bytes * 2 * 3) as u64,
+            max_batch_size_bytes: batch_bytes,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            max_inflight_leases: 1,
+            overflow_policy: OverflowPolicy::DropOldest,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_bounded_slots", config).unwrap();
+
+        // Enqueue batch 1 and lease it so seq_id = 1 remains InFlight.
+        tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1.id().first_seq, 1);
+        assert_eq!(lease1.id().last_seq, 1);
+
+        // Send 500 more batches while lease1 stays in flight; DropOldest evicts older queued batches.
+        for i in 0..500 {
+            tx.send(SignalBatch::Logs(make_batch(&[i, i + 1])))
+                .await
+                .unwrap();
+        }
+
+        // Verify ring.slots only tracks active (InFlight + Queued) sequences, never accumulating evicted ones.
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let ring = lock_unpoisoned(&ring_state.ring);
+            assert!(
+                ring.slots.len() <= 3,
+                "ring.slots.len() must stay bounded by active batches, got {}",
+                ring.slots.len()
+            );
+            assert_eq!(ring.slots.len(), 1 + ring.queue.len());
+        }
+        assert_eq!(
+            buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+                .committed_seq
+                .load(Ordering::Acquire),
+            0
+        );
+
+        // Acknowledging lease1 must jump the contiguous watermark across all 499 evicted sequences!
+        lease1.ack().await.unwrap();
+        assert_eq!(
+            buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+                .committed_seq
+                .load(Ordering::Acquire),
+            500
+        );
+
+        // Drain the final remaining queued batch (seq_id = 501).
+        let lease_last = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease_last.id().first_seq, 501);
+        assert_eq!(lease_last.id().last_seq, 501);
+        lease_last.ack().await.unwrap();
+        assert_eq!(
+            buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+                .committed_seq
+                .load(Ordering::Acquire),
+            501
+        );
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let ring = lock_unpoisoned(&ring_state.ring);
+            assert!(ring.slots.is_empty());
+        }
     }
 }
