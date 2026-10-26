@@ -275,66 +275,62 @@ impl Lease {
         next_attempt: u32,
         reason: String,
     ) -> Result<(), PipelineError> {
-        if let Some(ref dlq) = self.inner.dead_letter {
-            let dlq = Arc::clone(dlq);
-            let disk_path = self.inner.config.disk_path.clone();
-            let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
-            let dlq_meta = DeadLetterMetadata {
-                sink: self.inner.sink_name.clone(),
-                signal,
-                first_seq: self.id.first_seq,
-                last_seq: self.id.last_seq,
-                row_count: self.num_rows,
-                attempts: next_attempt,
-                reason: reason.clone(),
-                timestamp_unix_ms: current_unix_ms(),
-            };
+        let dlq = Arc::clone(&self.inner.dead_letter);
+        let disk_path = self.inner.config.disk_path.clone();
+        let max_payload_len = self.inner.config.max_disk_frame_payload_bytes();
+        let dlq_meta = DeadLetterMetadata {
+            sink: self.inner.sink_name.clone(),
+            signal,
+            first_seq: self.id.first_seq,
+            last_seq: self.id.last_seq,
+            row_count: self.num_rows,
+            attempts: next_attempt,
+            reason: reason.clone(),
+            timestamp_unix_ms: current_unix_ms(),
+        };
 
-            let (returned_payloads, write_res) = tokio::task::spawn_blocking(move || {
-                let res = (|| -> Result<PathBuf, PipelineError> {
-                    let mut decoded = Vec::with_capacity(payloads.len());
-                    for payload in &payloads {
-                        match payload {
-                            BatchPayload::InMemory(batch) => {
-                                decoded.push(batch.clone());
-                            }
-                            BatchPayload::OnDisk {
-                                segment_id,
-                                offset,
-                                len,
-                                ..
-                            } => {
-                                let base_dir = disk_path.as_ref().ok_or_else(|| {
-                                    PipelineError::Storage(
-                                        "OnDisk payload encountered without configured disk_path"
-                                            .into(),
-                                    )
-                                })?;
-                                let batch = crate::buffer::disk::read_frame_at(
-                                    base_dir,
-                                    *segment_id,
-                                    *offset,
-                                    *len,
-                                    max_payload_len,
-                                )?;
-                                decoded.push(batch);
-                            }
+        let (returned_payloads, write_res) = tokio::task::spawn_blocking(move || {
+            let res = (|| -> Result<PathBuf, PipelineError> {
+                let mut decoded = Vec::with_capacity(payloads.len());
+                for payload in &payloads {
+                    match payload {
+                        BatchPayload::InMemory(batch) => {
+                            decoded.push(batch.clone());
+                        }
+                        BatchPayload::OnDisk {
+                            segment_id,
+                            offset,
+                            len,
+                            ..
+                        } => {
+                            let base_dir = disk_path.as_ref().ok_or_else(|| {
+                                PipelineError::Storage(
+                                    "OnDisk payload encountered without configured disk_path"
+                                        .into(),
+                                )
+                            })?;
+                            let batch = crate::buffer::disk::read_frame_at(
+                                base_dir,
+                                *segment_id,
+                                *offset,
+                                *len,
+                                max_payload_len,
+                            )?;
+                            decoded.push(batch);
                         }
                     }
-                    dlq.write_quarantine(&dlq_meta, &decoded)
-                })();
-                (payloads, res)
-            })
-            .await
-            .map_err(|e| {
-                PipelineError::Internal(format!("Lease::nack dead-letter join error: {e}"))
-            })?;
+                }
+                dlq.write_quarantine(&dlq_meta, &decoded)
+            })();
+            (payloads, res)
+        })
+        .await
+        .map_err(|e| PipelineError::Internal(format!("Lease::nack dead-letter join error: {e}")))?;
 
-            if let Err(err) = write_res {
-                self.inner
-                    .fail_lease(signal, returned_payloads, meta, err.to_string());
-                return Err(err);
-            }
+        if let Err(err) = write_res {
+            self.inner
+                .fail_lease(signal, returned_payloads, meta, err.to_string());
+            return Err(err);
         }
 
         let dropped_rows = u64::try_from(self.num_rows).unwrap_or(u64::MAX);

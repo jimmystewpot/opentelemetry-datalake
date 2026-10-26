@@ -72,7 +72,7 @@ pub(crate) struct BufferInner {
     pub(crate) config: BufferConfig,
     pub(crate) rings: [SignalRingState; 3],
     pub(crate) disk: Option<DiskBackend>,
-    pub(crate) dead_letter: Option<Arc<DeadLetterStore>>,
+    pub(crate) dead_letter: Arc<DeadLetterStore>,
     pub(crate) metrics: BufferMetrics,
     pub(crate) any_data_ready_notify: Notify,
     pub(crate) fatal_error: Mutex<Option<String>>,
@@ -93,12 +93,15 @@ impl BufferInner {
             (None, generate_instance_id())
         };
         let dead_letter = if let Some(ref dl_path) = config.dead_letter_path {
-            Some(Arc::new(DeadLetterStore::new(
+            Arc::new(DeadLetterStore::new(
                 dl_path.clone(),
                 config.max_dead_letter_bytes,
-            )?))
+            )?)
         } else {
-            None
+            Arc::new(DeadLetterStore::new_default(
+                config.effective_dead_letter_path(),
+                config.max_dead_letter_bytes,
+            )?)
         };
         let metrics = BufferMetrics::new(sink_name, &config);
         for sig in ALL_SIGNALS {
@@ -135,6 +138,12 @@ impl BufferInner {
 
     fn new_passthrough() -> Arc<Self> {
         let config = BufferConfig::passthrough();
+        let dl_path = config.effective_dead_letter_path();
+        let max_dl_bytes = config.max_dead_letter_bytes;
+        let dead_letter = Arc::new(
+            DeadLetterStore::new_default(dl_path.clone(), max_dl_bytes)
+                .unwrap_or_else(|_| DeadLetterStore::empty_fallback(dl_path, max_dl_bytes)),
+        );
         let metrics = BufferMetrics::new("passthrough", &config);
         Arc::new(Self {
             sink_name: "passthrough".to_string(),
@@ -146,7 +155,7 @@ impl BufferInner {
                 SignalRingState::new(),
             ],
             disk: None,
-            dead_letter: None,
+            dead_letter,
             metrics,
             any_data_ready_notify: Notify::new(),
             fatal_error: Mutex::new(None),
@@ -381,27 +390,21 @@ impl BufferInner {
             return Ok(None);
         }
 
-        let written_path = if let Some(ref dlq) = self.dead_letter {
-            let dlq = Arc::clone(dlq);
-            let meta = DeadLetterMetadata {
-                sink: self.sink_name.clone(),
-                signal,
-                first_seq,
-                last_seq,
-                row_count,
-                attempts,
-                reason: reason.clone(),
-                timestamp_unix_ms: crate::buffer::dead_letter::current_unix_ms(),
-            };
-            let path = tokio::task::spawn_blocking(move || dlq.write_quarantine(&meta, &batches))
-                .await
-                .map_err(|e| {
-                    PipelineError::Internal(format!("dead-letter write join error: {e}"))
-                })??;
-            Some(path)
-        } else {
-            None
+        let dlq = Arc::clone(&self.dead_letter);
+        let meta = DeadLetterMetadata {
+            sink: self.sink_name.clone(),
+            signal,
+            first_seq,
+            last_seq,
+            row_count,
+            attempts,
+            reason: reason.clone(),
+            timestamp_unix_ms: crate::buffer::dead_letter::current_unix_ms(),
         };
+        let path = tokio::task::spawn_blocking(move || dlq.write_quarantine(&meta, &batches))
+            .await
+            .map_err(|e| PipelineError::Internal(format!("dead-letter write join error: {e}")))??;
+        let written_path = Some(path);
 
         let dropped_rows = u64::try_from(row_count).unwrap_or(u64::MAX);
         self.rings[signal.as_u8() as usize]
@@ -1387,10 +1390,10 @@ impl SinkBuffer {
         }
     }
 
-    /// Returns a reference to the underlying [`DeadLetterStore`] if `dead_letter_path` is configured.
+    /// Returns a reference to the underlying [`DeadLetterStore`].
     #[must_use]
     pub fn dead_letter_store(&self) -> Option<&Arc<DeadLetterStore>> {
-        self.inner.dead_letter.as_ref()
+        Some(&self.inner.dead_letter)
     }
 
     /// Quarantines a rejected subset of batches (e.g. item-level HTTP 400 rows) to the
@@ -2168,7 +2171,10 @@ mod tests {
         assert!(ctrl.is_ready());
         assert_eq!(ctrl.drain_timeout_sec(), 15);
         assert_eq!(buf.drain_timeout_sec(), 15);
-        assert!(buf.dead_letter_store().is_none());
+        assert_eq!(
+            buf.dead_letter_store().unwrap().dir(),
+            std::path::Path::new("./dlq/buffer")
+        );
 
         // quarantine_batches with empty slice returns Ok(None)
         assert!(
@@ -2177,20 +2183,23 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // quarantine_batches without dead_letter_path increments dead_letter_drops and returns Ok(None)
-        assert!(
-            buf.quarantine_batches(
+        // quarantine_batches without dead_letter_path override writes to default ./dlq/buffer/<sink>
+        let default_written = buf
+            .quarantine_batches(
                 SignalKind::Logs,
                 1,
                 1,
                 1,
-                "rejected_no_dlq".into(),
+                "rejected_default_dlq".into(),
                 vec![sample.clone()],
             )
             .await
             .unwrap()
-            .is_none()
-        );
+            .expect("default dead-letter store must write quarantine file");
+        assert!(default_written.exists());
+        let _ = std::fs::remove_dir_all("./dlq/buffer/test_ctrl_helper");
+        let _ = std::fs::remove_dir("./dlq/buffer");
+        let _ = std::fs::remove_dir("./dlq");
         assert_eq!(buf.dead_letter_drops(), 2);
 
         // Coalesce 2 batches into 1 lease and consume via recv_passthrough()
@@ -2601,5 +2610,63 @@ mod tests {
             let ring = lock_unpoisoned(&ring_state.ring);
             assert!(ring.slots.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn test_default_dead_letter_path_in_disk_mode_quarantines_rejected_leases_under_disk_path()
+     {
+        let dir = std::env::temp_dir().join(format!(
+            "dl_test_default_disk_dlq_{}_{}",
+            std::process::id(),
+            generate_instance_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(dir.clone()),
+            dead_letter_path: None,
+            max_attempts: 1,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        assert_eq!(config.effective_dead_letter_path(), dir.join("dead-letter"));
+
+        let (tx, mut buf) = SinkBuffer::new("test_default_disk_dlq", config).unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[100, 200])))
+            .await
+            .unwrap();
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        lease
+            .nack(FailureClass::Rejected {
+                reason: "schema_validation_failed".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(buf.dead_letter_drops(), 2);
+        let sink_dlq_dir = dir.join("dead-letter").join("test_default_disk_dlq");
+        assert!(
+            sink_dlq_dir.exists(),
+            "Default disk dead-letter directory must be created on rejected lease exhaustion"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&sink_dlq_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("arrow"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        );
+        drop(tx);
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1075,9 +1075,11 @@ impl DiskBackend {
         sync_on_write: bool,
         mut next_segment_id: u64,
         mut sealed_segments: Vec<SealedSegmentMeta>,
-        mut current_watermark: DiskWatermark,
+        initial_watermark: DiskWatermark,
     ) {
         let mut active_segment: Option<ActiveSegment> = None;
+        let mut persisted_watermark = initial_watermark;
+        let mut staged_watermark = initial_watermark;
 
         while let Ok(first_cmd) = cmd_rx.recv() {
             let mut batch_cmds = Vec::with_capacity(16);
@@ -1115,7 +1117,7 @@ impl DiskBackend {
                             &mut next_segment_id,
                             segment_size_bytes,
                             max_payload_len,
-                            current_watermark,
+                            persisted_watermark,
                             signal,
                             seq_id,
                             rows,
@@ -1124,7 +1126,7 @@ impl DiskBackend {
                         append_replies.push((reply, reservation, res));
                     }
                     WriterCommand::UpdateWatermark { watermark, reply } => {
-                        if current_watermark.merge_monotonic(watermark) {
+                        if staged_watermark.merge_monotonic(watermark) {
                             watermark_dirty = true;
                         }
                         if let Some(r) = reply {
@@ -1132,7 +1134,7 @@ impl DiskBackend {
                         }
                     }
                     WriterCommand::FlushWatermarkSync { watermark, reply } => {
-                        let _ = current_watermark.merge_monotonic(watermark);
+                        let _ = staged_watermark.merge_monotonic(watermark);
                         watermark_dirty = true;
                         force_sync_segment = true;
                         wm_blocking_replies.push(reply);
@@ -1168,10 +1170,13 @@ impl DiskBackend {
             if watermark_dirty {
                 let wm_res = match &sync_err {
                     Some(err) => Err(err.clone()),
-                    None => write_watermark_atomic(dir, current_watermark),
+                    None => write_watermark_atomic(dir, staged_watermark),
                 };
                 if wm_res.is_ok() {
-                    gc_sealed_segments(dir, &mut sealed_segments, current_watermark);
+                    persisted_watermark = staged_watermark;
+                    gc_sealed_segments(dir, &mut sealed_segments, persisted_watermark);
+                } else {
+                    staged_watermark = persisted_watermark;
                 }
                 for reply in wm_oneshot_replies {
                     let _ = reply.send(wm_res.clone());
@@ -2165,5 +2170,85 @@ mod tests {
         let (tx, buf) = SinkBuffer::new("test_inv_hdr", config).unwrap();
         assert_eq!(buf.corruption_drops(), 1);
         drop(tx);
+    }
+
+    #[test]
+    fn test_segment_roll_gc_uses_persisted_watermark_not_unpersisted_staged_watermark() {
+        let tmp = TempDiskDir::new("persisted_wm_gc");
+        let batch = make_batch(&[10, 20]);
+        let mut frame1 = split_and_encode_frames_for_disk(SignalKind::Logs, batch.clone(), 65_536)
+            .unwrap()
+            .pop()
+            .unwrap();
+        patch_frame_seq_id(&mut frame1.bytes, &mut frame1.header, 1).unwrap();
+
+        let mut frame2 = split_and_encode_frames_for_disk(SignalKind::Logs, batch, 65_536)
+            .unwrap()
+            .pop()
+            .unwrap();
+        patch_frame_seq_id(&mut frame2.bytes, &mut frame2.header, 2).unwrap();
+
+        let mut active_segment: Option<ActiveSegment> = None;
+        let mut sealed_segments: Vec<SealedSegmentMeta> = Vec::new();
+        let mut next_segment_id = 1u64;
+        let persisted_watermark = DiskWatermark {
+            instance_id: 42,
+            logs: 0,
+            metrics: 0,
+            traces: 0,
+        };
+        let staged_watermark = DiskWatermark {
+            instance_id: 42,
+            logs: 1,
+            metrics: 0,
+            traces: 0,
+        };
+
+        // Write frame 1 into segment 1 (leaving 1 byte of headroom so segment 2 rolls on pre-write check)
+        let segment_size_bytes = (frame1.bytes.len() as u64) + 1;
+        DiskBackend::write_encoded_frame(
+            &tmp.path,
+            &mut active_segment,
+            &mut sealed_segments,
+            &mut next_segment_id,
+            segment_size_bytes,
+            65_536,
+            persisted_watermark,
+            SignalKind::Logs,
+            1,
+            frame1.header.row_count,
+            &frame1.bytes,
+        )
+        .unwrap();
+        let seg1_path = segment_path(&tmp.path, 1);
+        assert!(seg1_path.exists());
+
+        // Write frame 2 which rolls segment 1; because persisted_watermark.logs == 0 (even though
+        // staged_watermark.logs == 1), segment 1 MUST NOT be deleted before staged_watermark is persisted!
+        DiskBackend::write_encoded_frame(
+            &tmp.path,
+            &mut active_segment,
+            &mut sealed_segments,
+            &mut next_segment_id,
+            segment_size_bytes,
+            65_536,
+            persisted_watermark,
+            SignalKind::Logs,
+            2,
+            frame2.header.row_count,
+            &frame2.bytes,
+        )
+        .unwrap();
+        assert_eq!(sealed_segments.len(), 1);
+        assert!(
+            seg1_path.exists(),
+            "Segment 1 must be retained until watermark = 1 is durably persisted to watermark.json"
+        );
+
+        // Once staged_watermark is persisted to watermark.json, gc_sealed_segments unlinks segment 1.
+        write_watermark_atomic(&tmp.path, staged_watermark).unwrap();
+        gc_sealed_segments(&tmp.path, &mut sealed_segments, staged_watermark);
+        assert!(sealed_segments.is_empty());
+        assert!(!seg1_path.exists());
     }
 }

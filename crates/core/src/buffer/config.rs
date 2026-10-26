@@ -335,6 +335,22 @@ impl BufferConfig {
             },
         }
     }
+
+    /// Returns the effective dead-letter quarantine root directory:
+    /// `dead_letter_path` if explicitly set, `<disk_path>/dead-letter` in `Disk` mode,
+    /// or `./dlq/buffer` in `Memory` mode (`docs/buffer.md` §4.3).
+    #[must_use]
+    pub fn effective_dead_letter_path(&self) -> PathBuf {
+        if let Some(ref dl_path) = self.dead_letter_path {
+            dl_path.clone()
+        } else if self.mode == BufferMode::Disk
+            && let Some(ref disk_dir) = self.disk_path
+        {
+            disk_dir.join("dead-letter")
+        } else {
+            PathBuf::from("./dlq/buffer")
+        }
+    }
 }
 
 #[cfg(test)]

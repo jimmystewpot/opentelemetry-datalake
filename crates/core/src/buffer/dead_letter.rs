@@ -84,6 +84,31 @@ impl DeadLetterStore {
         })
     }
 
+    /// Initializes a [`DeadLetterStore`] at the default `dir` without creating `dir` on disk
+    /// until the first quarantine write occurs (scanning existing bytes if `dir` already exists).
+    pub fn new_default(dir: PathBuf, max_bytes: u64) -> Result<Self, PipelineError> {
+        let existing_bytes = if dir.exists() {
+            Self::scan_existing_bytes(&dir)?
+        } else {
+            0
+        };
+        Ok(Self {
+            dir,
+            max_bytes,
+            current_bytes: AtomicU64::new(existing_bytes),
+            file_seq: AtomicU64::new(1),
+        })
+    }
+
+    pub(crate) const fn empty_fallback(dir: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            dir,
+            max_bytes,
+            current_bytes: AtomicU64::new(0),
+            file_seq: AtomicU64::new(1),
+        }
+    }
+
     /// Returns the root directory of this dead-letter store.
     #[must_use]
     pub fn dir(&self) -> &Path {
@@ -273,31 +298,48 @@ impl DeadLetterStore {
         }
     }
 
+    fn is_stale_tmp_file(name: &str) -> bool {
+        if !name.starts_with(".tmp_") {
+            return false;
+        }
+        // Do not delete temporary files currently being written by the active process.
+        let active_pid_tag = format!("_{}_", std::process::id());
+        !name.contains(&active_pid_tag)
+    }
+
     fn scan_existing_bytes(dir: &Path) -> Result<u64, PipelineError> {
         let mut total = 0u64;
-        let entries = std::fs::read_dir(dir).map_err(|e| {
-            storage_err(format!(
-                "failed to scan dead-letter directory '{}': {e}",
-                dir.display()
-            ))
-        })?;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(storage_err(format!(
+                    "failed to scan dead-letter directory '{}': {e}",
+                    dir.display()
+                )));
+            }
+        };
         for entry_res in entries {
             let entry = entry_res.map_err(|e| {
                 storage_err(format!("failed to read dead-letter directory entry: {e}"))
             })?;
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with(".tmp_")
+                && Self::is_stale_tmp_file(name)
             {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let meta = entry.metadata().map_err(|e| {
-                storage_err(format!(
-                    "failed to stat dead-letter entry '{}': {e}",
-                    path.display()
-                ))
-            })?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(storage_err(format!(
+                        "failed to stat dead-letter entry '{}': {e}",
+                        path.display()
+                    )));
+                }
+            };
             if meta.is_file() {
                 total = total.saturating_add(meta.len());
             } else if meta.is_dir() {
@@ -309,28 +351,36 @@ impl DeadLetterStore {
 
     fn scan_subdir_bytes(dir: &Path) -> Result<u64, PipelineError> {
         let mut total = 0u64;
-        let entries = std::fs::read_dir(dir).map_err(|e| {
-            storage_err(format!(
-                "failed to scan sink dead-letter directory '{}': {e}",
-                dir.display()
-            ))
-        })?;
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(storage_err(format!(
+                    "failed to scan sink dead-letter directory '{}': {e}",
+                    dir.display()
+                )));
+            }
+        };
         for entry_res in entries {
             let entry = entry_res
                 .map_err(|e| storage_err(format!("failed to read sink dead-letter entry: {e}")))?;
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with(".tmp_")
+                && Self::is_stale_tmp_file(name)
             {
                 let _ = std::fs::remove_file(&path);
                 continue;
             }
-            let meta = entry.metadata().map_err(|e| {
-                storage_err(format!(
-                    "failed to stat sink dead-letter entry '{}': {e}",
-                    path.display()
-                ))
-            })?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(storage_err(format!(
+                        "failed to stat sink dead-letter entry '{}': {e}",
+                        path.display()
+                    )));
+                }
+            };
             if meta.is_file() {
                 total = total.saturating_add(meta.len());
             }
