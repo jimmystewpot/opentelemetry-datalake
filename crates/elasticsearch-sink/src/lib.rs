@@ -209,7 +209,16 @@ impl ElasticsearchSink {
         }
     }
 
-    /// Records the result of an in-flight chunk task into the outcomes or error accumulators.
+    fn failure_class_severity(class: &FailureClass) -> u8 {
+        match class {
+            FailureClass::Transient => 1,
+            FailureClass::Rejected { .. } => 2,
+            FailureClass::Fatal { .. } => 3,
+        }
+    }
+
+    /// Records the result of an in-flight chunk task into the outcomes or error accumulators,
+    /// retaining the highest-severity [`ElasticsearchError`] (`Fatal > Rejected > Transient`).
     fn record_task_result(
         res: Result<ChunkTaskOutput, tokio::task::JoinError>,
         outcomes: &mut Vec<(usize, usize, BulkResponse)>,
@@ -221,7 +230,16 @@ impl ElasticsearchSink {
                 outcomes.push((start_row, row_count, resp));
             }
             Ok((_start_row, _row_count, Err(es_err))) => {
-                if first_es_err.is_none() {
+                let replace = match first_es_err {
+                    None => true,
+                    Some(existing) => {
+                        Self::failure_class_severity(&Self::classify_elasticsearch_error(&es_err))
+                            > Self::failure_class_severity(&Self::classify_elasticsearch_error(
+                                existing,
+                            ))
+                    }
+                };
+                if replace {
                     *first_es_err = Some(es_err);
                 }
             }
@@ -478,7 +496,14 @@ impl ElasticsearchSink {
         if !rejected_slices.is_empty() {
             let reason = first_reason
                 .unwrap_or_else(|| "item 400: unrecoverable bulk item error".to_string());
-            lease.quarantine_batches(reason, rejected_slices).await?;
+            if let Err(dlq_err) = lease.quarantine_batches(reason, rejected_slices).await {
+                let _ = lease
+                    .nack(FailureClass::Fatal {
+                        reason: dlq_err.to_string(),
+                    })
+                    .await;
+                return Err(dlq_err);
+            }
         }
 
         lease.ack().await?;
@@ -2652,5 +2677,110 @@ mod tests {
         assert_eq!(manifest.row_count, 1);
 
         let _ = std::fs::remove_dir_all(&dlq_dir);
+    }
+
+    #[tokio::test]
+    async fn test_es_quarantine_failure_nacks_fatal_and_propagates_error() {
+        let server = MockServer::start().await;
+        let dlq_dir = std::env::temp_dir().join(format!(
+            "otel-es-dlq-quota-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        Mock::given(method("POST"))
+            .and(path("/logs-otel-default/_bulk"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "took": 2,
+                "errors": true,
+                "items": [{
+                    "create": {
+                        "_index": "logs-otel-default",
+                        "_id": "1",
+                        "status": 400,
+                        "error": {
+                            "type": "mapper_parsing_exception",
+                            "reason": "failed to parse field"
+                        }
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut config = make_test_config(server.uri(), false);
+        config.max_retries = 0;
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(1);
+        buf_cfg.max_batch_interval_sec = 0;
+        buf_cfg.dead_letter_path = Some(dlq_dir.clone());
+        buf_cfg.max_dead_letter_bytes = 1; // Guarantee quarantine write fails quota check
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+        let ctrl = rx.controller();
+
+        tx.send(SignalBatch::Logs(make_multi_row_log_batch(1)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let res = sink.run(rx).await;
+        assert!(res.is_err(), "Quarantine quota failure must return Err");
+        assert!(
+            !ctrl.is_ready(),
+            "Buffer controller must report not-ready after Fatal nack on quarantine failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+    }
+
+    #[test]
+    fn test_es_record_task_result_keeps_highest_severity_error() {
+        let mut outcomes = Vec::new();
+        let mut first_es_err: Option<ElasticsearchError> = None;
+        let mut first_join_err: Option<PipelineError> = None;
+
+        // First chunk fails with a Transient error
+        ElasticsearchSink::record_task_result(
+            Ok((
+                0,
+                1,
+                Err(ElasticsearchError::BulkFailed {
+                    retries: 1,
+                    message: "HTTP 503 Service Unavailable".into(),
+                }),
+            )),
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        );
+        // Second chunk fails with a Fatal 401 error
+        ElasticsearchSink::record_task_result(
+            Ok((
+                1,
+                1,
+                Err(ElasticsearchError::AuthenticationFailed(
+                    "401 Unauthorized".into(),
+                )),
+            )),
+            &mut outcomes,
+            &mut first_es_err,
+            &mut first_join_err,
+        );
+
+        let chosen = first_es_err.expect("expected merged ElasticsearchError");
+        assert!(
+            matches!(
+                ElasticsearchSink::classify_elasticsearch_error(&chosen),
+                FailureClass::Fatal { .. }
+            ),
+            "Fatal chunk error must take precedence over earlier Transient chunk error, got: {chosen:?}"
+        );
     }
 }

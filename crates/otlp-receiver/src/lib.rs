@@ -370,7 +370,9 @@ impl Source for OtlpReceiverSource {
 
         let mut shutdown_rx_grpc = self.shutdown_rx.clone();
         let grpc_shutdown = async move {
-            let _ = shutdown_rx_grpc.changed().await;
+            let _ = shutdown_rx_grpc
+                .wait_for(|shutting_down| *shutting_down)
+                .await;
             tracing::info!("gRPC server shutting down gracefully");
         };
 
@@ -398,7 +400,9 @@ impl Source for OtlpReceiverSource {
 
         let mut shutdown_rx_http = self.shutdown_rx.clone();
         let http_shutdown = async move {
-            let _ = shutdown_rx_http.changed().await;
+            let _ = shutdown_rx_http
+                .wait_for(|shutting_down| *shutting_down)
+                .await;
             tracing::info!("HTTP server shutting down gracefully");
         };
 

@@ -468,30 +468,46 @@ impl KafkaSink {
             return Ok(None);
         }
 
-        let mut join_set = tokio::task::JoinSet::new();
-        for slice in slices {
-            let producer = self.producer.clone();
-            let topic = self.topic.clone();
-            join_set.spawn(async move {
-                let mut record = FutureRecord::to(&topic).payload(&slice.payload);
-                if let Some(ref k) = slice.partition_key {
-                    record = record.key(k.as_str());
+        let mut delivery_futs = Vec::with_capacity(slices.len());
+        let mut failure: Option<FailureClass> = None;
+
+        for slice in &slices {
+            let mut record = FutureRecord::to(&self.topic).payload(&slice.payload);
+            if let Some(ref k) = slice.partition_key {
+                record = record.key(k.as_str());
+            }
+            match self.producer.send_result(record) {
+                Ok(delivery_fut) => delivery_futs.push(delivery_fut),
+                Err((
+                    rdkafka::error::KafkaError::MessageProduction(
+                        rdkafka::types::RDKafkaErrorCode::QueueFull,
+                    ),
+                    returned_record,
+                )) => {
+                    if let Err((e, _)) = self.producer.send(returned_record, queue_timeout).await {
+                        tracing::error!("Failed to send record to Kafka: {e}");
+                        failure = Some(merge_failure_class(failure, classify_kafka_error(&e)));
+                    }
                 }
-                producer
-                    .send(record, queue_timeout)
-                    .await
-                    .map_err(|(e, _)| e)
-            });
+                Err((e, _)) => {
+                    tracing::error!("Failed to enqueue record to Kafka: {e}");
+                    failure = Some(merge_failure_class(failure, classify_kafka_error(&e)));
+                }
+            }
         }
 
-        let mut failure: Option<FailureClass> = None;
-        while let Some(res) = join_set.join_next().await {
-            let delivery_res = res.map_err(|join_err| {
-                PipelineError::Internal(format!("Kafka delivery task join error: {join_err}"))
-            })?;
-            if let Err(e) = delivery_res {
-                tracing::error!("Failed to send record to Kafka: {e}");
-                failure = Some(merge_failure_class(failure, classify_kafka_error(&e)));
+        for delivery_fut in delivery_futs {
+            match delivery_fut.await {
+                Ok(Ok(_)) => {}
+                Ok(Err((e, _))) => {
+                    tracing::error!("Failed to send record to Kafka: {e}");
+                    failure = Some(merge_failure_class(failure, classify_kafka_error(&e)));
+                }
+                Err(canceled) => {
+                    return Err(PipelineError::Internal(format!(
+                        "Kafka delivery future cancelled: {canceled}"
+                    )));
+                }
             }
         }
 

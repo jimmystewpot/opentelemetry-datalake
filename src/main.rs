@@ -160,12 +160,23 @@ static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Returns `true` if `val` is a safe, single relative path component without path traversal,
 /// separators, or null bytes (e.g. neither empty, `"."`, `".."`, nor containing `/` or `\`).
 fn is_safe_path_component(val: &str) -> bool {
-    if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains('\0') {
-        return false;
+    pipeline_core::buffer::is_safe_path_component(val)
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
     }
-    let mut components = std::path::Path::new(val).components();
-    matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none()
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
@@ -1056,6 +1067,7 @@ async fn main() -> anyhow::Result<()> {
     let mut source_handle = tokio::spawn(async move { source.run().await });
 
     let mut exit_err: Option<anyhow::Error> = None;
+    let mut source_done = false;
     let mut logs_trans_done = false;
     let mut traces_trans_done = false;
     let mut metrics_trans_done = false;
@@ -1065,16 +1077,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Handle shutdown
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        () = wait_for_shutdown_signal() => {
             tracing::info!("Received shutdown signal. Starting graceful shutdown...");
             let _ = shutdown_tx.send(true);
-            match source_handle.await {
+            source_done = true;
+            match (&mut source_handle).await {
                 Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {}", e),
                 Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
                 Err(e) => tracing::error!("Source receiver task failed/panicked: {}", e),
             }
         }
         res = &mut source_handle => {
+            source_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Source receiver stopped unexpectedly with error: {}", e);
@@ -1165,6 +1179,10 @@ async fn main() -> anyhow::Result<()> {
     // Wait for pipeline to drain within bounded drain_timeout_sec
     let drain_timeout = std::time::Duration::from_secs(buffer_controller.drain_timeout_sec());
     let drain_outcome = tokio::time::timeout(drain_timeout, async {
+        if !source_done {
+            let _ = (&mut source_handle).await;
+            source_done = true;
+        }
         tokio::join!(
             async {
                 if !logs_trans_done {
@@ -1245,6 +1263,10 @@ async fn main() -> anyhow::Result<()> {
             timeout_sec = buffer_controller.drain_timeout_sec(),
             "Graceful shutdown drain timed out; aborting remaining tasks and finalizing buffer policy"
         );
+        if !source_done {
+            source_handle.abort();
+            let _ = source_handle.await;
+        }
         if !logs_trans_done {
             logs_trans_handle.abort();
             let _ = logs_trans_handle.await;

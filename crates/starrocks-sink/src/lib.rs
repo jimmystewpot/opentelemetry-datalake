@@ -3105,9 +3105,9 @@ mod tests {
 
         let reqs = recorded.lock().await;
         assert!(
-            reqs.iter()
-                .any(|r| r.headers.get("label").map(String::as_str)
-                    == Some(fallback_label.as_str())),
+            reqs.iter().any(
+                |r| r.headers.get("label").map(String::as_str) == Some(fallback_label.as_str())
+            ),
             "Expected fallback attempt label '{fallback_label}' after base label was ABORTED"
         );
     }

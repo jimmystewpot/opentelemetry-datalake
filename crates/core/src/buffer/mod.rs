@@ -186,9 +186,7 @@ impl BufferInner {
 
         for sig in ALL_SIGNALS {
             let ring_state = &self.rings[sig.as_u8() as usize];
-            if stall_threshold_ms > 0
-                && ring_state.blocked_senders.load(Ordering::Acquire) > 0
-            {
+            if stall_threshold_ms > 0 && ring_state.blocked_senders.load(Ordering::Acquire) > 0 {
                 let blocked_since = ring_state.blocked_since_unix_ms.load(Ordering::Acquire);
                 if blocked_since > 0 && now_ms.saturating_sub(blocked_since) >= stall_threshold_ms {
                     return false;
