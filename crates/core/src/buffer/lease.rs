@@ -175,30 +175,40 @@ impl Lease {
     pub async fn ack(mut self) -> Result<(), PipelineError> {
         self.completed = true;
         let flush_duration = self.leased_at.elapsed();
-        self.inner
-            .ack_lease(self.id.signal, &self.meta, self.byte_size, self.num_rows)
+        let acked_rows = self
+            .inner
+            .ack_lease(
+                self.id.signal,
+                &self.meta,
+                self.byte_size,
+                self.num_rows,
+                true,
+            )
             .await?;
-        self.inner.metrics.record_committed(
-            self.id.signal,
-            u64::try_from(self.num_rows).unwrap_or(u64::MAX),
-            flush_duration,
-        );
+        if acked_rows > 0 {
+            self.inner.metrics.record_committed(
+                self.id.signal,
+                u64::try_from(acked_rows).unwrap_or(u64::MAX),
+                flush_duration,
+            );
+        }
         Ok(())
     }
 
     /// Rejects the lease with the given [`FailureClass`], either scheduling a backoff retry,
     /// quarantining after `max_attempts`, or failing the buffer on `Fatal`.
     pub async fn nack(mut self, class: FailureClass) -> Result<(), PipelineError> {
-        self.completed = true;
         let signal = self.id.signal;
         let next_attempt = self.attempt.saturating_add(1);
-        self.batches.clear();
-        let payloads = std::mem::take(&mut self.payloads);
-        let meta = std::mem::take(&mut self.meta);
 
         match class {
             FailureClass::Transient => {
+                self.completed = true;
+                self.batches.clear();
+                let payloads = std::mem::take(&mut self.payloads);
+                let mut meta = std::mem::take(&mut self.meta);
                 self.inner.metrics.record_nack(signal, "transient");
+                let now = Instant::now();
                 let now_ms = current_unix_ms().max(1);
                 let ring_state = &self.inner.rings[signal.as_u8() as usize];
                 let _ = ring_state.first_transient_failure_unix_ms.compare_exchange(
@@ -207,6 +217,11 @@ impl Lease {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 );
+                for item in &mut meta {
+                    if item.first_failed_at.is_none() {
+                        item.first_failed_at = Some(now);
+                    }
+                }
 
                 if self.inner.config.max_transient_duration_sec > 0 {
                     let max_dur = Duration::from_secs(self.inner.config.max_transient_duration_sec);
@@ -220,9 +235,11 @@ impl Lease {
                                 .config
                                 .max_transient_duration_sec
                                 .saturating_mul(1_000);
-                    let expired =
-                        streak_expired || meta.iter().any(|m| m.enqueued_at.elapsed() >= max_dur);
-                    if expired {
+                    let item_expired = meta.iter().any(|m| {
+                        m.first_failed_at
+                            .is_some_and(|t| now.saturating_duration_since(t) >= max_dur)
+                    });
+                    if streak_expired || item_expired {
                         let reason = format!(
                             "transient retry duration exceeded {}s on sink '{}'",
                             self.inner.config.max_transient_duration_sec, self.inner.sink_name
@@ -242,7 +259,7 @@ impl Lease {
                     .saturating_mul(factor)
                     .min(max_backoff_ms);
                 let ready_at = if backoff_ms > 0 {
-                    Some(Instant::now() + Duration::from_millis(backoff_ms))
+                    Some(now + Duration::from_millis(backoff_ms))
                 } else {
                     None
                 };
@@ -252,14 +269,22 @@ impl Lease {
             FailureClass::Rejected { reason } => {
                 self.inner.metrics.record_nack(signal, "rejected");
                 if next_attempt < self.inner.config.max_attempts {
+                    self.completed = true;
+                    self.batches.clear();
+                    let payloads = std::mem::take(&mut self.payloads);
+                    let meta = std::mem::take(&mut self.meta);
                     self.inner
                         .requeue_lease(signal, payloads, meta, next_attempt, None);
                 } else {
-                    self.nack_rejected_exhausted(signal, payloads, meta, next_attempt, reason)
+                    self.nack_rejected_exhausted(signal, next_attempt, reason)
                         .await?;
                 }
             }
             FailureClass::Fatal { reason } => {
+                self.completed = true;
+                self.batches.clear();
+                let payloads = std::mem::take(&mut self.payloads);
+                let meta = std::mem::take(&mut self.meta);
                 self.inner.metrics.record_nack(signal, "fatal");
                 self.inner.fail_lease(signal, payloads, meta, reason);
             }
@@ -268,10 +293,8 @@ impl Lease {
     }
 
     async fn nack_rejected_exhausted(
-        &self,
+        &mut self,
         signal: SignalKind,
-        payloads: Vec<BatchPayload>,
-        meta: Vec<LeasedBatchMeta>,
         next_attempt: u32,
         reason: String,
     ) -> Result<(), PipelineError> {
@@ -288,48 +311,50 @@ impl Lease {
             reason: reason.clone(),
             timestamp_unix_ms: current_unix_ms(),
         };
+        let payloads_for_dlq = self.payloads.clone();
 
-        let (returned_payloads, write_res) = tokio::task::spawn_blocking(move || {
-            let res = (|| -> Result<PathBuf, PipelineError> {
-                let mut decoded = Vec::with_capacity(payloads.len());
-                for payload in &payloads {
-                    match payload {
-                        BatchPayload::InMemory(batch) => {
-                            decoded.push(batch.clone());
-                        }
-                        BatchPayload::OnDisk {
-                            segment_id,
-                            offset,
-                            len,
-                            ..
-                        } => {
-                            let base_dir = disk_path.as_ref().ok_or_else(|| {
-                                PipelineError::Storage(
-                                    "OnDisk payload encountered without configured disk_path"
-                                        .into(),
-                                )
-                            })?;
-                            let batch = crate::buffer::disk::read_frame_at(
-                                base_dir,
-                                *segment_id,
-                                *offset,
-                                *len,
-                                max_payload_len,
-                            )?;
-                            decoded.push(batch);
-                        }
+        let write_res = tokio::task::spawn_blocking(move || -> Result<PathBuf, PipelineError> {
+            let mut decoded = Vec::with_capacity(payloads_for_dlq.len());
+            for payload in &payloads_for_dlq {
+                match payload {
+                    BatchPayload::InMemory(batch) => {
+                        decoded.push(batch.clone());
+                    }
+                    BatchPayload::OnDisk {
+                        segment_id,
+                        offset,
+                        len,
+                        ..
+                    } => {
+                        let base_dir = disk_path.as_ref().ok_or_else(|| {
+                            PipelineError::Storage(
+                                "OnDisk payload encountered without configured disk_path".into(),
+                            )
+                        })?;
+                        let batch = crate::buffer::disk::read_frame_at(
+                            base_dir,
+                            *segment_id,
+                            *offset,
+                            *len,
+                            max_payload_len,
+                        )?;
+                        decoded.push(batch);
                     }
                 }
-                dlq.write_quarantine(&dlq_meta, &decoded)
-            })();
-            (payloads, res)
+            }
+            dlq.write_quarantine(&dlq_meta, &decoded)
         })
         .await
         .map_err(|e| PipelineError::Internal(format!("Lease::nack dead-letter join error: {e}")))?;
 
+        self.completed = true;
+        self.batches.clear();
+        let payloads = std::mem::take(&mut self.payloads);
+        let meta = std::mem::take(&mut self.meta);
+
         if let Err(err) = write_res {
             self.inner
-                .fail_lease(signal, returned_payloads, meta, err.to_string());
+                .fail_lease(signal, payloads, meta, err.to_string());
             return Err(err);
         }
 
@@ -351,8 +376,9 @@ impl Lease {
             "Rejected lease exhausted max_attempts; quarantined and advancing watermark"
         );
         self.inner
-            .ack_lease(signal, &meta, self.byte_size, self.num_rows)
-            .await
+            .ack_lease(signal, &meta, self.byte_size, self.num_rows, false)
+            .await?;
+        Ok(())
     }
 }
 
@@ -361,8 +387,22 @@ impl Drop for Lease {
         if !self.completed {
             self.batches.clear();
             let payloads = std::mem::take(&mut self.payloads);
-            let meta = std::mem::take(&mut self.meta);
+            let mut meta = std::mem::take(&mut self.meta);
             let next_attempt = self.attempt.saturating_add(1);
+            let now = Instant::now();
+            let now_ms = current_unix_ms().max(1);
+            let ring_state = &self.inner.rings[self.id.signal.as_u8() as usize];
+            let _ = ring_state.first_transient_failure_unix_ms.compare_exchange(
+                0,
+                now_ms,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            for item in &mut meta {
+                if item.first_failed_at.is_none() {
+                    item.first_failed_at = Some(now);
+                }
+            }
             tracing::warn!(
                 sink = %self.inner.sink_name,
                 signal = self.id.signal.as_str(),

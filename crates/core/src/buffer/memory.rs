@@ -61,6 +61,8 @@ pub struct QueuedBatch {
     pub row_count: usize,
     /// Timestamp when the batch first entered the buffer.
     pub enqueued_at: Instant,
+    /// Timestamp when the batch first experienced a transient delivery failure (`None` while healthy).
+    pub first_failed_at: Option<Instant>,
     /// Number of previous delivery attempts (`0` on initial enqueue).
     pub attempt: u32,
     /// Optional backoff deadline before which this batch cannot be leased.
@@ -78,6 +80,8 @@ pub struct LeasedBatchMeta {
     pub row_count: usize,
     /// Original enqueue timestamp of the batch.
     pub enqueued_at: Instant,
+    /// Timestamp when the batch first experienced a transient delivery failure (`None` while healthy).
+    pub first_failed_at: Option<Instant>,
 }
 
 /// Mutable state for a single telemetry signal ring (`Logs`, `Metrics`, or `Traces`).
@@ -87,6 +91,9 @@ pub struct SignalRing {
     pub queue: VecDeque<QueuedBatch>,
     /// Sequence tracking table for out-of-order watermark progression.
     pub slots: BTreeMap<u64, LeaseSlotState>,
+    /// Original enqueue timestamps for currently `InFlight` sequences so `oldest_item_age_seconds`
+    /// remains accurate while batches are leased.
+    pub inflight_enqueued_at: BTreeMap<u64, Instant>,
     /// Next sequence number to assign on `send()` (starts at `1`).
     pub next_seq: u64,
     /// Total bytes currently held in `Queued` and `InFlight` batches.
@@ -118,6 +125,7 @@ impl SignalRing {
         Self {
             queue: VecDeque::new(),
             slots: BTreeMap::new(),
+            inflight_enqueued_at: BTreeMap::new(),
             next_seq: 1,
             bytes_in_flight: 0,
             rows_in_flight: 0,
@@ -137,6 +145,12 @@ impl SignalRing {
             .is_none_or(|back| back.seq_id < item.seq_id)
         {
             self.queue.push_back(item);
+        } else if self
+            .queue
+            .front()
+            .is_some_and(|front| item.seq_id < front.seq_id)
+        {
+            self.queue.push_front(item);
         } else {
             let pos = self
                 .queue
@@ -157,7 +171,8 @@ impl SignalRing {
         committed_seq.fetch_max(candidate, Ordering::AcqRel);
     }
 
-    /// Requeues leased batch payloads at the front of `queue` in their original sequence order.
+    /// Requeues leased batch payloads into `queue` in ascending `seq_id` order, ignoring any
+    /// slots that were already discarded by `finalize_shutdown_timeout`.
     pub fn requeue_at_head(
         &mut self,
         payloads: Vec<BatchPayload>,
@@ -165,47 +180,73 @@ impl SignalRing {
         next_attempt: u32,
         ready_at: Option<Instant>,
     ) {
+        let mut any_requeued = false;
         for (payload, item) in payloads.into_iter().zip(meta).rev() {
+            self.inflight_enqueued_at.remove(&item.seq_id);
+            if self.slots.get(&item.seq_id) != Some(&LeaseSlotState::InFlight) {
+                continue;
+            }
+            any_requeued = true;
             self.slots.insert(item.seq_id, LeaseSlotState::Queued);
-            self.queue.push_front(QueuedBatch {
+            self.enqueue_ordered(QueuedBatch {
                 seq_id: item.seq_id,
                 payload,
                 byte_size: item.byte_size,
                 row_count: item.row_count,
                 enqueued_at: item.enqueued_at,
+                first_failed_at: item.first_failed_at,
                 attempt: next_attempt,
                 ready_at,
             });
         }
-        self.inflight_leases = self.inflight_leases.saturating_sub(1);
+        if any_requeued {
+            self.inflight_leases = self.inflight_leases.saturating_sub(1);
+        }
     }
 
     /// Removes all acknowledged batch sequence numbers in `meta` from `slots`, releases
-    /// their byte/row budget, and advances the contiguous watermark.
+    /// their byte/row budget, advances the contiguous watermark, and returns the number
+    /// of active in-flight rows acknowledged.
     pub fn ack_entries(
         &mut self,
         meta: &[LeasedBatchMeta],
-        byte_size: usize,
-        num_rows: usize,
+        _byte_size: usize,
+        _num_rows: usize,
         committed_seq: &AtomicU64,
-    ) {
+    ) -> usize {
+        let mut acked_bytes = 0usize;
+        let mut acked_rows = 0usize;
+        let mut any_acked = false;
         for item in meta {
-            self.slots.remove(&item.seq_id);
+            self.inflight_enqueued_at.remove(&item.seq_id);
+            if self.slots.remove(&item.seq_id) == Some(LeaseSlotState::InFlight) {
+                any_acked = true;
+                acked_bytes = acked_bytes.saturating_add(item.byte_size);
+                acked_rows = acked_rows.saturating_add(item.row_count);
+            }
         }
-        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(byte_size);
-        self.rows_in_flight = self.rows_in_flight.saturating_sub(num_rows);
-        self.inflight_leases = self.inflight_leases.saturating_sub(1);
-        self.advance_watermark(committed_seq);
+        if any_acked {
+            self.bytes_in_flight = self.bytes_in_flight.saturating_sub(acked_bytes);
+            self.rows_in_flight = self.rows_in_flight.saturating_sub(acked_rows);
+            self.inflight_leases = self.inflight_leases.saturating_sub(1);
+            self.advance_watermark(committed_seq);
+        }
+        acked_rows
     }
 
-    /// Returns the approximate Unix epoch millisecond timestamp of the oldest queued batch,
-    /// or `0` if the queue is empty.
+    /// Returns the approximate Unix epoch millisecond timestamp of the oldest queued or
+    /// in-flight batch, or `0` if the buffer ring is completely empty.
     #[must_use]
     pub fn oldest_enqueued_unix_ms(&self) -> u64 {
-        let Some(front) = self.queue.front() else {
-            return 0;
+        let oldest_queued = self.queue.front().map(|b| b.enqueued_at);
+        let oldest_inflight = self.inflight_enqueued_at.values().copied().min();
+        let oldest = match (oldest_queued, oldest_inflight) {
+            (Some(q), Some(i)) => q.min(i),
+            (Some(q), None) => q,
+            (None, Some(i)) => i,
+            (None, None) => return 0,
         };
-        let elapsed_ms = u64::try_from(front.enqueued_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let elapsed_ms = u64::try_from(oldest.elapsed().as_millis()).unwrap_or(u64::MAX);
         crate::buffer::dead_letter::current_unix_ms()
             .saturating_sub(elapsed_ms)
             .max(1)

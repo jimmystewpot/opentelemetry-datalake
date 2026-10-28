@@ -917,6 +917,7 @@ impl DiskBackend {
             byte_size,
             row_count,
             enqueued_at: Instant::now(),
+            first_failed_at: None,
             attempt: 0,
             ready_at: None,
         });

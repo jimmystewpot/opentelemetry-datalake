@@ -186,7 +186,9 @@ impl BufferInner {
 
         for sig in ALL_SIGNALS {
             let ring_state = &self.rings[sig.as_u8() as usize];
-            if stall_threshold_ms > 0 {
+            if stall_threshold_ms > 0
+                && ring_state.blocked_senders.load(Ordering::Acquire) > 0
+            {
                 let blocked_since = ring_state.blocked_since_unix_ms.load(Ordering::Acquire);
                 if blocked_since > 0 && now_ms.saturating_sub(blocked_since) >= stall_threshold_ms {
                     return false;
@@ -227,6 +229,7 @@ impl BufferInner {
                         ring.rows_in_flight = 0;
                         ring.inflight_leases = 0;
                         ring.slots.clear();
+                        ring.inflight_enqueued_at.clear();
                         ring.advance_watermark(&ring_state.committed_seq);
                         self.sync_ring_metrics(sig, &ring);
                         rows
@@ -279,24 +282,31 @@ impl BufferInner {
         meta: &[LeasedBatchMeta],
         byte_size: usize,
         num_rows: usize,
-    ) -> Result<(), PipelineError> {
+        reset_transient_streak: bool,
+    ) -> Result<usize, PipelineError> {
         let ring_state = &self.rings[signal.as_u8() as usize];
-        ring_state
-            .first_transient_failure_unix_ms
-            .store(0, Ordering::Release);
-        {
-            let mut ring = lock_unpoisoned(&ring_state.ring);
-            ring.ack_entries(meta, byte_size, num_rows, &ring_state.committed_seq);
-            self.sync_ring_metrics(signal, &ring);
+        if reset_transient_streak {
+            ring_state
+                .first_transient_failure_unix_ms
+                .store(0, Ordering::Release);
         }
+        let acked_rows = {
+            let mut ring = lock_unpoisoned(&ring_state.ring);
+            let rows = ring.ack_entries(meta, byte_size, num_rows, &ring_state.committed_seq);
+            self.sync_ring_metrics(signal, &ring);
+            rows
+        };
         ring_state.space_available_notify.notify_waiters();
         self.notify_data_ready(signal);
 
         if let Some(disk) = &self.disk {
             let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
-            disk.update_watermark(wm).await?;
+            if let Err(err) = disk.update_watermark(wm).await {
+                self.record_storage_failure(signal, err.to_string());
+                return Err(err);
+            }
         }
-        Ok(())
+        Ok(acked_rows)
     }
 
     pub(crate) fn requeue_lease(
@@ -560,6 +570,8 @@ impl BufferInner {
         };
 
         ring.slots.insert(first.seq_id, LeaseSlotState::InFlight);
+        ring.inflight_enqueued_at
+            .insert(first.seq_id, first.enqueued_at);
         let first_seq = first.seq_id;
         let mut last_seq = first.seq_id;
         let attempt = first.attempt;
@@ -577,6 +589,7 @@ impl BufferInner {
             byte_size: first.byte_size,
             row_count: first.row_count,
             enqueued_at: first.enqueued_at,
+            first_failed_at: first.first_failed_at,
         });
 
         for _ in 1..coalesce_count {
@@ -584,6 +597,8 @@ impl BufferInner {
                 break;
             };
             ring.slots.insert(popped.seq_id, LeaseSlotState::InFlight);
+            ring.inflight_enqueued_at
+                .insert(popped.seq_id, popped.enqueued_at);
             last_seq = popped.seq_id;
             total_bytes = total_bytes.saturating_add(popped.byte_size);
             total_rows = total_rows.saturating_add(popped.row_count);
@@ -596,6 +611,7 @@ impl BufferInner {
                 byte_size: popped.byte_size,
                 row_count: popped.row_count,
                 enqueued_at: popped.enqueued_at,
+                first_failed_at: popped.first_failed_at,
             });
         }
 
@@ -666,6 +682,11 @@ impl<'a> BlockedSendGuard<'a> {
                 self.ring_state
                     .blocked_since_unix_ms
                     .store(now_ms, Ordering::Release);
+                if self.ring_state.blocked_senders.load(Ordering::Acquire) == 0 {
+                    self.ring_state
+                        .blocked_since_unix_ms
+                        .store(0, Ordering::Release);
+                }
             }
             self.active = false;
         }
@@ -749,6 +770,7 @@ impl AppendReservation {
                             byte_size: actual_bytes,
                             row_count: self.batch_rows,
                             enqueued_at: Instant::now(),
+                            first_failed_at: None,
                             attempt: 0,
                             ready_at: None,
                         });
@@ -937,6 +959,7 @@ impl BufferSender {
                             byte_size: batch_bytes,
                             row_count: batch_rows,
                             enqueued_at: Instant::now(),
+                            first_failed_at: None,
                             attempt: 0,
                             ready_at: None,
                         });
@@ -1306,10 +1329,6 @@ impl SinkBuffer {
         let signal = lease.signal();
         let batch = if lease.batches().len() == 1 {
             lease.batches()[0].clone()
-        } else if !lease.batches().is_empty() {
-            let schema = lease.batches()[0].schema();
-            arrow::compute::concat_batches(&schema, lease.batches())
-                .map_err(PipelineError::Arrow)?
         } else {
             lease.prepare(Ok).await?
         };
@@ -2668,5 +2687,227 @@ mod tests {
         drop(tx);
         drop(buf);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_transient_nack_timeout_measured_from_failure_onset_not_enqueue_time() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_buffer_bytes: 3 * 1024 * 1024,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(10),
+            max_batch_interval_sec: 0,
+            initial_backoff_ms: 10,
+            max_backoff_sec: 1,
+            max_transient_duration_sec: 1,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_transient_onset", config).unwrap();
+        let ctrl = buf.controller();
+
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+
+        // Simulate batch sitting in buffer longer than max_transient_duration_sec (1s)
+        // before its first transient failure occurs.
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let mut ring = lock_unpoisoned(&ring_state.ring);
+            if let Some(front) = ring.queue.front_mut() {
+                front.enqueued_at = Instant::now()
+                    .checked_sub(Duration::from_secs(5))
+                    .unwrap_or_else(Instant::now);
+            }
+        }
+
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1.attempt(), 0);
+
+        // First transient failure must record failure onset and requeue rather than
+        // immediately failing the buffer due to old enqueue age.
+        lease1.nack(FailureClass::Transient).await.unwrap();
+        assert!(
+            buf.inner.fatal_reason().is_none(),
+            "First transient nack must not trip max_transient_duration_sec based on enqueue time"
+        );
+        assert!(ctrl.is_ready());
+
+        // Lease again after backoff and verify it can be acknowledged cleanly.
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease2.attempt(), 1);
+        lease2.ack().await.unwrap();
+        assert_eq!(buf.committed_seq(SignalKind::Logs), 1);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_quarantine_does_not_reset_transient_failure_streak() {
+        let dir = std::env::temp_dir().join(format!(
+            "dl_test_rejected_preserves_streak_{}_{}",
+            std::process::id(),
+            generate_instance_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            dead_letter_path: Some(dir.clone()),
+            max_attempts: 1,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            max_inflight_leases: 2,
+            initial_backoff_ms: 1,
+            max_transient_duration_sec: 60,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_streak_preserve", config).unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[3, 4])))
+            .await
+            .unwrap();
+
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+
+        lease1.nack(FailureClass::Transient).await.unwrap();
+        let streak_before = buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+            .first_transient_failure_unix_ms
+            .load(Ordering::Acquire);
+        assert!(streak_before > 0);
+
+        // Quarantining a Rejected batch must not clear the ongoing Transient failure streak.
+        lease2
+            .nack(FailureClass::Rejected {
+                reason: "bad_schema".into(),
+            })
+            .await
+            .unwrap();
+        let streak_after = buf.inner.rings[SignalKind::Logs.as_u8() as usize]
+            .first_transient_failure_unix_ms
+            .load(Ordering::Acquire);
+        assert_eq!(
+            streak_after, streak_before,
+            "Rejected quarantine must not reset first_transient_failure_unix_ms"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_out_of_order_multi_lease_requeue_preserves_seq_order() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            max_inflight_leases: 2,
+            initial_backoff_ms: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_ooo_requeue", config).unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[3, 4])))
+            .await
+            .unwrap();
+
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1.id().first_seq, 1);
+        assert_eq!(lease2.id().first_seq, 2);
+
+        // Nack lease 1 first, then lease 2 second; queue must still remain ordered [1, 2].
+        lease1.nack(FailureClass::Transient).await.unwrap();
+        lease2.nack(FailureClass::Transient).await.unwrap();
+
+        let retry_first = buf.next_lease().await.unwrap().unwrap();
+        let retry_second = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(
+            retry_first.id().first_seq,
+            1,
+            "Lower sequence lease must remain at the head of the queue"
+        );
+        assert_eq!(retry_second.id().first_seq, 2);
+        retry_first.ack().await.unwrap();
+        retry_second.ack().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_discarded_inflight_lease_drop_or_ack_does_not_resurrect_items() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            max_inflight_leases: 2,
+            on_drain_timeout: Some(DrainTimeoutPolicy::Discard),
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_discard_inflight", config).unwrap();
+        let ctrl = buf.controller();
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[3, 4])))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        let lease2 = buf.next_lease().await.unwrap().unwrap();
+
+        // Trigger shutdown timeout discard while both leases are in-flight.
+        let discard_res = ctrl.finalize_shutdown_timeout();
+        assert!(discard_res.is_err());
+
+        // Dropping lease1 and acking lease2 after discard must not resurrect items into ring.queue or ring.slots.
+        drop(lease1);
+        lease2.ack().await.unwrap();
+
+        let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+        let ring = lock_unpoisoned(&ring_state.ring);
+        assert!(
+            ring.queue.is_empty(),
+            "Dropping a discarded in-flight lease must not re-enqueue items"
+        );
+        assert!(
+            ring.slots.is_empty(),
+            "Dropping or acking a discarded in-flight lease must leave slots empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oldest_item_age_includes_inflight_leases() {
+        let config = BufferConfig {
+            mode: BufferMode::Memory,
+            max_batch_size_bytes: 65_536,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_inflight_age", config).unwrap();
+        tx.send(SignalBatch::Logs(make_batch(&[1, 2])))
+            .await
+            .unwrap();
+
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let ring = lock_unpoisoned(&ring_state.ring);
+            assert!(ring.queue.is_empty());
+            assert!(
+                ring.oldest_enqueued_unix_ms() > 0,
+                "oldest_enqueued_unix_ms must remain non-zero while a batch is InFlight"
+            );
+        }
+        lease.ack().await.unwrap();
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let ring = lock_unpoisoned(&ring_state.ring);
+            assert_eq!(ring.oldest_enqueued_unix_ms(), 0);
+        }
     }
 }
