@@ -1085,6 +1085,19 @@ impl BufferController {
     pub fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
         self.inner.finalize_shutdown_timeout()
     }
+
+    /// Returns a reference to the buffer's [`BufferMetrics`] instruments and state.
+    #[must_use]
+    pub fn metrics(&self) -> &BufferMetrics {
+        &self.inner.metrics
+    }
+
+    /// Returns the cumulative number of dropped records for `reason` across `scope`
+    /// (or all signals if `None`).
+    #[must_use]
+    pub fn dropped_records(&self, scope: Option<SignalKind>, reason: &str) -> u64 {
+        self.inner.metrics.dropped_records(scope, reason)
+    }
 }
 
 /// Consumer handle owned by a sink task to acquire transactional [`Lease`]s.

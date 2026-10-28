@@ -181,10 +181,10 @@ AWS credentials (access key, secret key, and optional session token) are automat
 # Buffer storage mode: "memory" (default) or "disk".
 mode = "memory"
 
-# Maximum total buffer byte budget across all signals. Default: 256 MiB (268435456).
+# Maximum total buffer byte budget across all signals. Default: 768 MiB (805306368; 256 MiB per signal).
 max_buffer_bytes = 268435456
 
-# Maximum accumulated Arrow byte size per lease before flushing. Default: 64 MiB (67108864).
+# Maximum accumulated Arrow byte size per lease before flushing. Default: 32 MiB (33554432).
 max_batch_size_bytes = 10485760
 
 # Maximum record count per lease before flushing.

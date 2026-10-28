@@ -42,7 +42,7 @@ pub struct FrameHeader {
     /// Byte length of the Arrow IPC stream payload following the 28-byte header.
     pub payload_len: u32,
     /// CRC32 checksum computed over header bytes `4..24` and the IPC payload.
-    pub crc32c: u32,
+    pub crc32: u32,
 }
 
 /// Errors encountered while decoding an on-disk `OTLB` frame.
@@ -63,7 +63,7 @@ pub enum FrameDecodeError {
     #[error(
         "OTLB frame CRC32 mismatch at seq {}: expected {:#010x}, got {:#010x}",
         header.seq_id,
-        header.crc32c,
+        header.crc32,
         actual_crc
     )]
     CrcMismatch {
@@ -128,16 +128,16 @@ pub fn encode_frame(
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&out[header_start + 4..header_start + 24]);
     hasher.update(&out[payload_start..]);
-    let crc32c = hasher.finalize();
+    let crc32 = hasher.finalize();
 
-    out[header_start + 24..header_start + 28].copy_from_slice(&crc32c.to_le_bytes());
+    out[header_start + 24..header_start + 28].copy_from_slice(&crc32.to_le_bytes());
 
     Ok(FrameHeader {
         signal,
         seq_id,
         row_count,
         payload_len,
-        crc32c,
+        crc32,
     })
 }
 
@@ -149,7 +149,7 @@ pub(crate) struct PreEncodedFrame {
     pub batch: RecordBatch,
 }
 
-/// Patches `seq_id` into `frame_bytes[8..16]` and recomputes `crc32c` (`frame_bytes[24..28]`)
+/// Patches `seq_id` into `frame_bytes[8..16]` and recomputes `crc32` (`frame_bytes[24..28]`)
 /// in place without re-encoding the Arrow IPC payload.
 pub fn patch_frame_seq_id(
     frame_bytes: &mut [u8],
@@ -169,11 +169,11 @@ pub fn patch_frame_seq_id(
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&frame_bytes[4..24]);
     hasher.update(&frame_bytes[FRAME_HEADER_LEN..]);
-    let crc32c = hasher.finalize();
+    let crc32 = hasher.finalize();
 
-    frame_bytes[24..28].copy_from_slice(&crc32c.to_le_bytes());
+    frame_bytes[24..28].copy_from_slice(&crc32.to_le_bytes());
     header.seq_id = seq_id;
-    header.crc32c = crc32c;
+    header.crc32 = crc32;
     Ok(())
 }
 
@@ -282,7 +282,7 @@ pub fn decode_frame<R: Read>(
 
     let mut crc_bytes = [0u8; 4];
     crc_bytes.copy_from_slice(&hdr[24..28]);
-    let crc32c = u32::from_le_bytes(crc_bytes);
+    let crc32 = u32::from_le_bytes(crc_bytes);
 
     if payload_len > max_payload_len {
         return Err(FrameDecodeError::InvalidHeader {
@@ -297,7 +297,7 @@ pub fn decode_frame<R: Read>(
         seq_id,
         row_count,
         payload_len,
-        crc32c,
+        crc32,
     };
 
     let mut payload = vec![0u8; payload_len as usize];
@@ -312,7 +312,7 @@ pub fn decode_frame<R: Read>(
     hasher.update(&hdr[4..24]);
     hasher.update(&payload);
     let actual_crc = hasher.finalize();
-    if actual_crc != crc32c {
+    if actual_crc != crc32 {
         return Err(FrameDecodeError::CrcMismatch { header, actual_crc });
     }
 

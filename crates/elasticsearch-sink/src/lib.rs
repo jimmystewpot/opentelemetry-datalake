@@ -367,20 +367,21 @@ impl ElasticsearchSink {
         let prep_res = lease
             .prepare(move |batch| {
                 if batch.num_rows() == 0 {
-                    return Ok((batch, Vec::new()));
+                    return Ok((batch, Vec::new(), Vec::new()));
                 }
                 let sorted_batch = sorter.sort(&batch, signal_type)?;
-                let chunks = crate::serializer::serialize_batch_chunks_with_ranges(
-                    &sorted_batch,
-                    unpack_attributes,
-                    max_payload_bytes,
-                )?;
-                Ok((sorted_batch, chunks))
+                let (chunks, oversized_rows) =
+                    crate::serializer::serialize_batch_chunks_with_oversized(
+                        &sorted_batch,
+                        unpack_attributes,
+                        max_payload_bytes,
+                    )?;
+                Ok((sorted_batch, chunks, oversized_rows))
             })
             .await;
 
-        let (sorted_batch, chunks) = match prep_res {
-            Ok(pair) => pair,
+        let (sorted_batch, chunks, oversized_rows) = match prep_res {
+            Ok(triple) => triple,
             Err(err) => {
                 let _ = lease
                     .nack(FailureClass::Fatal {
@@ -392,6 +393,32 @@ impl ElasticsearchSink {
         };
 
         if chunks.is_empty() {
+            if !oversized_rows.is_empty() {
+                let mut rejected_slices = Vec::with_capacity(oversized_rows.len());
+                let mut first_reason: Option<String> = None;
+                for (row_idx, record_bytes) in oversized_rows {
+                    if first_reason.is_none() {
+                        first_reason = Some(format!(
+                            "oversized record ({record_bytes} bytes > max_payload_bytes {max_payload_bytes})"
+                        ));
+                    }
+                    if row_idx < sorted_batch.num_rows() {
+                        rejected_slices.push(sorted_batch.slice(row_idx, 1));
+                    }
+                }
+                if !rejected_slices.is_empty() {
+                    let reason =
+                        first_reason.unwrap_or_else(|| "oversized bulk item record".to_string());
+                    if let Err(dlq_err) = lease.quarantine_batches(reason, rejected_slices).await {
+                        let _ = lease
+                            .nack(FailureClass::Fatal {
+                                reason: dlq_err.to_string(),
+                            })
+                            .await;
+                        return Err(dlq_err);
+                    }
+                }
+            }
             lease.ack().await?;
             return Ok(());
         }
@@ -469,6 +496,17 @@ impl ElasticsearchSink {
 
         let mut rejected_slices: Vec<RecordBatch> = Vec::new();
         let mut first_reason: Option<String> = None;
+
+        for (row_idx, record_bytes) in oversized_rows {
+            if first_reason.is_none() {
+                first_reason = Some(format!(
+                    "oversized record ({record_bytes} bytes > max_payload_bytes {max_payload_bytes})"
+                ));
+            }
+            if row_idx < sorted_batch.num_rows() {
+                rejected_slices.push(sorted_batch.slice(row_idx, 1));
+            }
+        }
 
         for (start_row, row_count, resp) in &outcomes {
             for (item_idx, item_wrapper) in resp.items.iter().enumerate() {
@@ -2782,5 +2820,61 @@ mod tests {
             ),
             "Fatal chunk error must take precedence over earlier Transient chunk error, got: {chosen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_es_oversized_single_row_quarantined_and_counted_as_dead_letter() {
+        let server = MockServer::start().await;
+        let dlq_dir = std::env::temp_dir().join(format!(
+            "otel-es-dlq-oversized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dlq_dir);
+
+        let mut config = make_test_config(server.uri(), false);
+        // Set max_payload_bytes small enough that a single log row exceeds it.
+        config.max_payload_bytes = 32;
+
+        let mut buf_cfg = config.resolved_buffer_config().unwrap();
+        buf_cfg.max_batch_records = Some(1);
+        buf_cfg.max_batch_interval_sec = 0;
+        buf_cfg.dead_letter_path = Some(dlq_dir.clone());
+
+        let mut sink = ElasticsearchSink::try_new(config).unwrap();
+        let (tx, rx) = SinkBuffer::new("elasticsearch", buf_cfg).unwrap();
+        let ctrl = rx.controller();
+
+        tx.send(SignalBatch::Logs(make_multi_row_log_batch(1)))
+            .await
+            .unwrap();
+        drop(tx);
+
+        sink.run(rx).await.unwrap();
+
+        assert_eq!(
+            ctrl.dropped_records(Some(SignalType::Logs), "dead_letter"),
+            1,
+            "Oversized single row must be counted under dropped_records(dead_letter)"
+        );
+
+        let es_dlq = dlq_dir.join("elasticsearch");
+        assert!(es_dlq.exists(), "Oversized row must be quarantined to DLQ");
+        let mut json_files = Vec::new();
+        for entry in std::fs::read_dir(&es_dlq).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                json_files.push(p);
+            }
+        }
+        assert_eq!(json_files.len(), 1);
+        let manifest: DeadLetterManifest =
+            serde_json::from_slice(&std::fs::read(&json_files[0]).unwrap()).unwrap();
+        assert_eq!(manifest.row_count, 1);
+
+        let _ = std::fs::remove_dir_all(&dlq_dir);
     }
 }

@@ -45,6 +45,28 @@ pub fn serialize_batch_chunks_with_ranges(
     unpack_attributes: bool,
     max_payload_bytes: usize,
 ) -> Result<Vec<BulkChunk>, PipelineError> {
+    let (chunks, _) = serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)
+        .map_err(PipelineError::from)?;
+    Ok(chunks)
+}
+
+/// Bounded [`BulkChunk`] list paired with `(row_index, serialized_bytes)` entries for any
+/// individual rows that exceeded `max_payload_bytes`.
+pub type BulkChunksWithOversized = (Vec<BulkChunk>, Vec<(usize, usize)>);
+
+/// Serializes an Arrow `RecordBatch` into bounded [`BulkChunk`]s with exact row ranges,
+/// along with `(row_index, serialized_bytes)` pairs for any individual rows that exceeded
+/// `max_payload_bytes` so the caller can route them through dead-letter quarantine and
+/// dropped-record metrics.
+///
+/// # Errors
+///
+/// Returns [`PipelineError`] if Arrow column serialization fails.
+pub fn serialize_batch_chunks_with_oversized(
+    batch: &RecordBatch,
+    unpack_attributes: bool,
+    max_payload_bytes: usize,
+) -> Result<BulkChunksWithOversized, PipelineError> {
     serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)
         .map_err(PipelineError::from)
 }
@@ -64,7 +86,7 @@ pub fn serialize_batch_chunks(
     unpack_attributes: bool,
     max_payload_bytes: usize,
 ) -> Result<Vec<Bytes>, ElasticsearchError> {
-    let chunks = serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)?;
+    let (chunks, _) = serialize_batch_chunks_internal(batch, unpack_attributes, max_payload_bytes)?;
     Ok(chunks.into_iter().map(|c| c.payload).collect())
 }
 
@@ -72,9 +94,9 @@ fn serialize_batch_chunks_internal(
     batch: &RecordBatch,
     unpack_attributes: bool,
     max_payload_bytes: usize,
-) -> Result<Vec<BulkChunk>, ElasticsearchError> {
+) -> Result<BulkChunksWithOversized, ElasticsearchError> {
     if batch.num_rows() == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mem_size = batch.get_array_memory_size();
@@ -84,6 +106,7 @@ fn serialize_batch_chunks_internal(
     let mut chunk_row_count: usize = 0;
     let mut row_buf = Vec::with_capacity(1024);
     let mut chunks = Vec::new();
+    let mut oversized_rows = Vec::new();
 
     let schema = batch.schema();
     let num_rows = batch.num_rows();
@@ -148,8 +171,9 @@ fn serialize_batch_chunks_internal(
                 row,
                 record_bytes = row_buf.len(),
                 max_payload_bytes,
-                "Dropping individual telemetry record exceeding maximum payload bytes"
+                "Quarantining individual telemetry record exceeding maximum payload bytes"
             );
+            oversized_rows.push((row, row_buf.len()));
             continue;
         }
 
@@ -181,7 +205,7 @@ fn serialize_batch_chunks_internal(
         });
     }
 
-    Ok(chunks)
+    Ok((chunks, oversized_rows))
 }
 
 /// Serializes an Arrow `RecordBatch` into a single NDJSON bulk payload.

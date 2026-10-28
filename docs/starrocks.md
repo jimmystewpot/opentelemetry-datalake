@@ -94,10 +94,10 @@ max_buffer_bytes       = 268435456     # Default: 256 MiB across all signals
 max_batch_size_bytes   = 52428800      # Default: 50 MiB per Stream Load lease
 max_batch_interval_sec = 30            # Default: 30 seconds
 # max_batch_records    = 100000        # Optional record count trigger
-overflow_policy        = "backpressure"
+overflow_policy        = "block"       # "block" (default) or "drop_oldest"
 max_attempts           = 5
 initial_backoff_ms     = 500
-max_backoff_ms         = 30000
+max_backoff_sec        = 30
 # dead_letter_path     = "/var/lib/otel-datalake/dlq"
 
 # Optional pre-sorting configuration per signal type.

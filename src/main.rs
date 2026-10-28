@@ -1080,12 +1080,6 @@ async fn main() -> anyhow::Result<()> {
         () = wait_for_shutdown_signal() => {
             tracing::info!("Received shutdown signal. Starting graceful shutdown...");
             let _ = shutdown_tx.send(true);
-            source_done = true;
-            match (&mut source_handle).await {
-                Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {}", e),
-                Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
-                Err(e) => tracing::error!("Source receiver task failed/panicked: {}", e),
-            }
         }
         res = &mut source_handle => {
             source_done = true;
@@ -1180,7 +1174,11 @@ async fn main() -> anyhow::Result<()> {
     let drain_timeout = std::time::Duration::from_secs(buffer_controller.drain_timeout_sec());
     let drain_outcome = tokio::time::timeout(drain_timeout, async {
         if !source_done {
-            let _ = (&mut source_handle).await;
+            match (&mut source_handle).await {
+                Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {e}"),
+                Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
+                Err(e) => tracing::error!("Source receiver task failed/panicked: {e}"),
+            }
             source_done = true;
         }
         tokio::join!(

@@ -466,7 +466,7 @@ impl BufferMetrics {
                     .shutdown_timeout_drops
                     .fetch_add(rows, Ordering::Relaxed);
             }
-            _ => {}
+            _ => return,
         }
         let attrs = [
             KeyValue::new("signal", signal.as_str()),
@@ -496,7 +496,7 @@ impl BufferMetrics {
             "fatal" => {
                 sig_state.fatal_nacks.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {}
+            _ => return,
         }
         let attrs = [
             KeyValue::new("signal", signal.as_str()),

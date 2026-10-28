@@ -18,7 +18,7 @@ The keywords **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **S
    * **Iceberg Snapshot Delivery Tokens:** `IcebergSink` records the `SinkBuffer` lease sequence range in each committed snapshot's summary properties via `FastAppendAction::set_snapshot_properties`:
      * Property key: `datalake.lease.logs`, `datalake.lease.metrics`, or `datalake.lease.traces` (`datalake.lease.<signal>`).
      * Property value: `"{first_seq}:{last_seq}"` (parsers also accept `"{first_seq}-{last_seq}"`).
-   * Before writing Parquet files on a retry attempt—and after reloading table metadata if a catalog commit returns an error—`IcebergSink` inspects the current snapshot's `datalake.lease.<signal>` property. When `committed_last_seq >= lease.id().last_seq`, the sink acknowledges the lease (`lease.ack()`) immediately without writing duplicate Parquet files or committing a second snapshot.
+   * Before writing Parquet files on a retry attempt—and after reloading table metadata if a catalog commit returns an error—`IcebergSink` inspects the `datalake.lease.<signal>` properties across the table's snapshot history. When the lease's `[first_seq, last_seq]` interval is already covered by committed snapshot intervals, the sink acknowledges the lease (`lease.ack()`) immediately without writing duplicate Parquet files or committing a second snapshot.
 
 
 ## 3. Schema Evolution Modes
