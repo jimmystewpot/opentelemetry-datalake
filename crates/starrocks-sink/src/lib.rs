@@ -98,6 +98,13 @@ pub fn format_lease_label(table: &str, id: LeaseId) -> String {
     format!("dl_{table_prefix}_{hex_str}{suffix}")
 }
 
+fn format_attempt_lease_label(base_label: &str, attempt: u32) -> String {
+    let suffix = format!("_a{}", attempt.max(1));
+    let max_base_len = MAX_STREAM_LOAD_LABEL_LEN.saturating_sub(suffix.len());
+    let base_slice = &base_label[..base_label.len().min(max_base_len)];
+    format!("{base_slice}{suffix}")
+}
+
 /// Returns `true` if the `StarRocks` Stream Load error indicates that the transaction label
 /// was already committed (`Label Already Exists`), which is treated as an idempotent success.
 #[must_use]
@@ -806,9 +813,10 @@ impl StarRocksSink {
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
+        attempt: u32,
         payload: Bytes,
     ) -> Result<(), StreamLoadError> {
-        match manager.send_single_batch(label, payload).await {
+        match manager.send_single_batch(label, payload.clone()).await {
             Ok(response) => {
                 info!(
                     label = label,
@@ -820,7 +828,25 @@ impl StarRocksSink {
                 Ok(())
             }
             Err(e) if is_label_already_exists(&e) => {
-                Self::confirm_v1_label_committed(manager, table, label).await
+                if Self::confirm_v1_label_committed(manager, table, label).await? {
+                    return Ok(());
+                }
+                let fallback_label = format_attempt_lease_label(label, attempt);
+                info!(
+                    base_label = label,
+                    fallback_label = %fallback_label,
+                    table = table,
+                    "StarRocks V1 base label was aborted; retrying with attempt-disambiguated label"
+                );
+                let response = manager.send_single_batch(&fallback_label, payload).await?;
+                info!(
+                    label = %fallback_label,
+                    table = table,
+                    status = %response.status,
+                    rows = ?response.number_loaded_rows,
+                    "StarRocks V1 load committed with fallback label"
+                );
+                Ok(())
             }
             Err(e) => {
                 error!(
@@ -857,11 +883,21 @@ impl StarRocksSink {
         state.is_some_and(matches_prepared) || existing_job_status.is_some_and(matches_prepared)
     }
 
+    fn is_load_state_aborted(state: Option<&str>, existing_job_status: Option<&str>) -> bool {
+        let matches_aborted = |val: &str| {
+            let trimmed = val.trim();
+            trimmed.eq_ignore_ascii_case("ABORTED")
+                || trimmed.eq_ignore_ascii_case("CANCELLED")
+                || trimmed.eq_ignore_ascii_case("CANCELED")
+        };
+        state.is_some_and(matches_aborted) || existing_job_status.is_some_and(matches_aborted)
+    }
+
     async fn confirm_v1_label_committed(
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
-    ) -> Result<(), StreamLoadError> {
+    ) -> Result<bool, StreamLoadError> {
         match manager.get_load_status(label).await {
             Ok(status_resp)
                 if Self::is_load_status_ok(&status_resp.status)
@@ -877,7 +913,15 @@ impl StarRocksSink {
                     existing_job_status = ?status_resp.existing_job_status,
                     "StarRocks V1 confirmed existing label is committed; treating as idempotent success"
                 );
-                Ok(())
+                Ok(true)
+            }
+            Ok(status_resp)
+                if Self::is_load_state_aborted(
+                    status_resp.state.as_deref(),
+                    status_resp.existing_job_status.as_deref(),
+                ) =>
+            {
+                Ok(false)
             }
             Ok(status_resp) => {
                 warn!(
@@ -909,7 +953,7 @@ impl StarRocksSink {
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
-    ) -> Result<(), StreamLoadError> {
+    ) -> Result<bool, StreamLoadError> {
         match manager.get_load_status(label).await {
             Ok(status_resp)
                 if Self::is_load_status_ok(&status_resp.status)
@@ -925,7 +969,7 @@ impl StarRocksSink {
                     existing_job_status = ?status_resp.existing_job_status,
                     "StarRocks V2 confirmed existing label is committed; treating as idempotent success"
                 );
-                Ok(())
+                Ok(true)
             }
             Ok(status_resp)
                 if Self::is_load_status_ok(&status_resp.status)
@@ -949,7 +993,7 @@ impl StarRocksSink {
                             status = %commit_resp.status,
                             "StarRocks V2 prepared transaction committed on recovery"
                         );
-                        Ok(())
+                        Ok(true)
                     }
                     Err(e) if is_label_already_exists(&e) => {
                         match manager.get_load_status(label).await {
@@ -967,7 +1011,7 @@ impl StarRocksSink {
                                     existing_job_status = ?recheck.existing_job_status,
                                     "StarRocks V2 confirmed prepared label is now committed"
                                 );
-                                Ok(())
+                                Ok(true)
                             }
                             Ok(recheck) => {
                                 warn!(
@@ -976,32 +1020,14 @@ impl StarRocksSink {
                                     status = %recheck.status,
                                     state = ?recheck.state,
                                     existing_job_status = ?recheck.existing_job_status,
-                                    "StarRocks V2 prepared label still not committed after commit returned Label Already Exists; attempting rollback"
+                                    "StarRocks V2 prepared label still not committed after commit returned Label Already Exists; retaining prepared transaction for retry"
                                 );
-                                if let Err(rb_err) = manager.rollback_transaction(label).await {
-                                    warn!(
-                                        label = label,
-                                        table = table,
-                                        error = %rb_err,
-                                        "StarRocks V2 rollback of uncommitted existing label failed"
-                                    );
-                                }
                                 Err(StreamLoadError::Transaction(format!(
                                     "StarRocks V2 label '{label}' already exists in uncommitted state (status='{}', state={:?}, existing_job_status={:?})",
                                     recheck.status, recheck.state, recheck.existing_job_status
                                 )))
                             }
-                            Err(status_err) => {
-                                if let Err(rb_err) = manager.rollback_transaction(label).await {
-                                    warn!(
-                                        label = label,
-                                        table = table,
-                                        error = %rb_err,
-                                        "StarRocks V2 rollback of uncommitted existing label failed"
-                                    );
-                                }
-                                Err(status_err)
-                            }
+                            Err(status_err) => Err(status_err),
                         }
                     }
                     Err(commit_err) => {
@@ -1009,19 +1035,19 @@ impl StarRocksSink {
                             label = label,
                             table = table,
                             error = %commit_err,
-                            "StarRocks V2 commit of prepared existing label failed; attempting rollback"
+                            "StarRocks V2 commit of prepared existing label failed; retaining prepared transaction for retry"
                         );
-                        if let Err(rb_err) = manager.rollback_transaction(label).await {
-                            warn!(
-                                label = label,
-                                table = table,
-                                error = %rb_err,
-                                "StarRocks V2 rollback after prepared commit failure also failed"
-                            );
-                        }
                         Err(commit_err)
                     }
                 }
+            }
+            Ok(status_resp)
+                if Self::is_load_state_aborted(
+                    status_resp.state.as_deref(),
+                    status_resp.existing_job_status.as_deref(),
+                ) =>
+            {
+                Ok(false)
             }
             Ok(status_resp) => {
                 warn!(
@@ -1060,71 +1086,85 @@ impl StarRocksSink {
     /// Processes one batch via the V2 (exactly-once, 2PC) path.
     ///
     /// Steps: `begin` → `load` → `prepare` → `commit`.
-    /// Any failure after `begin` triggers a best-effort `rollback`; the rollback
-    /// error is logged but not returned (the original error is propagated).
+    /// Any failure during `load` or `prepare` triggers a best-effort `rollback`; once `prepare`
+    /// succeeds, `commit` failures retain the prepared transaction so a subsequent retry can
+    /// complete the commit idempotently.
     async fn send_v2(
         &self,
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
+        attempt: u32,
         payload: Bytes,
     ) -> Result<(), StreamLoadError> {
-        let txn_id = match manager.begin_transaction(label).await {
+        let mut active_label = label.to_owned();
+        let txn_id = match manager.begin_transaction(&active_label).await {
             Ok(id) => id,
             Err(e) if is_label_already_exists(&e) => {
-                return Self::confirm_or_complete_v2_label(manager, table, label).await;
+                if Self::confirm_or_complete_v2_label(manager, table, &active_label).await? {
+                    return Ok(());
+                }
+                active_label = format_attempt_lease_label(label, attempt);
+                info!(
+                    base_label = label,
+                    fallback_label = %active_label,
+                    table = table,
+                    "StarRocks V2 base label was aborted; retrying with attempt-disambiguated label"
+                );
+                manager.begin_transaction(&active_label).await?
             }
             Err(e) => {
-                error!(label = label, error = %e, "StarRocks V2 begin_transaction failed");
+                error!(label = %active_label, error = %e, "StarRocks V2 begin_transaction failed");
                 return Err(e);
             }
         };
 
         info!(
-            label = label,
+            label = %active_label,
             txn_id = txn_id,
             "StarRocks V2 transaction begun"
         );
 
         if let Err(e) = manager
-            .load_transaction_data(label, &self.config.database, table, 0, payload)
+            .load_transaction_data(&active_label, &self.config.database, table, 0, payload)
             .await
         {
-            error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 load failed; attempting rollback");
-            if let Err(rb_err) = manager.rollback_transaction(label).await {
-                warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
+            error!(label = %active_label, txn_id = txn_id, error = %e, "StarRocks V2 load failed; attempting rollback");
+            if let Err(rb_err) = manager.rollback_transaction(&active_label).await {
+                warn!(label = %active_label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(e);
         }
 
-        if let Err(e) = manager.prepare_transaction(label).await {
-            error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 prepare failed; attempting rollback");
-            if let Err(rb_err) = manager.rollback_transaction(label).await {
-                warn!(label = label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
+        if let Err(e) = manager.prepare_transaction(&active_label).await {
+            error!(label = %active_label, txn_id = txn_id, error = %e, "StarRocks V2 prepare failed; attempting rollback");
+            if let Err(rb_err) = manager.rollback_transaction(&active_label).await {
+                warn!(label = %active_label, error = %rb_err, "StarRocks V2 rollback also failed — manual intervention may be needed");
             }
             return Err(e);
         }
 
-        let commit_response = match manager.commit_transaction(label).await {
+        let commit_response = match manager.commit_transaction(&active_label).await {
             Ok(resp) => resp,
             Err(e) if is_label_already_exists(&e) => {
-                return Self::confirm_or_complete_v2_label(manager, table, label).await;
+                if Self::confirm_or_complete_v2_label(manager, table, &active_label).await? {
+                    return Ok(());
+                }
+                return Err(e);
             }
             Err(e) => {
-                error!(label = label, txn_id = txn_id, error = %e, "StarRocks V2 commit failed; attempting rollback");
-                if let Err(rb_err) = manager.rollback_transaction(label).await {
-                    warn!(
-                        label = label,
-                        error = %rb_err,
-                        "StarRocks V2 rollback after commit failure also failed — transaction {txn_id} may require manual resolution"
-                    );
-                }
+                error!(
+                    label = %active_label,
+                    txn_id = txn_id,
+                    error = %e,
+                    "StarRocks V2 commit failed after prepare; retaining prepared transaction for retry"
+                );
                 return Err(e);
             }
         };
 
         info!(
-            label = label,
+            label = %active_label,
             txn_id = txn_id,
             table = table,
             status = %commit_response.status,
@@ -1220,10 +1260,16 @@ impl Sink for StarRocksSink {
             let manager = self.manager_for(signal_str);
             let table = self.config.table_mapping.table_for(signal_str).to_owned();
             let label = format_lease_label(&table, lease.id());
+            let attempt = lease.attempt();
 
             let send_res = match self.config.transaction_mode {
-                TransactionMode::V1 => Self::send_v1(&manager, &table, &label, payload).await,
-                TransactionMode::V2 => self.send_v2(&manager, &table, &label, payload).await,
+                TransactionMode::V1 => {
+                    Self::send_v1(&manager, &table, &label, attempt, payload).await
+                }
+                TransactionMode::V2 => {
+                    self.send_v2(&manager, &table, &label, attempt, payload)
+                        .await
+                }
             };
 
             match send_res {
@@ -2989,6 +3035,80 @@ mod tests {
         assert_eq!(
             reqs[3].path,
             format!("/api/otel/get_load_state?label={expected_label}")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_aborted_label_falls_back_to_attempt_disambiguated_label() {
+        use pipeline_core::buffer::BufferConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+        let begin_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let begin_calls_clone = std::sync::Arc::clone(&begin_calls);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = move |_method: &str, path: &str| {
+                if path == "/api/transaction/begin" {
+                    let c = begin_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    if c == 0 {
+                        // First attempt: base label already exists because a previous load failed & rolled back
+                        (
+                            200,
+                            r#"{"Status":"Label Already Exists","Message":"Label already exists, state: ABORTED"}"#,
+                        )
+                    } else {
+                        // Fallback attempt-disambiguated label succeeds
+                        (200, r#"{"Status":"OK","TxnId":99}"#)
+                    }
+                } else if path.starts_with("/api/otel/get_load_state?label=") {
+                    (200, r#"{"Status":"Success","State":"ABORTED"}"#)
+                } else {
+                    (200, r#"{"Status":"OK"}"#)
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V2;
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            initial_backoff_ms: 10,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let base_label = format!("dl_otel_logs_{:016x}_logs_1_1", rx.instance_id());
+        let fallback_label = format!("{base_label}_a1");
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_millis(500), sink_handle)
+            .await
+            .expect("sink should recover from ABORTED label using attempt-disambiguated label")
+            .unwrap()
+            .unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert!(
+            reqs.iter()
+                .any(|r| r.headers.get("label").map(String::as_str)
+                    == Some(fallback_label.as_str())),
+            "Expected fallback attempt label '{fallback_label}' after base label was ABORTED"
         );
     }
 }

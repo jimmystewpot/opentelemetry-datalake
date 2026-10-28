@@ -90,12 +90,35 @@ pub fn parse_lease_token(token: &str) -> Option<(u64, u64, u64)> {
 }
 
 fn token_matches_lease(raw: &str, id: LeaseId) -> bool {
-    let Some((committed_instance_id, _committed_first_seq, committed_last_seq)) =
+    let Some((committed_instance_id, committed_first_seq, committed_last_seq)) =
         parse_lease_token(raw)
     else {
         return false;
     };
-    committed_instance_id == id.instance_id && committed_last_seq >= id.last_seq
+    committed_instance_id == id.instance_id
+        && committed_first_seq <= id.first_seq
+        && committed_last_seq >= id.last_seq
+}
+
+fn intervals_cover_range(intervals: &mut [(u64, u64)], first_seq: u64, last_seq: u64) -> bool {
+    if first_seq > last_seq || intervals.is_empty() {
+        return false;
+    }
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+    let mut covered_through = first_seq;
+    for &(start, end) in intervals.iter() {
+        if end < covered_through {
+            continue;
+        }
+        if start > covered_through {
+            return false;
+        }
+        if end >= last_seq {
+            return true;
+        }
+        covered_through = end.saturating_add(1);
+    }
+    false
 }
 
 /// Abstraction over an Iceberg [`iceberg::table::Table`], [`iceberg::spec::TableMetadata`],
@@ -158,8 +181,26 @@ impl SnapshotPropertiesSource for iceberg::spec::TableMetadata {
         {
             return true;
         }
-        self.snapshots()
+        if self
+            .snapshots()
             .any(|snap| snap.as_ref().has_committed_lease(id))
+        {
+            return true;
+        }
+        let inst_key = instance_snapshot_property_key(id.signal, id.instance_id);
+        let sig_key = snapshot_property_key(id.signal);
+        let mut intervals = Vec::new();
+        for snap in self.snapshots() {
+            for key in [inst_key.as_str(), sig_key] {
+                if let Some(raw) = snap.lease_property(key)
+                    && let Some((inst, first_seq, last_seq)) = parse_lease_token(raw)
+                    && inst == id.instance_id
+                {
+                    intervals.push((first_seq, last_seq));
+                }
+            }
+        }
+        intervals_cover_range(&mut intervals, id.first_seq, id.last_seq)
     }
 }
 
@@ -2633,5 +2674,40 @@ mod tests {
                 .to_string()
                 .contains("Unexpected timestamp column datatype")
         );
+    }
+
+    #[test]
+    fn test_token_matches_lease_requires_first_seq_coverage_and_supports_contiguous_intervals() {
+        use pipeline_core::buffer::{LeaseId, SignalKind};
+
+        // Out-of-order commit of 3..=4 must NOT match uncommitted earlier lease 1..=2 or coalesced 1..=4
+        let props = HashMap::from([(
+            "datalake.lease.logs.0000000000000001".to_string(),
+            "0000000000000001:3-4".to_string(),
+        )]);
+        assert!(
+            !props.has_committed_lease(LeaseId {
+                instance_id: 1,
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 2,
+            }),
+            "Committed token 3-4 must not match uncommitted earlier lease 1-2"
+        );
+        assert!(
+            !props.has_committed_lease(LeaseId {
+                instance_id: 1,
+                signal: SignalKind::Logs,
+                first_seq: 1,
+                last_seq: 4,
+            }),
+            "Committed token 3-4 must not match partially uncommitted coalesced lease 1-4"
+        );
+        assert!(props.has_committed_lease(LeaseId {
+            instance_id: 1,
+            signal: SignalKind::Logs,
+            first_seq: 3,
+            last_seq: 4,
+        }));
     }
 }
