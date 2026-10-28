@@ -208,15 +208,15 @@ impl BufferConfig {
             }
             (Some(cfg), None) => cfg,
             (None, Some(legacy)) => {
-                let min_buf = (legacy.max_batch_size_bytes as u64).saturating_mul(3);
-                Self {
+                let mut cfg = Self {
                     mode: BufferMode::Memory,
-                    max_buffer_bytes: default_max_buffer_bytes().max(min_buf),
                     max_batch_size_bytes: legacy.max_batch_size_bytes,
                     max_batch_records: legacy.max_batch_records,
                     max_batch_interval_sec: legacy.max_batch_interval_sec,
                     ..Self::default()
-                }
+                };
+                cfg.ensure_min_buffer_bytes();
+                cfg
             }
             (None, None) => {
                 if default_passthrough {
@@ -228,6 +228,17 @@ impl BufferConfig {
         };
         resolved.validate(sink_name)?;
         Ok(resolved)
+    }
+
+    /// Raises `max_buffer_bytes` (and `segment_size_bytes` when in `Disk` mode) if needed so a
+    /// synthesized configuration satisfies V1 (`3 * max_batch_size_bytes * (1 + max_inflight_leases)`).
+    pub fn ensure_min_buffer_bytes(&mut self) {
+        let slots = (self.max_inflight_leases as u64).saturating_add(1);
+        let min_per_signal = (self.max_batch_size_bytes as u64).saturating_mul(slots);
+        let min_total = min_per_signal.saturating_mul(3);
+        if self.max_buffer_bytes < min_total {
+            self.max_buffer_bytes = min_total;
+        }
     }
 
     /// Validates startup configuration invariants V1–V5 (`docs/buffer.md` §5.3).
@@ -259,12 +270,28 @@ impl BufferConfig {
             )));
         }
 
-        // V1: max_buffer_bytes must accommodate at least one full batch per signal (3 signals)
-        let min_buffer_bytes = (self.max_batch_size_bytes as u64).saturating_mul(3);
-        if self.max_buffer_bytes < min_buffer_bytes {
+        // V1: max_batch_size_bytes * (1 + max_inflight_leases) <= max_buffer_bytes / 3
+        let slots_per_signal = (self.max_inflight_leases as u64)
+            .checked_add(1)
+            .ok_or_else(|| {
+                Self::config_err(format!(
+                    "[{sink_name}.buffer]: max_inflight_leases ({}) overflows slot count (V1)",
+                    self.max_inflight_leases
+                ))
+            })?;
+        let min_per_signal = (self.max_batch_size_bytes as u64)
+            .checked_mul(slots_per_signal)
+            .ok_or_else(|| {
+                Self::config_err(format!(
+                    "[{sink_name}.buffer]: max_batch_size_bytes * (1 + max_inflight_leases) overflows u64 (V1)"
+                ))
+            })?;
+        let per_signal_budget = self.per_signal_budget();
+        if per_signal_budget < min_per_signal {
+            let min_buffer_bytes = min_per_signal.saturating_mul(3);
             return Err(Self::config_err(format!(
-                "[{sink_name}.buffer]: max_buffer_bytes ({}) must be >= 3 * max_batch_size_bytes ({min_buffer_bytes}) (V1)",
-                self.max_buffer_bytes
+                "[{sink_name}.buffer]: max_buffer_bytes ({}, per-signal {}) must be >= 3 * max_batch_size_bytes * (1 + max_inflight_leases) ({min_buffer_bytes}, per-signal {min_per_signal}) (V1)",
+                self.max_buffer_bytes, per_signal_budget
             )));
         }
 
@@ -285,6 +312,14 @@ impl BufferConfig {
                 if self.segment_size_bytes < min_segment_bytes {
                     return Err(Self::config_err(format!(
                         "[{sink_name}.buffer]: segment_size_bytes ({}) must be >= 2 * max_batch_size_bytes ({min_segment_bytes}) in disk mode (V2)",
+                        self.segment_size_bytes
+                    )));
+                }
+                // V5: segment_size_bytes <= max_buffer_bytes / 3 / 2
+                let max_segment_bytes = per_signal_budget / 2;
+                if self.segment_size_bytes > max_segment_bytes {
+                    return Err(Self::config_err(format!(
+                        "[{sink_name}.buffer]: segment_size_bytes ({}) must be <= (max_buffer_bytes / 3) / 2 ({max_segment_bytes}) in disk mode (V5)",
                         self.segment_size_bytes
                     )));
                 }
@@ -358,7 +393,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_v1_rejects_max_buffer_bytes_smaller_than_three_batches() {
+    fn test_v1_rejects_max_buffer_bytes_smaller_than_three_batches_or_inflight_headroom() {
         let cfg = BufferConfig {
             max_buffer_bytes: 300,
             max_batch_size_bytes: 200,
@@ -366,10 +401,20 @@ mod tests {
         };
         let err = cfg.validate("iceberg").unwrap_err();
         assert!(matches!(err, PipelineError::Configuration(_)));
+
+        // 32 MiB batch * (1 + 8 inflight leases) = 288 MiB per signal > 256 MiB (768 MiB / 3)
+        let inflight_overflow = BufferConfig {
+            max_buffer_bytes: 805_306_368,
+            max_batch_size_bytes: 33_554_432,
+            max_inflight_leases: 8,
+            ..BufferConfig::default()
+        };
+        let err2 = inflight_overflow.validate("elasticsearch").unwrap_err();
+        assert!(matches!(err2, PipelineError::Configuration(_)));
     }
 
     #[test]
-    fn test_v2_rejects_disk_segment_smaller_than_two_batches() {
+    fn test_v2_and_v5_reject_disk_segment_out_of_bounds() {
         let cfg = BufferConfig {
             mode: BufferMode::Disk,
             disk_path: Some(PathBuf::from("/tmp/otel-datalake-buf-v2")),
@@ -380,6 +425,16 @@ mod tests {
         };
         let err = cfg.validate("starrocks").unwrap_err();
         assert!(matches!(err, PipelineError::Configuration(_)));
+
+        // V5 upper bound: segment_size_bytes > (max_buffer_bytes / 3) / 2
+        let oversize_segment = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(PathBuf::from("/tmp/otel-datalake-buf-v5")),
+            segment_size_bytes: 200_000_000, // 200 MiB > (768 MiB / 3) / 2 = 128 MiB
+            ..BufferConfig::default()
+        };
+        let err_v5 = oversize_segment.validate("starrocks").unwrap_err();
+        assert!(matches!(err_v5, PipelineError::Configuration(_)));
     }
 
     #[test]

@@ -439,6 +439,10 @@ enum WriterCommand {
         watermark: DiskWatermark,
         reply: Option<WatermarkOneshotReply>,
     },
+    FlushWatermarkAsync {
+        watermark: DiskWatermark,
+        reply: WatermarkOneshotReply,
+    },
     FlushWatermarkSync {
         watermark: DiskWatermark,
         reply: WatermarkSyncReply,
@@ -587,6 +591,7 @@ pub(crate) struct DiskBackend {
     dir: PathBuf,
     instance_id: u64,
     cmd_tx: Mutex<Option<std::sync::mpsc::Sender<WriterCommand>>>,
+    shutdown_done_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
     _lock_file: File,
 }
@@ -631,6 +636,7 @@ impl DiskBackend {
             Self::recover_segments(sink_name, &dir, config, watermark, rings)?;
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WriterCommand>();
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let writer_dir = dir.clone();
         let segment_size_bytes = config.segment_size_bytes;
         let max_payload_len = config.max_disk_frame_payload_bytes();
@@ -650,6 +656,7 @@ impl DiskBackend {
                     sealed_segments,
                     recovered_watermark,
                 );
+                let _ = shutdown_done_tx.send(());
             })
             .map_err(|e| {
                 storage_err(format!(
@@ -661,6 +668,7 @@ impl DiskBackend {
             dir,
             instance_id,
             cmd_tx: Mutex::new(Some(cmd_tx)),
+            shutdown_done_rx: Mutex::new(Some(shutdown_done_rx)),
             writer_handle: Mutex::new(Some(writer_handle)),
             _lock_file: lock_file,
         })
@@ -1078,9 +1086,75 @@ impl DiskBackend {
             .map_err(|_| storage_err("disk buffer writer thread exited"))?;
 
         let res = rx
-            .recv()
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    storage_err("disk buffer writer thread timed out syncing watermark")
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    storage_err("disk buffer writer thread dropped sync reply")
+                }
+            })?;
+        res.map_err(storage_err)
+    }
+
+    pub(crate) async fn flush_and_sync_watermark_async(
+        &self,
+        watermark: DiskWatermark,
+        timeout: std::time::Duration,
+    ) -> Result<(), PipelineError> {
+        let sender = {
+            let guard = lock_unpoisoned(&self.cmd_tx);
+            guard
+                .clone()
+                .ok_or_else(|| storage_err("disk buffer writer thread is closed"))?
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(WriterCommand::FlushWatermarkAsync {
+                watermark,
+                reply: tx,
+            })
+            .map_err(|_| storage_err("disk buffer writer thread exited"))?;
+
+        let res = tokio::time::timeout(timeout, rx)
+            .await
+            .map_err(|_| storage_err("disk buffer writer thread timed out syncing watermark"))?
             .map_err(|_| storage_err("disk buffer writer thread dropped sync reply"))?;
         res.map_err(storage_err)
+    }
+
+    pub(crate) async fn shutdown_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), PipelineError> {
+        if let Some(tx) = lock_unpoisoned(&self.cmd_tx).take() {
+            let _ = tx.send(WriterCommand::Shutdown);
+        }
+        let done_rx = lock_unpoisoned(&self.shutdown_done_rx).take();
+        let handle = lock_unpoisoned(&self.writer_handle).take();
+        if done_rx.is_none() && handle.is_none() {
+            return Ok(());
+        }
+        tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                if let Some(rx) = done_rx
+                    && rx.recv_timeout(timeout).is_err()
+                {
+                    return Err(storage_err(
+                        "disk buffer writer thread timed out during shutdown",
+                    ));
+                }
+                if let Some(h) = handle {
+                    let _ = h.join();
+                }
+                Ok(())
+            }),
+        )
+        .await
+        .map_err(|_| storage_err("disk buffer writer thread timed out during shutdown"))?
+        .map_err(|e| storage_err(format!("disk buffer writer shutdown join error: {e}")))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1149,6 +1223,12 @@ impl DiskBackend {
                         if let Some(r) = reply {
                             wm_oneshot_replies.push(r);
                         }
+                    }
+                    WriterCommand::FlushWatermarkAsync { watermark, reply } => {
+                        let _ = staged_watermark.merge_monotonic(watermark);
+                        watermark_dirty = true;
+                        force_sync_segment = true;
+                        wm_oneshot_replies.push(reply);
                     }
                     WriterCommand::FlushWatermarkSync { watermark, reply } => {
                         let _ = staged_watermark.merge_monotonic(watermark);
@@ -1338,8 +1418,21 @@ impl Drop for DiskBackend {
         if let Some(tx) = lock_unpoisoned(&self.cmd_tx).take() {
             let _ = tx.send(WriterCommand::Shutdown);
         }
-        if let Some(handle) = lock_unpoisoned(&self.writer_handle).take() {
-            let _ = handle.join();
+        let done_rx = lock_unpoisoned(&self.shutdown_done_rx).take();
+        let handle = lock_unpoisoned(&self.writer_handle).take();
+        let wait_and_join = move || {
+            let finished =
+                done_rx.is_none_or(|rx| rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok());
+            if finished && let Some(h) = handle {
+                let _ = h.join();
+            }
+        };
+        if let Ok(rt) = tokio::runtime::Handle::try_current()
+            && rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(wait_and_join);
+        } else {
+            wait_and_join();
         }
     }
 }

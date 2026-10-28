@@ -241,7 +241,7 @@ mod tests {
             "test_bp",
             BufferConfig {
                 max_buffer_bytes: (batch_bytes as u64) * 3,
-                max_batch_size_bytes: batch_bytes,
+                max_batch_size_bytes: (batch_bytes / 2).max(1),
                 ..BufferConfig::passthrough()
             },
         )

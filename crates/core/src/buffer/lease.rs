@@ -51,6 +51,7 @@ pub struct Lease {
     pub(crate) payloads: Vec<BatchPayload>,
     pub(crate) meta: Vec<LeasedBatchMeta>,
     pub(crate) num_rows: usize,
+    pub(crate) quarantined_rows: std::sync::atomic::AtomicUsize,
     pub(crate) byte_size: usize,
     pub(crate) attempt: u32,
     pub(crate) leased_at: Instant,
@@ -159,7 +160,9 @@ impl Lease {
         reason: String,
         batches: Vec<RecordBatch>,
     ) -> Result<Option<PathBuf>, PipelineError> {
-        self.inner
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let path = self
+            .inner
             .quarantine_batches(
                 self.id.signal,
                 self.id.first_seq,
@@ -168,13 +171,19 @@ impl Lease {
                 reason,
                 batches,
             )
-            .await
+            .await?;
+        if row_count > 0 {
+            self.quarantined_rows
+                .fetch_add(row_count, Ordering::Relaxed);
+        }
+        Ok(path)
     }
 
     /// Commits the lease, freeing its byte budget and advancing the contiguous watermark.
     pub async fn ack(mut self) -> Result<(), PipelineError> {
         self.completed = true;
         let flush_duration = self.leased_at.elapsed();
+        let quarantined = self.quarantined_rows.load(Ordering::Relaxed);
         let acked_rows = self
             .inner
             .ack_lease(
@@ -185,10 +194,11 @@ impl Lease {
                 true,
             )
             .await?;
-        if acked_rows > 0 {
+        let committed_rows = acked_rows.saturating_sub(quarantined);
+        if committed_rows > 0 {
             self.inner.metrics.record_committed(
                 self.id.signal,
-                u64::try_from(acked_rows).unwrap_or(u64::MAX),
+                u64::try_from(committed_rows).unwrap_or(u64::MAX),
                 flush_duration,
             );
         }

@@ -381,6 +381,7 @@ impl IcebergSinkConfig {
         if self.buffer.is_none() && self.batching.is_none() {
             resolved.max_batch_size_bytes = default_max_batch_size_bytes();
             resolved.max_batch_interval_sec = default_max_batch_interval_sec();
+            resolved.ensure_min_buffer_bytes();
             resolved.validate("iceberg")?;
         }
         Ok(resolved)

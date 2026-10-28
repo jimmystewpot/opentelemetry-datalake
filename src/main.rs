@@ -1170,6 +1170,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let mut logs_drain_res = None;
+    let mut traces_drain_res = None;
+    let mut metrics_drain_res = None;
+
     // Wait for pipeline to drain within bounded drain_timeout_sec
     let drain_timeout = std::time::Duration::from_secs(buffer_controller.drain_timeout_sec());
     let drain_outcome = tokio::time::timeout(drain_timeout, async {
@@ -1201,62 +1205,56 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             async {
-                if logs_sink_done {
-                    None
-                } else {
+                if !logs_sink_done {
                     let res = (&mut logs_sink_handle).await;
                     logs_sink_done = true;
-                    Some(res)
+                    logs_drain_res = Some(res);
                 }
             },
             async {
-                if traces_sink_done {
-                    None
-                } else {
+                if !traces_sink_done {
                     let res = (&mut traces_sink_handle).await;
                     traces_sink_done = true;
-                    Some(res)
+                    traces_drain_res = Some(res);
                 }
             },
             async {
-                if metrics_sink_done {
-                    None
-                } else {
+                if !metrics_sink_done {
                     let res = (&mut metrics_sink_handle).await;
                     metrics_sink_done = true;
-                    Some(res)
+                    metrics_drain_res = Some(res);
                 }
             }
-        )
+        );
     })
     .await;
 
-    if let Ok(((), (), (), logs_drain_res, traces_drain_res, metrics_drain_res)) = drain_outcome {
-        for (signal_name, drain_res) in [
-            ("Logs", logs_drain_res),
-            ("Traces", traces_drain_res),
-            ("Metrics", metrics_drain_res),
-        ] {
-            match drain_res {
-                Some(Ok(Err(e))) => {
-                    if exit_err.is_none() {
-                        exit_err = Some(anyhow::anyhow!(
-                            "{signal_name} sink failed during drain: {e}"
-                        ));
-                    }
+    for (signal_name, drain_res) in [
+        ("Logs", logs_drain_res),
+        ("Traces", traces_drain_res),
+        ("Metrics", metrics_drain_res),
+    ] {
+        match drain_res {
+            Some(Ok(Err(e))) => {
+                if exit_err.is_none() {
+                    exit_err = Some(anyhow::anyhow!(
+                        "{signal_name} sink failed during drain: {e}"
+                    ));
                 }
-                Some(Err(join_err)) => {
-                    tracing::error!("{signal_name} sink task panicked during drain: {join_err}");
-                    if exit_err.is_none() {
-                        exit_err = Some(anyhow::anyhow!(
-                            "{signal_name} sink task panicked during drain: {join_err}"
-                        ));
-                    }
-                }
-                Some(Ok(Ok(()))) | None => {}
             }
+            Some(Err(join_err)) => {
+                tracing::error!("{signal_name} sink task panicked during drain: {join_err}");
+                if exit_err.is_none() {
+                    exit_err = Some(anyhow::anyhow!(
+                        "{signal_name} sink task panicked during drain: {join_err}"
+                    ));
+                }
+            }
+            Some(Ok(Ok(()))) | None => {}
         }
-    } else {
+    }
+
+    if drain_outcome.is_err() {
         tracing::warn!(
             timeout_sec = buffer_controller.drain_timeout_sec(),
             "Graceful shutdown drain timed out; aborting remaining tasks and finalizing buffer policy"
@@ -1289,7 +1287,9 @@ async fn main() -> anyhow::Result<()> {
             metrics_sink_handle.abort();
             let _ = metrics_sink_handle.await;
         }
-        if let Err(e) = buffer_controller.finalize_shutdown_timeout()
+        if let Err(e) = buffer_controller
+            .finalize_shutdown_timeout_async(std::time::Duration::from_secs(5))
+            .await
             && exit_err.is_none()
         {
             exit_err = Some(anyhow::anyhow!("Shutdown drain timed out: {e}"));

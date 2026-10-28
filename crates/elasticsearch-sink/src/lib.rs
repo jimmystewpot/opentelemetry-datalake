@@ -2860,6 +2860,11 @@ mod tests {
             1,
             "Oversized single row must be counted under dropped_records(dead_letter)"
         );
+        assert_eq!(
+            ctrl.committed_records(Some(SignalType::Logs)),
+            0,
+            "Quarantined oversized row must not be counted as committed"
+        );
 
         let es_dlq = dlq_dir.join("elasticsearch");
         assert!(es_dlq.exists(), "Oversized row must be quarantined to DLQ");

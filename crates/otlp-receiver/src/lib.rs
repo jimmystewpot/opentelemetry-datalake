@@ -60,15 +60,25 @@ pub fn estimate_traces_records(req: &ExportTraceServiceRequest) -> usize {
     })
 }
 
-/// Estimates the total number of metrics in an export request.
+/// Estimates the total number of metric data points in an export request.
 #[must_use]
 pub fn estimate_metrics_records(req: &ExportMetricsServiceRequest) -> usize {
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+
     req.resource_metrics.iter().fold(0usize, |acc, r| {
-        acc.saturating_add(
-            r.scope_metrics
-                .iter()
-                .fold(0usize, |s_acc, s| s_acc.saturating_add(s.metrics.len())),
-        )
+        acc.saturating_add(r.scope_metrics.iter().fold(0usize, |s_acc, s| {
+            s_acc.saturating_add(s.metrics.iter().fold(0usize, |m_acc, m| {
+                let dp_count = match m.data {
+                    Some(Data::Gauge(ref g)) => g.data_points.len(),
+                    Some(Data::Sum(ref sum)) => sum.data_points.len(),
+                    Some(Data::Histogram(ref h)) => h.data_points.len(),
+                    Some(Data::ExponentialHistogram(ref eh)) => eh.data_points.len(),
+                    Some(Data::Summary(ref s)) => s.data_points.len(),
+                    None => 0,
+                };
+                m_acc.saturating_add(dp_count.max(1))
+            }))
+        }))
     })
 }
 
@@ -1025,6 +1035,30 @@ mod tests {
         } else {
             panic!("Expected SignalBatch::Metrics");
         }
+
+        // Also verify a single Metric container holding 600 data points is estimated as 600 records
+        let single_metric_many_dps = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "single_gauge".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                NumberDataPoint {
+                                    time_unix_nano: 1_000_000_000,
+                                    ..Default::default()
+                                };
+                                600
+                            ],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert_eq!(estimate_metrics_records(&single_metric_many_dps), 600);
     }
 
     #[tokio::test]

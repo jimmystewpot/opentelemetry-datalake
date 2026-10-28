@@ -206,6 +206,38 @@ impl BufferInner {
         true
     }
 
+    pub(crate) fn discard_remaining_rings(&self) -> u64 {
+        let mut total_dropped: u64 = 0;
+        for sig in ALL_SIGNALS {
+            let ring_state = &self.rings[sig.as_u8() as usize];
+            let dropped_rows = {
+                let mut ring = lock_unpoisoned(&ring_state.ring);
+                let rows = u64::try_from(ring.rows_in_flight).unwrap_or(u64::MAX);
+                ring.queue.clear();
+                ring.bytes_in_flight = 0;
+                ring.rows_in_flight = 0;
+                ring.inflight_leases = 0;
+                ring.slots.clear();
+                ring.inflight_enqueued_at.clear();
+                ring.advance_watermark(&ring_state.committed_seq);
+                self.sync_ring_metrics(sig, &ring);
+                rows
+            };
+            if dropped_rows > 0 {
+                ring_state
+                    .shutdown_timeout_drops
+                    .fetch_add(dropped_rows, Ordering::Release);
+                self.metrics
+                    .record_dropped(sig, dropped_rows, "shutdown_timeout");
+                total_dropped = total_dropped.saturating_add(dropped_rows);
+            }
+            ring_state.space_available_notify.notify_waiters();
+            ring_state.data_ready_notify.notify_waiters();
+        }
+        self.any_data_ready_notify.notify_waiters();
+        total_dropped
+    }
+
     pub(crate) fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
         match self.config.effective_drain_policy() {
             DrainTimeoutPolicy::Persist => {
@@ -216,38 +248,54 @@ impl BufferInner {
                 Ok(())
             }
             DrainTimeoutPolicy::Discard => {
-                let mut total_dropped: u64 = 0;
-                for sig in ALL_SIGNALS {
-                    let ring_state = &self.rings[sig.as_u8() as usize];
-                    let dropped_rows = {
-                        let mut ring = lock_unpoisoned(&ring_state.ring);
-                        let rows = u64::try_from(ring.rows_in_flight).unwrap_or(u64::MAX);
-                        ring.queue.clear();
-                        ring.bytes_in_flight = 0;
-                        ring.rows_in_flight = 0;
-                        ring.inflight_leases = 0;
-                        ring.slots.clear();
-                        ring.inflight_enqueued_at.clear();
-                        ring.advance_watermark(&ring_state.committed_seq);
-                        self.sync_ring_metrics(sig, &ring);
-                        rows
-                    };
-                    if dropped_rows > 0 {
-                        ring_state
-                            .shutdown_timeout_drops
-                            .fetch_add(dropped_rows, Ordering::Release);
-                        self.metrics
-                            .record_dropped(sig, dropped_rows, "shutdown_timeout");
-                        total_dropped = total_dropped.saturating_add(dropped_rows);
-                    }
-                    ring_state.space_available_notify.notify_waiters();
-                    ring_state.data_ready_notify.notify_waiters();
-                }
-                self.any_data_ready_notify.notify_waiters();
+                let total_dropped = self.discard_remaining_rings();
 
                 if let Some(disk) = &self.disk {
                     let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
                     disk.flush_and_sync_watermark(wm)?;
+                }
+
+                tracing::error!(
+                    sink = %self.sink_name,
+                    dropped_records = total_dropped,
+                    "Graceful shutdown drain timed out under DrainTimeoutPolicy::Discard; discarded remaining unacknowledged records"
+                );
+
+                Err(PipelineError::Storage(
+                    format!(
+                        "sink '{}' shutdown drain timed out under Discard policy ({total_dropped} records dropped)",
+                        self.sink_name
+                    )
+                    .into(),
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn finalize_shutdown_timeout_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), PipelineError> {
+        match self.config.effective_drain_policy() {
+            DrainTimeoutPolicy::Persist => {
+                if let Some(disk) = &self.disk {
+                    let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
+                    let sync_res = disk.flush_and_sync_watermark_async(wm, timeout).await;
+                    let shut_res = disk.shutdown_async(timeout).await;
+                    sync_res?;
+                    shut_res?;
+                }
+                Ok(())
+            }
+            DrainTimeoutPolicy::Discard => {
+                let total_dropped = self.discard_remaining_rings();
+
+                if let Some(disk) = &self.disk {
+                    let wm = DiskWatermark::from_rings(self.instance_id, &self.rings);
+                    let sync_res = disk.flush_and_sync_watermark_async(wm, timeout).await;
+                    let shut_res = disk.shutdown_async(timeout).await;
+                    sync_res?;
+                    shut_res?;
                 }
 
                 tracing::error!(
@@ -627,6 +675,7 @@ impl BufferInner {
             payloads,
             meta,
             num_rows: total_rows,
+            quarantined_rows: std::sync::atomic::AtomicUsize::new(0),
             byte_size: total_bytes,
             attempt,
             leased_at: now,
@@ -1086,6 +1135,16 @@ impl BufferController {
         self.inner.finalize_shutdown_timeout()
     }
 
+    /// Asynchronously executes the configured [`DrainTimeoutPolicy`] (`Persist` or `Discard`)
+    /// with a bounded `timeout` for disk watermark sync and writer shutdown so async workers
+    /// are never blocked on stalled filesystems.
+    pub async fn finalize_shutdown_timeout_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), PipelineError> {
+        self.inner.finalize_shutdown_timeout_async(timeout).await
+    }
+
     /// Returns a reference to the buffer's [`BufferMetrics`] instruments and state.
     #[must_use]
     pub fn metrics(&self) -> &BufferMetrics {
@@ -1097,6 +1156,13 @@ impl BufferController {
     #[must_use]
     pub fn dropped_records(&self, scope: Option<SignalKind>, reason: &str) -> u64 {
         self.inner.metrics.dropped_records(scope, reason)
+    }
+
+    /// Returns the cumulative number of committed records across `scope`
+    /// (or all signals if `None`).
+    #[must_use]
+    pub fn committed_records(&self, scope: Option<SignalKind>) -> u64 {
+        self.inner.metrics.committed_records(scope)
     }
 }
 
@@ -1194,6 +1260,16 @@ impl SinkBuffer {
     /// shutdown exceeds `drain_timeout_sec`.
     pub fn finalize_shutdown_timeout(&self) -> Result<(), PipelineError> {
         self.inner.finalize_shutdown_timeout()
+    }
+
+    /// Asynchronously executes the configured [`DrainTimeoutPolicy`] (`Persist` or `Discard`)
+    /// with a bounded `timeout` for disk watermark sync and writer shutdown so async workers
+    /// are never blocked on stalled filesystems.
+    pub async fn finalize_shutdown_timeout_async(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), PipelineError> {
+        self.inner.finalize_shutdown_timeout_async(timeout).await
     }
 
     /// Returns a reference to the buffer's [`BufferMetrics`] instruments and state.
@@ -1481,7 +1557,7 @@ mod tests {
         // Per-signal budget fits exactly 1 batch
         let config = BufferConfig {
             max_buffer_bytes: (batch_bytes as u64) * 3,
-            max_batch_size_bytes: batch_bytes,
+            max_batch_size_bytes: (batch_bytes / 2).max(1),
             max_batch_interval_sec: 0,
             ..BufferConfig::default()
         };
@@ -1588,7 +1664,7 @@ mod tests {
         // Per-signal budget holds at most 3 batches
         let config = BufferConfig {
             max_buffer_bytes: (batch_bytes as u64) * 9, // per_signal_budget = 3 * batch_bytes
-            max_batch_size_bytes: batch_bytes,
+            max_batch_size_bytes: (batch_bytes / 2).max(1),
             max_batch_records: Some(2),
             max_batch_interval_sec: 0,
             max_inflight_leases: 3,
@@ -1857,7 +1933,7 @@ mod tests {
         let batch_bytes = sample.get_array_memory_size();
         let config = BufferConfig {
             max_buffer_bytes: (batch_bytes as u64) * 3,
-            max_batch_size_bytes: batch_bytes,
+            max_batch_size_bytes: (batch_bytes / 2).max(1),
             max_batch_interval_sec: 0,
             overflow_policy: OverflowPolicy::Block,
             readiness_stall_sec: 1,
@@ -2028,7 +2104,7 @@ mod tests {
         let config = BufferConfig {
             mode: BufferMode::Memory,
             max_buffer_bytes: batch_bytes * 3,
-            max_batch_size_bytes: batch_bytes as usize,
+            max_batch_size_bytes: ((batch_bytes as usize) / 2).max(1),
             max_batch_records: Some(1),
             max_batch_interval_sec: 0,
             overflow_policy: OverflowPolicy::DropOldest,

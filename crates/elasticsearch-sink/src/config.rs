@@ -212,6 +212,7 @@ impl ElasticsearchSinkConfig {
         let mut cfg = BufferConfig::resolve("elasticsearch", self.buffer.clone(), legacy, true)?;
         if self.buffer.is_none() {
             cfg.max_inflight_leases = self.max_concurrent_requests;
+            cfg.ensure_min_buffer_bytes();
             cfg.validate("elasticsearch")?;
         }
         Ok(cfg)
