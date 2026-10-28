@@ -627,7 +627,7 @@ impl DiskBackend {
         let lock_file = Self::acquire_advisory_lock(&dir)?;
         let watermark = Self::load_initial_watermark(&dir, rings)?;
         let instance_id = watermark.instance_id;
-        let (max_segment_id, sealed_segments) =
+        let (max_segment_id, sealed_segments, recovered_watermark) =
             Self::recover_segments(sink_name, &dir, config, watermark, rings)?;
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<WriterCommand>();
@@ -648,7 +648,7 @@ impl DiskBackend {
                     sync_on_write,
                     next_segment_id,
                     sealed_segments,
-                    watermark,
+                    recovered_watermark,
                 );
             })
             .map_err(|e| {
@@ -738,7 +738,7 @@ impl DiskBackend {
         config: &BufferConfig,
         watermark: DiskWatermark,
         rings: &[SignalRingState; 3],
-    ) -> Result<(u64, Vec<SealedSegmentMeta>), PipelineError> {
+    ) -> Result<(u64, Vec<SealedSegmentMeta>, DiskWatermark), PipelineError> {
         let mut segments: Vec<(u64, PathBuf)> = Vec::new();
         let read_dir = std::fs::read_dir(dir).map_err(|e| {
             storage_err(format!(
@@ -761,31 +761,44 @@ impl DiskBackend {
         let max_payload_len = config.max_disk_frame_payload_bytes();
         let mut max_segment_id = 0u64;
         let mut sealed_segments = Vec::new();
+        let mut obsolete_segments = Vec::new();
 
         for (segment_num, seg_path) in segments {
             max_segment_id = max_segment_id.max(segment_num);
             if let Some(sealed) = Self::recover_single_segment(
                 sink_name,
-                dir,
                 segment_num,
-                seg_path,
+                seg_path.clone(),
                 max_payload_len,
                 watermark,
                 rings,
             )? {
                 sealed_segments.push(sealed);
+            } else {
+                obsolete_segments.push(seg_path);
             }
         }
         for ring_state in rings {
             let mut ring = lock_unpoisoned(&ring_state.ring);
             ring.advance_watermark(&ring_state.committed_seq);
         }
-        Ok((max_segment_id, sealed_segments))
+        let mut recovered_watermark = watermark;
+        if recovered_watermark
+            .merge_monotonic(DiskWatermark::from_rings(watermark.instance_id, rings))
+        {
+            write_watermark_atomic(dir, recovered_watermark).map_err(storage_err)?;
+        }
+        if !obsolete_segments.is_empty() {
+            for seg_path in &obsolete_segments {
+                let _ = std::fs::remove_file(seg_path);
+            }
+            sync_dir(dir);
+        }
+        Ok((max_segment_id, sealed_segments, recovered_watermark))
     }
 
     fn recover_single_segment(
         sink_name: &str,
-        dir: &Path,
         segment_num: u64,
         seg_path: PathBuf,
         max_payload_len: u32,
@@ -806,7 +819,6 @@ impl DiskBackend {
         let mut offset = 0u64;
         let mut max_seq = [0u64; 3];
         let mut unacked_frames = 0usize;
-        let mut total_valid_frames = 0usize;
 
         loop {
             file.seek(SeekFrom::Start(offset)).map_err(|e| {
@@ -822,7 +834,6 @@ impl DiskBackend {
                     let frame_len = FRAME_HEADER_LEN_U32.saturating_add(header.payload_len);
                     let sig_idx = header.signal.as_u8() as usize;
                     max_seq[sig_idx] = max_seq[sig_idx].max(header.seq_id);
-                    total_valid_frames = total_valid_frames.saturating_add(1);
 
                     if Self::record_recovered_frame(
                         segment_num,
@@ -848,7 +859,13 @@ impl DiskBackend {
                     let frame_len = FRAME_HEADER_LEN_U32.saturating_add(header.payload_len);
                     let sig_idx = header.signal.as_u8() as usize;
                     max_seq[sig_idx] = max_seq[sig_idx].max(header.seq_id);
-                    Self::record_corrupted_frame(sink_name, &seg_path, &header, &rings[sig_idx]);
+                    Self::record_corrupted_frame(
+                        sink_name,
+                        &seg_path,
+                        &header,
+                        watermark,
+                        &rings[sig_idx],
+                    );
                     offset = offset.saturating_add(u64::from(frame_len));
                 }
                 Err(FrameDecodeError::InvalidHeader { reason }) => {
@@ -871,11 +888,7 @@ impl DiskBackend {
             }
         }
 
-        if unacked_frames == 0 && total_valid_frames > 0 {
-            let _ = std::fs::remove_file(&seg_path);
-            sync_dir(dir);
-            Ok(None)
-        } else if unacked_frames > 0 {
+        if unacked_frames > 0 {
             Ok(Some(SealedSegmentMeta {
                 path: seg_path,
                 max_seq,
@@ -931,6 +944,7 @@ impl DiskBackend {
         sink_name: &str,
         seg_path: &Path,
         header: &FrameHeader,
+        watermark: DiskWatermark,
         ring_state: &SignalRingState,
     ) {
         tracing::error!(
@@ -941,9 +955,11 @@ impl DiskBackend {
             segment = %seg_path.display(),
             "Skipping corrupted OTLB frame during crash recovery"
         );
-        ring_state
-            .corruption_drops
-            .fetch_add(u64::from(header.row_count), Ordering::Relaxed);
+        if header.seq_id > watermark.for_signal(header.signal) {
+            ring_state
+                .corruption_drops
+                .fetch_add(u64::from(header.row_count), Ordering::Relaxed);
+        }
         let mut ring = lock_unpoisoned(&ring_state.ring);
         ring.next_seq = ring.next_seq.max(header.seq_id.saturating_add(1));
     }
@@ -2251,5 +2267,68 @@ mod tests {
         gc_sealed_segments(&tmp.path, &mut sealed_segments, staged_watermark);
         assert!(sealed_segments.is_empty());
         assert!(!seg1_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_corrupt_only_segment_persists_advanced_watermark_and_unlinks_segment_on_recovery()
+    {
+        let tmp = TempDiskDir::new("corrupt_only_seg_gc");
+        let b1 = make_batch(&[10, 20, 30]);
+        let seg1_path = segment_path(&tmp.path, 1);
+
+        let mut raw_bytes = Vec::new();
+        encode_frame(SignalKind::Logs, 1, &b1, &mut raw_bytes).unwrap();
+        // Flip a payload byte so frame 1 fails CRC verification
+        raw_bytes[FRAME_HEADER_LEN + 2] ^= 0xFF;
+        std::fs::write(&seg1_path, &raw_bytes).unwrap();
+
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(1),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        let first_instance_id = {
+            let (tx, buf) = SinkBuffer::new("test_corrupt_seg_gc", config.clone()).unwrap();
+            drop(tx);
+            assert_eq!(buf.corruption_drops(), 3);
+            assert_eq!(buf.committed_seq(SignalKind::Logs), 1);
+            assert!(
+                !seg1_path.exists(),
+                "Segment containing only skipped corrupt frames must be unlinked during recovery"
+            );
+            let wm_bytes = std::fs::read(tmp.path.join("watermark.json")).unwrap();
+            let persisted_wm: DiskWatermark = serde_json::from_slice(&wm_bytes).unwrap();
+            assert_eq!(
+                persisted_wm.logs, 1,
+                "Post-recovery watermark advancing past corrupt frame must be persisted to watermark.json"
+            );
+            buf.instance_id()
+        };
+
+        // Second restart must not re-scan the corrupt segment or regress sequence numbering to 1
+        {
+            let (tx, mut buf) = SinkBuffer::new("test_corrupt_seg_gc", config).unwrap();
+            assert_eq!(buf.instance_id(), first_instance_id);
+            assert_eq!(
+                buf.corruption_drops(),
+                0,
+                "Unlinked corrupt segment must not re-trigger corruption_drops on subsequent startup"
+            );
+            assert_eq!(buf.committed_seq(SignalKind::Logs), 1);
+
+            tx.send(SignalBatch::Logs(make_batch(&[40]))).await.unwrap();
+            drop(tx);
+            let lease = buf.next_lease().await.unwrap().unwrap();
+            assert_eq!(
+                lease.id().first_seq,
+                2,
+                "Next sequence after persisted corrupt-frame watermark must be 2"
+            );
+            lease.ack().await.unwrap();
+        }
     }
 }
