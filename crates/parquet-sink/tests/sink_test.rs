@@ -6,8 +6,8 @@ use arrow::array::{Float64Array, Int64Array, StringArray, TimestampNanosecondArr
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet_sink::{CompressionCodec, ParquetSink, ParquetSinkConfig};
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::pipeline::{SignalBatch, Sink};
-use tokio::sync::mpsc;
 
 fn find_parquet_files(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut parquet_files = Vec::new();
@@ -35,7 +35,7 @@ async fn test_parquet_sink_drains_on_channel_close() {
     };
 
     let mut sink = ParquetSink::try_new(config).unwrap();
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -84,7 +84,7 @@ async fn test_parquet_sink_idle_sweeper_triggers_flush() {
     };
 
     let mut sink = ParquetSink::try_new(config).unwrap();
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -138,7 +138,7 @@ async fn test_parquet_sink_heterogeneous_signals() {
     };
 
     let mut sink = ParquetSink::try_new(config).unwrap();
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     // 1. Logs
     let logs_schema = Arc::new(Schema::new(vec![
@@ -234,7 +234,7 @@ async fn test_parquet_sink_propagates_batch_error_for_backpressure() {
     };
 
     let mut sink = ParquetSink::try_new(config).unwrap();
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -284,7 +284,7 @@ async fn test_parquet_sink_fatal_storage_error_shuts_down_cleanly() {
     std::fs::remove_dir_all(&path).unwrap();
     std::fs::write(&path, b"blocking file").unwrap();
 
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -329,7 +329,7 @@ async fn test_parquet_sink_fatal_routing_error_breaks_and_propagates() {
     };
 
     let mut sink = ParquetSink::try_new(config).unwrap();
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     let schema = Arc::new(Schema::new(vec![
         Field::new(

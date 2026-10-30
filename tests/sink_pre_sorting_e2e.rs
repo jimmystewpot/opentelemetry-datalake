@@ -288,6 +288,7 @@ fn test_e2e_starrocks_sink_presorting() {
         max_retries: 3,
         retry_interval_secs: 1,
         order_by: Some(sort_config),
+        buffer: None,
         batching: None,
         tls: pipeline_core::tls::TlsConfig::default(),
     };

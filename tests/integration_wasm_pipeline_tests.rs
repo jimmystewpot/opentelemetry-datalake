@@ -304,7 +304,7 @@ async fn test_wasm_transformer_transform_trait_pipeline_execution() {
         WasmTransformer::new(cfg, None, None).expect("transformer creation failed");
 
     let (input_tx, input_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
-    let (output_tx, mut output_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
+    let (output_tx, mut output_rx) = pipeline_core::buffer::SinkBuffer::passthrough_pair();
 
     let transform_handle =
         tokio::spawn(async move { transformer.transform(input_rx, output_tx).await });
@@ -319,8 +319,9 @@ async fn test_wasm_transformer_transform_trait_pipeline_execution() {
     drop(input_tx);
 
     let received = output_rx
-        .recv()
+        .recv_passthrough()
         .await
+        .expect("recv_passthrough failed")
         .expect("output batch must be received");
     match received {
         SignalBatch::Logs(rb) => {
@@ -367,7 +368,7 @@ async fn test_wasm_transformer_transform_zero_batch_success_consumes_without_emi
         WasmTransformer::new(cfg, None, None).expect("transformer creation failed");
 
     let (input_tx, input_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
-    let (output_tx, mut output_rx): (PipelineSender, PipelineReceiver) = mpsc::channel(10);
+    let (output_tx, mut output_rx) = pipeline_core::buffer::SinkBuffer::passthrough_pair();
 
     let transform_handle =
         tokio::spawn(async move { transformer.transform(input_rx, output_tx).await });
@@ -382,7 +383,11 @@ async fn test_wasm_transformer_transform_zero_batch_success_consumes_without_emi
 
     // Verify 0 rows are emitted downstream: batch was consumed
     assert!(
-        output_rx.recv().await.is_none(),
+        output_rx
+            .recv_passthrough()
+            .await
+            .expect("recv_passthrough failed")
+            .is_none(),
         "Zero-batch count success must consume batch and emit no output rows"
     );
 
