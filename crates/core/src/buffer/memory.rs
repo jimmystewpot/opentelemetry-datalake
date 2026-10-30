@@ -104,6 +104,11 @@ pub struct SignalRing {
     pub inflight_leases: usize,
     /// Cumulative number of rows evicted under `OverflowPolicy::DropOldest`.
     pub evicted_records: u64,
+    /// On-disk frame bytes evicted out of order while an earlier slot is still `InFlight` or `Reserved`
+    /// and therefore not yet reclaimable by segment GC until `committed_seq` advances past their `seq_id`.
+    pub evicted_unreclaimed_bytes: BTreeMap<u64, usize>,
+    /// Sum of bytes in `evicted_unreclaimed_bytes`.
+    pub unreclaimed_disk_bytes: usize,
     /// Whether all `BufferSender`s for this signal have been dropped.
     pub closed: bool,
     /// Whether the `SinkBuffer` consumer for this signal has been dropped.
@@ -131,6 +136,8 @@ impl SignalRing {
             rows_in_flight: 0,
             inflight_leases: 0,
             evicted_records: 0,
+            evicted_unreclaimed_bytes: BTreeMap::new(),
+            unreclaimed_disk_bytes: 0,
             closed: false,
             receiver_dropped: false,
             fatal_error: None,
@@ -162,13 +169,44 @@ impl SignalRing {
     }
 
     /// Advances `committed_seq` to the highest contiguous sequence number below the
-    /// earliest active slot in `slots` (or `next_seq - 1` when no active slots remain).
+    /// earliest active slot in `slots` (or `next_seq - 1` when no active slots remain),
+    /// and releases any evicted on-disk byte charges that are now `<= watermark`.
     pub fn advance_watermark(&mut self, committed_seq: &AtomicU64) {
         let candidate = self.slots.first_key_value().map_or_else(
             || self.next_seq.saturating_sub(1),
             |(&first_unacked, _)| first_unacked.saturating_sub(1),
         );
-        committed_seq.fetch_max(candidate, Ordering::AcqRel);
+        let prev = committed_seq.fetch_max(candidate, Ordering::AcqRel);
+        let watermark = prev.max(candidate);
+        while let Some((&seq, _)) = self.evicted_unreclaimed_bytes.first_key_value() {
+            if seq <= watermark {
+                if let Some(bytes) = self.evicted_unreclaimed_bytes.remove(&seq) {
+                    self.unreclaimed_disk_bytes = self.unreclaimed_disk_bytes.saturating_sub(bytes);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Records the eviction of `evicted` from `queue`, retaining its byte charge in
+    /// `unreclaimed_disk_bytes` when `evicted.payload` is `OnDisk` and an earlier slot
+    /// still prevents the contiguous watermark from advancing past `evicted.seq_id`.
+    pub fn record_evicted_batch(&mut self, evicted: &QueuedBatch, committed_seq: &AtomicU64) -> u64 {
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(evicted.byte_size);
+        self.rows_in_flight = self.rows_in_flight.saturating_sub(evicted.row_count);
+        let rows = u64::try_from(evicted.row_count).unwrap_or(u64::MAX);
+        self.evicted_records = self.evicted_records.saturating_add(rows);
+        self.slots.remove(&evicted.seq_id);
+        if matches!(evicted.payload, BatchPayload::OnDisk { .. }) {
+            self.evicted_unreclaimed_bytes
+                .insert(evicted.seq_id, evicted.byte_size);
+            self.unreclaimed_disk_bytes = self
+                .unreclaimed_disk_bytes
+                .saturating_add(evicted.byte_size);
+        }
+        self.advance_watermark(committed_seq);
+        rows
     }
 
     /// Requeues leased batch payloads into `queue` in ascending `seq_id` order, ignoring any

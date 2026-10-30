@@ -219,6 +219,8 @@ impl BufferInner {
                 ring.inflight_leases = 0;
                 ring.slots.clear();
                 ring.inflight_enqueued_at.clear();
+                ring.evicted_unreclaimed_bytes.clear();
+                ring.unreclaimed_disk_bytes = 0;
                 ring.advance_watermark(&ring_state.committed_seq);
                 self.sync_ring_metrics(sig, &ring);
                 rows
@@ -966,17 +968,23 @@ impl BufferSender {
                 let mut evicted_rows: u64 = 0;
                 if self.inner.config.overflow_policy == OverflowPolicy::DropOldest {
                     while !Self::can_admit(&ring, batch_bytes, budget) {
+                        let Some(front) = ring.queue.front() else {
+                            break;
+                        };
+                        let front_is_pinned_on_disk =
+                            matches!(front.payload, BatchPayload::OnDisk { .. })
+                                && ring
+                                    .slots
+                                    .first_key_value()
+                                    .is_some_and(|(&first_seq, _)| first_seq < front.seq_id);
+                        if front_is_pinned_on_disk {
+                            break;
+                        }
                         let Some(evicted) = ring.queue.pop_front() else {
                             break;
                         };
-                        ring.bytes_in_flight =
-                            ring.bytes_in_flight.saturating_sub(evicted.byte_size);
-                        ring.rows_in_flight = ring.rows_in_flight.saturating_sub(evicted.row_count);
-                        let rows = u64::try_from(evicted.row_count).unwrap_or(u64::MAX);
-                        ring.evicted_records = ring.evicted_records.saturating_add(rows);
+                        let rows = ring.record_evicted_batch(&evicted, &ring_state.committed_seq);
                         evicted_rows = evicted_rows.saturating_add(rows);
-                        ring.slots.remove(&evicted.seq_id);
-                        ring.advance_watermark(&ring_state.committed_seq);
                     }
                 }
 
@@ -1081,10 +1089,13 @@ impl BufferSender {
     }
 
     fn can_admit(ring: &SignalRing, batch_bytes: usize, budget: u64) -> bool {
-        if ring.queue.is_empty() && ring.bytes_in_flight == 0 {
+        let total_used = ring
+            .bytes_in_flight
+            .saturating_add(ring.unreclaimed_disk_bytes);
+        if ring.queue.is_empty() && total_used == 0 {
             return true;
         }
-        let in_flight_u64 = u64::try_from(ring.bytes_in_flight).unwrap_or(u64::MAX);
+        let in_flight_u64 = u64::try_from(total_used).unwrap_or(u64::MAX);
         let batch_u64 = u64::try_from(batch_bytes).unwrap_or(u64::MAX);
         in_flight_u64.saturating_add(batch_u64) <= budget
     }
@@ -2996,5 +3007,74 @@ mod tests {
             let ring = lock_unpoisoned(&ring_state.ring);
             assert_eq!(ring.oldest_enqueued_unix_ms(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn test_disk_drop_oldest_retains_unreclaimed_bytes_until_watermark_advances() {
+        let dir = std::env::temp_dir().join(format!(
+            "dl_test_disk_drop_oldest_reclaim_{}_{}",
+            std::process::id(),
+            generate_instance_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let sample = make_batch(&[1, 2, 3, 4]);
+        let mut probe_buf = Vec::new();
+        crate::buffer::disk::encode_frame(SignalKind::Logs, 1, &sample, &mut probe_buf).unwrap();
+        let frame_len = probe_buf.len();
+
+        // Per-signal budget fits 4 on-disk frames (`4 * frame_len`), segment_size = 2 * frame_len.
+        let per_signal_budget = (frame_len * 4) as u64;
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(dir.clone()),
+            segment_size_bytes: (frame_len * 2) as u64,
+            max_batch_size_bytes: frame_len,
+            max_buffer_bytes: per_signal_budget * 3,
+            max_batch_records: Some(4),
+            max_batch_interval_sec: 0,
+            max_inflight_leases: 1,
+            overflow_policy: OverflowPolicy::DropOldest,
+            ..BufferConfig::default()
+        };
+
+        let (tx, mut buf) = SinkBuffer::new("test_disk_reclaim", config).unwrap();
+
+        // 1. Send seq 1, 2, 3, 4 (fills the 4-frame per-signal budget).
+        for _ in 0..4 {
+            tx.send(SignalBatch::Logs(sample.clone())).await.unwrap();
+        }
+
+        // 2. Lease seq 1 and hold it InFlight so the contiguous watermark is pinned at 0.
+        let lease1 = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease1.id().first_seq, 1);
+
+        // 3. Attempting to send seq 5 under DropOldest cannot free physical disk budget
+        //    because seq 1 is still InFlight (watermark = 0) and pins all later segments on disk,
+        //    so send(seq 5) must block rather than growing disk usage without bound.
+        let tx_clone = tx.clone();
+        let sample_clone = sample.clone();
+        let mut send5 =
+            tokio::spawn(async move { tx_clone.send(SignalBatch::Logs(sample_clone)).await });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(
+            !send5.is_finished(),
+            "Disk DropOldest send must block when all budget is pinned by an earlier InFlight lease"
+        );
+
+        // 4. Acking lease 1 advances watermark across seq 1, allowing DropOldest to evict/reclaim
+        //    and unblocking send5!
+        lease1.ack().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(250), &mut send5)
+            .await
+            .expect(
+                "send5 must unblock after lease1.ack() advances watermark and frees reclaimable disk budget",
+            )
+            .unwrap()
+            .unwrap();
+
+        drop(tx);
+        drop(buf);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
