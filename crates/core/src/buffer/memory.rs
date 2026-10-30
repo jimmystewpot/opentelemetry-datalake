@@ -192,7 +192,11 @@ impl SignalRing {
     /// Records the eviction of `evicted` from `queue`, retaining its byte charge in
     /// `unreclaimed_disk_bytes` when `evicted.payload` is `OnDisk` and an earlier slot
     /// still prevents the contiguous watermark from advancing past `evicted.seq_id`.
-    pub fn record_evicted_batch(&mut self, evicted: &QueuedBatch, committed_seq: &AtomicU64) -> u64 {
+    pub fn record_evicted_batch(
+        &mut self,
+        evicted: &QueuedBatch,
+        committed_seq: &AtomicU64,
+    ) -> u64 {
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(evicted.byte_size);
         self.rows_in_flight = self.rows_in_flight.saturating_sub(evicted.row_count);
         let rows = u64::try_from(evicted.row_count).unwrap_or(u64::MAX);
