@@ -573,7 +573,8 @@ pub(crate) fn read_frame_at(
         ))
     })?;
     let mut limited = file.take(u64::from(len));
-    match decode_frame(&mut limited, max_payload_len) {
+    let effective_max_payload_len = max_payload_len.max(len.saturating_sub(FRAME_HEADER_LEN_U32));
+    match decode_frame(&mut limited, effective_max_payload_len) {
         Ok(Some((_hdr, batch))) => Ok(batch),
         Ok(None) => Err(storage_err(format!(
             "unexpected EOF reading frame at offset {offset} in {}",
@@ -824,6 +825,15 @@ impl DiskBackend {
                 ))
             })?;
 
+        let file_len = file
+            .metadata()
+            .map_err(|e| {
+                storage_err(format!(
+                    "failed to stat segment '{}' for recovery: {e}",
+                    seg_path.display()
+                ))
+            })?
+            .len();
         let mut offset = 0u64;
         let mut max_seq = [0u64; 3];
         let mut unacked_frames = 0usize;
@@ -836,7 +846,15 @@ impl DiskBackend {
                 ))
             })?;
 
-            match decode_frame(&mut file, max_payload_len) {
+            let remaining_payload_bound = u32::try_from(
+                file_len
+                    .saturating_sub(offset)
+                    .saturating_sub(FRAME_HEADER_LEN as u64),
+            )
+            .unwrap_or(u32::MAX);
+            let effective_max_payload_len = max_payload_len.max(remaining_payload_bound);
+
+            match decode_frame(&mut file, effective_max_payload_len) {
                 Ok(None) => break,
                 Ok(Some((header, batch))) => {
                     let frame_len = FRAME_HEADER_LEN_U32.saturating_add(header.payload_len);
@@ -2423,5 +2441,59 @@ mod tests {
             );
             lease.ack().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn test_disk_recovery_and_prepare_preserve_frames_after_segment_size_reduction() {
+        let tmp = TempDiskDir::new("shrink_segment_recovery");
+        // Write a ~16 KiB batch (2048 i64 values) under a 64 KiB segment_size_bytes config
+        let large_values: Vec<i64> = (0..2048).collect();
+        let large_batch = make_batch(&large_values);
+
+        let initial_config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            segment_size_bytes: 65_536,
+            max_batch_size_bytes: 32_768,
+            max_buffer_bytes: 3 * 1_048_576,
+            sync_on_write: true,
+            max_batch_records: Some(2048),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        {
+            let (tx, _buf) = SinkBuffer::new("shrink_seg", initial_config).unwrap();
+            tx.send(SignalBatch::Logs(large_batch.clone()))
+                .await
+                .unwrap();
+        }
+
+        // Reopen with a much smaller segment_size_bytes (4096 bytes -> max_disk_frame_payload_bytes = 8192 < ~16 KiB frame)
+        let shrunk_config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            segment_size_bytes: 4_096,
+            max_batch_size_bytes: 2_048,
+            max_buffer_bytes: 3 * 1_048_576,
+            sync_on_write: true,
+            max_batch_records: Some(2048),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+
+        let (tx, mut reopened) = SinkBuffer::new("shrink_seg", shrunk_config).unwrap();
+        drop(tx);
+        assert_eq!(reopened.corruption_drops(), 0);
+        assert_eq!(reopened.replayed_records(), 2048);
+
+        let lease = reopened
+            .next_lease()
+            .await
+            .unwrap()
+            .expect("previously persisted frame must be recovered after segment_size_bytes reduction");
+        let recovered_batch = lease.prepare(Ok).await.unwrap();
+        assert_eq!(recovered_batch, large_batch);
+        lease.ack().await.unwrap();
     }
 }
