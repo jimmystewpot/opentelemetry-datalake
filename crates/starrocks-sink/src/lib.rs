@@ -48,6 +48,8 @@ use tracing::{error, info, warn};
 pub type StreamLoadError = starrocks_stream_load::Error;
 
 const MAX_STREAM_LOAD_LABEL_LEN: usize = 128;
+const MAX_ABORTED_LABEL_PROBES_PER_ATTEMPT: usize = 64;
+const MAX_TRACKED_FALLBACK_LABELS: usize = 1024;
 
 /// Formats a deterministic `StarRocks` Stream Load transaction label from a table name
 /// and [`LeaseId`] (`dl_{table}_{instance_id:016x}_{signal}_{first_seq}_{last_seq}`).
@@ -561,6 +563,7 @@ pub struct StarRocksSink {
     metrics_manager: Arc<StreamLoadManager>,
     traces_manager: Arc<StreamLoadManager>,
     sorter: pipeline_core::sort::BatchSorter,
+    fallback_attempts: std::collections::HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for StarRocksSink {
@@ -571,6 +574,7 @@ impl std::fmt::Debug for StarRocksSink {
             .field("metrics_manager", &"<StreamLoadManager>")
             .field("traces_manager", &"<StreamLoadManager>")
             .field("sorter", &self.sorter)
+            .field("fallback_attempts_len", &self.fallback_attempts.len())
             .finish()
     }
 }
@@ -640,6 +644,7 @@ impl StarRocksSink {
             metrics_manager: Arc::clone(&manager),
             traces_manager: manager,
             sorter,
+            fallback_attempts: std::collections::HashMap::new(),
         })
     }
 
@@ -710,6 +715,7 @@ impl StarRocksSink {
             metrics_manager,
             traces_manager,
             sorter,
+            fallback_attempts: std::collections::HashMap::new(),
         })
     }
 
@@ -813,49 +819,62 @@ impl StarRocksSink {
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
-        attempt: u32,
+        fallback_idx: &mut u32,
         payload: Bytes,
     ) -> Result<(), StreamLoadError> {
-        match manager.send_single_batch(label, payload.clone()).await {
-            Ok(response) => {
-                info!(
-                    label = label,
-                    table = table,
-                    status = %response.status,
-                    rows = ?response.number_loaded_rows,
-                    "StarRocks V1 load committed"
-                );
-                Ok(())
-            }
-            Err(e) if is_label_already_exists(&e) => {
-                if Self::confirm_v1_label_committed(manager, table, label).await? {
+        let mut active_label = if *fallback_idx == 0 {
+            label.to_owned()
+        } else {
+            format_attempt_lease_label(label, *fallback_idx)
+        };
+        let mut probes = 0usize;
+
+        loop {
+            match manager
+                .send_single_batch(&active_label, payload.clone())
+                .await
+            {
+                Ok(response) => {
+                    info!(
+                        label = %active_label,
+                        table = table,
+                        status = %response.status,
+                        rows = ?response.number_loaded_rows,
+                        "StarRocks V1 load committed"
+                    );
                     return Ok(());
                 }
-                let fallback_label = format_attempt_lease_label(label, attempt);
-                info!(
-                    base_label = label,
-                    fallback_label = %fallback_label,
-                    table = table,
-                    "StarRocks V1 base label was aborted; retrying with attempt-disambiguated label"
-                );
-                let response = manager.send_single_batch(&fallback_label, payload).await?;
-                info!(
-                    label = %fallback_label,
-                    table = table,
-                    status = %response.status,
-                    rows = ?response.number_loaded_rows,
-                    "StarRocks V1 load committed with fallback label"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                error!(
-                    label = label,
-                    table = table,
-                    error = %e,
-                    "StarRocks V1 stream load failed"
-                );
-                Err(e)
+                Err(e) if is_label_already_exists(&e) => {
+                    if Self::confirm_v1_label_committed(manager, table, &active_label).await? {
+                        return Ok(());
+                    }
+                    probes = probes.saturating_add(1);
+                    if probes >= MAX_ABORTED_LABEL_PROBES_PER_ATTEMPT {
+                        return Err(e);
+                    }
+                    *fallback_idx = fallback_idx.saturating_add(1);
+                    let next_label = format_attempt_lease_label(label, *fallback_idx);
+                    if next_label == active_label {
+                        return Err(e);
+                    }
+                    info!(
+                        base_label = label,
+                        aborted_label = %active_label,
+                        fallback_label = %next_label,
+                        table = table,
+                        "StarRocks V1 label was aborted; retrying with attempt-disambiguated label"
+                    );
+                    active_label = next_label;
+                }
+                Err(e) => {
+                    error!(
+                        label = %active_label,
+                        table = table,
+                        error = %e,
+                        "StarRocks V1 stream load failed"
+                    );
+                    return Err(e);
+                }
             }
         }
     }
@@ -1094,28 +1113,45 @@ impl StarRocksSink {
         manager: &StreamLoadManager,
         table: &str,
         label: &str,
-        attempt: u32,
+        fallback_idx: &mut u32,
         payload: Bytes,
     ) -> Result<(), StreamLoadError> {
-        let mut active_label = label.to_owned();
-        let txn_id = match manager.begin_transaction(&active_label).await {
-            Ok(id) => id,
-            Err(e) if is_label_already_exists(&e) => {
-                if Self::confirm_or_complete_v2_label(manager, table, &active_label).await? {
-                    return Ok(());
+        let mut active_label = if *fallback_idx == 0 {
+            label.to_owned()
+        } else {
+            format_attempt_lease_label(label, *fallback_idx)
+        };
+        let mut probes = 0usize;
+
+        let txn_id = loop {
+            match manager.begin_transaction(&active_label).await {
+                Ok(id) => break id,
+                Err(e) if is_label_already_exists(&e) => {
+                    if Self::confirm_or_complete_v2_label(manager, table, &active_label).await? {
+                        return Ok(());
+                    }
+                    probes = probes.saturating_add(1);
+                    if probes >= MAX_ABORTED_LABEL_PROBES_PER_ATTEMPT {
+                        return Err(e);
+                    }
+                    *fallback_idx = fallback_idx.saturating_add(1);
+                    let next_label = format_attempt_lease_label(label, *fallback_idx);
+                    if next_label == active_label {
+                        return Err(e);
+                    }
+                    info!(
+                        base_label = label,
+                        aborted_label = %active_label,
+                        fallback_label = %next_label,
+                        table = table,
+                        "StarRocks V2 label was aborted; retrying with attempt-disambiguated label"
+                    );
+                    active_label = next_label;
                 }
-                active_label = format_attempt_lease_label(label, attempt);
-                info!(
-                    base_label = label,
-                    fallback_label = %active_label,
-                    table = table,
-                    "StarRocks V2 base label was aborted; retrying with attempt-disambiguated label"
-                );
-                manager.begin_transaction(&active_label).await?
-            }
-            Err(e) => {
-                error!(label = %active_label, error = %e, "StarRocks V2 begin_transaction failed");
-                return Err(e);
+                Err(e) => {
+                    error!(label = %active_label, error = %e, "StarRocks V2 begin_transaction failed");
+                    return Err(e);
+                }
             }
         };
 
@@ -1260,24 +1296,35 @@ impl Sink for StarRocksSink {
             let manager = self.manager_for(signal_str);
             let table = self.config.table_mapping.table_for(signal_str).to_owned();
             let label = format_lease_label(&table, lease.id());
-            let attempt = lease.attempt();
+            let mut fallback_idx = self.fallback_attempts.get(&label).copied().unwrap_or(0);
 
             let send_res = match self.config.transaction_mode {
                 TransactionMode::V1 => {
-                    Self::send_v1(&manager, &table, &label, attempt, payload).await
+                    Self::send_v1(&manager, &table, &label, &mut fallback_idx, payload).await
                 }
                 TransactionMode::V2 => {
-                    self.send_v2(&manager, &table, &label, attempt, payload)
+                    self.send_v2(&manager, &table, &label, &mut fallback_idx, payload)
                         .await
                 }
             };
 
             match send_res {
                 Ok(()) => {
+                    self.fallback_attempts.remove(&label);
                     lease.ack().await?;
                 }
                 Err(err) => {
                     let class = classify_stream_load_error(&err);
+                    if matches!(class, FailureClass::Transient) && fallback_idx > 0 {
+                        if self.fallback_attempts.len() >= MAX_TRACKED_FALLBACK_LABELS
+                            && !self.fallback_attempts.contains_key(&label)
+                        {
+                            self.fallback_attempts.clear();
+                        }
+                        self.fallback_attempts.insert(label, fallback_idx);
+                    } else {
+                        self.fallback_attempts.remove(&label);
+                    }
                     lease.nack(class).await?;
                 }
             }
@@ -3109,6 +3156,110 @@ mod tests {
                 |r| r.headers.get("label").map(String::as_str) == Some(fallback_label.as_str())
             ),
             "Expected fallback attempt label '{fallback_label}' after base label was ABORTED"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_aborted_base_label_rechecks_previous_fallback_label_on_subsequent_retry() {
+        use pipeline_core::buffer::BufferConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let recorded = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded_clone = std::sync::Arc::clone(&recorded);
+        let begin_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let begin_calls_clone = std::sync::Arc::clone(&begin_calls);
+        let commit_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let commit_calls_clone = std::sync::Arc::clone(&commit_calls);
+        let status_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let status_calls_clone = std::sync::Arc::clone(&status_calls);
+
+        let server_task = tokio::spawn(async move {
+            let response_fn = move |_method: &str, path: &str| {
+                if path == "/api/transaction/begin" {
+                    let c = begin_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    match c {
+                        0 => (
+                            200,
+                            r#"{"Status":"Label Already Exists","Message":"Label already exists, state: ABORTED"}"#,
+                        ),
+                        1 => (200, r#"{"Status":"OK","TxnId":101}"#),
+                        _ => (
+                            200,
+                            r#"{"Status":"Label Already Exists","Message":"Label already exists"}"#,
+                        ),
+                    }
+                } else if path == "/api/transaction/commit" {
+                    let c = commit_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    if c == 0 {
+                        // First commit on fallback _a1 succeeds on FE, but response is lost (503)
+                        (
+                            503,
+                            r#"{"Status":"Fail","Message":"Service Unavailable after commit"}"#,
+                        )
+                    } else {
+                        (200, r#"{"Status":"OK"}"#)
+                    }
+                } else if path.starts_with("/api/otel/get_load_state?label=") {
+                    let s = status_calls_clone.fetch_add(1, Ordering::SeqCst);
+                    if s == 0 {
+                        // Base label is ABORTED
+                        (200, r#"{"Status":"Success","State":"ABORTED"}"#)
+                    } else {
+                        // Fallback label _a1 is already VISIBLE on retry
+                        (200, r#"{"Status":"Success","State":"VISIBLE"}"#)
+                    }
+                } else {
+                    (200, r#"{"Status":"OK"}"#)
+                }
+            };
+            while let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_mock_http_connection(stream, &response_fn, &recorded_clone).await;
+            }
+        });
+
+        let mut config = base_config();
+        config.frontend_urls = vec![format!("http://127.0.0.1:{port}")];
+        config.transaction_mode = TransactionMode::V2;
+        config.max_retries = 0;
+        config.buffer = Some(BufferConfig {
+            initial_backoff_ms: 10,
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        });
+
+        let buf_cfg = config.resolved_buffer_config().unwrap();
+        let (tx, rx) = SinkBuffer::new("starrocks", buf_cfg).unwrap();
+        let base_label = format!("dl_otel_logs_{:016x}_logs_1_1", rx.instance_id());
+        let fallback_a1 = format!("{base_label}_a1");
+        let fallback_a2 = format!("{base_label}_a2");
+        let mut sink = StarRocksSink::try_new(config).unwrap();
+
+        let sink_handle = tokio::spawn(async move { sink.run(rx).await });
+
+        tx.send(SignalBatch::Logs(make_batch())).await.unwrap();
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_millis(500), sink_handle)
+            .await
+            .expect("sink should confirm _a1 without allocating _a2")
+            .unwrap()
+            .unwrap();
+        server_task.abort();
+
+        let reqs = recorded.lock().await;
+        assert!(
+            reqs.iter()
+                .any(|r| r.path == format!("/api/otel/get_load_state?label={fallback_a1}")),
+            "Expected retry to check load state of active fallback label '{fallback_a1}', got paths: {:?}",
+            reqs.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r.headers.get("label").map(String::as_str) == Some(fallback_a2.as_str())),
+            "Must not allocate a second fallback label '{fallback_a2}' when '{fallback_a1}' already committed"
         );
     }
 }
