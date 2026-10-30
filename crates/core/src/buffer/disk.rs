@@ -1215,7 +1215,7 @@ impl DiskBackend {
                         signal,
                         seq_id,
                         rows,
-                        frame_bytes,
+                        mut frame_bytes,
                         reservation,
                         reply,
                     } => {
@@ -1230,7 +1230,7 @@ impl DiskBackend {
                             signal,
                             seq_id,
                             rows,
-                            &frame_bytes,
+                            &mut frame_bytes,
                         );
                         append_replies.push((reply, reservation, res));
                     }
@@ -1327,7 +1327,7 @@ impl DiskBackend {
         signal: SignalKind,
         seq_id: u64,
         rows: u32,
-        frame_bytes: &[u8],
+        frame_bytes: &mut [u8],
     ) -> Result<WrittenFrame, String> {
         if frame_bytes.len() < FRAME_HEADER_LEN {
             return Err(format!(
@@ -1350,6 +1350,15 @@ impl DiskBackend {
                 "OTLB frame header row_count ({hdr_rows}) does not match expected rows ({rows})"
             ));
         }
+        let mut hdr = FrameHeader {
+            signal,
+            seq_id: 0,
+            row_count: hdr_rows,
+            payload_len,
+            crc32: 0,
+        };
+        patch_frame_seq_id(frame_bytes, &mut hdr, seq_id).map_err(|e| e.to_string())?;
+
         let frame_len_u64 = frame_bytes.len() as u64;
         let frame_len_u32 =
             u32::try_from(frame_bytes.len()).map_err(|_| "frame length overflow".to_string())?;
@@ -2345,7 +2354,7 @@ mod tests {
             SignalKind::Logs,
             1,
             frame1.header.row_count,
-            &frame1.bytes,
+            &mut frame1.bytes,
         )
         .unwrap();
         let seg1_path = segment_path(&tmp.path, 1);
@@ -2364,7 +2373,7 @@ mod tests {
             SignalKind::Logs,
             2,
             frame2.header.row_count,
-            &frame2.bytes,
+            &mut frame2.bytes,
         )
         .unwrap();
         assert_eq!(sealed_segments.len(), 1);
@@ -2487,13 +2496,83 @@ mod tests {
         assert_eq!(reopened.corruption_drops(), 0);
         assert_eq!(reopened.replayed_records(), 2048);
 
-        let lease = reopened
-            .next_lease()
-            .await
-            .unwrap()
-            .expect("previously persisted frame must be recovered after segment_size_bytes reduction");
+        let lease = reopened.next_lease().await.unwrap().expect(
+            "previously persisted frame must be recovered after segment_size_bytes reduction",
+        );
         let recovered_batch = lease.prepare(Ok).await.unwrap();
         assert_eq!(recovered_batch, large_batch);
+        lease.ack().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_encoded_frame_patches_seq_id_and_crc_on_writer_thread() {
+        let tmp = TempDiskDir::new("writer_patches_crc");
+        let config = BufferConfig {
+            mode: BufferMode::Disk,
+            disk_path: Some(tmp.path.clone()),
+            sync_on_write: true,
+            max_batch_records: Some(2),
+            max_batch_interval_sec: 0,
+            ..BufferConfig::default()
+        };
+        let (tx, mut buf) = SinkBuffer::new("test_writer_crc", config).unwrap();
+        let batch = make_batch(&[42, 99]);
+
+        // Pre-encode a frame with placeholder seq_id = 0 and intentionally corrupt its CRC
+        // before passing it to append_encoded_frame without calling patch_frame_seq_id on the caller thread.
+        let max_payload_len = buf.inner.config.max_disk_frame_payload_bytes();
+        let mut frame =
+            split_and_encode_frames_for_disk(SignalKind::Logs, batch.clone(), max_payload_len)
+                .unwrap()
+                .pop()
+                .unwrap();
+        assert_eq!(frame.header.seq_id, 0);
+        frame.bytes[24..28].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let frame_len = frame.bytes.len();
+        let frame_rows = frame.batch.num_rows();
+        let frame_schema = frame.batch.schema();
+        drop(frame.batch);
+
+        let reservation = crate::buffer::AppendReservation::new(
+            Arc::clone(&buf.inner),
+            SignalKind::Logs,
+            1,
+            frame_len,
+            frame_rows,
+            frame.header.row_count,
+            frame_schema,
+        );
+        {
+            let ring_state = &buf.inner.rings[SignalKind::Logs.as_u8() as usize];
+            let mut ring = crate::buffer::lock_unpoisoned(&ring_state.ring);
+            ring.next_seq = 2;
+            ring.bytes_in_flight = frame_len;
+            ring.rows_in_flight = frame_rows;
+            ring.slots
+                .insert(1, crate::buffer::memory::LeaseSlotState::Reserved);
+        }
+
+        buf.inner
+            .disk
+            .as_ref()
+            .unwrap()
+            .append_encoded_frame(
+                SignalKind::Logs,
+                1,
+                frame.header.row_count,
+                frame.bytes,
+                Some(reservation),
+            )
+            .await
+            .unwrap();
+        drop(tx);
+
+        // Lease::prepare reads the frame back from disk and verifies its CRC32C and seq_id.
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        assert_eq!(lease.id().first_seq, 1);
+        let decoded = lease.prepare(Ok).await.unwrap();
+        assert_eq!(decoded, batch);
         lease.ack().await.unwrap();
     }
 }

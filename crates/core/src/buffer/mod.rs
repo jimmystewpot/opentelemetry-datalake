@@ -1041,7 +1041,7 @@ impl BufferSender {
     async fn send_pre_encoded_disk_frame(
         &self,
         signal: SignalKind,
-        mut frame: crate::buffer::disk::PreEncodedFrame,
+        frame: crate::buffer::disk::PreEncodedFrame,
     ) -> Result<(), PipelineError> {
         let frame_bytes_len = frame.bytes.len();
         let batch_rows = frame.batch.num_rows();
@@ -1064,12 +1064,6 @@ impl BufferSender {
             frame.header.row_count,
             schema,
         );
-
-        crate::buffer::disk::patch_frame_seq_id(
-            &mut frame.bytes,
-            &mut frame.header,
-            reserved_seq_id,
-        )?;
 
         let Some(disk) = &self.inner.disk else {
             return Err(PipelineError::Internal(
