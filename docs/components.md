@@ -38,27 +38,27 @@ pub trait Transform: Send + Sync {
     async fn transform(
         &mut self,
         input: PipelineReceiver,
-        output: PipelineSender,
+        output: BufferSender,
     ) -> Result<(), PipelineError>;
 }
 ```
 
-*   **Implementation**: Currently implemented by `NoopTransformer` in `crates/noop-transformer`.
-*   **Behavior**: It pulls from an input channel and pushes to an output channel, potentially modifying the data in between.
+*   **Implementation**: Implemented by `NoopTransformer` in `crates/noop-transformer` and `WasmTransformer` in `crates/wasm-transformer`.
+*   **Behavior**: It pulls from an input channel and pushes to a downstream `BufferSender`, potentially modifying the data in between.
 
 ### 3. Sink
 
-A `Sink` writes `SignalBatch`es to a final storage destination.
+A `Sink` writes `SignalBatch`es to a final storage destination via transactional [`SinkBuffer`](buffer.md) leases.
 
 ```rust
 #[async_trait]
 pub trait Sink: Send + Sync {
-    async fn run(&mut self, input: PipelineReceiver) -> Result<(), PipelineError>;
+    async fn run(&mut self, input: SinkBuffer) -> Result<(), PipelineError>;
 }
 ```
 
-*   **Implementation**: Implemented by `IcebergSink` in `crates/storage`, `KafkaSink` in `crates/kafka-sink`, `StarRocksSink` in `crates/starrocks-sink`, and `ElasticsearchSink` in `crates/elasticsearch-sink`.
-*   **Behavior**: It consumes batches from its input channel and handles the complexities of external commits (e.g., Iceberg transactions or Kafka production).
+*   **Implementation**: Implemented by `IcebergSink` in `crates/storage`, `KafkaSink` in `crates/kafka-sink`, `StarRocksSink` in `crates/starrocks-sink`, `ElasticsearchSink` in `crates/elasticsearch-sink`, and `ParquetSink` in `crates/parquet-sink`.
+*   **Behavior**: It acquires `Lease`s from its `SinkBuffer`, offloads sorting, partitioning, and serialization onto the blocking thread pool via `Lease::prepare`, and acknowledges (`Lease::ack`) or negatively acknowledges (`Lease::nack`) each lease based on external commit or delivery outcomes.
 
 ---
 
@@ -105,7 +105,7 @@ Watch channel receivers for shutdown coordination **SHOULD** use `wait_for(|s| *
 
 ### 4. Buffer Retention Across Flushes
 
-Sinks that accumulate data in-memory (e.g., `IcebergSink`, `ElasticsearchSink`, `StarRocksSink`) **MUST NOT** discard their accumulated batch buffers prior to successful persistence or ACID transaction commits. On transient write or commit failures, buffers must be retained for retry or routed to dead-letter storage.
+Sinks (`IcebergSink`, `ElasticsearchSink`, `StarRocksSink`, `KafkaSink`) **MUST NOT** acknowledge a `SinkBuffer` lease (`Lease::ack`) prior to successful persistence, ACID transaction commits, or broker delivery confirmation across all partition slices/chunks in the lease. On transient write or delivery failures, leases must be negatively acknowledged (`Lease::nack(FailureClass::Transient)`) for backoff retry, or routed to dead-letter storage after `max_attempts` on `FailureClass::Rejected`.
 
 ### 5. Async & Blocking Isolation
 

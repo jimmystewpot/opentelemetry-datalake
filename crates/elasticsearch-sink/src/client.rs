@@ -1629,6 +1629,7 @@ mod tests {
             max_retries: 3,
             retry_interval_secs: 0, // 0 for instantaneous tests
             validate_on_startup: true,
+            buffer: None,
             batching: None,
             order_by: None,
         }

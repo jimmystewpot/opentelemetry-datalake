@@ -172,23 +172,37 @@ AWS credentials (access key, secret key, and optional session token) are automat
 
 ---
 
-## Micro-Batching Buffer (`[elasticsearch.batching]`)
+## Transactional Sink Buffer (`[elasticsearch.buffer]` and legacy `[elasticsearch.batching]`)
 
-When configured, records are accumulated in memory across incoming OTLP batches until any threshold (bytes, records, or time) is met:
+`ElasticsearchSink` is backed by the unified [`SinkBuffer`](buffer.md), which coalesces incoming signal batches per signal up to `max_batch_size_bytes`, `max_batch_records`, or `max_batch_interval_sec`, and issues up to `max_inflight_leases` concurrent transactional leases (defaulting to `max_concurrent_requests` when `[elasticsearch.buffer]` is omitted):
 
 ```toml
-[elasticsearch.batching]
-# Maximum accumulated Arrow byte size before flushing. Default: 10 MiB (10485760).
+[elasticsearch.buffer]
+# Buffer storage mode: "memory" (default) or "disk".
+mode = "memory"
+
+# Maximum total buffer byte budget across all signals. Default: 768 MiB (805306368; 256 MiB per signal).
+max_buffer_bytes = 268435456
+
+# Maximum accumulated Arrow byte size per lease before flushing. Default: 32 MiB (33554432).
 max_batch_size_bytes = 10485760
 
-# Maximum record count before flushing. Default: 50000.
+# Maximum record count per lease before flushing.
 max_batch_records = 50000
 
-# Maximum interval in seconds between flushes. Default: 10.
+# Maximum interval in seconds between flushes.
 max_batch_interval_sec = 10
+
+# Maximum concurrent in-flight leases per signal. Defaults to max_concurrent_requests (8) when omitted.
+max_inflight_leases = 8
+
+# Optional directory for quarantining item-level HTTP 400 rows as Arrow IPC + JSON manifest files.
+dead_letter_path = "/var/lib/otel-datalake/dlq"
 ```
 
-Flushing is handled on dedicated blocking threads via `tokio::task::spawn_blocking` to prevent CPU-intensive NDJSON serialization from starving Tokio async workers.
+Legacy `[elasticsearch.batching]` remains supported as a deprecated alias that maps `max_batch_size_bytes`, `max_batch_records`, and `max_batch_interval_sec` onto `[elasticsearch.buffer]`. Specifying both `[elasticsearch.buffer]` and `[elasticsearch.batching]` is rejected at startup (validation rule V4).
+
+Sorting (`BatchSorter`) and NDJSON chunk serialization (`serialize_batch_chunks_with_ranges`) run on dedicated blocking threads via `Lease::prepare` (`tokio::task::spawn_blocking`) to prevent CPU-intensive work from starving Tokio async workers.
 
 ---
 
@@ -201,7 +215,7 @@ Pre-sorting records chronologically before emitting them to Elasticsearch or Ope
 ```toml
 [elasticsearch.order_by]
 logs    = ["timestamp ASC", "service_name ASC NULLS LAST"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces  = ["timestamp ASC"]
 on_missing_column = "skip" # "skip" or "error"
 ```
@@ -221,10 +235,11 @@ The sink uses an atomic round-robin index over all configured `endpoints`. If a 
 ### Dynamic `Retry-After` Parsing
 When Elasticsearch or OpenSearch nodes encounter high CPU or indexing pressure, they return HTTP `429 Too Many Requests` or `503 Service Unavailable`. The sink parses standard `Retry-After` headers (supporting both integer seconds and HTTP-date formats via `httpdate`) and sleeps dynamically up to a maximum cap of 60 seconds before retrying.
 
-### Partial Bulk Item-Level Retries
-Bulk responses returning HTTP 200 OK may still contain individual record rejections (`"errors": true`). The sink inspects the response `items` array:
-* **Transient Item Errors (429 / 503)**: Sliced into a minimal retry NDJSON payload containing only the rejected records and retried across subsequent rounds.
-* **Fatal Item Errors (400 Bad Request / Schema Mismatch)**: Logged with the exact rejection reason and dropped, preventing head-of-line blocking.
+### Multi-Lease Chunk-Join Ack & Partial Bulk Item-Level Quarantine
+Each [`SinkBuffer`](buffer.md) lease may split into multiple `BulkChunk` HTTP requests when the serialized NDJSON exceeds `max_payload_bytes`. All chunks of a lease are dispatched concurrently under the shared `max_concurrent_requests` semaphore and joined before the lease outcome is decided:
+* **Chunk-Join Lease Retention**: A lease is acknowledged (`lease.ack()`) only after **every** bulk chunk in that lease succeeds. If any chunk fails with a transient HTTP/network error (or still has recoverable `429`/`503` items after client-level retries), the entire lease is retained via `lease.nack(FailureClass::Transient)` for exponential backoff retry. Fatal authentication failures (`401`/`403`) call `lease.nack(FailureClass::Fatal)` and abort the sink.
+* **Transient Item Errors (429 / 503)**: Within `HttpClient::send_bulk`, recoverable item errors are sliced into a minimal retry NDJSON payload containing only the rejected records and retried across subsequent client rounds.
+* **Unrecoverable Item Errors (400 Bad Request / Mapper Parsing Exception)**: Using each `BulkChunk`'s `start_row` and `row_count`, the sink maps item index `item_idx` back to the exact row in the sorted `RecordBatch` (`sorted_batch.slice(chunk.start_row + item_idx, 1)`), quarantines the rejected row slices via `lease.quarantine_batches(...)` (writing Arrow IPC `.arrow` + JSON manifest files when `dead_letter_path` is configured), and acknowledges the lease so valid rows are not blocked.
 * **Successful Items**: Committed without re-transmission.
 
 ### Clean In-Flight Task Drainage
@@ -554,13 +569,13 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 ca_cert_path = "/etc/ssl/certs/corporate-root-ca.pem"
 verification = "full"
 
-[elasticsearch.batching]
+[elasticsearch.buffer]
 max_batch_size_bytes = 15728640 # 15 MiB
 max_batch_records = 50000
 max_batch_interval_sec = 5
 
 [elasticsearch.order_by]
 logs    = ["timestamp ASC", "service_name ASC"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces  = ["timestamp ASC"]
 ```

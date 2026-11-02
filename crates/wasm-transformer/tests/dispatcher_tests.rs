@@ -1,6 +1,7 @@
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::config::{
     OnErrorPolicy, OnRejectPolicy, SchemaGuardMode, WasmTransformerConfig,
 };
@@ -150,7 +151,7 @@ async fn test_dispatcher_executes_batches_and_drains_on_close() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
 
     let dispatcher = WasmDispatcher::new(
         DispatcherConfig {
@@ -181,7 +182,7 @@ async fn test_dispatcher_executes_batches_and_drains_on_close() {
     drop(input_tx); // Close input
 
     let mut received = 0;
-    while output_rx.recv().await.is_some() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         received += 1;
     }
     assert_eq!(
@@ -200,7 +201,7 @@ async fn test_dispatcher_error_reroute_policy_routes_to_reroute_error() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -241,7 +242,7 @@ async fn test_dispatcher_error_reroute_policy_routes_to_reroute_error() {
     );
 
     let mut out_received = 0;
-    while output_rx.try_recv().is_ok() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         out_received += 1;
     }
     assert_eq!(
@@ -261,7 +262,7 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
     cfg.allow_unmasked_passthrough = true;
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -293,7 +294,7 @@ async fn test_dispatcher_error_passthrough_policy_routes_to_output() {
     drop(input_tx);
 
     let mut out_received = 0;
-    while output_rx.recv().await.is_some() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         out_received += 1;
     }
     assert_eq!(
@@ -322,7 +323,7 @@ async fn test_dispatcher_error_passthrough_disabled_drops_batch() {
     cfg.allow_unmasked_passthrough = false;
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -354,7 +355,7 @@ async fn test_dispatcher_error_passthrough_disabled_drops_batch() {
     drop(input_tx);
 
     let mut out_received = 0;
-    while output_rx.recv().await.is_some() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         out_received += 1;
     }
     assert_eq!(
@@ -382,7 +383,7 @@ async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (rej_tx, mut rej_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -423,7 +424,7 @@ async fn test_dispatcher_reject_reroute_policy_routes_to_reroute_reject() {
     );
 
     let mut out_received = 0;
-    while output_rx.try_recv().is_ok() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         out_received += 1;
     }
     assert_eq!(
@@ -442,7 +443,7 @@ async fn test_dispatcher_reject_drop_policy_drops_batch() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Drop, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (rej_tx, mut rej_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -474,7 +475,7 @@ async fn test_dispatcher_reject_drop_policy_drops_batch() {
     drop(input_tx);
 
     // Wait until output is closed on drain completion
-    assert!(output_rx.recv().await.is_none());
+    assert!(output_rx.recv_passthrough().await.unwrap().is_none());
 
     let mut rej_received = 0;
     while rej_rx.try_recv().is_ok() {
@@ -496,7 +497,7 @@ async fn test_dispatcher_discard_outcome_drops_batch() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
 
     let dispatcher = WasmDispatcher::new(
         DispatcherConfig {
@@ -527,7 +528,7 @@ async fn test_dispatcher_discard_outcome_drops_batch() {
     drop(input_tx);
 
     assert!(
-        output_rx.recv().await.is_none(),
+        output_rx.recv_passthrough().await.unwrap().is_none(),
         "discarded batches must be dropped without emission"
     );
 }
@@ -544,7 +545,7 @@ async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, concurrency);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(16);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(64);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
 
     let dispatcher = WasmDispatcher::new(
         DispatcherConfig {
@@ -574,7 +575,7 @@ async fn test_dispatcher_concurrent_drain_completes_without_dropping_batches() {
     drop(input_tx); // Trigger drain
 
     let mut received = 0;
-    while output_rx.recv().await.is_some() {
+    while output_rx.recv_passthrough().await.unwrap().is_some() {
         received += 1;
     }
     assert_eq!(
@@ -628,7 +629,7 @@ async fn test_dispatcher_worker_init_failure() {
     let tf_cfg = test_tf_cfg();
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
-    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+    let (out_tx, _out_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
     let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
 
@@ -678,7 +679,7 @@ async fn test_dispatcher_output_channel_closed() {
     let tf_cfg = test_tf_cfg();
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel(1);
-    let (out_tx, out_rx) = tokio::sync::mpsc::channel(1);
+    let (out_tx, out_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, _err_rx) = tokio::sync::mpsc::channel(1);
     let (rej_tx, _rej_rx) = tokio::sync::mpsc::channel(1);
 
@@ -737,7 +738,7 @@ async fn test_dispatcher_trap_passthrough_policy_routes_to_output() {
     cfg.allow_unmasked_passthrough = true;
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
 
     let dispatcher = WasmDispatcher::new(
         DispatcherConfig {
@@ -763,7 +764,7 @@ async fn test_dispatcher_trap_passthrough_policy_routes_to_output() {
         .expect("send batch");
     drop(input_tx);
 
-    let received = output_rx.recv().await;
+    let received = output_rx.recv_passthrough().await.unwrap();
     assert!(
         received.is_some(),
         "Trap with passthrough policy must route original batch to output"
@@ -780,7 +781,7 @@ async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, mut err_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(
@@ -813,7 +814,7 @@ async fn test_dispatcher_trap_reroute_policy_routes_to_dlq() {
         "Trap with reroute policy must route original batch to DLQ"
     );
     assert!(
-        output_rx.try_recv().is_err(),
+        output_rx.recv_passthrough().await.unwrap().is_none(),
         "Output channel must receive nothing on trap reroute"
     );
 }
@@ -826,7 +827,7 @@ async fn test_dlq_error_channel_closed_terminates_worker() {
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Drop, 1);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = SinkBuffer::passthrough_pair();
     let (err_tx, err_rx) = mpsc::channel::<SignalBatch>(8);
 
     // Drop err_rx immediately so DLQ sends fail
@@ -871,7 +872,7 @@ async fn test_dlq_reject_channel_closed_terminates_worker() {
     let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = SinkBuffer::passthrough_pair();
     let (rej_tx, rej_rx) = mpsc::channel::<SignalBatch>(8);
 
     // Drop rej_rx immediately so DLQ sends fail
@@ -936,7 +937,7 @@ async fn test_dispatcher_custom_dlq_sink_routes_successfully() {
     let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = SinkBuffer::passthrough_pair();
 
     let dlq_sink = Arc::new(MockDlqSink::default());
 
@@ -975,7 +976,7 @@ async fn test_dispatcher_custom_dlq_sink_write_failure_terminates_worker() {
     let cfg = test_config(OnErrorPolicy::Drop, OnRejectPolicy::Reroute, 1);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = SinkBuffer::passthrough_pair();
 
     let dlq_sink = Arc::new(MockDlqSink::default());
     dlq_sink
@@ -1022,7 +1023,7 @@ async fn test_dispatcher_zero_batch_success_marks_consumed_without_emitting_rows
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 2);
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
 
     let dispatcher = WasmDispatcher::new(
         DispatcherConfig {
@@ -1059,7 +1060,7 @@ async fn test_dispatcher_zero_batch_success_marks_consumed_without_emitting_rows
 
     // Verify 0 rows are emitted downstream (input is consumed, not leaked)
     assert!(
-        output_rx.recv().await.is_none(),
+        output_rx.recv_passthrough().await.unwrap().is_none(),
         "zero-batch success must mark batch consumed and emit zero rows downstream"
     );
 }
@@ -1093,7 +1094,7 @@ async fn test_dispatcher_single_rejuvenation_on_trap() {
     cfg.allow_unmasked_passthrough = true;
 
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, mut output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, mut output_rx) = SinkBuffer::passthrough_pair();
     let registry = test_registry();
 
     let dispatcher = WasmDispatcher::new(
@@ -1125,9 +1126,9 @@ async fn test_dispatcher_single_rejuvenation_on_trap() {
         .expect("send batch 2");
     drop(input_tx);
 
-    let received1 = output_rx.recv().await;
+    let received1 = output_rx.recv_passthrough().await.unwrap();
     assert!(received1.is_some(), "Batch 1 should pass through on error");
-    let received2 = output_rx.recv().await;
+    let received2 = output_rx.recv_passthrough().await.unwrap();
     assert!(received2.is_some(), "Batch 2 should pass through on error");
 
     // Instantiations: exactly 1 at worker start + 2 for the 2 trap rejuvenations = 3
@@ -1167,7 +1168,7 @@ async fn test_dispatcher_rejuvenation_pool_exhaustion_terminates_worker_and_drai
 
     let cfg = test_config(OnErrorPolicy::Reroute, OnRejectPolicy::Reroute, 1);
     let (input_tx, input_rx) = mpsc::channel::<SignalBatch>(8);
-    let (output_tx, _output_rx) = mpsc::channel::<SignalBatch>(8);
+    let (output_tx, _output_rx) = SinkBuffer::passthrough_pair();
     let (dlq_tx, mut dlq_rx) = mpsc::channel::<SignalBatch>(8);
 
     let dispatcher = WasmDispatcher::new(

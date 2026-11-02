@@ -9,8 +9,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet_sink::{CompressionCodec, ParquetSink, ParquetSinkConfig};
+use pipeline_core::buffer::SinkBuffer;
 use pipeline_core::pipeline::{SignalBatch, Sink};
-use tokio::sync::mpsc;
 
 fn find_parquet_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -253,7 +253,7 @@ async fn test_e2e_write_and_read_back_variant_parquet() {
     };
 
     let mut sink = ParquetSink::try_new(config).expect("sink try_new");
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     tx.send(SignalBatch::Logs(create_logs_batch()))
         .await
@@ -324,7 +324,7 @@ async fn test_compression_codecs_roundtrip() {
         };
 
         let mut sink = ParquetSink::try_new(config).expect("sink try_new");
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = SinkBuffer::passthrough_pair();
 
         let batch = create_logs_batch();
         let expected_rows = batch.num_rows();
@@ -367,7 +367,7 @@ async fn test_path_partitioning_hierarchy() {
     };
 
     let mut sink = ParquetSink::try_new(config).expect("sink try_new");
-    let (tx, rx) = mpsc::channel(10);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
 
     // Two rows with timestamps in two separate hours:
     // 1_700_000_000_000_000_000 ns -> 2023-11-14 22:13:20 UTC
@@ -476,7 +476,7 @@ async fn test_s3_compatible_storage_configuration() {
     }
 
     let mut sink = sink_res.unwrap();
-    let (tx, rx) = mpsc::channel(4);
+    let (tx, rx) = SinkBuffer::passthrough_pair();
     let batch = create_logs_batch();
     let num_rows = batch.num_rows();
     tx.send(SignalBatch::Logs(batch)).await.unwrap();

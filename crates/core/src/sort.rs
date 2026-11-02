@@ -144,7 +144,8 @@ pub fn parse_shorthand(input: &str) -> Result<NormalizedSortKey, PipelineError> 
 }
 
 /// Distinguishes the incoming telemetry signal stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SignalType {
     /// OpenTelemetry Log telemetry.
     Logs,
@@ -152,6 +153,39 @@ pub enum SignalType {
     Metrics,
     /// OpenTelemetry Trace telemetry.
     Traces,
+}
+
+impl SignalType {
+    /// Encodes the signal type into its compact binary tag (`0 = Logs`, `1 = Metrics`, `2 = Traces`).
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Logs => 0,
+            Self::Metrics => 1,
+            Self::Traces => 2,
+        }
+    }
+
+    /// Decodes a compact binary tag back into a [`SignalType`].
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Logs),
+            1 => Some(Self::Metrics),
+            2 => Some(Self::Traces),
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical lowercase signal identifier (`"logs"`, `"metrics"`, `"traces"`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Logs => "logs",
+            Self::Metrics => "metrics",
+            Self::Traces => "traces",
+        }
+    }
 }
 
 /// Centralized pre-sorting engine for Arrow `RecordBatches`.

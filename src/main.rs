@@ -7,7 +7,6 @@ use pipeline_core::pipeline::Sink;
 use pipeline_core::pipeline::Source;
 use pipeline_core::pipeline::Transform;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -33,25 +32,7 @@ struct ServerConfig {
     admin_addr: Option<SocketAddr>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct KafkaConfig {
-    brokers: String,
-    logs_topic: String,
-    traces_topic: String,
-    metrics_topic: String,
-    logs_format: String,
-    traces_format: String,
-    metrics_format: String,
-    logs_partition_key: Option<String>,
-    metrics_partition_key: Option<String>,
-    traces_partition_key: Option<String>,
-    #[serde(default)]
-    order_by: Option<pipeline_core::sort::SortConfig>,
-    #[serde(default)]
-    flush_timeout_ms: Option<u64>,
-    #[serde(default)]
-    options: HashMap<String, String>,
-}
+type KafkaConfig = kafka_sink::KafkaSinkConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "opentelemetry-datalake")]
@@ -88,6 +69,11 @@ struct Cli {
 
 /// Validates that required sink configuration constraints are satisfied.
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
+    config
+        .pipeline
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
@@ -126,6 +112,9 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
                 "Configuration validation failed: logs, traces, and metrics Iceberg table identifiers must be distinct. Got: logs='{logs_table}', traces='{traces_table}', metrics='{metrics_table}'"
             );
         }
+        iceberg_cfg
+            .resolved_buffer_config()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref es_cfg) = config.elasticsearch {
         es_cfg
             .validate()
@@ -135,15 +124,9 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
             .validate()
             .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref kafka_cfg) = config.kafka {
-        if kafka_cfg.flush_timeout_ms == Some(0) {
-            anyhow::bail!(
-                "Configuration validation failed: kafka.flush_timeout_ms must be greater than 0"
-            );
-        }
-        if let Some(sort_cfg) = kafka_cfg.order_by.as_ref() {
-            pipeline_core::sort::BatchSorter::from_config(sort_cfg)
-                .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
-        }
+        kafka_cfg
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
     } else if let Some(ref parquet_cfg) = config.parquet {
         parquet_cfg
             .validate()
@@ -177,12 +160,23 @@ static DLQ_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Returns `true` if `val` is a safe, single relative path component without path traversal,
 /// separators, or null bytes (e.g. neither empty, `"."`, `".."`, nor containing `/` or `\`).
 fn is_safe_path_component(val: &str) -> bool {
-    if val.is_empty() || val.contains('/') || val.contains('\\') || val.contains('\0') {
-        return false;
+    pipeline_core::buffer::is_safe_path_component(val)
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            return;
+        }
     }
-    let mut components = std::path::Path::new(val).components();
-    matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none()
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Durable filesystem Dead Letter Queue (DLQ) sink writing Arrow IPC batches directly in the routed send path.
@@ -579,6 +573,31 @@ fn supervise_sink_exit(
     }
 }
 
+/// Attaches `GET /healthz` and `GET /readyz` probe endpoints to the admin HTTP [`axum::Router`].
+fn attach_admin_probe_routes(
+    router: axum::Router,
+    buffer_controller: pipeline_core::buffer::BufferController,
+) -> axum::Router {
+    router
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        )
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let ctrl = buffer_controller.clone();
+                async move {
+                    if ctrl.is_ready() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
@@ -615,7 +634,9 @@ async fn main() -> anyhow::Result<()> {
         figment = figment.merge(Toml::file("config.toml"));
     }
 
-    let mut config: AppConfig = figment.merge(Env::prefixed("OTEL_DATALAKE_")).extract()?;
+    let mut config: AppConfig = figment
+        .merge(Env::prefixed("OTEL_DATALAKE_").split("__"))
+        .extract()?;
 
     // Apply CLI overrides to configuration
     if let Some(grpc_addr) = cli_args.grpc_addr {
@@ -648,14 +669,31 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Starting opentelemetry-datalake service");
 
     // Channels for the OTLP source demultiplexer
-    let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(1000);
-    let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(1000);
-    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(1000);
+    let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
+    let (traces_tx, traces_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
+    let (metrics_tx, metrics_rx) = tokio::sync::mpsc::channel(config.pipeline.channel_capacity);
 
-    // Channels between Transformers and Sinks
-    let (logs_sink_tx, logs_sink_rx) = tokio::sync::mpsc::channel(1000);
-    let (traces_sink_tx, traces_sink_rx) = tokio::sync::mpsc::channel(1000);
-    let (metrics_sink_tx, metrics_sink_rx) = tokio::sync::mpsc::channel(1000);
+    // Sink buffers between Transformers and Sinks
+    let (active_sink_name, sink_buffer_config) = if let Some(ref iceberg_cfg) = config.iceberg {
+        ("iceberg", iceberg_cfg.resolved_buffer_config()?)
+    } else if let Some(ref es_cfg) = config.elasticsearch {
+        ("elasticsearch", es_cfg.resolved_buffer_config()?)
+    } else if let Some(ref sr_cfg) = config.starrocks {
+        ("starrocks", sr_cfg.resolved_buffer_config()?)
+    } else if let Some(ref kafka_cfg) = config.kafka {
+        ("kafka", kafka_cfg.resolved_buffer_config()?)
+    } else {
+        (
+            "parquet",
+            pipeline_core::buffer::BufferConfig::passthrough(),
+        )
+    };
+    let [
+        (logs_sink_tx, logs_sink_rx),
+        (metrics_sink_tx, metrics_sink_rx),
+        (traces_sink_tx, traces_sink_rx),
+    ] = pipeline_core::buffer::SinkBuffer::new_signal_triad(active_sink_name, sink_buffer_config)?;
+    let buffer_controller = logs_sink_rx.controller();
 
     // Create shutdown watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -676,7 +714,7 @@ async fn main() -> anyhow::Result<()> {
         initialize_transformers(&config, &mut metric_bridges)?;
 
     let admin_handle = if let Some(admin_addr) = config.server.admin_addr {
-        let admin_router =
+        let base_admin_router =
             if let (Some(wasm_cfg), Some(engine)) = (&config.wasm_transformer, &shared_engine) {
                 wasm_transformer::reload::build_admin_router_with_sha(
                     std::sync::Arc::clone(engine),
@@ -686,6 +724,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 axum::Router::new()
             };
+        let admin_router = attach_admin_probe_routes(base_admin_router, buffer_controller.clone());
         let listener = tokio::net::TcpListener::bind(admin_addr)
             .await
             .map_err(|e| {
@@ -1028,19 +1067,22 @@ async fn main() -> anyhow::Result<()> {
     let mut source_handle = tokio::spawn(async move { source.run().await });
 
     let mut exit_err: Option<anyhow::Error> = None;
+    let mut source_done = false;
+    let mut logs_trans_done = false;
+    let mut traces_trans_done = false;
+    let mut metrics_trans_done = false;
+    let mut logs_sink_done = false;
+    let mut traces_sink_done = false;
+    let mut metrics_sink_done = false;
 
     // Handle shutdown
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        () = wait_for_shutdown_signal() => {
             tracing::info!("Received shutdown signal. Starting graceful shutdown...");
             let _ = shutdown_tx.send(true);
-            match source_handle.await {
-                Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {}", e),
-                Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
-                Err(e) => tracing::error!("Source receiver task failed/panicked: {}", e),
-            }
         }
         res = &mut source_handle => {
+            source_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Source receiver stopped unexpectedly with error: {}", e);
@@ -1058,6 +1100,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut logs_trans_handle => {
+            logs_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Logs transformer failed: {e}");
@@ -1075,6 +1118,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut traces_trans_handle => {
+            traces_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Traces transformer failed: {e}");
@@ -1092,6 +1136,7 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut metrics_trans_handle => {
+            metrics_trans_done = true;
             match res {
                 Ok(Err(e)) => {
                     tracing::error!("Metrics transformer failed: {e}");
@@ -1109,58 +1154,80 @@ async fn main() -> anyhow::Result<()> {
             let _ = shutdown_tx.send(true);
         }
         res = &mut logs_sink_handle => {
+            logs_sink_done = true;
             exit_err = Some(supervise_sink_exit("Logs", res));
             let _ = shutdown_tx.send(true);
         }
         res = &mut traces_sink_handle => {
+            traces_sink_done = true;
             exit_err = Some(supervise_sink_exit("Traces", res));
             let _ = shutdown_tx.send(true);
         }
         res = &mut metrics_sink_handle => {
+            metrics_sink_done = true;
             exit_err = Some(supervise_sink_exit("Metrics", res));
             let _ = shutdown_tx.send(true);
         }
     }
 
-    // Wait for pipeline to drain
-    let ((), (), (), logs_drain_res, traces_drain_res, metrics_drain_res) = tokio::join!(
-        async {
-            if !logs_trans_handle.is_finished() {
-                let _ = logs_trans_handle.await;
+    let mut logs_drain_res = None;
+    let mut traces_drain_res = None;
+    let mut metrics_drain_res = None;
+
+    // Wait for pipeline to drain within bounded drain_timeout_sec
+    let drain_timeout = std::time::Duration::from_secs(buffer_controller.drain_timeout_sec());
+    let drain_outcome = tokio::time::timeout(drain_timeout, async {
+        if !source_done {
+            match (&mut source_handle).await {
+                Ok(Err(e)) => tracing::error!("Source receiver stopped with error: {e}"),
+                Ok(Ok(())) => tracing::info!("Source receiver shut down gracefully."),
+                Err(e) => tracing::error!("Source receiver task failed/panicked: {e}"),
             }
-        },
-        async {
-            if !traces_trans_handle.is_finished() {
-                let _ = traces_trans_handle.await;
-            }
-        },
-        async {
-            if !metrics_trans_handle.is_finished() {
-                let _ = metrics_trans_handle.await;
-            }
-        },
-        async {
-            if logs_sink_handle.is_finished() {
-                None
-            } else {
-                Some(logs_sink_handle.await)
-            }
-        },
-        async {
-            if traces_sink_handle.is_finished() {
-                None
-            } else {
-                Some(traces_sink_handle.await)
-            }
-        },
-        async {
-            if metrics_sink_handle.is_finished() {
-                None
-            } else {
-                Some(metrics_sink_handle.await)
-            }
+            source_done = true;
         }
-    );
+        tokio::join!(
+            async {
+                if !logs_trans_done {
+                    let _ = (&mut logs_trans_handle).await;
+                    logs_trans_done = true;
+                }
+            },
+            async {
+                if !traces_trans_done {
+                    let _ = (&mut traces_trans_handle).await;
+                    traces_trans_done = true;
+                }
+            },
+            async {
+                if !metrics_trans_done {
+                    let _ = (&mut metrics_trans_handle).await;
+                    metrics_trans_done = true;
+                }
+            },
+            async {
+                if !logs_sink_done {
+                    let res = (&mut logs_sink_handle).await;
+                    logs_sink_done = true;
+                    logs_drain_res = Some(res);
+                }
+            },
+            async {
+                if !traces_sink_done {
+                    let res = (&mut traces_sink_handle).await;
+                    traces_sink_done = true;
+                    traces_drain_res = Some(res);
+                }
+            },
+            async {
+                if !metrics_sink_done {
+                    let res = (&mut metrics_sink_handle).await;
+                    metrics_sink_done = true;
+                    metrics_drain_res = Some(res);
+                }
+            }
+        );
+    })
+    .await;
 
     for (signal_name, drain_res) in [
         ("Logs", logs_drain_res),
@@ -1184,6 +1251,48 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Some(Ok(Ok(()))) | None => {}
+        }
+    }
+
+    if drain_outcome.is_err() {
+        tracing::warn!(
+            timeout_sec = buffer_controller.drain_timeout_sec(),
+            "Graceful shutdown drain timed out; aborting remaining tasks and finalizing buffer policy"
+        );
+        if !source_done {
+            source_handle.abort();
+            let _ = source_handle.await;
+        }
+        if !logs_trans_done {
+            logs_trans_handle.abort();
+            let _ = logs_trans_handle.await;
+        }
+        if !traces_trans_done {
+            traces_trans_handle.abort();
+            let _ = traces_trans_handle.await;
+        }
+        if !metrics_trans_done {
+            metrics_trans_handle.abort();
+            let _ = metrics_trans_handle.await;
+        }
+        if !logs_sink_done {
+            logs_sink_handle.abort();
+            let _ = logs_sink_handle.await;
+        }
+        if !traces_sink_done {
+            traces_sink_handle.abort();
+            let _ = traces_sink_handle.await;
+        }
+        if !metrics_sink_done {
+            metrics_sink_handle.abort();
+            let _ = metrics_sink_handle.await;
+        }
+        if let Err(e) = buffer_controller
+            .finalize_shutdown_timeout_async(std::time::Duration::from_secs(5))
+            .await
+            && exit_err.is_none()
+        {
+            exit_err = Some(anyhow::anyhow!("Shutdown drain timed out: {e}"));
         }
     }
 
@@ -2697,5 +2806,306 @@ mod tests {
                 .contains("flush_timeout_ms must be greater than 0"),
             "Unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn test_cli_check_supports_nested_double_underscore_env_override() {
+        let temp_dir = std::env::temp_dir();
+        let tmp_path = temp_dir.join(format!("test_cli_env_override_{}.toml", std::process::id()));
+        let toml_content = r#"
+            [server]
+            grpc_addr = "127.0.0.1:4317"
+            http_addr = "127.0.0.1:4318"
+
+            [starrocks]
+            frontend_urls = ["http://127.0.0.1:8030"]
+            database = "telemetry"
+            username = "writer"
+
+            [starrocks.table_mapping]
+            type = "per_signal"
+            logs = "otel_logs"
+            metrics = "otel_metrics"
+            traces = "otel_traces"
+        "#;
+        std::fs::write(&tmp_path, toml_content).expect("write temp toml");
+
+        let bin_path = option_env!("CARGO_BIN_EXE_opentelemetry-datalake")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("CARGO_BIN_EXE_opentelemetry-datalake")
+                    .map(std::path::PathBuf::from)
+            })
+            .unwrap_or_else(|| {
+                let mut path = std::env::current_exe().expect("current exe");
+                path.pop();
+                if path.ends_with("deps") {
+                    path.pop();
+                }
+                path.join(format!(
+                    "opentelemetry-datalake{}",
+                    std::env::consts::EXE_SUFFIX
+                ))
+            });
+
+        if !bin_path.exists() {
+            let status = std::process::Command::new(env!("CARGO"))
+                .args(["build", "--bin", "opentelemetry-datalake"])
+                .status()
+                .expect("build opentelemetry-datalake binary");
+            assert!(status.success(), "failed to build binary for test");
+        }
+
+        let status = std::process::Command::new(&bin_path)
+            .args(["--check", "--config"])
+            .arg(&tmp_path)
+            .env("OTEL_DATALAKE_STARROCKS__PASSWORD", "env-secret")
+            .env("OTEL_DATALAKE_CHANNEL_CAPACITY", "32")
+            .status()
+            .expect("execute cli check");
+
+        assert!(status.success());
+
+        let invalid_status = std::process::Command::new(&bin_path)
+            .args(["--check", "--config"])
+            .arg(&tmp_path)
+            .env("OTEL_DATALAKE_STARROCKS__PASSWORD", "env-secret")
+            .env("OTEL_DATALAKE_CHANNEL_CAPACITY", "0")
+            .status()
+            .expect("execute cli check with invalid capacity");
+
+        let _ = std::fs::remove_file(&tmp_path);
+        assert!(!invalid_status.success());
+    }
+
+    #[tokio::test]
+    async fn test_admin_probe_routes_healthz_and_readyz_reflect_buffer_readiness() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use tower::ServiceExt;
+
+        let config = pipeline_core::buffer::BufferConfig {
+            max_batch_interval_sec: 0,
+            ..pipeline_core::buffer::BufferConfig::default()
+        };
+        let (tx, mut buf) = pipeline_core::buffer::SinkBuffer::new("probe_test", config).unwrap();
+        let router = attach_admin_probe_routes(axum::Router::new(), buf.controller());
+
+        let health_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), axum::http::StatusCode::OK);
+
+        let ready_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready_resp.status(), axum::http::StatusCode::OK);
+
+        // Nack with Fatal to transition buffer to not-ready
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        tx.send(pipeline_core::pipeline::SignalBatch::Logs(batch))
+            .await
+            .unwrap();
+        let lease = buf.next_lease().await.unwrap().unwrap();
+        let _ = lease
+            .nack(pipeline_core::buffer::FailureClass::Fatal {
+                reason: "auth failure".to_string(),
+            })
+            .await;
+
+        let not_ready_resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ready_resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_validate_config_starrocks_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [starrocks]
+        frontend_urls = ["http://127.0.0.1:8030"]
+        database = "otel"
+        username = "root"
+
+        [starrocks.table_mapping]
+        type = "per_signal"
+        logs = "otel_logs"
+        metrics = "otel_metrics"
+        traces = "otel_traces"
+
+        [starrocks.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml =
+            format!("{valid_buffer_toml}\n[starrocks.batching]\nmax_batch_size_bytes = 2097152\n");
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[starrocks.buffer]"), "Got: {err}");
+        assert!(
+            err.to_string().contains("[starrocks.batching]"),
+            "Got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_elasticsearch_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [elasticsearch]
+        endpoints = ["http://127.0.0.1:9200"]
+
+        [elasticsearch.data_streams]
+        logs = "logs-otel-default"
+        metrics = "metrics-otel-default"
+        traces = "traces-otel-default"
+
+        [elasticsearch.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml = format!(
+            "{valid_buffer_toml}\n[elasticsearch.batching]\nmax_batch_size_bytes = 2097152\n"
+        );
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(
+            err.to_string().contains("[elasticsearch.buffer]"),
+            "Got: {err}"
+        );
+        assert!(
+            err.to_string().contains("[elasticsearch.batching]"),
+            "Got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_iceberg_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [iceberg]
+        catalog_type = "Rest"
+        catalog_uri = "http://localhost:8181"
+        warehouse = "s3://warehouse"
+        table_identifier = "otel.default"
+        logs_table_identifier = "otel.logs"
+        traces_table_identifier = "otel.traces"
+        metrics_table_identifier = "otel.metrics"
+
+        [iceberg.buffer]
+        max_batch_size_bytes = 134217728
+        max_batch_interval_sec = 60
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml =
+            format!("{valid_buffer_toml}\n[iceberg.batching]\nmax_batch_size_bytes = 67108864\n");
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[iceberg.buffer]"), "Got: {err}");
+        assert!(err.to_string().contains("[iceberg.batching]"), "Got: {err}");
+    }
+
+    #[test]
+    fn test_validate_config_kafka_buffer_and_legacy_batching_conflict() {
+        let valid_buffer_toml = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+
+        [kafka.buffer]
+        max_batch_size_bytes = 1048576
+        max_batch_interval_sec = 5
+        "#;
+        let cfg_valid: AppConfig = Figment::new()
+            .merge(Toml::string(valid_buffer_toml))
+            .extract()
+            .unwrap();
+        assert!(validate_config(&cfg_valid).is_ok());
+
+        let conflict_toml = format!(
+            "{valid_buffer_toml}\n[kafka.batching]\nmax_batch_size_bytes = 2097152\nmax_batch_interval_sec = 5\n"
+        );
+        let cfg_conflict: AppConfig = Figment::new()
+            .merge(Toml::string(&conflict_toml))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg_conflict).unwrap_err();
+        assert!(err.to_string().contains("[kafka.buffer]"), "Got: {err}");
+        assert!(err.to_string().contains("[kafka.batching]"), "Got: {err}");
     }
 }

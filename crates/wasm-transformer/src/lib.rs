@@ -545,7 +545,7 @@ impl Transform for WasmTransformer {
     async fn transform(
         &mut self,
         input: PipelineReceiver,
-        output: PipelineSender,
+        output: pipeline_core::buffer::BufferSender,
     ) -> Result<(), PipelineError> {
         let dispatcher = WasmDispatcher::new(
             DispatcherConfig {

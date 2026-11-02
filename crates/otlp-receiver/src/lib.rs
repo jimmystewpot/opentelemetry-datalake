@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
+use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
@@ -27,6 +28,60 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 use pipeline_core::error::PipelineError;
 use pipeline_core::pipeline::{SignalBatch, Source};
 
+/// Maximum HTTP payload byte size processed inline on the async worker.
+/// Payloads exceeding this threshold are offloaded to `tokio::task::spawn_blocking`.
+pub const HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 64 * 1024;
+
+/// Maximum gRPC record count processed inline on the async worker.
+/// Batches exceeding this threshold are offloaded to `tokio::task::spawn_blocking`.
+pub const GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD: usize = 512;
+
+/// Estimates the total number of log records in an export request.
+#[must_use]
+pub fn estimate_logs_records(req: &ExportLogsServiceRequest) -> usize {
+    req.resource_logs.iter().fold(0usize, |acc, r| {
+        acc.saturating_add(
+            r.scope_logs
+                .iter()
+                .fold(0usize, |s_acc, s| s_acc.saturating_add(s.log_records.len())),
+        )
+    })
+}
+
+/// Estimates the total number of spans in an export request.
+#[must_use]
+pub fn estimate_traces_records(req: &ExportTraceServiceRequest) -> usize {
+    req.resource_spans.iter().fold(0usize, |acc, r| {
+        acc.saturating_add(
+            r.scope_spans
+                .iter()
+                .fold(0usize, |s_acc, s| s_acc.saturating_add(s.spans.len())),
+        )
+    })
+}
+
+/// Estimates the total number of metric data points in an export request.
+#[must_use]
+pub fn estimate_metrics_records(req: &ExportMetricsServiceRequest) -> usize {
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+
+    req.resource_metrics.iter().fold(0usize, |acc, r| {
+        acc.saturating_add(r.scope_metrics.iter().fold(0usize, |s_acc, s| {
+            s_acc.saturating_add(s.metrics.iter().fold(0usize, |m_acc, m| {
+                let dp_count = match m.data {
+                    Some(Data::Gauge(ref g)) => g.data_points.len(),
+                    Some(Data::Sum(ref sum)) => sum.data_points.len(),
+                    Some(Data::Histogram(ref h)) => h.data_points.len(),
+                    Some(Data::ExponentialHistogram(ref eh)) => eh.data_points.len(),
+                    Some(Data::Summary(ref s)) => s.data_points.len(),
+                    None => 0,
+                };
+                m_acc.saturating_add(dp_count.max(1))
+            }))
+        }))
+    })
+}
+
 #[derive(Clone)]
 struct GrpcLogsService {
     tx: mpsc::Sender<SignalBatch>,
@@ -39,7 +94,15 @@ impl LogsService for GrpcLogsService {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         let req = request.into_inner();
-        match arrow_codec::decode_logs(&req) {
+        let batch_res = if estimate_logs_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
+            tokio::task::spawn_blocking(move || arrow_codec::decode_logs(&req))
+                .await
+                .map_err(|e| Status::internal(format!("codec task join error: {e}")))?
+        } else {
+            arrow_codec::decode_logs(&req)
+        };
+
+        match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
                     self.tx
@@ -68,7 +131,15 @@ impl TraceService for GrpcTraceService {
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
         let req = request.into_inner();
-        match arrow_codec::decode_traces(&req) {
+        let batch_res = if estimate_traces_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
+            tokio::task::spawn_blocking(move || arrow_codec::decode_traces(&req))
+                .await
+                .map_err(|e| Status::internal(format!("codec task join error: {e}")))?
+        } else {
+            arrow_codec::decode_traces(&req)
+        };
+
+        match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
                     self.tx
@@ -97,7 +168,15 @@ impl MetricsService for GrpcMetricsService {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         let req = request.into_inner();
-        match arrow_codec::decode_metrics(&req) {
+        let batch_res = if estimate_metrics_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
+            tokio::task::spawn_blocking(move || arrow_codec::decode_metrics(&req))
+                .await
+                .map_err(|e| Status::internal(format!("codec task join error: {e}")))?
+        } else {
+            arrow_codec::decode_metrics(&req)
+        };
+
+        match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
                     self.tx
@@ -130,6 +209,44 @@ fn decode_http_body<T: prost::Message + Default + serde::de::DeserializeOwned>(
     }
 }
 
+async fn decode_and_convert_http<T, F>(
+    headers: HeaderMap,
+    body: Bytes,
+    signal_name: &'static str,
+    decode_fn: F,
+) -> Result<RecordBatch, StatusCode>
+where
+    T: prost::Message + Default + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(&T) -> Result<RecordBatch, PipelineError> + Send + 'static,
+{
+    if body.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES {
+        tokio::task::spawn_blocking(move || {
+            let req: T = decode_http_body(&headers, body).map_err(|e| {
+                tracing::error!("{signal_name} HTTP decode error: {e}");
+                StatusCode::BAD_REQUEST
+            })?;
+            decode_fn(&req).map_err(|e| {
+                tracing::error!("{signal_name} arrow-codec error: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("{signal_name} spawn_blocking join error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    } else {
+        let req: T = decode_http_body(&headers, body).map_err(|e| {
+            tracing::error!("{signal_name} HTTP decode error: {e}");
+            StatusCode::BAD_REQUEST
+        })?;
+        decode_fn(&req).map_err(|e| {
+            tracing::error!("{signal_name} arrow-codec error: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+    }
+}
+
 #[derive(Clone)]
 #[allow(clippy::struct_field_names)]
 struct HttpState {
@@ -143,30 +260,25 @@ async fn handle_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let req: ExportLogsServiceRequest = decode_http_body(&headers, body).map_err(|e| {
-        tracing::error!("Logs HTTP decode error: {e}");
-        StatusCode::BAD_REQUEST
-    })?;
+    let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+        headers,
+        body,
+        "Logs",
+        arrow_codec::decode_logs,
+    )
+    .await?;
 
-    match arrow_codec::decode_logs(&req) {
-        Ok(batch) => {
-            if batch.num_rows() > 0 {
-                state
-                    .logs_tx
-                    .send(SignalBatch::Logs(batch))
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            }
-            Ok((
-                StatusCode::OK,
-                serde_json::json!({ "partial_success": null }).to_string(),
-            ))
-        }
-        Err(e) => {
-            tracing::error!("Logs arrow-codec error: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    if batch.num_rows() > 0 {
+        state
+            .logs_tx
+            .send(SignalBatch::Logs(batch))
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "partial_success": null }).to_string(),
+    ))
 }
 
 async fn handle_traces(
@@ -174,30 +286,25 @@ async fn handle_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let req: ExportTraceServiceRequest = decode_http_body(&headers, body).map_err(|e| {
-        tracing::error!("Traces HTTP decode error: {e}");
-        StatusCode::BAD_REQUEST
-    })?;
+    let batch = decode_and_convert_http::<ExportTraceServiceRequest, _>(
+        headers,
+        body,
+        "Traces",
+        arrow_codec::decode_traces,
+    )
+    .await?;
 
-    match arrow_codec::decode_traces(&req) {
-        Ok(batch) => {
-            if batch.num_rows() > 0 {
-                state
-                    .traces_tx
-                    .send(SignalBatch::Traces(batch))
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            }
-            Ok((
-                StatusCode::OK,
-                serde_json::json!({ "partial_success": null }).to_string(),
-            ))
-        }
-        Err(e) => {
-            tracing::error!("Traces arrow-codec error: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    if batch.num_rows() > 0 {
+        state
+            .traces_tx
+            .send(SignalBatch::Traces(batch))
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "partial_success": null }).to_string(),
+    ))
 }
 
 async fn handle_metrics(
@@ -205,30 +312,25 @@ async fn handle_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let req: ExportMetricsServiceRequest = decode_http_body(&headers, body).map_err(|e| {
-        tracing::error!("Metrics HTTP decode error: {e}");
-        StatusCode::BAD_REQUEST
-    })?;
+    let batch = decode_and_convert_http::<ExportMetricsServiceRequest, _>(
+        headers,
+        body,
+        "Metrics",
+        arrow_codec::decode_metrics,
+    )
+    .await?;
 
-    match arrow_codec::decode_metrics(&req) {
-        Ok(batch) => {
-            if batch.num_rows() > 0 {
-                state
-                    .metrics_tx
-                    .send(SignalBatch::Metrics(batch))
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            }
-            Ok((
-                StatusCode::OK,
-                serde_json::json!({ "partial_success": null }).to_string(),
-            ))
-        }
-        Err(e) => {
-            tracing::error!("Metrics arrow-codec error: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    if batch.num_rows() > 0 {
+        state
+            .metrics_tx
+            .send(SignalBatch::Metrics(batch))
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     }
+    Ok((
+        StatusCode::OK,
+        serde_json::json!({ "partial_success": null }).to_string(),
+    ))
 }
 
 /// OTLP Receiver source supporting gRPC and HTTP/JSON endpoints.
@@ -278,7 +380,9 @@ impl Source for OtlpReceiverSource {
 
         let mut shutdown_rx_grpc = self.shutdown_rx.clone();
         let grpc_shutdown = async move {
-            let _ = shutdown_rx_grpc.changed().await;
+            let _ = shutdown_rx_grpc
+                .wait_for(|shutting_down| *shutting_down)
+                .await;
             tracing::info!("gRPC server shutting down gracefully");
         };
 
@@ -306,7 +410,9 @@ impl Source for OtlpReceiverSource {
 
         let mut shutdown_rx_http = self.shutdown_rx.clone();
         let http_shutdown = async move {
-            let _ = shutdown_rx_http.changed().await;
+            let _ = shutdown_rx_http
+                .wait_for(|shutting_down| *shutting_down)
+                .await;
             tracing::info!("HTTP server shutting down gracefully");
         };
 
@@ -647,5 +753,476 @@ mod tests {
             matches!(msg.unwrap(), SignalBatch::Traces(_)),
             "Signal must be Traces variant"
         );
+    }
+
+    #[test]
+    fn test_estimate_record_counts_sums_across_resources_and_scopes() {
+        use opentelemetry_proto::tonic::metrics::v1::{Metric, ResourceMetrics, ScopeMetrics};
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        // Construct ExportLogsServiceRequest with 2 resources x 2 scopes x 200 records = 800 records
+        let logs_req = ExportLogsServiceRequest {
+            resource_logs: vec![
+                ResourceLogs {
+                    scope_logs: vec![
+                        ScopeLogs {
+                            log_records: vec![LogRecord::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeLogs {
+                            log_records: vec![LogRecord::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ResourceLogs {
+                    scope_logs: vec![
+                        ScopeLogs {
+                            log_records: vec![LogRecord::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeLogs {
+                            log_records: vec![LogRecord::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(estimate_logs_records(&logs_req), 800);
+        assert!(estimate_logs_records(&logs_req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD);
+
+        // Construct ExportTraceServiceRequest with 2 resources x 2 scopes x 200 records = 800 records
+        let traces_req = ExportTraceServiceRequest {
+            resource_spans: vec![
+                ResourceSpans {
+                    scope_spans: vec![
+                        ScopeSpans {
+                            spans: vec![Span::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeSpans {
+                            spans: vec![Span::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ResourceSpans {
+                    scope_spans: vec![
+                        ScopeSpans {
+                            spans: vec![Span::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeSpans {
+                            spans: vec![Span::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(estimate_traces_records(&traces_req), 800);
+        assert!(estimate_traces_records(&traces_req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD);
+
+        // Construct ExportMetricsServiceRequest with 2 resources x 2 scopes x 200 records = 800 records
+        let metrics_req = ExportMetricsServiceRequest {
+            resource_metrics: vec![
+                ResourceMetrics {
+                    scope_metrics: vec![
+                        ScopeMetrics {
+                            metrics: vec![Metric::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeMetrics {
+                            metrics: vec![Metric::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                ResourceMetrics {
+                    scope_metrics: vec![
+                        ScopeMetrics {
+                            metrics: vec![Metric::default(); 200],
+                            ..Default::default()
+                        },
+                        ScopeMetrics {
+                            metrics: vec![Metric::default(); 200],
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        assert_eq!(estimate_metrics_records(&metrics_req), 800);
+        assert!(estimate_metrics_records(&metrics_req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn test_http_logs_over_64kib_decodes_via_spawn_blocking() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use prost::Message;
+
+        let (logs_tx, mut logs_rx) = mpsc::channel(10);
+        let (traces_tx, _traces_rx) = mpsc::channel(10);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(10);
+
+        let state = HttpState {
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+        };
+
+        // Construct a protobuf ExportLogsServiceRequest body > 65_536 bytes (64 KiB)
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("x".repeat(70_000))),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let mut body_bytes = Vec::new();
+        req.encode(&mut body_bytes).unwrap();
+        assert!(
+            body_bytes.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES,
+            "Payload must be larger than threshold: {} <= {}",
+            body_bytes.len(),
+            HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+
+        let res = handle_logs(State(state), headers, Bytes::from(body_bytes)).await;
+        assert!(res.is_ok(), "handle_logs should succeed for >64KiB payload");
+        let resp = res.unwrap().into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = logs_rx.try_recv();
+        assert!(received.is_ok(), "Expected batch in logs channel");
+        if let SignalBatch::Logs(batch) = received.unwrap() {
+            assert_eq!(batch.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Logs variant");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grpc_logs_over_threshold_decodes_via_spawn_blocking() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let svc = GrpcLogsService { tx };
+
+        let req = Request::new(ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![
+                        LogRecord {
+                            time_unix_nano: 1_000_000_000,
+                            ..Default::default()
+                        };
+                        600
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        let resp = svc.export(req).await;
+        assert!(resp.is_ok(), "Large logs export should succeed");
+
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Expected batch in channel");
+        if let SignalBatch::Logs(batch) = msg.unwrap() {
+            assert_eq!(batch.num_rows(), 600);
+        } else {
+            panic!("Expected SignalBatch::Logs");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grpc_traces_over_threshold_decodes_via_spawn_blocking() {
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let svc = GrpcTraceService { tx };
+
+        let req = Request::new(ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![
+                        Span {
+                            start_time_unix_nano: 1_000_000_000,
+                            end_time_unix_nano: 2_000_000_000,
+                            ..Default::default()
+                        };
+                        600
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        let resp = svc.export(req).await;
+        assert!(resp.is_ok(), "Large traces export should succeed");
+
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Expected batch in channel");
+        if let SignalBatch::Traces(batch) = msg.unwrap() {
+            assert_eq!(batch.num_rows(), 600);
+        } else {
+            panic!("Expected SignalBatch::Traces");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grpc_metrics_over_threshold_decodes_via_spawn_blocking() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+        };
+
+        let (tx, mut rx) = mpsc::channel(10);
+        let svc = GrpcMetricsService { tx };
+
+        let req = Request::new(ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: (0..600)
+                        .map(|i| Metric {
+                            name: format!("metric_{i}"),
+                            data: Some(metric::Data::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: 1_000_000_000,
+                                    value: Some(
+                                        opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                                            1.0,
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+
+        let resp = svc.export(req).await;
+        assert!(resp.is_ok(), "Large metrics export should succeed");
+
+        let msg = rx.try_recv();
+        assert!(msg.is_ok(), "Expected batch in channel");
+        if let SignalBatch::Metrics(batch) = msg.unwrap() {
+            assert_eq!(batch.num_rows(), 600);
+        } else {
+            panic!("Expected SignalBatch::Metrics");
+        }
+
+        // Also verify a single Metric container holding 600 data points is estimated as 600 records
+        let single_metric_many_dps = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "single_gauge".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                NumberDataPoint {
+                                    time_unix_nano: 1_000_000_000,
+                                    ..Default::default()
+                                };
+                                600
+                            ],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        assert_eq!(estimate_metrics_records(&single_metric_many_dps), 600);
+    }
+
+    #[tokio::test]
+    async fn test_http_traces_over_64kib_decodes_via_spawn_blocking() {
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use prost::Message;
+
+        let (logs_tx, _logs_rx) = mpsc::channel(10);
+        let (traces_tx, mut traces_rx) = mpsc::channel(10);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(10);
+
+        let state = HttpState {
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+        };
+
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        name: "s".repeat(70_000),
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 2_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let mut body_bytes = Vec::new();
+        req.encode(&mut body_bytes).unwrap();
+        assert!(body_bytes.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+
+        let res = handle_traces(State(state), headers, Bytes::from(body_bytes)).await;
+        assert!(res.is_ok());
+        let resp = res.unwrap().into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = traces_rx.try_recv();
+        assert!(received.is_ok());
+        if let SignalBatch::Traces(batch) = received.unwrap() {
+            assert_eq!(batch.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Traces");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_metrics_over_64kib_decodes_via_spawn_blocking() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+        };
+        use prost::Message;
+
+        let (logs_tx, _logs_rx) = mpsc::channel(10);
+        let (traces_tx, _traces_rx) = mpsc::channel(10);
+        let (metrics_tx, mut metrics_rx) = mpsc::channel(10);
+
+        let state = HttpState {
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+        };
+
+        let req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".repeat(70_000),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_000_000_000,
+                                value: Some(
+                                    opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                                        1.0,
+                                    ),
+                                ),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let mut body_bytes = Vec::new();
+        req.encode(&mut body_bytes).unwrap();
+        assert!(body_bytes.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+
+        let res = handle_metrics(State(state), headers, Bytes::from(body_bytes)).await;
+        assert!(res.is_ok());
+        let resp = res.unwrap().into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = metrics_rx.try_recv();
+        assert!(received.is_ok());
+        if let SignalBatch::Metrics(batch) = received.unwrap() {
+            assert_eq!(batch.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Metrics");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_logs_under_threshold_decodes_inline() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use prost::Message;
+
+        let (logs_tx, mut logs_rx) = mpsc::channel(10);
+        let (traces_tx, _traces_rx) = mpsc::channel(10);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(10);
+
+        let state = HttpState {
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+        };
+
+        let req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("small".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let mut body_bytes = Vec::new();
+        req.encode(&mut body_bytes).unwrap();
+        assert!(body_bytes.len() <= HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+
+        let res = handle_logs(State(state), headers, Bytes::from(body_bytes)).await;
+        assert!(res.is_ok());
+        let resp = res.unwrap().into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = logs_rx.try_recv();
+        assert!(received.is_ok());
+        if let SignalBatch::Logs(batch) = received.unwrap() {
+            assert_eq!(batch.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Logs");
+        }
     }
 }

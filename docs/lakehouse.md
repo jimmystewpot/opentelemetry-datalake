@@ -15,6 +15,10 @@ The keywords **MUST**, **MUST NOT**, **REQUIRED**, **SHALL**, **SHALL NOT**, **S
 
 1. **ACID Commit Isolation:** Every data write block compiled from incoming OTLP streams **MUST** be committed to the target lakehouse table using an isolated transaction. Partial or uncommitted Parquet files **MUST NOT** be visible to active lakehouse readers.
 2. **Idempotency and Retries:** In the event of a network or metadata commit timeout, the system **SHOULD** retry the transaction. To prevent data duplication during distributed pipeline retries, the sink engine **MUST** track batch delivery tokens inside transaction identifiers if supported by the underlying storage protocol (e.g., Iceberg snapshot properties).
+   * **Iceberg Snapshot Delivery Tokens:** `IcebergSink` records the `SinkBuffer` lease sequence range in each committed snapshot's summary properties via `FastAppendAction::set_snapshot_properties`:
+     * Property key: `datalake.lease.logs`, `datalake.lease.metrics`, or `datalake.lease.traces` (`datalake.lease.<signal>`).
+     * Property value: `"{first_seq}:{last_seq}"` (parsers also accept `"{first_seq}-{last_seq}"`).
+   * Before writing Parquet files on a retry attempt—and after reloading table metadata if a catalog commit returns an error—`IcebergSink` inspects the `datalake.lease.<signal>` properties across the table's snapshot history. When the lease's `[first_seq, last_seq]` interval is already covered by committed snapshot intervals, the sink acknowledges the lease (`lease.ack()`) immediately without writing duplicate Parquet files or committing a second snapshot.
 
 
 ## 3. Schema Evolution Modes
@@ -134,18 +138,22 @@ $$\text{Sort Order} = (\text{ServiceName}, \text{SeverityText}, \text{toDateTime
 
 ## 7. Batching & Compaction Optimization
 
-To minimize metadata overhead and avoid the "small files problem" common in distributed lakehouse environments, the sink engine **MUST** implement configurable batching logic.
+To minimize metadata overhead and avoid the "small files problem" common in distributed lakehouse environments, the sink engine **MUST** implement configurable batching and lease buffering via `[iceberg.buffer]` (see [Buffer Specification](buffer.md)).
 
-```yaml
-# Configuration for commit batching
-batching:
-  max_batch_size_bytes: 134217728 # Default: 128MB
-  max_batch_interval_sec: 60      # Default: 60 seconds
+```toml
+# Canonical unified buffer configuration for Iceberg
+[iceberg.buffer]
+mode = "memory"                 # "memory" (default) or "disk"
+max_buffer_bytes = 536870912    # Default: 512 MiB
+max_batch_size_bytes = 134217728 # Default for Iceberg: 128 MiB
+max_batch_interval_sec = 60     # Default for Iceberg: 60 seconds
 ```
+
+> **Legacy Compatibility:** `[iceberg.batching]` (`max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`) remains accepted as a deprecated alias and is mapped onto `[iceberg.buffer]` flush triggers at startup. Specifying both `[iceberg.buffer]` and `[iceberg.batching]` is rejected by startup validation.
 
 ### 7.1 Buffer Integration
 
-The sink engine batching logic **SHOULD** be aligned with the underlying [Buffer Specification](buffer.md) to ensure that data is committed to the lakehouse in sync with the pipeline's buffering and flushing cycle.
+`IcebergSink` consumes leases directly from [`SinkBuffer`](buffer.md). Multi-batch concatenation (`arrow::compute::concat_batches`), schema-mode projection (`fixed` / `auto` / `catalog`), per-signal lexicographical sorting, and timestamp partitioning run inside `Lease::prepare` on the Tokio blocking pool before Parquet files are written and committed. If a Parquet write or catalog commit fails transiently, the lease is negatively acknowledged (`lease.nack(FailureClass::Transient)`) and retained in `SinkBuffer` for exponential-backoff retry.
 
 ### 7.2 Format-Specific Batching Heuristics
 

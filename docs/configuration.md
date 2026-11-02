@@ -54,15 +54,20 @@ Configures the Apache Iceberg sink. This sink converts OTLP data into Apache Arr
 | `schema_mode` | String | `"fixed"` | How to handle schema validation. Options: `fixed`, `auto`, `catalog`. |
 | `partition_granularity`| String | `"hourly"` | Time-based partitioning. Options: `hourly`, `daily`. |
 | `log_dropped_fields` | Boolean | `true` | Whether to log warnings when fields are dropped due to schema mismatch. |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy commit-batching alias for `[iceberg.buffer]`. Cannot be combined with `[iceberg.buffer]`. |
 | `dry_run` | Boolean | `false` | If true, simulates commits without talking to a live catalog. |
 | `properties` | Map | `{}` | Additional catalog-specific properties (e.g., S3 endpoint, credentials). |
 
-### Iceberg Batching (`[iceberg.batching]`)
+### Iceberg Buffering (`[iceberg.buffer]` and legacy `[iceberg.batching]`)
+
+Prefer `[iceberg.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). Legacy `[iceberg.batching]` remains supported as a deprecated alias, but specifying both `[iceberg.buffer]` and `[iceberg.batching]` is rejected at startup:
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128MB). |
+| `max_batch_size_bytes` | Integer | `134217728` | Max size in bytes before triggering a flush (default 128 MiB when neither `[iceberg.buffer]` nor `[iceberg.batching]` overrides it). |
 | `max_batch_interval_sec`| Integer | `60` | Max time in seconds between flushes. |
+| `max_batch_records` | Integer | `null` | Optional maximum accumulated records before triggering a flush. |
 
 ---
 
@@ -76,11 +81,21 @@ Configures the Kafka sink.
 | `logs_topic` | String | `"telemetry-logs"` | Kafka topic for logs. |
 | `traces_topic` | String | `"telemetry-traces"`| Kafka topic for traces. |
 | `metrics_topic` | String | `"telemetry-metrics"`| Kafka topic for metrics. |
-| `logs_format` | String | `"json"` | Serialization format for logs (`json` or `protobuf`). |
-| `traces_format` | String | `"json"` | Serialization format for traces (`json` or `protobuf`). |
-| `metrics_format` | String | `"json"` | Serialization format for metrics (`json` or `protobuf`). |
+| `logs_format` | String | `"json"` | Serialization format for logs (`"json"` or `"ipc"`). |
+| `traces_format` | String | `"json"` | Serialization format for traces (`"json"` or `"ipc"`). |
+| `metrics_format` | String | `"json"` | Serialization format for metrics (`"json"` or `"ipc"`). |
+| `logs_partition_key` | String | `null` | Optional column name used to partition and key log batches. |
+| `traces_partition_key` | String | `null` | Optional column name used to partition and key trace batches. |
+| `metrics_partition_key` | String | `null` | Optional column name used to partition and key metric batches. |
+| `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `flush_timeout_ms` | Integer | `10000` | Maximum time in milliseconds to wait for in-flight messages in `librdkafka` to flush during graceful shutdown (must be > 0). |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy batching alias for `[kafka.buffer]`. Cannot be combined with `[kafka.buffer]`. |
 | `options` | Map | `{}` | Additional `librdkafka` configuration options. |
+
+### Kafka Buffering (`[kafka.buffer]` and legacy `[kafka.batching]`)
+
+When neither `[kafka.buffer]` nor `[kafka.batching]` is specified, `KafkaSink` defaults to [`BufferConfig::passthrough()`](buffer.md) (`max_batch_records = 1`, `max_batch_interval_sec = 0`) so each incoming batch is leased, sorted, partition-sliced, and serialized via `Lease::prepare` on the Tokio blocking pool without artificial coalescing latency. Configure `[kafka.buffer]` to enable multi-batch coalescing, NVMe `disk` buffering, retry backoff, or dead-letter quarantine. Specifying both `[kafka.buffer]` and `[kafka.batching]` is rejected at startup.
 
 ---
 
@@ -101,7 +116,20 @@ Configures the StarRocks Stream Load sink. See [`docs/starrocks.md`](starrocks.m
 | `request_timeout_secs` | Integer | `600` | HTTP read/request timeout in seconds. |
 | `max_retries` | Integer | `3` | SDK-level retries per request before backpressure. |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds. |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `overflow_policy`, `max_attempts`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy micro-batch alias for `[starrocks.buffer]`. Cannot be combined with `[starrocks.buffer]`. |
+| `order_by` | Map | `null` | Optional chronological pre-sorting columns per signal. |
 | `tls` | Map | `{}` | Standard TLS configuration (`ca_cert_path`, `verification`). |
+
+### StarRocks Buffering (`[starrocks.buffer]` and legacy `[starrocks.batching]`)
+
+Prefer `[starrocks.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). Legacy `[starrocks.batching]` remains supported as a deprecated alias, but specifying both `[starrocks.buffer]` and `[starrocks.batching]` is rejected at startup:
+
+| Field | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `max_batch_size_bytes` | Integer | `52428800` | Max accumulated Arrow byte size per lease before flushing (50 MiB in `[starrocks.batching]`; 64 MiB default in `[starrocks.buffer]`). |
+| `max_batch_interval_sec` | Integer | `30` | Max time in seconds between flushes. |
+| `max_batch_records` | Integer | `null` | Optional max accumulated records before flushing. |
 
 ### StarRocks Table Mapping (`[starrocks.table_mapping]`)
 
@@ -149,7 +177,8 @@ Configures the Elasticsearch & OpenSearch data streams sink. See [`docs/elastics
 | `max_retries` | Integer | `3` | Maximum SDK-level retries for transient HTTP errors (429/503/network). |
 | `retry_interval_secs` | Integer | `1` | Delay between retries in seconds (overridden dynamically by `Retry-After`). |
 | `validate_on_startup` | Boolean | `true` | Validate cluster health and data stream index templates during startup. |
-| `batching` | Map | `null` | Optional micro-batch accumulation settings (see below). |
+| `buffer` | Map | `null` | Unified [`SinkBuffer`](buffer.md) configuration (`mode`, `max_buffer_bytes`, `max_batch_size_bytes`, `max_batch_interval_sec`, `max_batch_records`, `max_inflight_leases`, `dead_letter_path`, etc.). |
+| `batching` | Map | `null` | Deprecated legacy micro-batch alias for `[elasticsearch.buffer]`. Cannot be combined with `[elasticsearch.buffer]`. |
 | `order_by` | Map | `null` | Optional pre-sorting columns per signal (see below). |
 
 ### Elasticsearch Data Streams (`[elasticsearch.data_streams]`)
@@ -169,11 +198,13 @@ traces  = "traces-otel-default"
 * **Bearer Token**: `{ type = "bearer", token = "<jwt_or_oauth_token>" }`
 * **AWS SigV4**: `{ type = "aws_sigv4", region = "us-east-1", service = "es" }` (Requires `--features aws`).
 
-### Elasticsearch Batching (`[elasticsearch.batching]`)
+### Elasticsearch Buffering (`[elasticsearch.buffer]` and legacy `[elasticsearch.batching]`)
+
+Prefer `[elasticsearch.buffer]` (see [`docs/buffer.md`](buffer.md) for all buffer, retry, disk-spill, and dead-letter fields). When `[elasticsearch.buffer]` is not explicitly set, `max_inflight_leases` defaults to `max_concurrent_requests` (`8`). Legacy `[elasticsearch.batching]` remains supported as a deprecated alias, but specifying both `[elasticsearch.buffer]` and `[elasticsearch.batching]` is rejected at startup:
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `max_batch_size_bytes` | Integer | `10485760` | Max accumulated Arrow byte size before flushing (10 MiB). |
+| `max_batch_size_bytes` | Integer | `10485760` | Max accumulated Arrow byte size per lease before flushing (10 MiB in `[elasticsearch.batching]`; 64 MiB default in `[elasticsearch.buffer]`). |
 | `max_batch_records` | Integer | `50000` | Max accumulated records before flushing. |
 | `max_batch_interval_sec` | Integer | `10` | Max time in seconds between flushes. |
 
@@ -184,7 +215,7 @@ All sinks (Iceberg, Kafka, StarRocks, and Elasticsearch) support in-memory chron
 ```toml
 [elasticsearch.order_by]
 logs    = ["timestamp ASC", "service_name ASC NULLS LAST"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces  = ["timestamp ASC"]
 on_missing_column = "skip" # "skip" (default) or "error"
 ```
@@ -269,7 +300,7 @@ partition_granularity = "hourly"
 "s3.region" = "us-east-1"
 "s3.path.style.access" = "true"
 
-[iceberg.batching]
+[iceberg.buffer]
 max_batch_size_bytes = 67108864
 max_batch_interval_sec = 30
 ```
@@ -303,13 +334,13 @@ api_key = "VnVhQ2ZHY0JDZGJrUW0tZTVhT3g6dWkybHAyYXhUTm1zeW5rNVliY1RtZw=="
 ca_cert_path = "/etc/ssl/certs/es-ca.crt"
 verification = "full"
 
-[elasticsearch.batching]
+[elasticsearch.buffer]
 max_batch_size_bytes = 10485760 # 10 MiB
 max_batch_records = 50000
 max_batch_interval_sec = 5
 
 [elasticsearch.order_by]
 logs = ["timestamp ASC", "service_name ASC"]
-metrics = ["timestamp ASC", "metric_name ASC"]
+metrics = ["timestamp ASC", "name ASC"]
 traces = ["timestamp ASC"]
 ```
