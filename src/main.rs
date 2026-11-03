@@ -67,12 +67,36 @@ struct Cli {
     dry_run: Option<bool>,
 }
 
+/// Maps CLI `-v` / `-vv` count to a tracing filter directive without mutating process env vars.
+const fn cli_verbosity_filter(verbose: u8) -> Option<&'static str> {
+    match verbose {
+        0 => None,
+        1 => Some("debug"),
+        _ => Some("trace"),
+    }
+}
+
 /// Validates that required sink configuration constraints are satisfied.
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     config
         .pipeline
         .validate()
         .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+
+    if config.pipeline.telemetry.enabled
+        && pipeline_core::telemetry::is_self_referential_endpoint(
+            &config.pipeline.telemetry.otlp_endpoint,
+            config.server.grpc_addr,
+            config.server.http_addr,
+        )
+    {
+        anyhow::bail!(
+            "Configuration validation failed: telemetry.otlp_endpoint ({}) resolves to this receiver's own ingestion address (grpc_addr={}, http_addr={}), which would cause a self-referential OTLP feedback loop",
+            config.pipeline.telemetry.otlp_endpoint,
+            config.server.grpc_addr,
+            config.server.http_addr
+        );
+    }
 
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
@@ -602,19 +626,7 @@ fn attach_admin_probe_routes(
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
-
-    // Set logging verbosity based on the flag
-    if cli_args.verbose > 0 {
-        let level = match cli_args.verbose {
-            1 => "debug",
-            _ => "trace",
-        };
-        // SAFETY: This is executed at the very beginning of the program's main function
-        // before any other threads are spawned, ensuring no concurrent environment mutation occurs.
-        unsafe {
-            std::env::set_var("RUST_LOG", level);
-        }
-    }
+    let verbosity_override = cli_verbosity_filter(cli_args.verbose);
 
     // Load configuration using Figment with fallback defaults
     let mut figment = Figment::new().merge(Toml::string(
@@ -664,7 +676,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry
-    let _telemetry = pipeline_core::telemetry::init_telemetry(&config.pipeline.telemetry)?;
+    let _telemetry = pipeline_core::telemetry::init_telemetry_with_verbosity(
+        &config.pipeline.telemetry,
+        verbosity_override,
+    )?;
 
     tracing::info!("Starting opentelemetry-datalake service");
 
@@ -3107,5 +3122,135 @@ mod tests {
         let err = validate_config(&cfg_conflict).unwrap_err();
         assert!(err.to_string().contains("[kafka.buffer]"), "Got: {err}");
         assert!(err.to_string().contains("[kafka.batching]"), "Got: {err}");
+    }
+
+    #[test]
+    fn test_cli_verbosity_filter_maps_levels_without_env_mutation() {
+        assert_eq!(cli_verbosity_filter(0), None);
+        assert_eq!(cli_verbosity_filter(1), Some("debug"));
+        assert_eq!(cli_verbosity_filter(2), Some("trace"));
+        assert_eq!(cli_verbosity_filter(3), Some("trace"));
+    }
+
+    #[test]
+    fn test_validate_config_allows_default_disabled_telemetry_on_4317() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(!cfg.pipeline.telemetry.enabled);
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "Default disabled telemetry must pass validation even when grpc_addr is 4317"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_self_referential_telemetry_on_grpc_port() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "0.0.0.0:4317"
+        http_addr = "0.0.0.0:4318"
+
+        [telemetry]
+        enabled = true
+        otlp_endpoint = "http://localhost:4317"
+        service_name = "otel-datalake"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("self-referential"),
+            "Expected self-referential error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_self_referential_telemetry_on_http_port() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+
+        [telemetry]
+        enabled = true
+        otlp_endpoint = "http://127.0.0.1:4318"
+        service_name = "otel-datalake"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("self-referential"),
+            "Expected self-referential error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_config_allows_enabled_telemetry_with_distinct_collector() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "0.0.0.0:4317"
+        http_addr = "0.0.0.0:4318"
+
+        [telemetry]
+        enabled = true
+        otlp_endpoint = "http://otel-collector.monitoring:4317"
+        service_name = "otel-datalake"
+
+        [kafka]
+        brokers = "localhost:9092"
+        logs_topic = "logs"
+        traces_topic = "traces"
+        metrics_topic = "metrics"
+        logs_format = "json"
+        traces_format = "json"
+        metrics_format = "json"
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(
+            validate_config(&cfg).is_ok(),
+            "Distinct collector host must pass validation when telemetry.enabled = true"
+        );
     }
 }
