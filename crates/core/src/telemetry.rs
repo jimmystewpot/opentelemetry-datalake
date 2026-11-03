@@ -200,12 +200,8 @@ pub fn build_env_filter(verbosity_override: Option<&str>) -> Result<EnvFilter, P
     let mut spec = base;
     for &(target, directive) in SUPPRESSED_TRANSPORT_TARGETS {
         let has_target = spec.split(',').map(str::trim).any(|part| {
-            part.strip_prefix(target).is_some_and(|rest| {
-                rest.is_empty()
-                    || rest.starts_with('=')
-                    || rest.starts_with("::")
-                    || rest.starts_with('[')
-            })
+            part.strip_prefix(target)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
         });
         if !has_target {
             spec.push(',');
@@ -275,7 +271,12 @@ fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     }
 }
 
-/// Returns `true` if `otlp_endpoint` resolves to a loopback or wildcard host
+/// Returns `true` if `ip` is assigned to a network interface on the local host/container.
+fn is_local_interface_ip(ip: IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
+/// Returns `true` if `otlp_endpoint` resolves to a loopback, wildcard, or local-interface host
 /// targeting the same port as the local gRPC or HTTP OTLP ingestion listeners.
 #[must_use]
 pub fn is_self_referential_endpoint(
@@ -299,7 +300,11 @@ pub fn is_self_referential_endpoint(
         let listen_is_local_or_wildcard = listen_ip.is_loopback() || listen_ip.is_unspecified();
 
         (host_is_local && listen_is_local_or_wildcard)
-            || parsed_ip.is_some_and(|ip| ip.is_unspecified() || ip == listen_ip)
+            || parsed_ip.is_some_and(|ip| {
+                ip.is_unspecified()
+                    || ip == listen_ip
+                    || (listen_ip.is_unspecified() && is_local_interface_ip(ip))
+            })
     })
 }
 
@@ -501,6 +506,20 @@ mod tests {
     }
 
     #[test]
+    fn test_build_env_filter_retains_root_suppression_when_submodule_overridden() {
+        let filter = build_env_filter(Some("debug,h2::codec=trace")).unwrap();
+        let rendered = filter.to_string();
+        assert!(
+            rendered.contains("h2::codec=trace"),
+            "Submodule directive h2::codec=trace must be preserved: {rendered}"
+        );
+        assert!(
+            rendered.contains("h2=warn"),
+            "Root h2=warn must still be appended when only a submodule is overridden: {rendered}"
+        );
+    }
+
+    #[test]
     fn test_build_env_filter_rejects_invalid_directive_with_configuration_error() {
         let err = build_env_filter(Some("invalid===directive"))
             .expect_err("malformed filter directive must return error");
@@ -556,6 +575,19 @@ mod tests {
             http
         ));
         assert!(is_self_referential_endpoint("localhost:4317", grpc, http));
+
+        // If a non-loopback local interface IP exists on this host, a wildcard listener
+        // on the same port must detect it as self-referential.
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0")
+            && sock.connect("198.51.100.1:80").is_ok()
+            && let Ok(local_addr) = sock.local_addr()
+        {
+            let endpoint = format!("http://{}:4317", local_addr.ip());
+            assert!(
+                is_self_referential_endpoint(&endpoint, grpc, http),
+                "Wildcard listener must detect local interface IP {endpoint} as self-referential"
+            );
+        }
     }
 
     #[test]
