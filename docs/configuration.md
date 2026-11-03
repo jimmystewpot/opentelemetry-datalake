@@ -262,13 +262,16 @@ Configures the Apache Parquet streaming sink. This sink streams telemetry signal
 
 ## Telemetry Section (`[telemetry]`)
 
-Configures how `opentelemetry-datalake` exports its own internal telemetry (self-monitoring).
+Configures how `opentelemetry-datalake` exports its own internal telemetry (self-monitoring). Self-telemetry OTLP export is **opt-in** (`enabled = false` by default) to prevent self-referential OTLP feedback loops when the pipeline binds to `:4317` / `:4318` without an external collector. When `enabled = false`, structured `tracing` logs are still emitted to `stdout`.
 
 | Field | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `otlp_endpoint` | String | `"http://localhost:4317"` | OTLP gRPC endpoint for internal telemetry. |
-| `service_name` | String | `"otel-datalake"` | Service name for internal telemetry. |
-| `region` | String | `null` | Cloud region tag to attach to internal telemetry. |
+| `enabled` | Boolean | `false` | Enables OTLP gRPC export of internal traces and metrics. Must point to a collector distinct from `[server].grpc_addr` and `[server].http_addr`. |
+| `otlp_endpoint` | String | `"http://localhost:4317"` | OTLP gRPC endpoint for internal telemetry (used when `enabled = true`). |
+| `service_name` | String | `"otel-datalake"` | Service name for internal telemetry (`service.name` resource attribute). |
+| `region` | String | `null` | Cloud region tag to attach to internal telemetry (`cloud.region` resource attribute; falls back to `REGION` env var). |
+
+> **Loopback Safeguard**: When `telemetry.enabled = true`, startup validation (`--check` and normal boot) rejects any `otlp_endpoint` whose host (`localhost`, `127.0.0.1`, `[::1]`, `0.0.0.0`, or listener IP) and port match `[server].grpc_addr` or `[server].http_addr`.
 
 ---
 
@@ -280,6 +283,7 @@ grpc_addr = "0.0.0.0:4317"
 http_addr = "0.0.0.0:4318"
 
 [telemetry]
+enabled = true
 otlp_endpoint = "http://jaeger:4317"
 service_name = "otel-datalake-prod"
 
@@ -313,7 +317,8 @@ grpc_addr = "0.0.0.0:4317"
 http_addr = "0.0.0.0:4318"
 
 [telemetry]
-otlp_endpoint = "http://localhost:4317"
+enabled = true
+otlp_endpoint = "http://otel-collector:4317"
 service_name = "otel-datalake"
 
 [elasticsearch]
