@@ -41,13 +41,15 @@ impl PipelineConfig {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError::Configuration` if `channel_capacity` is zero.
+    /// Returns `PipelineError::Configuration` if `channel_capacity` is zero or if
+    /// `telemetry` configuration is invalid when `telemetry.enabled` is `true`.
     pub fn validate(&self) -> Result<(), PipelineError> {
         if self.channel_capacity == 0 {
             return Err(PipelineError::Configuration(Box::new(
                 figment::Error::from("channel_capacity must be >= 1"),
             )));
         }
+        self.telemetry.validate()?;
         Ok(())
     }
 }
@@ -265,5 +267,65 @@ mod tests {
             cfg.validate(),
             Err(PipelineError::Configuration(_))
         ));
+    }
+
+    #[test]
+    fn test_pipeline_config_telemetry_disabled_by_default() {
+        let cfg =
+            PipelineConfig::load("/tmp/nonexistent-otel-datalake-telemetry-default.toml").unwrap();
+        assert!(!cfg.telemetry.enabled);
+        assert_eq!(cfg.telemetry.otlp_endpoint, "http://localhost:4317");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_pipeline_config_rejects_empty_endpoint_when_telemetry_enabled() {
+        let toml_str = r#"
+            [telemetry]
+            enabled = true
+            otlp_endpoint = "   "
+            service_name = "otel-datalake"
+        "#;
+        let cfg: PipelineConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_config_rejects_malformed_endpoint_when_telemetry_enabled() {
+        let toml_str = r#"
+            [telemetry]
+            enabled = true
+            otlp_endpoint = "http://"
+            service_name = "otel-datalake"
+        "#;
+        let cfg: PipelineConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_config_allows_empty_endpoint_when_telemetry_disabled() {
+        let toml_str = r#"
+            [telemetry]
+            enabled = false
+            otlp_endpoint = ""
+            service_name = "otel-datalake"
+        "#;
+        let cfg: PipelineConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }

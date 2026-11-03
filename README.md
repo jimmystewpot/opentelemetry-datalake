@@ -96,9 +96,10 @@ metrics_format = "json"
 "compression.codec" = "snappy"
 
 [telemetry]
-endpoint = "http://127.0.0.1:4317"
+enabled = false # Set to true when exporting internal telemetry to an external OTLP collector
+otlp_endpoint = "http://otel-collector:4317"
 service_name = "opentelemetry-datalake"
-cloud_region = "us-east-1"
+region = "us-east-1"
 ```
 
 Or to use the StarRocks sink:
@@ -158,7 +159,7 @@ traces = ["timestamp ASC"]
 ### Environment Overrides:
 Any configuration value can be overridden using the `OTEL_DATALAKE_` environment variable prefix. Use double underscores (`__`) to navigate nested sections. For example:
 *   `OTEL_DATALAKE_KAFKA__BROKERS="kafka-broker:9092"`
-*   `OTEL_DATALAKE_TELEMETRY__CLOUD_REGION="us-west-2"`
+*   `OTEL_DATALAKE_TELEMETRY__REGION="us-west-2"`
 *   `OTEL_DATALAKE_STARROCKS__PASSWORD="secret"`
 *   `OTEL_DATALAKE_ELASTICSEARCH__AUTH__PASSWORD="secret"`
 
