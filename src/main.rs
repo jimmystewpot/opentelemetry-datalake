@@ -83,20 +83,11 @@ fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
         .validate()
         .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
 
-    if config.pipeline.telemetry.enabled
-        && pipeline_core::telemetry::is_self_referential_endpoint(
-            &config.pipeline.telemetry.otlp_endpoint,
-            config.server.grpc_addr,
-            config.server.http_addr,
-        )
-    {
-        anyhow::bail!(
-            "Configuration validation failed: telemetry.otlp_endpoint ({}) resolves to this receiver's own ingestion address (grpc_addr={}, http_addr={}), which would cause a self-referential OTLP feedback loop",
-            config.pipeline.telemetry.otlp_endpoint,
-            config.server.grpc_addr,
-            config.server.http_addr
-        );
-    }
+    config
+        .pipeline
+        .telemetry
+        .validate_with_listeners(config.server.grpc_addr, config.server.http_addr)
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
 
     if let Some(ref wasm_cfg) = config.wasm_transformer {
         wasm_transformer::WasmTransformer::validate_config(wasm_cfg)
@@ -676,7 +667,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize telemetry
-    let _telemetry = pipeline_core::telemetry::init_telemetry_with_verbosity(
+    let mut telemetry_guard = pipeline_core::telemetry::init_telemetry_with_verbosity(
         &config.pipeline.telemetry,
         verbosity_override,
     )?;
@@ -1333,10 +1324,12 @@ async fn main() -> anyhow::Result<()> {
     drop(metric_bridges);
 
     if let Some(err) = exit_err {
+        telemetry_guard.shutdown();
         return Err(err);
     }
 
     tracing::info!("Shutdown complete.");
+    telemetry_guard.shutdown();
     Ok(())
 }
 

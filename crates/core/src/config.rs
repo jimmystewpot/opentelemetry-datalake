@@ -42,20 +42,14 @@ impl PipelineConfig {
     /// # Errors
     ///
     /// Returns `PipelineError::Configuration` if `channel_capacity` is zero or if
-    /// `telemetry.enabled` is `true` while `telemetry.otlp_endpoint` is empty.
+    /// `telemetry` configuration is invalid when `telemetry.enabled` is `true`.
     pub fn validate(&self) -> Result<(), PipelineError> {
         if self.channel_capacity == 0 {
             return Err(PipelineError::Configuration(Box::new(
                 figment::Error::from("channel_capacity must be >= 1"),
             )));
         }
-        if self.telemetry.enabled && self.telemetry.otlp_endpoint.trim().is_empty() {
-            return Err(PipelineError::Configuration(Box::new(
-                figment::Error::from(
-                    "telemetry.otlp_endpoint must not be empty when telemetry.enabled is true",
-                ),
-            )));
-        }
+        self.telemetry.validate()?;
         Ok(())
     }
 }
@@ -290,6 +284,24 @@ mod tests {
             [telemetry]
             enabled = true
             otlp_endpoint = "   "
+            service_name = "otel-datalake"
+        "#;
+        let cfg: PipelineConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+    }
+
+    #[test]
+    fn test_pipeline_config_rejects_malformed_endpoint_when_telemetry_enabled() {
+        let toml_str = r#"
+            [telemetry]
+            enabled = true
+            otlp_endpoint = "http://"
             service_name = "otel-datalake"
         "#;
         let cfg: PipelineConfig = Figment::new()
