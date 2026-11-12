@@ -5742,9 +5742,9 @@ dependencies = [
 
 [[package]]
 name = "starrocks-stream-load"
-version = "1.0.13"
+version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "439a85ed0733e9f906981f63280a8f02fb4e3dc734103009a7f98f2df85d3dda"
+checksum = "0478c81413c33156378eca3ad79494cf67123d0c7b938d9f70ebcff915308b0f"
 dependencies = [
  "bytes",
  "reqwest 0.13.5",
