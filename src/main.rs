@@ -2846,9 +2846,17 @@ mod tests {
             })
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("current exe");
+                // Cargo 1.100+ places test executables under `target/<profile>/build/<pkg>/<hash>/out/`
+                // while Cargo <=1.99 placed them under `target/<profile>/deps/`.
+                // Ascend until we reach the `<profile>` directory (whose parent is `target` or a target triple).
                 path.pop();
                 if path.ends_with("deps") {
                     path.pop();
+                } else if path.ends_with("out") {
+                    // Pop `out`, `<hash>`, `<pkg>`, `build` to reach `target/<profile>`
+                    for _ in 0..4 {
+                        path.pop();
+                    }
                 }
                 path.join(format!(
                     "opentelemetry-datalake{}",
