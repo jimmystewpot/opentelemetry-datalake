@@ -5,7 +5,6 @@ edition = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
 description = { workspace = true }
-homepage = { workspace = true }
 authors = { workspace = true }
 
 [package.metadata.wix]
@@ -27,7 +26,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MPL-2.0"
 repository = "https://github.com/jimmystewpot/opentelemetry-datalake"
-homepage = "https://github.com/jimmystewpot/opentelemetry-datalake"
 authors = ["James Lamb"]
 
 [dependencies]
@@ -63,11 +61,6 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 axum = { workspace = true }
-criterion = { workspace = true }
-
-[[bench]]
-name = "wasm_boundary_bench"
-harness = false
 
 [workspace.dependencies]
 # Internal Workspace Crates
@@ -112,8 +105,8 @@ arrow = { version = "59", default-features = false, features = ["json", "ipc"] }
 parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2-rust_backend", "lz4"] }
 
 # WebAssembly Runtime (Wasmtime 50, Rust 1.98+ required)
-wasmtime = { version = "50.0.0", default-features = false, features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "50.0.0", default-features = false }
+wasmtime = { version = "50.0.2", default-features = false, features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "50.0.2", default-features = false }
 
 # Concurrent Collections
 dashmap = { version = "6.0", default-features = false }

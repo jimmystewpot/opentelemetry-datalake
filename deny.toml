@@ -80,6 +80,9 @@ ignore = [
     "RUSTSEC-2026-0391",
     "RUSTSEC-2026-0398",
     "RUSTSEC-2026-0403",
+    # RUSTSEC-2026-0543: chrono is marked unmaintained across all versions; transitively required
+    # by arrow-cast, arrow-json, parquet, and apache-iceberg.
+    "RUSTSEC-2026-0543",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.

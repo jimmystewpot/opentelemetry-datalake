@@ -27,3 +27,8 @@ wat = "1.220"
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "wasm_boundary_bench"
+harness = false

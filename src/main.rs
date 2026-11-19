@@ -2846,9 +2846,17 @@ mod tests {
             })
             .unwrap_or_else(|| {
                 let mut path = std::env::current_exe().expect("current exe");
+                // Cargo 1.100+ places test executables under `target/<profile>/build/<pkg>/<hash>/out/`
+                // while Cargo <=1.99 placed them under `target/<profile>/deps/`.
+                // Ascend until we reach the `<profile>` directory (whose parent is `target` or a target triple).
                 path.pop();
                 if path.ends_with("deps") {
                     path.pop();
+                } else if path.ends_with("out") {
+                    // Pop `out`, `<hash>`, `<pkg>`, `build` to reach `target/<profile>`
+                    for _ in 0..4 {
+                        path.pop();
+                    }
                 }
                 path.join(format!(
                     "opentelemetry-datalake{}",
@@ -2857,8 +2865,16 @@ mod tests {
             });
 
         if !bin_path.exists() {
-            let status = std::process::Command::new(env!("CARGO"))
-                .args(["build", "--bin", "opentelemetry-datalake"])
+            let mut build_cmd = std::process::Command::new(env!("CARGO"));
+            build_cmd.args(["build", "--bin", "opentelemetry-datalake"]);
+            if bin_path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|dir| dir == "release")
+            {
+                build_cmd.arg("--release");
+            }
+            let status = build_cmd
                 .status()
                 .expect("build opentelemetry-datalake binary");
             assert!(status.success(), "failed to build binary for test");
