@@ -115,18 +115,22 @@ static SHED_LOGS_HTTP: AtomicU64 = AtomicU64::new(0);
 static SHED_TRACES_HTTP: AtomicU64 = AtomicU64::new(0);
 static SHED_METRICS_HTTP: AtomicU64 = AtomicU64::new(0);
 
+fn shed_counter_slot(signal: &str, protocol: &str) -> Option<&'static AtomicU64> {
+    match (signal, protocol) {
+        ("logs", "grpc") => Some(&SHED_LOGS_GRPC),
+        ("traces", "grpc") => Some(&SHED_TRACES_GRPC),
+        ("metrics", "grpc") => Some(&SHED_METRICS_GRPC),
+        ("logs", "http") => Some(&SHED_LOGS_HTTP),
+        ("traces", "http") => Some(&SHED_TRACES_HTTP),
+        ("metrics", "http") => Some(&SHED_METRICS_HTTP),
+        _ => None,
+    }
+}
+
 /// Returns the cumulative number of shed requests for the given `(signal, protocol)` pair.
 #[must_use]
 pub fn shed_requests_total(signal: &str, protocol: &str) -> u64 {
-    match (signal, protocol) {
-        ("logs", "grpc") => SHED_LOGS_GRPC.load(Ordering::Relaxed),
-        ("traces", "grpc") => SHED_TRACES_GRPC.load(Ordering::Relaxed),
-        ("metrics", "grpc") => SHED_METRICS_GRPC.load(Ordering::Relaxed),
-        ("logs", "http") => SHED_LOGS_HTTP.load(Ordering::Relaxed),
-        ("traces", "http") => SHED_TRACES_HTTP.load(Ordering::Relaxed),
-        ("metrics", "http") => SHED_METRICS_HTTP.load(Ordering::Relaxed),
-        _ => 0,
-    }
+    shed_counter_slot(signal, protocol).map_or(0, |slot| slot.load(Ordering::Relaxed))
 }
 
 fn build_requests_shed_counter() -> Counter<u64> {
@@ -140,26 +144,8 @@ fn build_requests_shed_counter() -> Counter<u64> {
 }
 
 fn record_request_shed(shed_counter: &Counter<u64>, signal: &'static str, protocol: &'static str) {
-    match (signal, protocol) {
-        ("logs", "grpc") => {
-            SHED_LOGS_GRPC.fetch_add(1, Ordering::Relaxed);
-        }
-        ("traces", "grpc") => {
-            SHED_TRACES_GRPC.fetch_add(1, Ordering::Relaxed);
-        }
-        ("metrics", "grpc") => {
-            SHED_METRICS_GRPC.fetch_add(1, Ordering::Relaxed);
-        }
-        ("logs", "http") => {
-            SHED_LOGS_HTTP.fetch_add(1, Ordering::Relaxed);
-        }
-        ("traces", "http") => {
-            SHED_TRACES_HTTP.fetch_add(1, Ordering::Relaxed);
-        }
-        ("metrics", "http") => {
-            SHED_METRICS_HTTP.fetch_add(1, Ordering::Relaxed);
-        }
-        _ => {}
+    if let Some(slot) = shed_counter_slot(signal, protocol) {
+        slot.fetch_add(1, Ordering::Relaxed);
     }
 
     shed_counter.add(
@@ -177,6 +163,7 @@ fn remaining_timeout(deadline: tokio::time::Instant) -> Duration {
 
 struct ConcurrencyPermit {
     _permit: OwnedSemaphorePermit,
+    deadline: tokio::time::Instant,
 }
 
 type GrpcGateState = (Arc<Semaphore>, Duration, Counter<u64>);
@@ -201,9 +188,11 @@ async fn grpc_concurrency_gate(
             return Status::unavailable("receiver concurrency limit reached: request shed")
                 .into_http();
         };
-        let shared_permit = Arc::new(ConcurrencyPermit { _permit: permit });
+        let shared_permit = Arc::new(ConcurrencyPermit {
+            _permit: permit,
+            deadline,
+        });
         req.extensions_mut().insert(Arc::clone(&shared_permit));
-        req.extensions_mut().insert(deadline);
         _gate_permit = Some(shared_permit);
     }
 
@@ -354,11 +343,7 @@ async fn retain_or_acquire_grpc_permit<T>(
         .get::<Arc<ConcurrencyPermit>>()
         .cloned()
     {
-        let dl = request
-            .extensions()
-            .get::<tokio::time::Instant>()
-            .copied()
-            .unwrap_or_else(|| tokio::time::Instant::now() + send_timeout);
+        let dl = ext_permit.deadline;
         Ok((ext_permit, dl))
     } else {
         let dl = tokio::time::Instant::now() + send_timeout;
@@ -368,7 +353,13 @@ async fn retain_or_acquire_grpc_permit<T>(
                 "receiver concurrency limit reached: request shed",
             ));
         };
-        Ok((Arc::new(ConcurrencyPermit { _permit: permit }), dl))
+        Ok((
+            Arc::new(ConcurrencyPermit {
+                _permit: permit,
+                deadline: dl,
+            }),
+            dl,
+        ))
     }
 }
 
@@ -599,7 +590,8 @@ impl ContentEncoding {
         }
         let raw_str = raw_val
             .to_str()
-            .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+            .ok()
+            .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let trimmed = raw_str.trim();
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
             Ok(Self::Identity)
@@ -623,7 +615,8 @@ fn read_bounded<R: Read>(
     loop {
         let n = reader
             .read(&mut chunk)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
+            .ok()
+            .ok_or(StatusCode::BAD_REQUEST)?;
         if n == 0 {
             break;
         }
@@ -656,7 +649,8 @@ fn decompress_bounded(
         }
         CompressedEncoding::Zstd => {
             let decoder = zstd::stream::read::Decoder::with_buffer(raw)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+                .ok()
+                .ok_or(StatusCode::BAD_REQUEST)?;
             read_bounded(decoder, max_body_bytes, raw.len())
         }
     }
@@ -2111,7 +2105,11 @@ mod tests {
         // Closed channel returns 503 + Retry-After: 1 WITHOUT incrementing shed counter
         drop(logs_rx);
         let before_closed = shed_requests_total("logs", "http");
-        let closed_res = handle_logs(State(state), test_http_request(headers, json_body)).await;
+        let closed_res = handle_logs(
+            State(state.clone()),
+            test_http_request(headers.clone(), json_body),
+        )
+        .await;
         assert!(closed_res.is_err());
         let closed_resp = closed_res.into_response();
         assert_eq!(closed_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2123,6 +2121,57 @@ mod tests {
             Some("1")
         );
         assert_eq!(shed_requests_total("logs", "http"), before_closed);
+
+        // Traces and Metrics HTTP full-channel shedding + unknown signal query
+        let trace_json = Bytes::from_static(
+            br#"{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","startTimeUnixNano":"1000000000","endTimeUnixNano":"2000000000"}]}]}]}"#,
+        );
+        assert!(
+            handle_traces(
+                State(state.clone()),
+                test_http_request(headers.clone(), trace_json.clone())
+            )
+            .await
+            .is_ok()
+        );
+        let before_http_traces = shed_requests_total("traces", "http");
+        let trace_shed = handle_traces(
+            State(state.clone()),
+            test_http_request(headers.clone(), trace_json),
+        )
+        .await;
+        assert_eq!(
+            trace_shed.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            shed_requests_total("traces", "http"),
+            before_http_traces + 1
+        );
+
+        let metrics_json = Bytes::from_static(
+            br#"{"resourceMetrics":[{"scopeMetrics":[{"metrics":[{"name":"cpu","gauge":{"dataPoints":[{"timeUnixNano":"1000000000","asDouble":1.0}]}}]}]}]}"#,
+        );
+        assert!(
+            handle_metrics(
+                State(state.clone()),
+                test_http_request(headers.clone(), metrics_json.clone())
+            )
+            .await
+            .is_ok()
+        );
+        let before_http_metrics = shed_requests_total("metrics", "http");
+        let metrics_shed =
+            handle_metrics(State(state), test_http_request(headers, metrics_json)).await;
+        assert_eq!(
+            metrics_shed.into_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            shed_requests_total("metrics", "http"),
+            before_http_metrics + 1
+        );
+        assert_eq!(shed_requests_total("unknown", "http"), 0);
     }
 
     #[tokio::test]
@@ -2308,6 +2357,37 @@ mod tests {
         )
         .await;
         assert_eq!(res.unwrap_err(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // 4. Explicit Content-Encoding: identity succeeds; non-UTF8 Content-Encoding -> 415
+        let mut identity_headers = HeaderMap::new();
+        identity_headers.insert(CONTENT_ENCODING, "identity".parse().unwrap());
+        let id_res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            identity_headers,
+            Bytes::from_static(br#"{"resourceLogs":[]}"#),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert!(id_res.is_ok());
+
+        let mut non_utf8_headers = HeaderMap::new();
+        non_utf8_headers.insert(
+            CONTENT_ENCODING,
+            axum::http::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let non_utf8_res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            non_utf8_headers,
+            Bytes::from_static(b"{}"),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(
+            non_utf8_res.unwrap_err(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
     }
 
     #[tokio::test]
@@ -2384,11 +2464,7 @@ mod tests {
             .await
             .expect("gzip compressed gRPC logs request should succeed");
         let received = logs_rx.recv().await.expect("should receive logs batch");
-        if let SignalBatch::Logs(batch) = received {
-            assert_eq!(batch.num_rows(), 1);
-        } else {
-            panic!("Expected SignalBatch::Logs");
-        }
+        assert!(matches!(received, SignalBatch::Logs(ref b) if b.num_rows() == 1));
 
         // 2. Oversized request (decoded > 2048 bytes, even when gzip compressed) is rejected with ResourceExhausted
         let oversized_req = ExportLogsServiceRequest {
@@ -2564,9 +2640,8 @@ mod tests {
         let mut req1 = Request::new(non_empty_req);
         req1.extensions_mut().insert(Arc::new(ConcurrencyPermit {
             _permit: gate_permit,
+            deadline: tokio::time::Instant::now() + Duration::from_millis(500),
         }));
-        req1.extensions_mut()
-            .insert(tokio::time::Instant::now() + Duration::from_millis(500));
 
         let svc_clone = grpc_svc.clone();
         let in_flight = tokio::spawn(async move { svc_clone.export(req1).await });
@@ -2587,5 +2662,60 @@ mod tests {
         let err = in_flight.await.unwrap().unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
         assert_eq!(grpc_sem.available_permits(), 1);
+
+        // Also exercise grpc_concurrency_gate middleware across logs, traces, metrics, unknown paths,
+        // and permit-exhaustion shedding.
+        let gate_sem = Arc::new(Semaphore::new(1));
+        let gate_state: GrpcGateState = (
+            Arc::clone(&gate_sem),
+            Duration::from_millis(50),
+            build_requests_shed_counter(),
+        );
+        let mut gate_app = Router::new()
+            .route("/{*path}", axum::routing::any(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(
+                gate_state,
+                grpc_concurrency_gate,
+            ));
+
+        for uri in [
+            "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            "/opentelemetry.proto.collector.trace.v1.TraceService/Export",
+            "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
+            "/healthz",
+        ] {
+            let req = AxumRequest::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = tonic::codegen::Service::call(&mut gate_app, req)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Hold the sole permit so grpc_concurrency_gate sheds on timeout
+        let _held = gate_sem.acquire().await.unwrap();
+        let before_gate_traces = shed_requests_total("traces", "grpc");
+        let shed_req = AxumRequest::builder()
+            .method("POST")
+            .uri("/opentelemetry.proto.collector.trace.v1.TraceService/Export")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let shed_resp = tonic::codegen::Service::call(&mut gate_app, shed_req)
+            .await
+            .unwrap();
+        assert_eq!(
+            shed_resp
+                .headers()
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok()),
+            Some("14")
+        );
+        assert_eq!(
+            shed_requests_total("traces", "grpc"),
+            before_gate_traces + 1
+        );
     }
 }
