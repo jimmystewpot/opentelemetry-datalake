@@ -193,6 +193,7 @@ async fn grpc_concurrency_gate(
         _ => None,
     };
 
+    let mut _gate_permit: Option<Arc<ConcurrencyPermit>> = None;
     if let Some(sig) = signal {
         let deadline = tokio::time::Instant::now() + send_timeout;
         let Some(permit) = acquire_concurrency_permit(&semaphore, send_timeout).await else {
@@ -200,9 +201,10 @@ async fn grpc_concurrency_gate(
             return Status::unavailable("receiver concurrency limit reached: request shed")
                 .into_http();
         };
-        req.extensions_mut()
-            .insert(Arc::new(ConcurrencyPermit { _permit: permit }));
+        let shared_permit = Arc::new(ConcurrencyPermit { _permit: permit });
+        req.extensions_mut().insert(Arc::clone(&shared_permit));
         req.extensions_mut().insert(deadline);
+        _gate_permit = Some(shared_permit);
     }
 
     next.run(req).await
@@ -340,6 +342,36 @@ pub fn estimate_metrics_records(req: &ExportMetricsServiceRequest) -> usize {
     })
 }
 
+async fn retain_or_acquire_grpc_permit<T>(
+    request: &Request<T>,
+    semaphore: &Arc<Semaphore>,
+    send_timeout: Duration,
+    shed_counter: &Counter<u64>,
+    signal: &'static str,
+) -> Result<(Arc<ConcurrencyPermit>, tokio::time::Instant), Status> {
+    if let Some(ext_permit) = request
+        .extensions()
+        .get::<Arc<ConcurrencyPermit>>()
+        .cloned()
+    {
+        let dl = request
+            .extensions()
+            .get::<tokio::time::Instant>()
+            .copied()
+            .unwrap_or_else(|| tokio::time::Instant::now() + send_timeout);
+        Ok((ext_permit, dl))
+    } else {
+        let dl = tokio::time::Instant::now() + send_timeout;
+        let Some(permit) = acquire_concurrency_permit(semaphore, send_timeout).await else {
+            record_request_shed(shed_counter, signal, "grpc");
+            return Err(Status::unavailable(
+                "receiver concurrency limit reached: request shed",
+            ));
+        };
+        Ok((Arc::new(ConcurrencyPermit { _permit: permit }), dl))
+    }
+}
+
 #[derive(Clone)]
 struct GrpcLogsService {
     tx: mpsc::Sender<SignalBatch>,
@@ -369,28 +401,14 @@ impl LogsService for GrpcLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let (_inline_permit, deadline) = if request
-            .extensions()
-            .get::<Arc<ConcurrencyPermit>>()
-            .is_some()
-        {
-            let dl = request
-                .extensions()
-                .get::<tokio::time::Instant>()
-                .copied()
-                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
-            (None, dl)
-        } else {
-            let dl = tokio::time::Instant::now() + self.send_timeout;
-            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-            else {
-                record_request_shed(&self.shed_counter, "logs", "grpc");
-                return Err(Status::unavailable(
-                    "receiver concurrency limit reached: request shed",
-                ));
-            };
-            (Some(permit), dl)
-        };
+        let (_permit, deadline) = retain_or_acquire_grpc_permit(
+            &request,
+            &self.semaphore,
+            self.send_timeout,
+            &self.shed_counter,
+            "logs",
+        )
+        .await?;
 
         let req = request.into_inner();
         let batch_res = if estimate_logs_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
@@ -451,28 +469,14 @@ impl TraceService for GrpcTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        let (_inline_permit, deadline) = if request
-            .extensions()
-            .get::<Arc<ConcurrencyPermit>>()
-            .is_some()
-        {
-            let dl = request
-                .extensions()
-                .get::<tokio::time::Instant>()
-                .copied()
-                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
-            (None, dl)
-        } else {
-            let dl = tokio::time::Instant::now() + self.send_timeout;
-            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-            else {
-                record_request_shed(&self.shed_counter, "traces", "grpc");
-                return Err(Status::unavailable(
-                    "receiver concurrency limit reached: request shed",
-                ));
-            };
-            (Some(permit), dl)
-        };
+        let (_permit, deadline) = retain_or_acquire_grpc_permit(
+            &request,
+            &self.semaphore,
+            self.send_timeout,
+            &self.shed_counter,
+            "traces",
+        )
+        .await?;
 
         let req = request.into_inner();
         let batch_res = if estimate_traces_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
@@ -533,28 +537,14 @@ impl MetricsService for GrpcMetricsService {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let (_inline_permit, deadline) = if request
-            .extensions()
-            .get::<Arc<ConcurrencyPermit>>()
-            .is_some()
-        {
-            let dl = request
-                .extensions()
-                .get::<tokio::time::Instant>()
-                .copied()
-                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
-            (None, dl)
-        } else {
-            let dl = tokio::time::Instant::now() + self.send_timeout;
-            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-            else {
-                record_request_shed(&self.shed_counter, "metrics", "grpc");
-                return Err(Status::unavailable(
-                    "receiver concurrency limit reached: request shed",
-                ));
-            };
-            (Some(permit), dl)
-        };
+        let (_permit, deadline) = retain_or_acquire_grpc_permit(
+            &request,
+            &self.semaphore,
+            self.send_timeout,
+            &self.shed_counter,
+            "metrics",
+        )
+        .await?;
 
         let req = request.into_inner();
         let batch_res = if estimate_metrics_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
@@ -2533,5 +2523,69 @@ mod tests {
         )
         .await;
         assert_eq!(multi_res.unwrap_err(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_grpc_extension_permit_retained_across_into_inner_and_channel_send() {
+        let cfg = OtlpReceiverConfig {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_requests: 1,
+            ingest_send_timeout_ms: 500,
+        };
+        let grpc_sem = Arc::new(Semaphore::new(1));
+        let non_empty_req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let (logs_tx, _logs_rx) = mpsc::channel(1);
+        // Pre-fill the channel so export() parks on send_batch_grpc after request.into_inner().
+        logs_tx
+            .send(SignalBatch::Logs(
+                arrow_codec::decode_logs(&non_empty_req).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let grpc_svc = GrpcLogsService::new(logs_tx, cfg, Arc::clone(&grpc_sem));
+
+        // Simulate a request admitted by grpc_concurrency_gate carrying the sole Arc<ConcurrencyPermit>
+        // in its extensions.
+        let gate_permit = grpc_sem.clone().acquire_owned().await.unwrap();
+        assert_eq!(grpc_sem.available_permits(), 0);
+
+        let mut req1 = Request::new(non_empty_req);
+        req1.extensions_mut().insert(Arc::new(ConcurrencyPermit {
+            _permit: gate_permit,
+        }));
+        req1.extensions_mut()
+            .insert(tokio::time::Instant::now() + Duration::from_millis(500));
+
+        let svc_clone = grpc_svc.clone();
+        let in_flight = tokio::spawn(async move { svc_clone.export(req1).await });
+
+        // Yield so in_flight enters export(), calls request.into_inner(), decodes the batch,
+        // and parks on send_batch_grpc.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+
+        // The concurrency permit MUST still be held while export() is parked on send_batch_grpc.
+        assert_eq!(
+            grpc_sem.available_permits(),
+            0,
+            "concurrency permit was dropped prematurely by request.into_inner()"
+        );
+
+        let err = in_flight.await.unwrap().unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(grpc_sem.available_permits(), 1);
     }
 }
