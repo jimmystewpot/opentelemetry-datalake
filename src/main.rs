@@ -2865,8 +2865,16 @@ mod tests {
             });
 
         if !bin_path.exists() {
-            let status = std::process::Command::new(env!("CARGO"))
-                .args(["build", "--bin", "opentelemetry-datalake"])
+            let mut build_cmd = std::process::Command::new(env!("CARGO"));
+            build_cmd.args(["build", "--bin", "opentelemetry-datalake"]);
+            if bin_path
+                .parent()
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|dir| dir == "release")
+            {
+                build_cmd.arg("--release");
+            }
+            let status = build_cmd
                 .status()
                 .expect("build opentelemetry-datalake binary");
             assert!(status.success(), "failed to build binary for test");

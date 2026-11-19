@@ -218,7 +218,7 @@ jobs:
           shared-key: "benchmarks"
 
       - name: cargo bench (smoke test)
-        run: cargo bench --workspace -- --test
+        run: cargo bench --workspace --benches -- --test
 
   deny:
     needs: [lint, unit-test]
