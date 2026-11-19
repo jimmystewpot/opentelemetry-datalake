@@ -4097,6 +4097,7 @@ dependencies = [
  "arrow-codec",
  "async-trait",
  "axum",
+ "figment",
  "flate2",
  "opentelemetry",
  "opentelemetry-proto",

@@ -2,15 +2,16 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, FromRequest, Request as AxumRequest, State},
     http::{
         HeaderMap, StatusCode,
         header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER},
     },
+    middleware::{self, Next},
     response::IntoResponse,
     routing::post,
 };
-use opentelemetry::KeyValue;
+use opentelemetry::{KeyValue, metrics::Counter};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::{
@@ -61,8 +62,11 @@ pub const DEFAULT_INGEST_SEND_TIMEOUT_MS: u64 = 500;
 /// Resource bounds and overload shedding configuration for [`OtlpReceiverSource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OtlpReceiverConfig {
+    /// Maximum decompressed request payload size in bytes (`>= 1024`).
     pub max_body_bytes: usize,
+    /// Maximum concurrent in-flight requests per protocol listener (`>= 1`).
     pub max_concurrent_requests: usize,
+    /// Maximum time in milliseconds to wait on a semaphore permit or full channel before shedding (`>= 1`).
     pub ingest_send_timeout_ms: u64,
 }
 
@@ -125,7 +129,17 @@ pub fn shed_requests_total(signal: &str, protocol: &str) -> u64 {
     }
 }
 
-fn record_request_shed(signal: &'static str, protocol: &'static str) {
+fn build_requests_shed_counter() -> Counter<u64> {
+    opentelemetry::global::meter("otel-datalake")
+        .u64_counter("datalake.receiver.requests_shed_total")
+        .with_unit("{request}")
+        .with_description(
+            "Requests rejected with gRPC UNAVAILABLE / HTTP 503 when the receiver concurrency limit or downstream channel send timeout is reached",
+        )
+        .build()
+}
+
+fn record_request_shed(shed_counter: &Counter<u64>, signal: &'static str, protocol: &'static str) {
     match (signal, protocol) {
         ("logs", "grpc") => {
             SHED_LOGS_GRPC.fetch_add(1, Ordering::Relaxed);
@@ -148,16 +162,50 @@ fn record_request_shed(signal: &'static str, protocol: &'static str) {
         _ => {}
     }
 
-    let counter = opentelemetry::global::meter("otel-datalake")
-        .u64_counter("datalake.receiver.requests_shed_total")
-        .build();
-    counter.add(
+    shed_counter.add(
         1,
         &[
             KeyValue::new("signal", signal),
             KeyValue::new("protocol", protocol),
         ],
     );
+}
+
+fn remaining_timeout(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+struct ConcurrencyPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+type GrpcGateState = (Arc<Semaphore>, Duration, Counter<u64>);
+
+async fn grpc_concurrency_gate(
+    State((semaphore, send_timeout, shed_counter)): State<GrpcGateState>,
+    mut req: AxumRequest,
+    next: Next,
+) -> axum::response::Response {
+    let signal = match req.uri().path() {
+        "/opentelemetry.proto.collector.logs.v1.LogsService/Export" => Some("logs"),
+        "/opentelemetry.proto.collector.trace.v1.TraceService/Export" => Some("traces"),
+        "/opentelemetry.proto.collector.metrics.v1.MetricsService/Export" => Some("metrics"),
+        _ => None,
+    };
+
+    if let Some(sig) = signal {
+        let deadline = tokio::time::Instant::now() + send_timeout;
+        let Some(permit) = acquire_concurrency_permit(&semaphore, send_timeout).await else {
+            record_request_shed(&shed_counter, sig, "grpc");
+            return Status::unavailable("receiver concurrency limit reached: request shed")
+                .into_http();
+        };
+        req.extensions_mut()
+            .insert(Arc::new(ConcurrencyPermit { _permit: permit }));
+        req.extensions_mut().insert(deadline);
+    }
+
+    next.run(req).await
 }
 
 async fn acquire_concurrency_permit(
@@ -175,11 +223,12 @@ async fn send_batch_grpc(
     batch: SignalBatch,
     timeout: Duration,
     signal: &'static str,
+    shed_counter: &Counter<u64>,
 ) -> Result<(), Status> {
     match tx.send_timeout(batch, timeout).await {
         Ok(()) => Ok(()),
         Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
-            record_request_shed(signal, "grpc");
+            record_request_shed(shed_counter, signal, "grpc");
             Err(Status::unavailable(
                 "pipeline channel full: request shed after send timeout",
             ))
@@ -229,11 +278,12 @@ async fn send_batch_http(
     batch: SignalBatch,
     timeout: Duration,
     signal: &'static str,
+    shed_counter: &Counter<u64>,
 ) -> Result<(), HttpReject> {
     match tx.send_timeout(batch, timeout).await {
         Ok(()) => Ok(()),
         Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
-            record_request_shed(signal, "http");
+            record_request_shed(shed_counter, signal, "http");
             Err(HttpReject::service_unavailable(
                 "pipeline channel full: request shed after send timeout",
             ))
@@ -295,6 +345,7 @@ struct GrpcLogsService {
     tx: mpsc::Sender<SignalBatch>,
     send_timeout: Duration,
     semaphore: Arc<Semaphore>,
+    shed_counter: Counter<u64>,
 }
 
 impl GrpcLogsService {
@@ -307,6 +358,7 @@ impl GrpcLogsService {
             tx,
             send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
             semaphore,
+            shed_counter: build_requests_shed_counter(),
         }
     }
 }
@@ -317,12 +369,27 @@ impl LogsService for GrpcLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
-        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-        else {
-            record_request_shed("logs", "grpc");
-            return Err(Status::unavailable(
-                "receiver concurrency limit reached: request shed",
-            ));
+        let (_inline_permit, deadline) = if request
+            .extensions()
+            .get::<Arc<ConcurrencyPermit>>()
+            .is_some()
+        {
+            let dl = request
+                .extensions()
+                .get::<tokio::time::Instant>()
+                .copied()
+                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
+            (None, dl)
+        } else {
+            let dl = tokio::time::Instant::now() + self.send_timeout;
+            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+            else {
+                record_request_shed(&self.shed_counter, "logs", "grpc");
+                return Err(Status::unavailable(
+                    "receiver concurrency limit reached: request shed",
+                ));
+            };
+            (Some(permit), dl)
         };
 
         let req = request.into_inner();
@@ -340,8 +407,9 @@ impl LogsService for GrpcLogsService {
                     send_batch_grpc(
                         &self.tx,
                         SignalBatch::Logs(batch),
-                        self.send_timeout,
+                        remaining_timeout(deadline),
                         "logs",
+                        &self.shed_counter,
                     )
                     .await?;
                 }
@@ -359,6 +427,7 @@ struct GrpcTraceService {
     tx: mpsc::Sender<SignalBatch>,
     send_timeout: Duration,
     semaphore: Arc<Semaphore>,
+    shed_counter: Counter<u64>,
 }
 
 impl GrpcTraceService {
@@ -371,6 +440,7 @@ impl GrpcTraceService {
             tx,
             send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
             semaphore,
+            shed_counter: build_requests_shed_counter(),
         }
     }
 }
@@ -381,12 +451,27 @@ impl TraceService for GrpcTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
-        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-        else {
-            record_request_shed("traces", "grpc");
-            return Err(Status::unavailable(
-                "receiver concurrency limit reached: request shed",
-            ));
+        let (_inline_permit, deadline) = if request
+            .extensions()
+            .get::<Arc<ConcurrencyPermit>>()
+            .is_some()
+        {
+            let dl = request
+                .extensions()
+                .get::<tokio::time::Instant>()
+                .copied()
+                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
+            (None, dl)
+        } else {
+            let dl = tokio::time::Instant::now() + self.send_timeout;
+            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+            else {
+                record_request_shed(&self.shed_counter, "traces", "grpc");
+                return Err(Status::unavailable(
+                    "receiver concurrency limit reached: request shed",
+                ));
+            };
+            (Some(permit), dl)
         };
 
         let req = request.into_inner();
@@ -404,8 +489,9 @@ impl TraceService for GrpcTraceService {
                     send_batch_grpc(
                         &self.tx,
                         SignalBatch::Traces(batch),
-                        self.send_timeout,
+                        remaining_timeout(deadline),
                         "traces",
+                        &self.shed_counter,
                     )
                     .await?;
                 }
@@ -423,6 +509,7 @@ struct GrpcMetricsService {
     tx: mpsc::Sender<SignalBatch>,
     send_timeout: Duration,
     semaphore: Arc<Semaphore>,
+    shed_counter: Counter<u64>,
 }
 
 impl GrpcMetricsService {
@@ -435,6 +522,7 @@ impl GrpcMetricsService {
             tx,
             send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
             semaphore,
+            shed_counter: build_requests_shed_counter(),
         }
     }
 }
@@ -445,12 +533,27 @@ impl MetricsService for GrpcMetricsService {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
-        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
-        else {
-            record_request_shed("metrics", "grpc");
-            return Err(Status::unavailable(
-                "receiver concurrency limit reached: request shed",
-            ));
+        let (_inline_permit, deadline) = if request
+            .extensions()
+            .get::<Arc<ConcurrencyPermit>>()
+            .is_some()
+        {
+            let dl = request
+                .extensions()
+                .get::<tokio::time::Instant>()
+                .copied()
+                .unwrap_or_else(|| tokio::time::Instant::now() + self.send_timeout);
+            (None, dl)
+        } else {
+            let dl = tokio::time::Instant::now() + self.send_timeout;
+            let Some(permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+            else {
+                record_request_shed(&self.shed_counter, "metrics", "grpc");
+                return Err(Status::unavailable(
+                    "receiver concurrency limit reached: request shed",
+                ));
+            };
+            (Some(permit), dl)
         };
 
         let req = request.into_inner();
@@ -468,8 +571,9 @@ impl MetricsService for GrpcMetricsService {
                     send_batch_grpc(
                         &self.tx,
                         SignalBatch::Metrics(batch),
-                        self.send_timeout,
+                        remaining_timeout(deadline),
                         "metrics",
+                        &self.shed_counter,
                     )
                     .await?;
                 }
@@ -483,17 +587,26 @@ impl MetricsService for GrpcMetricsService {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContentEncoding {
-    Identity,
+enum CompressedEncoding {
     Gzip,
     Zstd,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentEncoding {
+    Identity,
+    Compressed(CompressedEncoding),
+}
+
 impl ContentEncoding {
     fn from_headers(headers: &HeaderMap) -> Result<Self, StatusCode> {
-        let Some(raw_val) = headers.get(CONTENT_ENCODING) else {
+        let mut values = headers.get_all(CONTENT_ENCODING).iter();
+        let Some(raw_val) = values.next() else {
             return Ok(Self::Identity);
         };
+        if values.next().is_some() {
+            return Err(StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
         let raw_str = raw_val
             .to_str()
             .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
@@ -501,49 +614,61 @@ impl ContentEncoding {
         if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
             Ok(Self::Identity)
         } else if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
-            Ok(Self::Gzip)
+            Ok(Self::Compressed(CompressedEncoding::Gzip))
         } else if trimmed.eq_ignore_ascii_case("zstd") {
-            Ok(Self::Zstd)
+            Ok(Self::Compressed(CompressedEncoding::Zstd))
         } else {
             Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
         }
     }
 }
 
+fn read_bounded<R: Read>(
+    mut reader: R,
+    max_body_bytes: usize,
+    initial_cap: usize,
+) -> Result<Vec<u8>, StatusCode> {
+    let mut buf = Vec::with_capacity(initial_cap.min(max_body_bytes));
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        if n == 0 {
+            break;
+        }
+        let needed = buf.len().saturating_add(n);
+        if needed > max_body_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        if needed > buf.capacity() {
+            let target_cap = buf
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(max_body_bytes);
+            buf.reserve_exact(target_cap.saturating_sub(buf.len()));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 fn decompress_bounded(
     raw: &[u8],
-    encoding: ContentEncoding,
+    encoding: CompressedEncoding,
     max_body_bytes: usize,
 ) -> Result<Vec<u8>, StatusCode> {
-    let limit = (max_body_bytes as u64).saturating_add(1);
-    let mut buf = Vec::with_capacity(raw.len().min(max_body_bytes));
     match encoding {
-        ContentEncoding::Identity => {
-            if raw.len() > max_body_bytes {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
-            }
-            return Ok(raw.to_vec());
+        CompressedEncoding::Gzip => {
+            let decoder = flate2::bufread::GzDecoder::new(raw);
+            read_bounded(decoder, max_body_bytes, raw.len())
         }
-        ContentEncoding::Gzip => {
-            let decoder = flate2::read::GzDecoder::new(raw);
-            decoder
-                .take(limit)
-                .read_to_end(&mut buf)
+        CompressedEncoding::Zstd => {
+            let decoder = zstd::stream::read::Decoder::with_buffer(raw)
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
+            read_bounded(decoder, max_body_bytes, raw.len())
         }
-        ContentEncoding::Zstd => {
-            let decoder =
-                zstd::stream::read::Decoder::new(raw).map_err(|_| StatusCode::BAD_REQUEST)?;
-            decoder
-                .take(limit)
-                .read_to_end(&mut buf)
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-        }
-    }
-    if buf.len() > max_body_bytes {
-        Err(StatusCode::PAYLOAD_TOO_LARGE)
-    } else {
-        Ok(buf)
     }
 }
 
@@ -583,8 +708,8 @@ where
         tokio::task::spawn_blocking(move || {
             let payload = match encoding {
                 ContentEncoding::Identity => body,
-                ContentEncoding::Gzip | ContentEncoding::Zstd => {
-                    let decompressed = decompress_bounded(&body, encoding, max_body_bytes)?;
+                ContentEncoding::Compressed(compressed) => {
+                    let decompressed = decompress_bounded(&body, compressed, max_body_bytes)?;
                     Bytes::from(decompressed)
                 }
             };
@@ -622,6 +747,7 @@ struct HttpState {
     metrics_tx: mpsc::Sender<SignalBatch>,
     config: OtlpReceiverConfig,
     semaphore: Arc<Semaphore>,
+    shed_counter: Counter<u64>,
 }
 
 impl HttpState {
@@ -637,39 +763,58 @@ impl HttpState {
             metrics_tx,
             config,
             semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests.max(1))),
+            shed_counter: build_requests_shed_counter(),
         }
     }
 }
 
-async fn handle_logs(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<impl IntoResponse, HttpReject> {
+async fn handle_http_signal<T, F, W>(
+    state: HttpState,
+    req: AxumRequest,
+    signal: &'static str,
+    signal_name: &'static str,
+    tx_fn: impl FnOnce(&HttpState) -> &mpsc::Sender<SignalBatch>,
+    decode_fn: F,
+    wrap_batch: W,
+) -> Result<impl IntoResponse, HttpReject>
+where
+    T: prost::Message + Default + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(&T) -> Result<RecordBatch, PipelineError> + Send + 'static,
+    W: FnOnce(RecordBatch) -> SignalBatch,
+{
+    let _ = ContentEncoding::from_headers(req.headers()).map_err(HttpReject::status_only)?;
+
     let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
+    let deadline = tokio::time::Instant::now() + send_timeout;
     let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
-        record_request_shed("logs", "http");
+        record_request_shed(&state.shed_counter, signal, "http");
         return Err(HttpReject::service_unavailable(
             "receiver concurrency limit reached: request shed",
         ));
     };
 
-    let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+    let headers = req.headers().clone();
+    let body = Bytes::from_request(req, &state)
+        .await
+        .map_err(|rej| HttpReject::status_only(rej.status()))?;
+
+    let batch = decode_and_convert_http::<T, _>(
         headers,
         body,
         state.config.max_body_bytes,
-        "Logs",
-        arrow_codec::decode_logs,
+        signal_name,
+        decode_fn,
     )
     .await
     .map_err(HttpReject::status_only)?;
 
     if batch.num_rows() > 0 {
         send_batch_http(
-            &state.logs_tx,
-            SignalBatch::Logs(batch),
-            send_timeout,
-            "logs",
+            tx_fn(&state),
+            wrap_batch(batch),
+            remaining_timeout(deadline),
+            signal,
+            &state.shed_counter,
         )
         .await?;
     }
@@ -677,82 +822,64 @@ async fn handle_logs(
         StatusCode::OK,
         serde_json::json!({ "partial_success": null }).to_string(),
     ))
+}
+
+async fn handle_logs(
+    State(state): State<HttpState>,
+    req: AxumRequest,
+) -> Result<impl IntoResponse, HttpReject> {
+    handle_http_signal::<ExportLogsServiceRequest, _, _>(
+        state,
+        req,
+        "logs",
+        "Logs",
+        |s| &s.logs_tx,
+        arrow_codec::decode_logs,
+        SignalBatch::Logs,
+    )
+    .await
 }
 
 async fn handle_traces(
     State(state): State<HttpState>,
-    headers: HeaderMap,
-    body: Bytes,
+    req: AxumRequest,
 ) -> Result<impl IntoResponse, HttpReject> {
-    let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
-    let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
-        record_request_shed("traces", "http");
-        return Err(HttpReject::service_unavailable(
-            "receiver concurrency limit reached: request shed",
-        ));
-    };
-
-    let batch = decode_and_convert_http::<ExportTraceServiceRequest, _>(
-        headers,
-        body,
-        state.config.max_body_bytes,
+    handle_http_signal::<ExportTraceServiceRequest, _, _>(
+        state,
+        req,
+        "traces",
         "Traces",
+        |s| &s.traces_tx,
         arrow_codec::decode_traces,
+        SignalBatch::Traces,
     )
     .await
-    .map_err(HttpReject::status_only)?;
-
-    if batch.num_rows() > 0 {
-        send_batch_http(
-            &state.traces_tx,
-            SignalBatch::Traces(batch),
-            send_timeout,
-            "traces",
-        )
-        .await?;
-    }
-    Ok((
-        StatusCode::OK,
-        serde_json::json!({ "partial_success": null }).to_string(),
-    ))
 }
 
 async fn handle_metrics(
     State(state): State<HttpState>,
-    headers: HeaderMap,
-    body: Bytes,
+    req: AxumRequest,
 ) -> Result<impl IntoResponse, HttpReject> {
-    let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
-    let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
-        record_request_shed("metrics", "http");
-        return Err(HttpReject::service_unavailable(
-            "receiver concurrency limit reached: request shed",
-        ));
-    };
-
-    let batch = decode_and_convert_http::<ExportMetricsServiceRequest, _>(
-        headers,
-        body,
-        state.config.max_body_bytes,
+    handle_http_signal::<ExportMetricsServiceRequest, _, _>(
+        state,
+        req,
+        "metrics",
         "Metrics",
+        |s| &s.metrics_tx,
         arrow_codec::decode_metrics,
+        SignalBatch::Metrics,
     )
     .await
-    .map_err(HttpReject::status_only)?;
+}
 
-    if batch.num_rows() > 0 {
-        send_batch_http(
-            &state.metrics_tx,
-            SignalBatch::Metrics(batch),
-            send_timeout,
-            "metrics",
-        )
-        .await?;
-    }
-    Ok((
-        StatusCode::OK,
-        serde_json::json!({ "partial_success": null }).to_string(),
-    ))
+fn build_http_router(http_state: HttpState) -> Router {
+    let max_body_bytes = http_state.config.max_body_bytes;
+    Router::new()
+        .route("/v1/logs", post(handle_logs))
+        .route("/v1/traces", post(handle_traces))
+        .route("/v1/metrics", post(handle_metrics))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(http_state)
 }
 
 /// OTLP Receiver source supporting gRPC and HTTP/JSON endpoints.
@@ -827,8 +954,11 @@ impl Source for OtlpReceiverSource {
             self.config,
             Arc::clone(&grpc_semaphore),
         );
-        let grpc_service_metrics =
-            GrpcMetricsService::new(self.metrics_tx.clone(), self.config, grpc_semaphore);
+        let grpc_service_metrics = GrpcMetricsService::new(
+            self.metrics_tx.clone(),
+            self.config,
+            Arc::clone(&grpc_semaphore),
+        );
 
         let mut shutdown_rx_grpc = self.shutdown_rx.clone();
         let grpc_shutdown = async move {
@@ -839,26 +969,35 @@ impl Source for OtlpReceiverSource {
         };
 
         let max_body_bytes = self.config.max_body_bytes;
+        let send_timeout = Duration::from_millis(self.config.ingest_send_timeout_ms.max(1));
+        let grpc_shed_counter = build_requests_shed_counter();
+        let grpc_routes = tonic::service::Routes::new(
+            LogsServiceServer::new(grpc_service_logs)
+                .max_decoding_message_size(max_body_bytes)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        )
+        .add_service(
+            TraceServiceServer::new(grpc_service_traces)
+                .max_decoding_message_size(max_body_bytes)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        )
+        .add_service(
+            MetricsServiceServer::new(grpc_service_metrics)
+                .max_decoding_message_size(max_body_bytes)
+                .accept_compressed(CompressionEncoding::Gzip)
+                .accept_compressed(CompressionEncoding::Zstd),
+        )
+        .into_axum_router()
+        .layer(middleware::from_fn_with_state(
+            (grpc_semaphore, send_timeout, grpc_shed_counter),
+            grpc_concurrency_gate,
+        ));
+
         let grpc_server = tonic::transport::Server::builder()
             .concurrency_limit_per_connection(self.config.max_concurrent_requests)
-            .add_service(
-                LogsServiceServer::new(grpc_service_logs)
-                    .max_decoding_message_size(max_body_bytes)
-                    .accept_compressed(CompressionEncoding::Gzip)
-                    .accept_compressed(CompressionEncoding::Zstd),
-            )
-            .add_service(
-                TraceServiceServer::new(grpc_service_traces)
-                    .max_decoding_message_size(max_body_bytes)
-                    .accept_compressed(CompressionEncoding::Gzip)
-                    .accept_compressed(CompressionEncoding::Zstd),
-            )
-            .add_service(
-                MetricsServiceServer::new(grpc_service_metrics)
-                    .max_decoding_message_size(max_body_bytes)
-                    .accept_compressed(CompressionEncoding::Gzip)
-                    .accept_compressed(CompressionEncoding::Zstd),
-            )
+            .add_routes(tonic::service::Routes::from(grpc_routes))
             .serve_with_shutdown(self.grpc_addr, grpc_shutdown);
 
         let http_state = HttpState::new(
@@ -868,12 +1007,7 @@ impl Source for OtlpReceiverSource {
             self.config,
         );
 
-        let app = Router::new()
-            .route("/v1/logs", post(handle_logs))
-            .route("/v1/traces", post(handle_traces))
-            .route("/v1/metrics", post(handle_metrics))
-            .layer(DefaultBodyLimit::max(self.config.max_body_bytes))
-            .with_state(http_state);
+        let app = build_http_router(http_state);
 
         let listener = tokio::net::TcpListener::bind(self.http_addr)
             .await
@@ -1411,7 +1545,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
 
-        let res = handle_logs(State(state), headers, Bytes::from(body_bytes)).await;
+        let res = handle_logs(
+            State(state),
+            test_http_request(headers, Bytes::from(body_bytes)),
+        )
+        .await;
         assert!(res.is_ok(), "handle_logs should succeed for >64KiB payload");
         let resp = res.unwrap().into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1615,7 +1753,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
 
-        let res = handle_traces(State(state), headers, Bytes::from(body_bytes)).await;
+        let res = handle_traces(
+            State(state),
+            test_http_request(headers, Bytes::from(body_bytes)),
+        )
+        .await;
         assert!(res.is_ok());
         let resp = res.unwrap().into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1678,7 +1820,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
 
-        let res = handle_metrics(State(state), headers, Bytes::from(body_bytes)).await;
+        let res = handle_metrics(
+            State(state),
+            test_http_request(headers, Bytes::from(body_bytes)),
+        )
+        .await;
         assert!(res.is_ok());
         let resp = res.unwrap().into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1731,7 +1877,11 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
 
-        let res = handle_logs(State(state), headers, Bytes::from(body_bytes)).await;
+        let res = handle_logs(
+            State(state),
+            test_http_request(headers, Bytes::from(body_bytes)),
+        )
+        .await;
         assert!(res.is_ok());
         let resp = res.unwrap().into_response();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1743,6 +1893,12 @@ mod tests {
         } else {
             panic!("Expected SignalBatch::Logs");
         }
+    }
+
+    fn test_http_request(headers: HeaderMap, body: Bytes) -> AxumRequest {
+        let mut req = AxumRequest::new(axum::body::Body::from(body));
+        *req.headers_mut() = headers;
+        req
     }
 
     static SHED_METRIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1937,13 +2093,20 @@ mod tests {
         );
 
         // First request fills the capacity-1 channel
-        let first_res = handle_logs(State(state.clone()), headers.clone(), json_body.clone()).await;
+        let first_res = handle_logs(
+            State(state.clone()),
+            test_http_request(headers.clone(), json_body.clone()),
+        )
+        .await;
         assert!(first_res.is_ok());
 
         // Second request blocks until timeout and sheds with 503 + Retry-After: 1
         let before_http_logs = shed_requests_total("logs", "http");
-        let second_res =
-            handle_logs(State(state.clone()), headers.clone(), json_body.clone()).await;
+        let second_res = handle_logs(
+            State(state.clone()),
+            test_http_request(headers.clone(), json_body.clone()),
+        )
+        .await;
         assert!(second_res.is_err());
         let resp = second_res.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1958,7 +2121,7 @@ mod tests {
         // Closed channel returns 503 + Retry-After: 1 WITHOUT incrementing shed counter
         drop(logs_rx);
         let before_closed = shed_requests_total("logs", "http");
-        let closed_res = handle_logs(State(state), headers, json_body).await;
+        let closed_res = handle_logs(State(state), test_http_request(headers, json_body)).await;
         assert!(closed_res.is_err());
         let closed_resp = closed_res.into_response();
         assert_eq!(closed_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2065,10 +2228,13 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
         headers.insert(CONTENT_ENCODING, "zstd".parse().unwrap());
-        let resp = handle_logs(State(state), headers, Bytes::from(zstd_proto))
-            .await
-            .expect("zstd protobuf handler should succeed")
-            .into_response();
+        let resp = handle_logs(
+            State(state),
+            test_http_request(headers, Bytes::from(zstd_proto)),
+        )
+        .await
+        .expect("zstd protobuf handler should succeed")
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
         if let SignalBatch::Logs(b) = logs_rx.try_recv().unwrap() {
             assert_eq!(b.num_rows(), 1);
@@ -2299,8 +2465,7 @@ mod tests {
         headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         let res = handle_logs(
             State(state.clone()),
-            headers,
-            Bytes::from_static(br#"{"resourceLogs":[]}"#),
+            test_http_request(headers, Bytes::from_static(br#"{"resourceLogs":[]}"#)),
         )
         .await;
         assert!(res.is_err());
@@ -2313,5 +2478,60 @@ mod tests {
             Some("1")
         );
         assert_eq!(shed_requests_total("logs", "http"), before_http + 1);
+    }
+
+    #[tokio::test]
+    async fn test_http_raw_body_exceeding_max_body_bytes_rejected_with_413() {
+        use axum::http::header::CONTENT_ENCODING;
+
+        let cfg = OtlpReceiverConfig {
+            max_body_bytes: 1024,
+            max_concurrent_requests: 16,
+            ingest_send_timeout_ms: 500,
+        };
+        let (logs_tx, _logs_rx) = mpsc::channel(4);
+        let (traces_tx, _traces_rx) = mpsc::channel(4);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(4);
+        let state = HttpState::new(logs_tx, traces_tx, metrics_tx, cfg);
+
+        let oversized_body = Bytes::from(vec![b' '; 2048]);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+
+        // 1. Direct decode_and_convert_http rejects uncompressed payload > max_body_bytes with 413
+        let direct_res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            headers.clone(),
+            oversized_body.clone(),
+            cfg.max_body_bytes,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(direct_res.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 2. HTTP router with DefaultBodyLimit::max(max_body_bytes) rejects > max_body_bytes with 413 before buffering
+        let mut app = build_http_router(state);
+        let mut req = AxumRequest::builder()
+            .method("POST")
+            .uri("/v1/logs")
+            .body(axum::body::Body::from(oversized_body))
+            .unwrap();
+        *req.headers_mut() = headers;
+        let resp = tonic::codegen::Service::call(&mut app, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 3. Multiple Content-Encoding headers rejected with 415 Unsupported Media Type
+        let mut multi_enc_headers = HeaderMap::new();
+        multi_enc_headers.append(CONTENT_ENCODING, "gzip".parse().unwrap());
+        multi_enc_headers.append(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let multi_res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            multi_enc_headers,
+            Bytes::from_static(b"{}"),
+            cfg.max_body_bytes,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(multi_res.unwrap_err(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 }

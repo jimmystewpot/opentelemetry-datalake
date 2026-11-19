@@ -21,6 +21,7 @@ async-trait = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
 opentelemetry = { workspace = true }
+figment = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
