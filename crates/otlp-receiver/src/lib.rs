@@ -2,14 +2,24 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::Bytes,
-    extract::State,
-    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    extract::{DefaultBodyLimit, State},
+    http::{
+        HeaderMap, StatusCode,
+        header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER},
+    },
     response::IntoResponse,
     routing::post,
 };
+use opentelemetry::KeyValue;
+use std::io::Read;
 use std::net::SocketAddr;
-use tokio::sync::mpsc;
-use tonic::{Request, Response, Status};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tonic::{Request, Response, Status, codec::CompressionEncoding};
 
 use arrow::record_batch::RecordBatch;
 use opentelemetry_proto::tonic::collector::logs::v1::{
@@ -35,6 +45,204 @@ pub const HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES: usize = 64 * 1024;
 /// Maximum gRPC record count processed inline on the async worker.
 /// Batches exceeding this threshold are offloaded to `tokio::task::spawn_blocking`.
 pub const GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD: usize = 512;
+
+/// Default maximum decompressed request payload size (16 MiB).
+pub const DEFAULT_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Minimum permitted `max_body_bytes` value (1 KiB).
+pub const MIN_MAX_BODY_BYTES: usize = 1024;
+
+/// Default maximum concurrent in-flight requests per protocol listener.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
+
+/// Default maximum duration in milliseconds to wait on a full downstream channel before shedding.
+pub const DEFAULT_INGEST_SEND_TIMEOUT_MS: u64 = 500;
+
+/// Resource bounds and overload shedding configuration for [`OtlpReceiverSource`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OtlpReceiverConfig {
+    pub max_body_bytes: usize,
+    pub max_concurrent_requests: usize,
+    pub ingest_send_timeout_ms: u64,
+}
+
+impl Default for OtlpReceiverConfig {
+    fn default() -> Self {
+        Self {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            ingest_send_timeout_ms: DEFAULT_INGEST_SEND_TIMEOUT_MS,
+        }
+    }
+}
+
+impl OtlpReceiverConfig {
+    /// Validates receiver bounds before starting the servers.
+    ///
+    /// # Errors
+    /// Returns [`PipelineError::Configuration`] if any bound is below its minimum threshold.
+    pub fn validate(&self) -> Result<(), PipelineError> {
+        if self.max_body_bytes < MIN_MAX_BODY_BYTES {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from(format!(
+                    "server.max_body_bytes must be >= {MIN_MAX_BODY_BYTES} (got {})",
+                    self.max_body_bytes
+                )),
+            )));
+        }
+        if self.max_concurrent_requests == 0 {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from("server.max_concurrent_requests must be >= 1 (got 0)"),
+            )));
+        }
+        if self.ingest_send_timeout_ms == 0 {
+            return Err(PipelineError::Configuration(Box::new(
+                figment::Error::from("server.ingest_send_timeout_ms must be >= 1 (got 0)"),
+            )));
+        }
+        Ok(())
+    }
+}
+
+static SHED_LOGS_GRPC: AtomicU64 = AtomicU64::new(0);
+static SHED_TRACES_GRPC: AtomicU64 = AtomicU64::new(0);
+static SHED_METRICS_GRPC: AtomicU64 = AtomicU64::new(0);
+static SHED_LOGS_HTTP: AtomicU64 = AtomicU64::new(0);
+static SHED_TRACES_HTTP: AtomicU64 = AtomicU64::new(0);
+static SHED_METRICS_HTTP: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the cumulative number of shed requests for the given `(signal, protocol)` pair.
+#[must_use]
+pub fn shed_requests_total(signal: &str, protocol: &str) -> u64 {
+    match (signal, protocol) {
+        ("logs", "grpc") => SHED_LOGS_GRPC.load(Ordering::Relaxed),
+        ("traces", "grpc") => SHED_TRACES_GRPC.load(Ordering::Relaxed),
+        ("metrics", "grpc") => SHED_METRICS_GRPC.load(Ordering::Relaxed),
+        ("logs", "http") => SHED_LOGS_HTTP.load(Ordering::Relaxed),
+        ("traces", "http") => SHED_TRACES_HTTP.load(Ordering::Relaxed),
+        ("metrics", "http") => SHED_METRICS_HTTP.load(Ordering::Relaxed),
+        _ => 0,
+    }
+}
+
+fn record_request_shed(signal: &'static str, protocol: &'static str) {
+    match (signal, protocol) {
+        ("logs", "grpc") => {
+            SHED_LOGS_GRPC.fetch_add(1, Ordering::Relaxed);
+        }
+        ("traces", "grpc") => {
+            SHED_TRACES_GRPC.fetch_add(1, Ordering::Relaxed);
+        }
+        ("metrics", "grpc") => {
+            SHED_METRICS_GRPC.fetch_add(1, Ordering::Relaxed);
+        }
+        ("logs", "http") => {
+            SHED_LOGS_HTTP.fetch_add(1, Ordering::Relaxed);
+        }
+        ("traces", "http") => {
+            SHED_TRACES_HTTP.fetch_add(1, Ordering::Relaxed);
+        }
+        ("metrics", "http") => {
+            SHED_METRICS_HTTP.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    let counter = opentelemetry::global::meter("otel-datalake")
+        .u64_counter("datalake.receiver.requests_shed_total")
+        .build();
+    counter.add(
+        1,
+        &[
+            KeyValue::new("signal", signal),
+            KeyValue::new("protocol", protocol),
+        ],
+    );
+}
+
+async fn acquire_concurrency_permit(
+    semaphore: &Arc<Semaphore>,
+    timeout: Duration,
+) -> Option<OwnedSemaphorePermit> {
+    match tokio::time::timeout(timeout, Arc::clone(semaphore).acquire_owned()).await {
+        Ok(Ok(permit)) => Some(permit),
+        _ => None,
+    }
+}
+
+async fn send_batch_grpc(
+    tx: &mpsc::Sender<SignalBatch>,
+    batch: SignalBatch,
+    timeout: Duration,
+    signal: &'static str,
+) -> Result<(), Status> {
+    match tx.send_timeout(batch, timeout).await {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+            record_request_shed(signal, "grpc");
+            Err(Status::unavailable(
+                "pipeline channel full: request shed after send timeout",
+            ))
+        }
+        Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+            Err(Status::unavailable("pipeline downstream closed"))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HttpReject {
+    status: StatusCode,
+    retry_after: Option<&'static str>,
+    body: &'static str,
+}
+
+impl HttpReject {
+    const fn status_only(status: StatusCode) -> Self {
+        Self {
+            status,
+            retry_after: None,
+            body: "",
+        }
+    }
+
+    const fn service_unavailable(body: &'static str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some("1"),
+            body,
+        }
+    }
+}
+
+impl IntoResponse for HttpReject {
+    fn into_response(self) -> axum::response::Response {
+        match self.retry_after {
+            Some(retry) => (self.status, [(RETRY_AFTER, retry)], self.body).into_response(),
+            None => self.status.into_response(),
+        }
+    }
+}
+
+async fn send_batch_http(
+    tx: &mpsc::Sender<SignalBatch>,
+    batch: SignalBatch,
+    timeout: Duration,
+    signal: &'static str,
+) -> Result<(), HttpReject> {
+    match tx.send_timeout(batch, timeout).await {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+            record_request_shed(signal, "http");
+            Err(HttpReject::service_unavailable(
+                "pipeline channel full: request shed after send timeout",
+            ))
+        }
+        Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(HttpReject::service_unavailable(
+            "pipeline downstream closed",
+        )),
+    }
+}
 
 /// Estimates the total number of log records in an export request.
 #[must_use]
@@ -85,6 +293,22 @@ pub fn estimate_metrics_records(req: &ExportMetricsServiceRequest) -> usize {
 #[derive(Clone)]
 struct GrpcLogsService {
     tx: mpsc::Sender<SignalBatch>,
+    send_timeout: Duration,
+    semaphore: Arc<Semaphore>,
+}
+
+impl GrpcLogsService {
+    fn new(
+        tx: mpsc::Sender<SignalBatch>,
+        config: OtlpReceiverConfig,
+        semaphore: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            tx,
+            send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
+            semaphore,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -93,6 +317,14 @@ impl LogsService for GrpcLogsService {
         &self,
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
+        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+        else {
+            record_request_shed("logs", "grpc");
+            return Err(Status::unavailable(
+                "receiver concurrency limit reached: request shed",
+            ));
+        };
+
         let req = request.into_inner();
         let batch_res = if estimate_logs_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
             tokio::task::spawn_blocking(move || arrow_codec::decode_logs(&req))
@@ -105,10 +337,13 @@ impl LogsService for GrpcLogsService {
         match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    self.tx
-                        .send(SignalBatch::Logs(batch))
-                        .await
-                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
+                    send_batch_grpc(
+                        &self.tx,
+                        SignalBatch::Logs(batch),
+                        self.send_timeout,
+                        "logs",
+                    )
+                    .await?;
                 }
                 Ok(Response::new(ExportLogsServiceResponse {
                     partial_success: None,
@@ -122,6 +357,22 @@ impl LogsService for GrpcLogsService {
 #[derive(Clone)]
 struct GrpcTraceService {
     tx: mpsc::Sender<SignalBatch>,
+    send_timeout: Duration,
+    semaphore: Arc<Semaphore>,
+}
+
+impl GrpcTraceService {
+    fn new(
+        tx: mpsc::Sender<SignalBatch>,
+        config: OtlpReceiverConfig,
+        semaphore: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            tx,
+            send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
+            semaphore,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -130,6 +381,14 @@ impl TraceService for GrpcTraceService {
         &self,
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+        else {
+            record_request_shed("traces", "grpc");
+            return Err(Status::unavailable(
+                "receiver concurrency limit reached: request shed",
+            ));
+        };
+
         let req = request.into_inner();
         let batch_res = if estimate_traces_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
             tokio::task::spawn_blocking(move || arrow_codec::decode_traces(&req))
@@ -142,10 +401,13 @@ impl TraceService for GrpcTraceService {
         match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    self.tx
-                        .send(SignalBatch::Traces(batch))
-                        .await
-                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
+                    send_batch_grpc(
+                        &self.tx,
+                        SignalBatch::Traces(batch),
+                        self.send_timeout,
+                        "traces",
+                    )
+                    .await?;
                 }
                 Ok(Response::new(ExportTraceServiceResponse {
                     partial_success: None,
@@ -159,6 +421,22 @@ impl TraceService for GrpcTraceService {
 #[derive(Clone)]
 struct GrpcMetricsService {
     tx: mpsc::Sender<SignalBatch>,
+    send_timeout: Duration,
+    semaphore: Arc<Semaphore>,
+}
+
+impl GrpcMetricsService {
+    fn new(
+        tx: mpsc::Sender<SignalBatch>,
+        config: OtlpReceiverConfig,
+        semaphore: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            tx,
+            send_timeout: Duration::from_millis(config.ingest_send_timeout_ms.max(1)),
+            semaphore,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -167,6 +445,14 @@ impl MetricsService for GrpcMetricsService {
         &self,
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
+        let Some(_permit) = acquire_concurrency_permit(&self.semaphore, self.send_timeout).await
+        else {
+            record_request_shed("metrics", "grpc");
+            return Err(Status::unavailable(
+                "receiver concurrency limit reached: request shed",
+            ));
+        };
+
         let req = request.into_inner();
         let batch_res = if estimate_metrics_records(&req) >= GRPC_SPAWN_BLOCKING_RECORD_THRESHOLD {
             tokio::task::spawn_blocking(move || arrow_codec::decode_metrics(&req))
@@ -179,10 +465,13 @@ impl MetricsService for GrpcMetricsService {
         match batch_res {
             Ok(batch) => {
                 if batch.num_rows() > 0 {
-                    self.tx
-                        .send(SignalBatch::Metrics(batch))
-                        .await
-                        .map_err(|_| Status::unavailable("pipeline downstream closed"))?;
+                    send_batch_grpc(
+                        &self.tx,
+                        SignalBatch::Metrics(batch),
+                        self.send_timeout,
+                        "metrics",
+                    )
+                    .await?;
                 }
                 Ok(Response::new(ExportMetricsServiceResponse {
                     partial_success: None,
@@ -190,6 +479,71 @@ impl MetricsService for GrpcMetricsService {
             }
             Err(e) => Err(Status::internal(e.to_string())),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentEncoding {
+    Identity,
+    Gzip,
+    Zstd,
+}
+
+impl ContentEncoding {
+    fn from_headers(headers: &HeaderMap) -> Result<Self, StatusCode> {
+        let Some(raw_val) = headers.get(CONTENT_ENCODING) else {
+            return Ok(Self::Identity);
+        };
+        let raw_str = raw_val
+            .to_str()
+            .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+        let trimmed = raw_str.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
+            Ok(Self::Identity)
+        } else if trimmed.eq_ignore_ascii_case("gzip") || trimmed.eq_ignore_ascii_case("x-gzip") {
+            Ok(Self::Gzip)
+        } else if trimmed.eq_ignore_ascii_case("zstd") {
+            Ok(Self::Zstd)
+        } else {
+            Err(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        }
+    }
+}
+
+fn decompress_bounded(
+    raw: &[u8],
+    encoding: ContentEncoding,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, StatusCode> {
+    let limit = (max_body_bytes as u64).saturating_add(1);
+    let mut buf = Vec::with_capacity(raw.len().min(max_body_bytes));
+    match encoding {
+        ContentEncoding::Identity => {
+            if raw.len() > max_body_bytes {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            return Ok(raw.to_vec());
+        }
+        ContentEncoding::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(raw);
+            decoder
+                .take(limit)
+                .read_to_end(&mut buf)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        }
+        ContentEncoding::Zstd => {
+            let decoder =
+                zstd::stream::read::Decoder::new(raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+            decoder
+                .take(limit)
+                .read_to_end(&mut buf)
+                .map_err(|_| StatusCode::BAD_REQUEST)?;
+        }
+    }
+    if buf.len() > max_body_bytes {
+        Err(StatusCode::PAYLOAD_TOO_LARGE)
+    } else {
+        Ok(buf)
     }
 }
 
@@ -212,6 +566,7 @@ fn decode_http_body<T: prost::Message + Default + serde::de::DeserializeOwned>(
 async fn decode_and_convert_http<T, F>(
     headers: HeaderMap,
     body: Bytes,
+    max_body_bytes: usize,
     signal_name: &'static str,
     decode_fn: F,
 ) -> Result<RecordBatch, StatusCode>
@@ -219,9 +574,21 @@ where
     T: prost::Message + Default + serde::de::DeserializeOwned + Send + 'static,
     F: FnOnce(&T) -> Result<RecordBatch, PipelineError> + Send + 'static,
 {
-    if body.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES {
+    let encoding = ContentEncoding::from_headers(&headers)?;
+    if body.len() > max_body_bytes {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    if encoding != ContentEncoding::Identity || body.len() > HTTP_SPAWN_BLOCKING_THRESHOLD_BYTES {
         tokio::task::spawn_blocking(move || {
-            let req: T = decode_http_body(&headers, body).map_err(|e| {
+            let payload = match encoding {
+                ContentEncoding::Identity => body,
+                ContentEncoding::Gzip | ContentEncoding::Zstd => {
+                    let decompressed = decompress_bounded(&body, encoding, max_body_bytes)?;
+                    Bytes::from(decompressed)
+                }
+            };
+            let req: T = decode_http_body(&headers, payload).map_err(|e| {
                 tracing::error!("{signal_name} HTTP decode error: {e}");
                 StatusCode::BAD_REQUEST
             })?;
@@ -253,27 +620,58 @@ struct HttpState {
     logs_tx: mpsc::Sender<SignalBatch>,
     traces_tx: mpsc::Sender<SignalBatch>,
     metrics_tx: mpsc::Sender<SignalBatch>,
+    config: OtlpReceiverConfig,
+    semaphore: Arc<Semaphore>,
+}
+
+impl HttpState {
+    fn new(
+        logs_tx: mpsc::Sender<SignalBatch>,
+        traces_tx: mpsc::Sender<SignalBatch>,
+        metrics_tx: mpsc::Sender<SignalBatch>,
+        config: OtlpReceiverConfig,
+    ) -> Self {
+        Self {
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+            config,
+            semaphore: Arc::new(Semaphore::new(config.max_concurrent_requests.max(1))),
+        }
+    }
 }
 
 async fn handle_logs(
     State(state): State<HttpState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, HttpReject> {
+    let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
+    let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
+        record_request_shed("logs", "http");
+        return Err(HttpReject::service_unavailable(
+            "receiver concurrency limit reached: request shed",
+        ));
+    };
+
     let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
         headers,
         body,
+        state.config.max_body_bytes,
         "Logs",
         arrow_codec::decode_logs,
     )
-    .await?;
+    .await
+    .map_err(HttpReject::status_only)?;
 
     if batch.num_rows() > 0 {
-        state
-            .logs_tx
-            .send(SignalBatch::Logs(batch))
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        send_batch_http(
+            &state.logs_tx,
+            SignalBatch::Logs(batch),
+            send_timeout,
+            "logs",
+        )
+        .await?;
     }
     Ok((
         StatusCode::OK,
@@ -285,21 +683,33 @@ async fn handle_traces(
     State(state): State<HttpState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, HttpReject> {
+    let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
+    let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
+        record_request_shed("traces", "http");
+        return Err(HttpReject::service_unavailable(
+            "receiver concurrency limit reached: request shed",
+        ));
+    };
+
     let batch = decode_and_convert_http::<ExportTraceServiceRequest, _>(
         headers,
         body,
+        state.config.max_body_bytes,
         "Traces",
         arrow_codec::decode_traces,
     )
-    .await?;
+    .await
+    .map_err(HttpReject::status_only)?;
 
     if batch.num_rows() > 0 {
-        state
-            .traces_tx
-            .send(SignalBatch::Traces(batch))
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        send_batch_http(
+            &state.traces_tx,
+            SignalBatch::Traces(batch),
+            send_timeout,
+            "traces",
+        )
+        .await?;
     }
     Ok((
         StatusCode::OK,
@@ -311,21 +721,33 @@ async fn handle_metrics(
     State(state): State<HttpState>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, HttpReject> {
+    let send_timeout = Duration::from_millis(state.config.ingest_send_timeout_ms.max(1));
+    let Some(_permit) = acquire_concurrency_permit(&state.semaphore, send_timeout).await else {
+        record_request_shed("metrics", "http");
+        return Err(HttpReject::service_unavailable(
+            "receiver concurrency limit reached: request shed",
+        ));
+    };
+
     let batch = decode_and_convert_http::<ExportMetricsServiceRequest, _>(
         headers,
         body,
+        state.config.max_body_bytes,
         "Metrics",
         arrow_codec::decode_metrics,
     )
-    .await?;
+    .await
+    .map_err(HttpReject::status_only)?;
 
     if batch.num_rows() > 0 {
-        state
-            .metrics_tx
-            .send(SignalBatch::Metrics(batch))
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        send_batch_http(
+            &state.metrics_tx,
+            SignalBatch::Metrics(batch),
+            send_timeout,
+            "metrics",
+        )
+        .await?;
     }
     Ok((
         StatusCode::OK,
@@ -341,10 +763,11 @@ pub struct OtlpReceiverSource {
     traces_tx: mpsc::Sender<SignalBatch>,
     metrics_tx: mpsc::Sender<SignalBatch>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    config: OtlpReceiverConfig,
 }
 
 impl OtlpReceiverSource {
-    /// Creates a new `OtlpReceiverSource`.
+    /// Creates a new `OtlpReceiverSource` with default resource bounds.
     #[must_use]
     pub fn new(
         grpc_addr: SocketAddr,
@@ -354,6 +777,28 @@ impl OtlpReceiverSource {
         metrics_tx: mpsc::Sender<SignalBatch>,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
+        Self::with_config(
+            grpc_addr,
+            http_addr,
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+            shutdown_rx,
+            OtlpReceiverConfig::default(),
+        )
+    }
+
+    /// Creates a new `OtlpReceiverSource` with explicit resource bounds.
+    #[must_use]
+    pub fn with_config(
+        grpc_addr: SocketAddr,
+        http_addr: SocketAddr,
+        logs_tx: mpsc::Sender<SignalBatch>,
+        traces_tx: mpsc::Sender<SignalBatch>,
+        metrics_tx: mpsc::Sender<SignalBatch>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        config: OtlpReceiverConfig,
+    ) -> Self {
         Self {
             grpc_addr,
             http_addr,
@@ -361,6 +806,7 @@ impl OtlpReceiverSource {
             traces_tx,
             metrics_tx,
             shutdown_rx,
+            config,
         }
     }
 }
@@ -368,15 +814,21 @@ impl OtlpReceiverSource {
 #[async_trait]
 impl Source for OtlpReceiverSource {
     async fn run(&mut self) -> Result<(), PipelineError> {
-        let grpc_service_logs = GrpcLogsService {
-            tx: self.logs_tx.clone(),
-        };
-        let grpc_service_traces = GrpcTraceService {
-            tx: self.traces_tx.clone(),
-        };
-        let grpc_service_metrics = GrpcMetricsService {
-            tx: self.metrics_tx.clone(),
-        };
+        self.config.validate()?;
+
+        let grpc_semaphore = Arc::new(Semaphore::new(self.config.max_concurrent_requests));
+        let grpc_service_logs = GrpcLogsService::new(
+            self.logs_tx.clone(),
+            self.config,
+            Arc::clone(&grpc_semaphore),
+        );
+        let grpc_service_traces = GrpcTraceService::new(
+            self.traces_tx.clone(),
+            self.config,
+            Arc::clone(&grpc_semaphore),
+        );
+        let grpc_service_metrics =
+            GrpcMetricsService::new(self.metrics_tx.clone(), self.config, grpc_semaphore);
 
         let mut shutdown_rx_grpc = self.shutdown_rx.clone();
         let grpc_shutdown = async move {
@@ -386,22 +838,41 @@ impl Source for OtlpReceiverSource {
             tracing::info!("gRPC server shutting down gracefully");
         };
 
+        let max_body_bytes = self.config.max_body_bytes;
         let grpc_server = tonic::transport::Server::builder()
-            .add_service(LogsServiceServer::new(grpc_service_logs))
-            .add_service(TraceServiceServer::new(grpc_service_traces))
-            .add_service(MetricsServiceServer::new(grpc_service_metrics))
+            .concurrency_limit_per_connection(self.config.max_concurrent_requests)
+            .add_service(
+                LogsServiceServer::new(grpc_service_logs)
+                    .max_decoding_message_size(max_body_bytes)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Zstd),
+            )
+            .add_service(
+                TraceServiceServer::new(grpc_service_traces)
+                    .max_decoding_message_size(max_body_bytes)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Zstd),
+            )
+            .add_service(
+                MetricsServiceServer::new(grpc_service_metrics)
+                    .max_decoding_message_size(max_body_bytes)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .accept_compressed(CompressionEncoding::Zstd),
+            )
             .serve_with_shutdown(self.grpc_addr, grpc_shutdown);
 
-        let http_state = HttpState {
-            logs_tx: self.logs_tx.clone(),
-            traces_tx: self.traces_tx.clone(),
-            metrics_tx: self.metrics_tx.clone(),
-        };
+        let http_state = HttpState::new(
+            self.logs_tx.clone(),
+            self.traces_tx.clone(),
+            self.metrics_tx.clone(),
+            self.config,
+        );
 
         let app = Router::new()
             .route("/v1/logs", post(handle_logs))
             .route("/v1/traces", post(handle_traces))
             .route("/v1/metrics", post(handle_metrics))
+            .layer(DefaultBodyLimit::max(self.config.max_body_bytes))
             .with_state(http_state);
 
         let listener = tokio::net::TcpListener::bind(self.http_addr)
@@ -480,7 +951,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_logs_empty_request() {
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcLogsService { tx };
+        let svc = GrpcLogsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportLogsServiceRequest::default());
         let resp = svc.export(req).await;
@@ -497,7 +972,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_traces_empty_request() {
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcTraceService { tx };
+        let svc = GrpcTraceService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportTraceServiceRequest::default());
         let resp = svc.export(req).await;
@@ -513,7 +992,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_metrics_empty_request() {
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcMetricsService { tx };
+        let svc = GrpcMetricsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportMetricsServiceRequest::default());
         let resp = svc.export(req).await;
@@ -530,7 +1013,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_logs_backpressure_on_closed_channel() {
         let (tx, rx) = mpsc::channel(10);
-        let svc = GrpcLogsService { tx };
+        let svc = GrpcLogsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         // Drop the receiver to simulate a failed downstream.
         drop(rx);
@@ -615,7 +1102,11 @@ mod tests {
         use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
         let (tx, rx) = mpsc::channel(10);
-        let svc = GrpcTraceService { tx };
+        let svc = GrpcTraceService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
         drop(rx);
 
         let req = Request::new(ExportTraceServiceRequest {
@@ -648,7 +1139,11 @@ mod tests {
         use opentelemetry_proto::tonic::resource::v1::Resource;
 
         let (tx, rx) = mpsc::channel(10);
-        let svc = GrpcMetricsService { tx };
+        let svc = GrpcMetricsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
         drop(rx);
 
         let req = Request::new(ExportMetricsServiceRequest {
@@ -694,7 +1189,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_logs_non_empty_sends_to_channel() {
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcLogsService { tx };
+        let svc = GrpcLogsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -727,7 +1226,11 @@ mod tests {
         use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcTraceService { tx };
+        let svc = GrpcTraceService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -872,11 +1375,12 @@ mod tests {
         let (traces_tx, _traces_rx) = mpsc::channel(10);
         let (metrics_tx, _metrics_rx) = mpsc::channel(10);
 
-        let state = HttpState {
+        let state = HttpState::new(
             logs_tx,
             traces_tx,
             metrics_tx,
-        };
+            OtlpReceiverConfig::default(),
+        );
 
         // Construct a protobuf ExportLogsServiceRequest body > 65_536 bytes (64 KiB)
         let req = ExportLogsServiceRequest {
@@ -924,7 +1428,11 @@ mod tests {
     #[tokio::test]
     async fn test_grpc_logs_over_threshold_decodes_via_spawn_blocking() {
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcLogsService { tx };
+        let svc = GrpcLogsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -959,7 +1467,11 @@ mod tests {
         use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcTraceService { tx };
+        let svc = GrpcTraceService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -997,7 +1509,11 @@ mod tests {
         };
 
         let (tx, mut rx) = mpsc::channel(10);
-        let svc = GrpcMetricsService { tx };
+        let svc = GrpcMetricsService::new(
+            tx,
+            OtlpReceiverConfig::default(),
+            Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+        );
 
         let req = Request::new(ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
@@ -1070,11 +1586,12 @@ mod tests {
         let (traces_tx, mut traces_rx) = mpsc::channel(10);
         let (metrics_tx, _metrics_rx) = mpsc::channel(10);
 
-        let state = HttpState {
+        let state = HttpState::new(
             logs_tx,
             traces_tx,
             metrics_tx,
-        };
+            OtlpReceiverConfig::default(),
+        );
 
         let req = ExportTraceServiceRequest {
             resource_spans: vec![ResourceSpans {
@@ -1123,11 +1640,12 @@ mod tests {
         let (traces_tx, _traces_rx) = mpsc::channel(10);
         let (metrics_tx, mut metrics_rx) = mpsc::channel(10);
 
-        let state = HttpState {
+        let state = HttpState::new(
             logs_tx,
             traces_tx,
             metrics_tx,
-        };
+            OtlpReceiverConfig::default(),
+        );
 
         let req = ExportMetricsServiceRequest {
             resource_metrics: vec![ResourceMetrics {
@@ -1183,11 +1701,12 @@ mod tests {
         let (traces_tx, _traces_rx) = mpsc::channel(10);
         let (metrics_tx, _metrics_rx) = mpsc::channel(10);
 
-        let state = HttpState {
+        let state = HttpState::new(
             logs_tx,
             traces_tx,
             metrics_tx,
-        };
+            OtlpReceiverConfig::default(),
+        );
 
         let req = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
@@ -1224,5 +1743,575 @@ mod tests {
         } else {
             panic!("Expected SignalBatch::Logs");
         }
+    }
+
+    static SHED_METRIC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn test_otlp_receiver_config_defaults_and_validation() {
+        let cfg = OtlpReceiverConfig::default();
+        assert_eq!(cfg.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(cfg.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.max_concurrent_requests, DEFAULT_MAX_CONCURRENT_REQUESTS);
+        assert_eq!(cfg.max_concurrent_requests, 256);
+        assert_eq!(cfg.ingest_send_timeout_ms, DEFAULT_INGEST_SEND_TIMEOUT_MS);
+        assert_eq!(cfg.ingest_send_timeout_ms, 500);
+        assert!(cfg.validate().is_ok());
+
+        let too_small_body = OtlpReceiverConfig {
+            max_body_bytes: 512,
+            ..Default::default()
+        };
+        assert!(matches!(
+            too_small_body.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+
+        let zero_concurrency = OtlpReceiverConfig {
+            max_concurrent_requests: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            zero_concurrency.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+
+        let zero_timeout = OtlpReceiverConfig {
+            ingest_send_timeout_ms: 0,
+            ..Default::default()
+        };
+        assert!(matches!(
+            zero_timeout.validate(),
+            Err(PipelineError::Configuration(_))
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_grpc_full_channel_sheds_after_timeout_and_increments_metric() {
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource;
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let _guard = SHED_METRIC_TEST_LOCK.lock().await;
+
+        let cfg = OtlpReceiverConfig {
+            ingest_send_timeout_ms: 250,
+            ..Default::default()
+        };
+        let sem = Arc::new(Semaphore::new(cfg.max_concurrent_requests));
+
+        // 1. Logs
+        let (logs_tx, _logs_rx) = mpsc::channel(1);
+        let logs_svc = GrpcLogsService::new(logs_tx, cfg, Arc::clone(&sem));
+        let log_req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        logs_svc
+            .export(Request::new(log_req.clone()))
+            .await
+            .unwrap();
+        let before_logs = shed_requests_total("logs", "grpc");
+        let err = logs_svc
+            .export(Request::new(log_req))
+            .await
+            .expect_err("full logs channel should shed after timeout");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            err.message().contains("shed"),
+            "Expected message containing 'shed', got: {}",
+            err.message()
+        );
+        assert_eq!(shed_requests_total("logs", "grpc"), before_logs + 1);
+
+        // 2. Traces
+        let (traces_tx, _traces_rx) = mpsc::channel(1);
+        let traces_svc = GrpcTraceService::new(traces_tx, cfg, Arc::clone(&sem));
+        let trace_req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        start_time_unix_nano: 1_000_000_000,
+                        end_time_unix_nano: 2_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        traces_svc
+            .export(Request::new(trace_req.clone()))
+            .await
+            .unwrap();
+        let before_traces = shed_requests_total("traces", "grpc");
+        let err = traces_svc
+            .export(Request::new(trace_req))
+            .await
+            .expect_err("full traces channel should shed after timeout");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("shed"));
+        assert_eq!(shed_requests_total("traces", "grpc"), before_traces + 1);
+
+        // 3. Metrics
+        let (metrics_tx, _metrics_rx) = mpsc::channel(1);
+        let metrics_svc = GrpcMetricsService::new(metrics_tx, cfg, Arc::clone(&sem));
+        let metrics_req = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_string(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("svc".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".to_string(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 1_000_000_000,
+                                value: Some(
+                                    opentelemetry_proto::tonic::metrics::v1::number_data_point::Value::AsDouble(
+                                        1.0,
+                                    ),
+                                ),
+                                ..Default::default()
+                            }],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        metrics_svc
+            .export(Request::new(metrics_req.clone()))
+            .await
+            .unwrap();
+        let before_metrics = shed_requests_total("metrics", "grpc");
+        let err = metrics_svc
+            .export(Request::new(metrics_req))
+            .await
+            .expect_err("full metrics channel should shed after timeout");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("shed"));
+        assert_eq!(shed_requests_total("metrics", "grpc"), before_metrics + 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_http_full_channel_sheds_with_503_and_retry_after_header() {
+        let _guard = SHED_METRIC_TEST_LOCK.lock().await;
+
+        let (logs_tx, logs_rx) = mpsc::channel(1);
+        let (traces_tx, _traces_rx) = mpsc::channel(1);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(1);
+
+        let cfg = OtlpReceiverConfig {
+            ingest_send_timeout_ms: 200,
+            ..Default::default()
+        };
+        let state = HttpState::new(logs_tx, traces_tx, metrics_tx, cfg);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let json_body = Bytes::from_static(
+            br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000"}]}]}]}"#,
+        );
+
+        // First request fills the capacity-1 channel
+        let first_res = handle_logs(State(state.clone()), headers.clone(), json_body.clone()).await;
+        assert!(first_res.is_ok());
+
+        // Second request blocks until timeout and sheds with 503 + Retry-After: 1
+        let before_http_logs = shed_requests_total("logs", "http");
+        let second_res =
+            handle_logs(State(state.clone()), headers.clone(), json_body.clone()).await;
+        assert!(second_res.is_err());
+        let resp = second_res.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(shed_requests_total("logs", "http"), before_http_logs + 1);
+
+        // Closed channel returns 503 + Retry-After: 1 WITHOUT incrementing shed counter
+        drop(logs_rx);
+        let before_closed = shed_requests_total("logs", "http");
+        let closed_res = handle_logs(State(state), headers, json_body).await;
+        assert!(closed_res.is_err());
+        let closed_resp = closed_res.into_response();
+        assert_eq!(closed_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            closed_resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(shed_requests_total("logs", "http"), before_closed);
+    }
+
+    #[tokio::test]
+    async fn test_http_gzip_and_zstd_decompression_roundtrip() {
+        use axum::http::header::CONTENT_ENCODING;
+        use flate2::{Compression, write::GzEncoder};
+        use prost::Message;
+        use std::io::Write;
+
+        let json_payload =
+            br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000"}]}]}]}"#;
+
+        let proto_req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut proto_payload = Vec::new();
+        proto_req.encode(&mut proto_payload).unwrap();
+
+        // 1. Gzip JSON ("gzip")
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(json_payload).unwrap();
+        let gz_json = gz.finish().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            headers,
+            Bytes::from(gz_json),
+            DEFAULT_MAX_BODY_BYTES,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await
+        .expect("gzip JSON should decode");
+        assert_eq!(batch.num_rows(), 1);
+
+        // 2. Gzip Protobuf ("GZIP" uppercase)
+        let mut gz_proto = GzEncoder::new(Vec::new(), Compression::default());
+        gz_proto.write_all(&proto_payload).unwrap();
+        let gz_proto_bytes = gz_proto.finish().unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "GZIP".parse().unwrap());
+        let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            headers,
+            Bytes::from(gz_proto_bytes),
+            DEFAULT_MAX_BODY_BYTES,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await
+        .expect("GZIP protobuf should decode");
+        assert_eq!(batch.num_rows(), 1);
+
+        // 3. Zstd JSON ("zstd")
+        let zstd_json = zstd::stream::encode_all(&json_payload[..], 3).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "zstd".parse().unwrap());
+        let batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            headers,
+            Bytes::from(zstd_json),
+            DEFAULT_MAX_BODY_BYTES,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await
+        .expect("zstd JSON should decode");
+        assert_eq!(batch.num_rows(), 1);
+
+        // 4. Zstd Protobuf through HTTP handler
+        let zstd_proto = zstd::stream::encode_all(&proto_payload[..], 3).unwrap();
+        let (logs_tx, mut logs_rx) = mpsc::channel(4);
+        let (traces_tx, _traces_rx) = mpsc::channel(4);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(4);
+        let state = HttpState::new(
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+            OtlpReceiverConfig::default(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "zstd".parse().unwrap());
+        let resp = handle_logs(State(state), headers, Bytes::from(zstd_proto))
+            .await
+            .expect("zstd protobuf handler should succeed")
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        if let SignalBatch::Logs(b) = logs_rx.try_recv().unwrap() {
+            assert_eq!(b.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Logs");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_decompression_bomb_and_corrupt_encoding_and_unsupported_encoding() {
+        use axum::http::header::CONTENT_ENCODING;
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        // 1. Decompression bomb: 64 KiB of zeros compressed with gzip (< 200 bytes on wire) vs max_body_bytes = 4096
+        let zeros = vec![0u8; 64 * 1024];
+        let mut gz = GzEncoder::new(Vec::new(), Compression::best());
+        gz.write_all(&zeros).unwrap();
+        let bomb_bytes = gz.finish().unwrap();
+        assert!(bomb_bytes.len() < 1024);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            headers,
+            Bytes::from(bomb_bytes),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 2. Corrupt gzip and corrupt zstd -> 400 Bad Request
+        let mut bad_gz_headers = HeaderMap::new();
+        bad_gz_headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            bad_gz_headers,
+            Bytes::from_static(b"not a valid gzip stream"),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+
+        let mut bad_zstd_headers = HeaderMap::new();
+        bad_zstd_headers.insert(CONTENT_ENCODING, "zstd".parse().unwrap());
+        let res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            bad_zstd_headers,
+            Bytes::from_static(b"not a valid zstd stream"),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::BAD_REQUEST);
+
+        // 3. Unsupported Content-Encoding ("br" and comma-chained "gzip, deflate") -> 415 Unsupported Media Type
+        let mut br_headers = HeaderMap::new();
+        br_headers.insert(CONTENT_ENCODING, "br".parse().unwrap());
+        let res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            br_headers,
+            Bytes::from_static(b"{}"),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let mut chained_headers = HeaderMap::new();
+        chained_headers.insert(CONTENT_ENCODING, "gzip, deflate".parse().unwrap());
+        let res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            chained_headers,
+            Bytes::from_static(b"{}"),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(res.unwrap_err(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_grpc_compressed_requests_and_max_decoding_message_size() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use opentelemetry_proto::tonic::common::v1::{AnyValue, any_value};
+        use tonic::codec::CompressionEncoding;
+
+        // Reserve two free loopback ports
+        let grpc_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let grpc_addr = grpc_listener.local_addr().unwrap();
+        drop(grpc_listener);
+
+        let http_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        drop(http_listener);
+
+        let (logs_tx, mut logs_rx) = mpsc::channel(10);
+        let (traces_tx, _traces_rx) = mpsc::channel(10);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(10);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let cfg = OtlpReceiverConfig {
+            max_body_bytes: 2048,
+            max_concurrent_requests: 16,
+            ingest_send_timeout_ms: 500,
+        };
+        let mut source = OtlpReceiverSource::with_config(
+            grpc_addr,
+            http_addr,
+            logs_tx,
+            traces_tx,
+            metrics_tx,
+            shutdown_rx,
+            cfg,
+        );
+
+        let server_handle = tokio::spawn(async move {
+            let _ = source.run().await;
+        });
+
+        // Connect gRPC client with retry while server binds
+        let endpoint = format!("http://{grpc_addr}");
+        let mut client = None;
+        for _ in 0..25 {
+            if let Ok(c) = LogsServiceClient::connect(endpoint.clone()).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+        let mut client = client
+            .expect("gRPC client should connect to OtlpReceiverSource")
+            .send_compressed(CompressionEncoding::Gzip);
+
+        // 1. Small Gzip-compressed request succeeds
+        let small_req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("hello gzip".to_string())),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        client
+            .export(Request::new(small_req))
+            .await
+            .expect("gzip compressed gRPC logs request should succeed");
+        let received = logs_rx.recv().await.expect("should receive logs batch");
+        if let SignalBatch::Logs(batch) = received {
+            assert_eq!(batch.num_rows(), 1);
+        } else {
+            panic!("Expected SignalBatch::Logs");
+        }
+
+        // 2. Oversized request (decoded > 2048 bytes, even when gzip compressed) is rejected with ResourceExhausted
+        let oversized_req = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_000_000_000,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("A".repeat(8192))),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let err = client
+            .export(Request::new(oversized_req))
+            .await
+            .expect_err("oversized decoded gRPC message must fail");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), server_handle).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_receiver_concurrency_limit_sheds_when_permits_exhausted() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let _guard = SHED_METRIC_TEST_LOCK.lock().await;
+
+        let cfg = OtlpReceiverConfig {
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_concurrent_requests: 1,
+            ingest_send_timeout_ms: 100,
+        };
+
+        // 1. gRPC concurrency limit exhaustion
+        let grpc_sem = Arc::new(Semaphore::new(1));
+        let _held_grpc_permit = grpc_sem.acquire().await.unwrap();
+        let (logs_tx, _logs_rx) = mpsc::channel(4);
+        let grpc_svc = GrpcLogsService::new(logs_tx, cfg, Arc::clone(&grpc_sem));
+
+        let before_grpc = shed_requests_total("logs", "grpc");
+        let err = grpc_svc
+            .export(Request::new(ExportLogsServiceRequest::default()))
+            .await
+            .expect_err("gRPC export should shed when semaphore permits are exhausted");
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert_eq!(shed_requests_total("logs", "grpc"), before_grpc + 1);
+
+        // 2. HTTP concurrency limit exhaustion
+        let (logs_tx, _logs_rx) = mpsc::channel(4);
+        let (traces_tx, _traces_rx) = mpsc::channel(4);
+        let (metrics_tx, _metrics_rx) = mpsc::channel(4);
+        let state = HttpState::new(logs_tx, traces_tx, metrics_tx, cfg);
+        let _held_http_permit = state.semaphore.acquire().await.unwrap();
+
+        let before_http = shed_requests_total("logs", "http");
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let res = handle_logs(
+            State(state.clone()),
+            headers,
+            Bytes::from_static(br#"{"resourceLogs":[]}"#),
+        )
+        .await;
+        assert!(res.is_err());
+        let resp = res.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert_eq!(shed_requests_total("logs", "http"), before_http + 1);
     }
 }
