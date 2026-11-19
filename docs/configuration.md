@@ -35,6 +35,9 @@ Configures the OTLP receiver that listens for incoming telemetry data.
 | `grpc_addr` | String | `"127.0.0.1:4317"` | Socket address for the gRPC OTLP receiver. |
 | `http_addr` | String | `"127.0.0.1:4318"` | Socket address for the HTTP/JSON OTLP receiver. |
 | `admin_addr` | String | `null` | Optional socket address for the admin HTTP server (e.g. `"127.0.0.1:9090"`). Must bind to loopback or a private non-wildcard interface and use a distinct port from `grpc_addr` and `http_addr` for port isolation. |
+| `max_body_bytes` | Integer | `16777216` (16 MiB) | Maximum decompressed request payload size in bytes for gRPC (`max_decoding_message_size`) and HTTP (`DefaultBodyLimit::max` and decompressed stream cap). Minimum `1024` (1 KiB). |
+| `max_concurrent_requests` | Integer | `256` | Maximum concurrent in-flight requests per protocol listener before shedding. Minimum `1`. |
+| `ingest_send_timeout_ms` | Integer | `500` | Maximum wait in milliseconds on a full downstream channel or concurrency semaphore before shedding with gRPC `UNAVAILABLE` / HTTP `503` + `Retry-After: 1`. Minimum `1`. |
 
 ---
 
