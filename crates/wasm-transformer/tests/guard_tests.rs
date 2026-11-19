@@ -1042,7 +1042,7 @@ fn test_strict_schema_equality_dropped_metadata_fails() {
         "otel::compliance::status".to_string(),
         "verified".to_string(),
     );
-    in_schema.metadata = meta;
+    in_schema.metadata = meta.into();
     let in_schema = Arc::new(in_schema);
 
     let out_schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, true)]));

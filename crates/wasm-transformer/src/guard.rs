@@ -269,9 +269,9 @@ pub fn backfill_missing_columns(
         if k.starts_with("otel::compliance::") {
             continue;
         }
-        merged_metadata
-            .entry(k.clone())
-            .or_insert_with(|| v.clone());
+        if !merged_metadata.contains_key(k) {
+            merged_metadata.insert(k.clone(), v.clone());
+        }
     }
 
     if !added
