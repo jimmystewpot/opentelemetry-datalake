@@ -637,6 +637,24 @@ fn read_bounded<R: Read>(
     Ok(buf)
 }
 
+/// Computes the maximum allowed Zstd window log (`log2(window_bytes)`) for `max_body_bytes`.
+///
+/// Clamped to `[20, 25]` (`1 MiB`..=`32 MiB`) so standard streaming Zstd frames at default
+/// compression levels (whose headers advertise up to `windowLog = 19..=20` when input size
+/// is unpledged) remain accepted for small `max_body_bytes`, while frames advertising extreme
+/// windows (such as libzstd's 128 MiB `windowLog = 27` default) are rejected before allocating.
+const fn zstd_window_log_max(max_body_bytes: usize) -> u32 {
+    let ceil_pow2 = max_body_bytes.next_power_of_two();
+    let log2 = ceil_pow2.trailing_zeros();
+    if log2 < 20 {
+        20
+    } else if log2 > 25 {
+        25
+    } else {
+        log2
+    }
+}
+
 fn decompress_bounded(
     raw: &[u8],
     encoding: CompressedEncoding,
@@ -644,11 +662,15 @@ fn decompress_bounded(
 ) -> Result<Vec<u8>, StatusCode> {
     match encoding {
         CompressedEncoding::Gzip => {
-            let decoder = flate2::bufread::GzDecoder::new(raw);
+            let decoder = flate2::bufread::MultiGzDecoder::new(raw);
             read_bounded(decoder, max_body_bytes, raw.len())
         }
         CompressedEncoding::Zstd => {
-            let decoder = zstd::stream::read::Decoder::with_buffer(raw)
+            let mut decoder = zstd::stream::read::Decoder::with_buffer(raw)
+                .ok()
+                .ok_or(StatusCode::BAD_REQUEST)?;
+            decoder
+                .window_log_max(zstd_window_log_max(max_body_bytes))
                 .ok()
                 .ok_or(StatusCode::BAD_REQUEST)?;
             read_bounded(decoder, max_body_bytes, raw.len())
@@ -2388,6 +2410,58 @@ mod tests {
             non_utf8_res.unwrap_err(),
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
+
+        // 5. Multi-member gzip stream must decode all concatenated members (and enforce aggregate max_body_bytes)
+        let part1 =
+            br#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000"}]}]}"#;
+        let part2 = br#",{"scopeLogs":[{"logRecords":[{"timeUnixNano":"2000000000"}]}]}]}"#;
+        let mut multi_gz_bytes = Vec::new();
+        for part in [part1.as_slice(), part2.as_slice()] {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(part).unwrap();
+            multi_gz_bytes.extend_from_slice(&enc.finish().unwrap());
+        }
+        let mut multi_gz_headers = HeaderMap::new();
+        multi_gz_headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        multi_gz_headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let multi_gz_batch = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            multi_gz_headers,
+            Bytes::from(multi_gz_bytes),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await
+        .expect("multi-member gzip JSON request should decode all members");
+        assert_eq!(multi_gz_batch.num_rows(), 2);
+
+        // 6. Zstd frame advertising a 128 MiB window (windowLog = 27, WD = 0x88) must be rejected by window_log_max
+        let zstd_128mib_window_frame: &[u8] = &[
+            0x28, 0xB5, 0x2F, 0xFD, // Zstd magic number
+            0x00, // Frame_Header_Descriptor (Single_Segment=0, FCS_Flag=0)
+            0x88, // Window_Descriptor: exponent = (0x88 >> 3) + 10 = 27 (128 MiB window)
+            0x11, 0x00, 0x00, // Block_Header: Last_Block=1, Block_Type=0 (Raw), Block_Size=2
+            b'{', b'}', // Raw payload "{}"
+        ];
+        let mut zstd_win_headers = HeaderMap::new();
+        zstd_win_headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        zstd_win_headers.insert(CONTENT_ENCODING, "zstd".parse().unwrap());
+        let zstd_win_res = decode_and_convert_http::<ExportLogsServiceRequest, _>(
+            zstd_win_headers,
+            Bytes::from_static(zstd_128mib_window_frame),
+            4096,
+            "Logs",
+            arrow_codec::decode_logs,
+        )
+        .await;
+        assert_eq!(
+            zstd_win_res.unwrap_err(),
+            StatusCode::BAD_REQUEST,
+            "zstd frame advertising 128 MiB window must be rejected by window_log_max"
+        );
+        assert_eq!(zstd_window_log_max(4096), 20);
+        assert_eq!(zstd_window_log_max(DEFAULT_MAX_BODY_BYTES), 24);
+        assert_eq!(zstd_window_log_max(64 * 1024 * 1024), 25);
     }
 
     #[tokio::test]
