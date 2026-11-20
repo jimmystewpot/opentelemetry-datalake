@@ -9,4 +9,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 opentelemetry-datalake-wasm-sdk = { path = "../../../crates/wasm-sdk" }
-arrow = { version = "59", default-features = false, features = ["ipc"] }
+arrow = { workspace = true, features = ["ipc"] }

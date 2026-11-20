@@ -101,12 +101,12 @@ toml = { version = "1.1.6", default-features = false, features = ["parse", "serd
 clap = { version = "4.6", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 
 # Arrow
-arrow = { version = "59", default-features = false, features = ["json", "ipc"] }
-parquet = { version = "59", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2-rust_backend", "lz4"] }
+arrow = { version = "60", default-features = false, features = ["json", "ipc"] }
+parquet = { version = "60", default-features = false, features = ["async", "arrow", "zstd", "snap", "flate2-rust_backend", "lz4"] }
 
 # WebAssembly Runtime (Wasmtime 50, Rust 1.98+ required)
-wasmtime = { version = "50.0.2", default-features = false, features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = { version = "50.0.2", default-features = false }
+wasmtime = { version = "50.0.3", default-features = false, features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = { version = "50.0.3", default-features = false }
 
 # Concurrent Collections
 dashmap = { version = "6.0", default-features = false }
@@ -134,11 +134,11 @@ criterion = { version = "0.8.2", default-features = false, features = ["async_to
 
 # Storage & Iceberg Catalogs
 chrono = { version = "0.4.38", default-features = false, features = ["clock", "serde", "std"] }
-iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }  
-iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
-iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "492234eb43b1aceee1b9379d5c676e4635b5d4d7" }
+iceberg = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "91f820f275f4c476356299fe8eba88710a2c8ce6" }
+iceberg-catalog-rest = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "91f820f275f4c476356299fe8eba88710a2c8ce6" }
+iceberg-catalog-glue = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "91f820f275f4c476356299fe8eba88710a2c8ce6" }
+iceberg-catalog-s3tables = { default-features = false, git = "https://github.com/apache/iceberg-rust.git", rev = "91f820f275f4c476356299fe8eba88710a2c8ce6" }
+iceberg-storage-opendal = { default-features = false, features = ["opendal-s3"], git = "https://github.com/apache/iceberg-rust.git", rev = "91f820f275f4c476356299fe8eba88710a2c8ce6" }
 
 [profile.release]
 lto = "thin"

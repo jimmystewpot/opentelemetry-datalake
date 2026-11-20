@@ -27,12 +27,6 @@ updates:
       aws:
         patterns:
           - "aws-*"
-    ignore:
-      - dependency-name: "arrow"
-        versions: [">= 60.0.0"]
-      - dependency-name: "parquet"
-        versions: [">= 60.0.0"]
-
 
   - package-ecosystem: "github-actions"
     directory: "/"
