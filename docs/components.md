@@ -81,9 +81,11 @@ pub enum SignalBatch {
 ### 1. Backpressure Handling & Channel Sizing
 
 Components **MUST** respect backpressure:
-*   Pipeline channels (`tokio::sync::mpsc`) carry `SignalBatch`es containing Arrow `RecordBatch`es. To prevent unbounded memory growth under ingestion spikes or sink latency, channel capacities **MUST** be bounded conservatively (target: 32–64 batches, or a byte-budget semaphore).
-*   **Current behavior:** when a channel is full, upstream `.send().await` stays pending, so the producer's request waits. `OtlpReceiverSource` returns `503 Service Unavailable` / gRPC `UNAVAILABLE` only when a channel is **closed**.
-*   **Target contract:** receivers wait a bounded time on a full channel and then shed with `503` / `UNAVAILABLE` and a shed metric (#142). Current channel sizing is described in [buffer.md](buffer.md) (#125).
+*   Pipeline channels (`tokio::sync::mpsc`) carry `SignalBatch`es containing Arrow `RecordBatch`es. To prevent unbounded memory growth under ingestion spikes or sink latency, channel capacities **MUST** be bounded conservatively (target: 32–64 batches, default `64` via `[pipeline].channel_capacity`, plus per-sink byte-bounded `SinkBuffer` ringbuffers as described in [buffer.md](buffer.md)).
+*   `OtlpReceiverSource` enforces explicit ingress bounds on both gRPC and HTTP listeners:
+    *   `max_body_bytes` (default `16777216` / 16 MiB): limits the maximum decompressed request payload size via gRPC `max_decoding_message_size`, HTTP `DefaultBodyLimit::max`, and a bounded decompressed stream cap (`Read::take(max_body_bytes + 1)`) during `gzip` and `zstd` decompression so decompression bombs are rejected with HTTP `413 Payload Too Large` / gRPC `RESOURCE_EXHAUSTED`.
+    *   `max_concurrent_requests` (default `256`): limits concurrent in-flight requests per protocol listener via a shared semaphore.
+    *   `ingest_send_timeout_ms` (default `500` ms): bounds the time a receiver waits on a full downstream pipeline channel or saturated concurrency semaphore before shedding the request with gRPC `UNAVAILABLE` or HTTP `503 Service Unavailable` (`Retry-After: 1`) and incrementing `datalake.receiver.requests_shed_total{signal, protocol}`.
 *   Components **MUST NOT** drop batches silently under backpressure.
 
 ### 2. Error Handling & Task Supervision
@@ -110,7 +112,7 @@ Sinks (`IcebergSink`, `ElasticsearchSink`, `StarRocksSink`, `KafkaSink`) **MUST 
 ### 5. Async & Blocking Isolation
 
 Synchronous, CPU-heavy operations **MUST NOT** run directly on Tokio async worker threads. The following operations **MUST** be isolated in `tokio::task::spawn_blocking`:
-*   OTLP Protobuf and JSON decoding (> 64 KB).
+*   HTTP `gzip` and `zstd` request decompression, as well as OTLP Protobuf and JSON decoding (> 64 KB).
 *   Arrow batch concatenation (`compute::concat_batches`).
 *   Arrow sorting (`compute::lexsort_to_indices` + `compute::take`).
 *   Batch serialization (NDJSON, Arrow IPC, CSV, Parquet).

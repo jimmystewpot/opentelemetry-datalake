@@ -121,8 +121,10 @@ prost = { version = "0.14.4", default-features = false, features = ["std", "deri
 opentelemetry-proto = { version = "0.33.1", default-features = false, features = ["gen-tonic-messages", "gen-tonic", "tonic", "logs", "metrics", "trace", "with-serde"] }
 
 # Networking
-tonic = { version = "0.14.6", default-features = false, features = ["transport", "codegen", "router"] }
+tonic = { version = "0.14.6", default-features = false, features = ["transport", "codegen", "router", "gzip", "zstd"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "http2", "tokio", "json"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+zstd = { version = "0.14", default-features = false }
 
 # Sinks
 rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio"] }
