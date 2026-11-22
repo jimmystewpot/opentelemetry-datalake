@@ -23,6 +23,18 @@ struct AppConfig {
     pub wasm_transformer: Option<pipeline_core::config::WasmTransformerConfig>,
 }
 
+const fn default_max_body_bytes() -> usize {
+    otlp_receiver::DEFAULT_MAX_BODY_BYTES
+}
+
+const fn default_max_concurrent_requests() -> usize {
+    otlp_receiver::DEFAULT_MAX_CONCURRENT_REQUESTS
+}
+
+const fn default_ingest_send_timeout_ms() -> u64 {
+    otlp_receiver::DEFAULT_INGEST_SEND_TIMEOUT_MS
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(clippy::struct_field_names)]
 struct ServerConfig {
@@ -30,6 +42,22 @@ struct ServerConfig {
     http_addr: SocketAddr,
     #[serde(default)]
     admin_addr: Option<SocketAddr>,
+    #[serde(default = "default_max_body_bytes")]
+    max_body_bytes: usize,
+    #[serde(default = "default_max_concurrent_requests")]
+    max_concurrent_requests: usize,
+    #[serde(default = "default_ingest_send_timeout_ms")]
+    ingest_send_timeout_ms: u64,
+}
+
+impl ServerConfig {
+    const fn receiver_config(&self) -> otlp_receiver::OtlpReceiverConfig {
+        otlp_receiver::OtlpReceiverConfig {
+            max_body_bytes: self.max_body_bytes,
+            max_concurrent_requests: self.max_concurrent_requests,
+            ingest_send_timeout_ms: self.ingest_send_timeout_ms,
+        }
+    }
 }
 
 type KafkaConfig = kafka_sink::KafkaSinkConfig;
@@ -80,6 +108,12 @@ const fn cli_verbosity_filter(verbose: u8) -> Option<&'static str> {
 fn validate_config(config: &AppConfig) -> anyhow::Result<()> {
     config
         .pipeline
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
+
+    config
+        .server
+        .receiver_config()
         .validate()
         .map_err(|e| anyhow::anyhow!("Configuration validation failed: {e}"))?;
 
@@ -705,13 +739,14 @@ async fn main() -> anyhow::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Create OTLP Receiver Source
-    let mut source = otlp_receiver::OtlpReceiverSource::new(
+    let mut source = otlp_receiver::OtlpReceiverSource::with_config(
         config.server.grpc_addr,
         config.server.http_addr,
         logs_tx,
         traces_tx,
         metrics_tx,
         shutdown_rx.clone(),
+        config.server.receiver_config(),
     );
 
     // Create Transformers (WASM if configured, otherwise Noop)
@@ -3261,5 +3296,81 @@ mod tests {
             validate_config(&cfg).is_ok(),
             "Distinct collector host must pass validation when telemetry.enabled = true"
         );
+    }
+
+    #[test]
+    fn test_server_config_receiver_defaults() {
+        let toml_str = r#"
+        [server]
+        grpc_addr = "127.0.0.1:4317"
+        http_addr = "127.0.0.1:4318"
+        "#;
+        let cfg: AppConfig = Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .expect("Minimal server config should deserialize");
+
+        assert_eq!(cfg.server.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.server.max_concurrent_requests, 256);
+        assert_eq!(cfg.server.ingest_send_timeout_ms, 500);
+        assert_eq!(
+            cfg.server.receiver_config(),
+            otlp_receiver::OtlpReceiverConfig {
+                max_body_bytes: 16 * 1024 * 1024,
+                max_concurrent_requests: 256,
+                ingest_send_timeout_ms: 500,
+            }
+        );
+    }
+
+    #[test]
+    fn test_validate_config_rejects_invalid_server_receiver_limits() {
+        for (invalid_field, expected_fragment) in [
+            (
+                "max_body_bytes = 512",
+                "server.max_body_bytes must be >= 1024",
+            ),
+            (
+                "max_concurrent_requests = 0",
+                "server.max_concurrent_requests must be >= 1",
+            ),
+            (
+                "ingest_send_timeout_ms = 0",
+                "server.ingest_send_timeout_ms must be >= 1",
+            ),
+        ] {
+            let toml_str = format!(
+                r#"
+                [server]
+                grpc_addr = "127.0.0.1:4317"
+                http_addr = "127.0.0.1:4318"
+                {invalid_field}
+
+                [kafka]
+                brokers = "localhost:9092"
+                logs_topic = "logs"
+                traces_topic = "traces"
+                metrics_topic = "metrics"
+                logs_format = "json"
+                traces_format = "json"
+                metrics_format = "json"
+                "#
+            );
+            let cfg: AppConfig = Figment::new()
+                .merge(Toml::string(&toml_str))
+                .extract()
+                .expect("Config with invalid server receiver limit should deserialize");
+
+            let err = validate_config(&cfg).expect_err("Invalid server receiver limit must fail");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Configuration validation failed"),
+                "Expected 'Configuration validation failed' in: {msg}"
+            );
+            assert!(
+                msg.contains(expected_fragment),
+                "Expected '{expected_fragment}' in: {msg}"
+            );
+        }
     }
 }

@@ -79,7 +79,7 @@ Since `opentelemetry-datalake` is an async application, developers **SHOULD** us
 ## Metrics Standards
 
 > [!NOTE]
-> **Status:** only `datalake.sink.parquet.*` metrics and the WASM transformer registry are implemented today. The table below is the **target contract** for all components, pending ratification in #145 and implementation in #139.
+> **Status:** `datalake.receiver.requests_shed_total` (`signal`, `protocol`) in `otlp-receiver`, `datalake.sink.parquet.*` metrics, and the WASM transformer registry are actively emitted today. The remaining metrics in the table below form the **target contract** for all components, pending ratification in #145 and implementation in #139.
 
 All components and storage sinks **MUST** emit OpenTelemetry metrics using the global meter provider.
 
@@ -88,7 +88,7 @@ All components and storage sinks **MUST** emit OpenTelemetry metrics using the g
 *   Names use the `datalake.<component>.<name>` namespace, matching the existing `datalake.sink.parquet.records_written_total`.
 *   Use `snake_case` within a segment, include units where applicable (`_bytes`, `_seconds`), and end monotonic counters with `_total`.
 *   Each metric has exactly **one** instrument type, as listed below. Buffer occupancy uses an `ObservableGauge` reading an `AtomicU64`, so error paths cannot cause drift (as an `UpDownCounter` could) and no lock or allocation occurs on the hot path.
-*   Attributes: `signal` (`logs`/`traces`/`metrics`) and `sink`. Do not use unbounded-cardinality attributes (table names, service names, trace IDs).
+*   Attributes: `signal` (`logs`/`traces`/`metrics`), `protocol` (`grpc`/`http` for receiver metrics), and `sink`. Do not use unbounded-cardinality attributes (table names, service names, trace IDs).
 
 ### Target metrics
 
@@ -96,7 +96,7 @@ All components and storage sinks **MUST** emit OpenTelemetry metrics using the g
 |---|---|---|---|
 | `datalake.receiver.records_total` | Counter | `{record}` | Records received by OTLP receivers |
 | `datalake.receiver.bytes_total` | Counter | `By` | Raw bytes received at the ingestion edge |
-| `datalake.receiver.requests_shed_total` | Counter | `{request}` | Requests rejected because the pipeline was overloaded (#142) |
+| `datalake.receiver.requests_shed_total` | Counter | `{request}` | Requests rejected with gRPC `UNAVAILABLE` / HTTP `503` when the receiver concurrency limit or downstream channel send timeout is reached (`signal`, `protocol`) |
 | `datalake.sink.buffer_records` | ObservableGauge | `{record}` | Records currently buffered in memory |
 | `datalake.sink.buffer_bytes` | ObservableGauge | `By` | Bytes currently buffered in memory |
 | `datalake.sink.records_committed_total` | Counter | `{record}` | Records committed to persistent storage |

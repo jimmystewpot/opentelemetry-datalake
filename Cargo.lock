@@ -4097,6 +4097,9 @@ dependencies = [
  "arrow-codec",
  "async-trait",
  "axum",
+ "figment",
+ "flate2",
+ "opentelemetry",
  "opentelemetry-proto",
  "pipeline-core",
  "prost",
@@ -4106,6 +4109,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "zstd 0.14.4",
 ]
 
 [[package]]
@@ -6206,6 +6210,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http 1.5.0",
  "http-body",
@@ -6224,6 +6229,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "zstd 0.14.4",
 ]
 
 [[package]]
