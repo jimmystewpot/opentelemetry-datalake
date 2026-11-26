@@ -24,7 +24,7 @@ env:
 jobs:
   analyze:
     name: Analyze (Rust)
-    runs-on: ${{ github.actor == 'dependabot[bot]' && 'ubuntu-latest' || 'arc-runner-set' }}
+    runs-on: ${{ github.actor == 'dependabot[bot]' && 'ubuntu-latest' || 'arc-runner-otel-datalake' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
