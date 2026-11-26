@@ -127,7 +127,7 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 zstd = { version = "0.14", default-features = false }
 
 # Sinks
-rdkafka = { version = "0.39.0", default-features = false, features = ["cmake-build", "tokio"] }
+rdkafka = { version = "0.40.0", default-features = false, features = ["cmake-build", "tokio"] }
 starrocks-stream-load = { version = "1.0.13", default-features = false }
 bytes = "1.6"
 
